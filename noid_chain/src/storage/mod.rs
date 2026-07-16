@@ -111,6 +111,6 @@ pub trait BlockStore: Send + Sync {
     fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError>;
 
     /// Look up a transaction by body hash. Returns `(block_height, tx_pos)`
-    /// for O(1) receipt lookup and Merkle path reconstruction.
+    /// for O(1) logical-tx receipt lookup and Merkle path reconstruction.
     fn get_tx_index(&self, hash: &[u8; 32]) -> Result<Option<(u64, u32)>, StoreError>;
 }

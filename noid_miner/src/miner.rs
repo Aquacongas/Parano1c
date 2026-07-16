@@ -689,7 +689,8 @@ impl BlockMiner {
 
         // --- Update mempool (no chain lock held) ---
         let block = committed.block();
-        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        let confirmed = noid_chain::try_compute_logical_txids(&block.transactions)
+            .expect("locally committed block has a canonical logical tx stream");
         self.mempool
             .on_new_block(&confirmed, block.header.height, new_view)
             .await;

@@ -141,10 +141,12 @@ pub fn update_wallet_artifacts_from_block(
     active_index: u32,
     block: &Block,
 ) {
-    let block_tx_hashes: Vec<[u8; 32]> = block
-        .transactions
-        .iter()
-        .map(|transaction| transaction.txid().0)
+    let stream = noid_chain::validate_block_page_stream(&block.transactions)
+        .expect("accepted block has a canonical PagedSpend stream");
+    let block_tx_hashes: Vec<[u8; 32]> = noid_chain::try_compute_logical_txids(&block.transactions)
+        .expect("accepted block has canonical logical txids")
+        .into_iter()
+        .map(|txid| txid.0)
         .collect();
     let pending_hashes: std::collections::HashSet<[u8; 32]> = history
         .iter()
@@ -157,12 +159,40 @@ pub fn update_wallet_artifacts_from_block(
         .map(|entry| entry.tx_hash)
         .collect();
 
-    for (tx_index, tx) in block.transactions.iter().enumerate() {
-        let tx_hash = tx.txid().0;
+    let coinbase = &block.transactions[0];
+    let coinbase_hash = block_tx_hashes[0];
+    if !existing_confirmed.contains(&coinbase_hash) {
+        let received = coinbase
+            .body
+            .live_outputs()
+            .map(|(_, output)| output)
+            .filter(|output| output.owner == active_address)
+            .map(|output| output.amount)
+            .fold(0u64, u64::saturating_add);
+        if received > 0 {
+            history.push(TxHistoryEntry {
+                tx_hash: coinbase_hash,
+                height: block.header.height,
+                direction: TxDirection::Received,
+                amount_micronoid: received,
+                peer_address: None,
+                timestamp: block.header.timestamp,
+                own_address: Some(active_address.to_bech32()),
+                own_key_index: Some(active_index),
+            });
+        }
+    }
+
+    for (group_index, group) in stream.groups.iter().enumerate() {
+        let tx_index = group_index + 1;
+        let tx_hash = group.spend.logical_txid.0;
+        let start = 1 + usize::from(group.start_page);
+        let end = 1 + group.end_page_exclusive();
+        let pages = &block.transactions[start..end];
         let pending_send = pending_hashes.contains(&tx_hash);
 
         if pending_send {
-            let receipt = generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes);
+            let receipt = generate_receipt(&block.header, pages, tx_index, &block_tx_hashes);
             receipts.insert(tx_hash, receipt.to_bytes());
             continue;
         }
@@ -170,10 +200,9 @@ pub fn update_wallet_artifacts_from_block(
         if existing_confirmed.contains(&tx_hash) {
             continue;
         }
-        let received = tx
-            .body
-            .live_outputs()
-            .map(|(_, output)| output)
+        let received = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
             .filter(|output| output.owner == active_address)
             .map(|output| output.amount)
             .fold(0u64, u64::saturating_add);
@@ -227,10 +256,13 @@ pub fn update_active_wallet_from_block(
         )
     })?;
 
-    let block_tx_hashes: Vec<[u8; 32]> = block
-        .transactions
-        .iter()
-        .map(|transaction| transaction.txid().0)
+    let stream = noid_chain::validate_block_page_stream(&block.transactions).map_err(|error| {
+        format!("wallet block h={height} has invalid PagedSpend stream: {error}")
+    })?;
+    let block_tx_hashes: Vec<[u8; 32]> = noid_chain::try_compute_logical_txids(&block.transactions)
+        .map_err(|error| format!("wallet block h={height} has invalid txids: {error}"))?
+        .into_iter()
+        .map(|txid| txid.0)
         .collect();
 
     // Build once before the loop: O(history) instead of O(history × txs).
@@ -240,46 +272,49 @@ pub fn update_active_wallet_from_block(
         .map(|e| e.tx_hash)
         .collect();
 
-    for (tx_index, tx) in block.transactions.iter().enumerate() {
-        let tx_hash = tx.txid().0;
-        if tx.body.is_coinbase {
-            // Coinbase: track UTXOs for our addresses, record history.
-            // No receipt — receipts are proof-of-payment for OUTGOING txs only.
-            for (output_index, output) in tx.body.outputs.iter().enumerate() {
-                if !tx.body.output_is_live(output_index) {
-                    continue;
-                }
-                let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
-                    return Err(format!(
-                        "wallet block h={height} is missing creation id for live coinbase output {tx_index}:{output_index}"
-                    ));
-                };
-                if output.owner == active_address {
-                    let utxo = WalletUtxo {
-                        slot_index: output.slot_index,
-                        value: output.amount,
-                        creation_id,
-                        address: output.owner,
-                        key_index: active_index,
-                        confirmed_height: height,
-                    };
-                    utxos.insert(output.slot_index, utxo);
-                    let addr_str = output.owner.to_bech32();
-                    history.push(TxHistoryEntry {
-                        tx_hash,
-                        height,
-                        direction: TxDirection::Received,
-                        amount_micronoid: output.amount,
-                        peer_address: None,
-                        timestamp,
-                        own_address: Some(addr_str),
-                        own_key_index: Some(active_index),
-                    });
-                }
-            }
+    // Coinbase is the sole non-PagedSpend leaf and remains at logical index 0.
+    let coinbase = &block.transactions[0];
+    let coinbase_hash = block_tx_hashes[0];
+    for (output_index, output) in coinbase.body.outputs.iter().enumerate() {
+        if !coinbase.body.output_is_live(output_index) {
             continue;
         }
+        let Some(creation_id) = output_creation_ids[0][output_index] else {
+            return Err(format!(
+                "wallet block h={height} is missing creation id for live coinbase output 0:{output_index}"
+            ));
+        };
+        if output.owner == active_address {
+            utxos.insert(
+                output.slot_index,
+                WalletUtxo {
+                    slot_index: output.slot_index,
+                    value: output.amount,
+                    creation_id,
+                    address: output.owner,
+                    key_index: active_index,
+                    confirmed_height: height,
+                },
+            );
+            history.push(TxHistoryEntry {
+                tx_hash: coinbase_hash,
+                height,
+                direction: TxDirection::Received,
+                amount_micronoid: output.amount,
+                peer_address: None,
+                timestamp,
+                own_address: Some(output.owner.to_bech32()),
+                own_key_index: Some(active_index),
+            });
+        }
+    }
 
+    for (group_index, group) in stream.groups.iter().enumerate() {
+        let logical_index = group_index + 1;
+        let tx_hash = group.spend.logical_txid.0;
+        let start = 1 + usize::from(group.start_page);
+        let end = 1 + group.end_page_exclusive();
+        let pages = &block.transactions[start..end];
         // Track value flow for this transaction
         let mut sent_from_wallet: u64 = 0;
         let mut received_by_wallet: u64 = 0;
@@ -288,44 +323,47 @@ pub fn update_active_wallet_from_block(
         let mut recv_own_address: Option<String> = None;
         let mut recv_own_key_index: Option<u32> = None;
 
-        // Inputs: remove spent UTXOs and clear from pending_input_slots.
-        for (_, input) in tx.body.live_inputs() {
-            pending_input_slots.remove(&input.slot_index);
-            if let Some(spent) = utxos.remove(&input.slot_index) {
-                sent_from_wallet = sent_from_wallet.saturating_add(spent.value);
-                // Track the first spent address as the "own" sending address.
-                if sent_own_address.is_none() {
-                    sent_own_address = Some(spent.address.to_bech32());
-                    sent_own_key_index = Some(spent.key_index);
+        for (page_offset, page) in pages.iter().enumerate() {
+            let physical_index = start + page_offset;
+            // Inputs: remove spent UTXOs and clear pending reservations.
+            for (_, input) in page.body.live_inputs() {
+                pending_input_slots.remove(&input.slot_index);
+                if let Some(spent) = utxos.remove(&input.slot_index) {
+                    sent_from_wallet = sent_from_wallet.saturating_add(spent.value);
+                    if sent_own_address.is_none() {
+                        sent_own_address = Some(spent.address.to_bech32());
+                        sent_own_key_index = Some(spent.key_index);
+                    }
                 }
             }
-        }
 
-        // Outputs: add new UTXOs owned by this wallet
-        for (output_index, output) in tx.body.outputs.iter().enumerate() {
-            if !tx.body.output_is_live(output_index) {
-                continue;
-            }
-            let Some(creation_id) = output_creation_ids[tx_index][output_index] else {
-                return Err(format!(
-                    "wallet block h={height} is missing creation id for live user output {tx_index}:{output_index}"
-                ));
-            };
-            if output.owner == active_address {
-                let utxo = WalletUtxo {
-                    slot_index: output.slot_index,
-                    value: output.amount,
-                    creation_id,
-                    address: output.owner,
-                    key_index: active_index,
-                    confirmed_height: height,
+            // Outputs: add new UTXOs owned by this wallet.
+            for (output_index, output) in page.body.outputs.iter().enumerate() {
+                if !page.body.output_is_live(output_index) {
+                    continue;
+                }
+                let Some(creation_id) = output_creation_ids[physical_index][output_index] else {
+                    return Err(format!(
+                        "wallet block h={height} is missing creation id for live user output {physical_index}:{output_index}"
+                    ));
                 };
-                utxos.insert(output.slot_index, utxo);
-                received_by_wallet = received_by_wallet.saturating_add(output.amount);
-                // Track the first received-to address as the "own" receiving address.
-                if recv_own_address.is_none() {
-                    recv_own_address = Some(output.owner.to_bech32());
-                    recv_own_key_index = Some(active_index);
+                if output.owner == active_address {
+                    utxos.insert(
+                        output.slot_index,
+                        WalletUtxo {
+                            slot_index: output.slot_index,
+                            value: output.amount,
+                            creation_id,
+                            address: output.owner,
+                            key_index: active_index,
+                            confirmed_height: height,
+                        },
+                    );
+                    received_by_wallet = received_by_wallet.saturating_add(output.amount);
+                    if recv_own_address.is_none() {
+                        recv_own_address = Some(output.owner.to_bech32());
+                        recv_own_key_index = Some(active_index);
+                    }
                 }
             }
         }
@@ -368,7 +406,7 @@ pub fn update_active_wallet_from_block(
         // pending history tag is the ownership signal for receipt generation.
         // Incoming-only transactions still need no receipt.
         if sent_from_wallet > 0 || already_pending {
-            let receipt = generate_receipt(&block.header, &tx.body, tx_index, &block_tx_hashes);
+            let receipt = generate_receipt(&block.header, pages, logical_index, &block_tx_hashes);
             receipts.insert(tx_hash, receipt.to_bytes());
         }
     }
@@ -381,7 +419,8 @@ mod tests {
     use noid_chain::block_header::BlockHeader;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+        PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
 
     fn transaction(is_coinbase: bool, slot_index: u32, owner: Address) -> Transaction {
@@ -410,17 +449,24 @@ mod tests {
             },
             inputs,
             outputs,
-            validity_bitmap: output_bitmap_bit(0) | u16::from(!is_coinbase),
+            validity_bitmap: output_bitmap_bit(0)
+                | u16::from(!is_coinbase)
+                | if is_coinbase {
+                    0
+                } else {
+                    PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT
+                },
             is_coinbase,
         })
     }
 
     fn block(transactions: Vec<Transaction>, alloc_counter: u64) -> Block {
+        let tx_root = noid_chain::try_compute_tx_root(&transactions).unwrap_or([0; 32]);
         Block {
             header: BlockHeader {
                 prev_block_hash: [0; 32],
                 state_root: [0; 32],
-                tx_root: [0; 32],
+                tx_root,
                 timestamp: 123,
                 height: 7,
                 miner_address: Address([0x77; 32]),
@@ -432,6 +478,15 @@ mod tests {
             },
             transactions,
         }
+    }
+
+    fn logical_txid(transaction: &Transaction) -> [u8; 32] {
+        noid_tx::validate_paged_spend(&[noid_tx::TxPage {
+            body: transaction.body.clone(),
+        }])
+        .unwrap()
+        .logical_txid
+        .0
     }
 
     #[test]
@@ -548,7 +603,7 @@ mod tests {
         let inactive_source = Address([0xA7; 32]);
         let coinbase = transaction(true, 10, Address([0xCC; 32]));
         let outgoing = transaction(false, 20, Address([0xBB; 32]));
-        let outgoing_hash = outgoing.txid().0;
+        let outgoing_hash = logical_txid(&outgoing);
         let block = block(vec![coinbase, outgoing], 2);
         let mut utxos = HashMap::new();
         let mut history = vec![TxHistoryEntry {
@@ -586,7 +641,7 @@ mod tests {
         let inactive_source = Address([0xD2; 32]);
         let coinbase = transaction(true, 10, Address([0xCC; 32]));
         let outgoing = transaction(false, 20, Address([0xBB; 32]));
-        let outgoing_hash = outgoing.txid().0;
+        let outgoing_hash = logical_txid(&outgoing);
         let block = block(vec![coinbase, outgoing], 2);
         let mut history = vec![TxHistoryEntry {
             tx_hash: outgoing_hash,

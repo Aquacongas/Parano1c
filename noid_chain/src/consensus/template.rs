@@ -204,11 +204,8 @@ impl PreparedBlockStateCommit {
         if nonce_free_header != self.nonce_free_header {
             return Err("sealed block header differs from its prepared template".to_string());
         }
-        let tx_hashes = block
-            .transactions
-            .iter()
-            .map(Transaction::txid)
-            .collect::<Vec<_>>();
+        let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
+            .map_err(|error| format!("sealed block has invalid PagedSpend stream: {error}"))?;
         if tx_hashes != self.undo_log.tx_hashes {
             return Err("sealed block body differs from its prepared template".to_string());
         }
@@ -405,7 +402,9 @@ pub fn build_node_owned_block_template(
         difficulty_target,
     )?;
     let nonce_free_block = template.clone().into_block(0);
-    let undo_log = build_undo_log(state, &nonce_free_block);
+    let undo_log = build_undo_log(state, &nonce_free_block).map_err(|error| {
+        TemplateBuildError::StateApplyError(format!("canonical PagedSpend undo log: {error}"))
+    })?;
     let prepared = PreparedBlockStateCommit {
         parent_header: *parent,
         nonce_free_header: nonce_free_block.header,

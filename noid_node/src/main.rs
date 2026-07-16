@@ -1345,6 +1345,18 @@ async fn apply_p2p_block_offthread(
     let chain = chain.clone();
     let wallet = wallet.clone();
     tokio::task::spawn_blocking(move || {
+        let confirmed_tx_hashes =
+            match noid_chain::try_compute_logical_txids(&candidate.block.transactions) {
+                Ok(txids) => txids,
+                Err(_) => {
+                    return Err((
+                        noid_chain::storage::MdbxContextError::Corrupt(
+                            "candidate block has a non-canonical logical tx stream",
+                        ),
+                        candidate,
+                    ));
+                }
+            };
         let mut ctx = chain.blocking_write();
         let apply_result = ctx.apply_next_block(
             &candidate.bundle,
@@ -1364,12 +1376,6 @@ async fn apply_p2p_block_offthread(
         // prevents an exact newer snapshot from receiving this delta twice.
         update_wallet_for_block(&wallet, &candidate.block);
         let height = candidate.block.header.height;
-        let confirmed_tx_hashes = candidate
-            .block
-            .transactions
-            .iter()
-            .map(|tx| tx.txid())
-            .collect();
         let view = ChainView::from_mdbx(&ctx);
         drop(ctx);
         let block_hash = candidate.bundle.block_hash();
@@ -1485,7 +1491,10 @@ async fn apply_reorg_offthread(
                 }
                 let confirmed_tx_hashes = replacement_blocks
                     .iter()
-                    .flat_map(|block| block.transactions.iter().map(|tx| tx.txid()))
+                    .flat_map(|block| {
+                        noid_chain::try_compute_logical_txids(&block.transactions)
+                            .expect("committed reorg blocks have canonical logical tx streams")
+                    })
                     .collect();
                 let view = ChainView::from_mdbx(&ctx);
                 Ok(AppliedReorg {

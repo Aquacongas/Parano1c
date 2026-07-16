@@ -264,13 +264,13 @@ pub struct BlockHeaderInfo {
 /// Transaction location info (from the permanent tx index).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxInfo {
-    /// Transaction body hash (64-char hex).
+    /// Canonical logical transaction id (64-char hex).
     pub tx_hash: String,
     /// Block height where this tx was confirmed.
     pub height: u64,
     /// H_BLOCK of the confirming block.
     pub block_hash: String,
-    /// Zero-based position of the tx within the block.
+    /// Zero-based position in the logical tx tree (coinbase is position zero).
     pub tx_position: u32,
 }
 

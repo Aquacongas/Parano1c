@@ -957,8 +957,9 @@ impl RpcHandler {
         let block = committed.block();
         let height = block.header.height;
         let hash = block_id(&block.header);
-        let n_txs = block.transactions.len();
-        let confirmed: Vec<_> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        let confirmed = noid_chain::try_compute_logical_txids(&block.transactions)
+            .expect("locally committed block has a canonical logical tx stream");
+        let n_txs = confirmed.len();
         self.mempool
             .on_new_block(&confirmed, height, new_view)
             .await;

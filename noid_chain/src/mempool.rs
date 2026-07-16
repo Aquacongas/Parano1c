@@ -35,13 +35,13 @@ use crate::consensus::params::BLOCK_MAX_TXS;
 /// Ordering key for the fee-priority BTreeMap index.
 ///
 /// BTreeMap iterates in ascending key order, so we use descending fee_rate
-/// (via `u64::MAX - fee_rate`) and ascending tx_body_hash as tie-break.
+/// (via `u64::MAX - fee_rate`) and ascending logical txid as tie-break.
 /// This gives us the highest-fee tx at the front of iteration.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FeeKey {
     /// `u64::MAX - fee_rate`: sorts higher fee_rate to lower BTreeMap key.
     neg_fee_rate: u64,
-    /// Ascending tx_body_hash: deterministic tie-break.
+    /// Ascending logical txid: deterministic tie-break.
     hash: [u8; 32],
 }
 
@@ -161,14 +161,14 @@ pub enum MempoolError {
 /// At N=8192, BTreeMap is ~8192x faster for a 1-tx block, and equivalent for
 /// a 1024-tx full block (both O(N)). In both cases no allocation occurs.
 pub struct Mempool {
-    /// Admitted entries, indexed by tx_body_hash.
+    /// Admitted entries, indexed by logical txid.
     entries: HashMap<TxBodyHash, MempoolEntry>,
-    /// Fee-priority index: sorted by (desc fee_rate, asc tx_body_hash).
+    /// Fee-priority index: sorted by (desc fee_rate, asc logical txid).
     /// Always in sync with `entries`: insert on `admit`, remove on `remove`.
     fee_index: BTreeMap<FeeKey, TxBodyHash>,
-    /// Input slot -> tx_body_hash of the tx that spends it.
+    /// Input slot -> logical txid of the group that spends it.
     spent_inputs: HashMap<u32, TxBodyHash>,
-    /// Output slot -> tx_body_hash of the tx that mints it.
+    /// Output slot -> logical txid of the group that mints it.
     minted_outputs: HashMap<u32, TxBodyHash>,
     /// Maximum number of entries.
     capacity: usize,
@@ -206,7 +206,7 @@ impl Mempool {
         self.entries.contains_key(hash)
     }
 
-    /// Get an entry by tx_body_hash. O(1) HashMap lookup.
+    /// Get an entry by logical txid. O(1) HashMap lookup.
     pub fn get(&self, hash: &TxBodyHash) -> Option<&MempoolEntry> {
         self.entries.get(hash)
     }
@@ -305,7 +305,7 @@ impl Mempool {
     /// Fee-pack complete groups into at most `max_pages` physical pages.
     ///
     /// Returns entries in descending fee_rate order (highest fees first),
-    /// with ascending tx_body_hash as a deterministic tie-break.
+    /// with ascending logical txid as a deterministic tie-break.
     ///
     /// Does NOT include coinbase (caller adds it separately).
     /// Does NOT resolve cross-tx slot conflicts — the caller must call
@@ -358,10 +358,10 @@ impl Mempool {
 
     /// Update the pool after a block is confirmed or after a reorg.
     ///
-    /// - `confirmed`: tx_body_hashes that were included in the confirmed block.
+    /// - `confirmed`: logical txids that were included in the confirmed block.
     ///   These are removed from the pool (already applied to state).
     ///
-    /// - `reverted`: tx_body_hashes from REORGED blocks that should be returned
+    /// - `reverted`: logical txids from reorged blocks that should be returned
     ///   to the pool (their state changes were undone). The caller is responsible
     ///   for re-validating these txs against the new chain state before re-admitting.
     ///   This function only removes confirmed; reverted txs must be re-admitted via `admit()`.

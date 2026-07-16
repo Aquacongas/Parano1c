@@ -21,7 +21,6 @@ use crate::fri_state::SlotValue;
 use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
-use noid_tx::Transaction;
 
 /// Per-block undo log. Records the pre-image value of every UTXO slot
 /// mutated by the block, enabling reversion without the full block data.
@@ -43,7 +42,8 @@ pub struct BlockUndoLog {
     /// this block, recorded once at the slot's first occurrence in application
     /// order. Replaying these restores the pre-block UTXO state.
     pub slot_changes: Vec<(u32, SlotValue)>,
-    /// Derived txids of all transactions in this block (coinbase first).
+    /// Canonical transaction-tree leaves for this block (coinbase first,
+    /// followed by one logical txid per complete PagedSpend group).
     /// Used to restore the mempool after a reorg: txs that are no longer
     /// on the canonical chain can be re-admitted.
     pub tx_hashes: Vec<TxBodyHash>,
@@ -73,8 +73,11 @@ impl BlockUndoLog {
 /// Does not panic. Slots outside both the parent domain and a legal one-level
 /// child domain are skipped; outputs in the newly-created upper half are
 /// recorded with the canonical parent pre-image [`SlotValue::EMPTY`].
-pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog {
-    let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(Transaction::txid).collect();
+pub fn build_undo_log(
+    state_before: &ChainState,
+    block: &Block,
+) -> Result<BlockUndoLog, crate::block::BlockPageStreamError> {
+    let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)?;
     let mut slot_changes = Vec::new();
     let mut touched_slots = HashSet::new();
 
@@ -114,14 +117,14 @@ pub fn build_undo_log(state_before: &ChainState, block: &Block) -> BlockUndoLog 
         }
     }
 
-    BlockUndoLog {
+    Ok(BlockUndoLog {
         block_height: block.header.height,
         log_slots_before: state_before.state.log_slots() as u32,
         active_slot_count_before: state_before.active_slot_count,
         alloc_counter_before: state_before.alloc_counter,
         slot_changes,
         tx_hashes,
-    }
+    })
 }
 
 /// Revert the UTXO state to what it was before a block was applied by
@@ -155,7 +158,9 @@ mod tests {
     use crate::block_header::BlockHeader;
     use crate::consensus::params::GENESIS_TARGET;
     use noid_poseidon2b::primitives::Address;
-    use noid_tx::{output_bitmap_bit, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
     fn mint_block(slot: u32) -> Block {
         let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
@@ -195,7 +200,7 @@ mod tests {
     fn undo_log_uses_derived_txid_and_records_first_preimage() {
         let state = ChainState::with_log_slots(8);
         let block = mint_block(7);
-        let undo = build_undo_log(&state, &block);
+        let undo = build_undo_log(&state, &block).unwrap();
         assert_eq!(undo.tx_hashes, vec![block.transactions[0].txid()]);
         assert_eq!(undo.slot_changes, vec![(7, SlotValue::EMPTY)]);
         assert_eq!(undo.active_slot_count_before, 0);

@@ -138,8 +138,12 @@ pub fn update_for_accepted_block(
     });
 
     let mut history_changed = wallet.history.len() != history_count_before;
+    for txid in noid_chain::try_compute_logical_txids(&block.transactions)
+        .map_err(|error| format!("accepted block logical txids: {error}"))?
+    {
+        history_changed |= wallet.confirm_pending_tx(&txid.0, block.header.height);
+    }
     for tx in &block.transactions {
-        history_changed |= wallet.confirm_pending_tx(&tx.txid().0, block.header.height);
         let output_slots: Vec<u32> = tx
             .body
             .live_outputs()
@@ -165,21 +169,26 @@ fn recover_outgoing_receipts_from_block(
     sent_history: &std::collections::HashSet<[u8; 32]>,
     block: &noid_chain::block::Block,
 ) -> (usize, bool) {
-    let tx_hashes = block
-        .transactions
-        .iter()
-        .map(|transaction| transaction.txid().0)
+    let stream = noid_chain::validate_block_page_stream(&block.transactions)
+        .expect("retained accepted block has a canonical PagedSpend stream");
+    let tx_hashes = noid_chain::try_compute_logical_txids(&block.transactions)
+        .expect("retained accepted block has canonical logical txids")
+        .into_iter()
+        .map(|txid| txid.0)
         .collect::<Vec<_>>();
     let mut recovered = 0usize;
     let mut history_changed = false;
-    for (tx_index, transaction) in block.transactions.iter().enumerate() {
-        if transaction.body.is_coinbase {
-            continue;
-        }
-        let tx_hash = tx_hashes[tx_index];
+    for (group_index, group) in stream.groups.iter().enumerate() {
+        let tx_index = group_index + 1;
+        let tx_hash = group.spend.logical_txid.0;
+        let start = 1 + usize::from(group.start_page);
+        let end = 1 + group.end_page_exclusive();
+        let pages = &block.transactions[start..end];
         let outgoing = sent_history.contains(&tx_hash)
-            || (transaction.body.live_inputs().next().is_some()
-                && owned_addresses.contains(&transaction.body.input_owner.0));
+            || pages.iter().any(|page| {
+                page.body.live_inputs().next().is_some()
+                    && owned_addresses.contains(&page.body.input_owner.0)
+            });
         if !outgoing {
             continue;
         }
@@ -187,7 +196,7 @@ fn recover_outgoing_receipts_from_block(
             entry.insert(
                 noid_chain::consensus::receipt::generate_receipt(
                     &block.header,
-                    &transaction.body,
+                    pages,
                     tx_index,
                     &tx_hashes,
                 )
@@ -228,7 +237,7 @@ pub fn reconcile_receipts_at_startup(
             .and_then(|bytes| ParanoidReceipt::from_bytes(bytes).ok());
         let valid = match receipt {
             Some(receipt)
-                if receipt.summary.tx_body_hash == tx_hash && verify_merkle_inclusion(&receipt) =>
+                if receipt.summary.logical_txid == tx_hash && verify_merkle_inclusion(&receipt) =>
             {
                 chain
                     .store
@@ -337,8 +346,11 @@ pub fn install_reorg_snapshot_and_artifacts(
     }
     let replacement: std::collections::HashSet<[u8; 32]> = replacement_blocks
         .iter()
-        .flat_map(|block| block.transactions.iter())
-        .map(|transaction| transaction.txid().0)
+        .flat_map(|block| {
+            noid_chain::try_compute_logical_txids(&block.transactions)
+                .expect("committed replacement block has a canonical logical tx stream")
+        })
+        .map(|txid| txid.0)
         .collect();
     wallet.history.retain_mut(|entry| {
         if !reclaimed.contains(&entry.tx_hash) {
@@ -1020,7 +1032,8 @@ mod tests {
         };
         use noid_poseidon2b::primitives::Address;
         use noid_tx::{
-            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
         };
 
         let (dir, handle) = handle_with_utxos(&[]);
@@ -1045,10 +1058,19 @@ mod tests {
             input_owner: owner,
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
         });
-        let transactions = vec![transaction];
+        let coinbase = Transaction::new(TxBody {
+            epoch_anchor: [0; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [TxOutput::dummy(); TX_OUTPUTS],
+            validity_bitmap: 0,
+            is_coinbase: true,
+        });
+        let transactions = vec![coinbase, transaction];
         let header = BlockHeader {
             prev_block_hash: [0; 32],
             state_root: [0; 32],
@@ -1075,7 +1097,7 @@ mod tests {
         );
         assert_eq!(recovered, 1);
         assert!(!history_changed);
-        let tx_hash = block.transactions[0].txid().0;
+        let tx_hash = noid_chain::try_compute_logical_txids(&block.transactions).unwrap()[1].0;
         let receipt = ParanoidReceipt::from_bytes(&wallet.receipts[&tx_hash]).unwrap();
         assert!(verify_merkle_inclusion(&receipt));
         assert!(verify_against_header(&receipt, &block.header));
@@ -1092,15 +1114,13 @@ mod tests {
     }
 
     #[test]
-    fn planner_rejects_a_payment_that_needs_more_than_eight_inputs() {
+    fn planner_accepts_a_payment_that_needs_multiple_pages() {
         let (_dir, handle) = handle_with_utxos(&[10_000; 20]);
-        let error = handle
+        let plan = handle
             .plan_send(150_000, Some(10_000), 0, 24, 0)
-            .unwrap_err();
-        assert_eq!(
-            error,
-            WalletSendPlanError::InputLimitExceeded { max_inputs: 8 }
-        );
+            .expect("16-input PagedSpend plan");
+        assert_eq!(plan.input_count, 16);
+        assert_eq!(plan.output_count, 1);
         let guard = handle.inner.lock().unwrap();
         let wallet = guard.as_ref().unwrap();
         assert!(wallet.pending_input_slots.is_empty());
@@ -1109,12 +1129,27 @@ mod tests {
     }
 
     #[test]
-    fn automatic_fee_path_reports_the_input_limit_without_a_workaround() {
+    fn automatic_fee_path_selects_more_than_one_physical_page() {
         let (_dir, handle) = handle_with_utxos(&[1_000; 20]);
-        let error = handle.plan_send(10_000, None, 0, 24, 0).unwrap_err();
+        let plan = handle
+            .plan_send(10_000, None, 0, 24, 0)
+            .expect("automatic multi-page plan");
+        assert!(plan.input_count > noid_tx::TX_INPUTS);
+        assert!(plan.input_count <= MAX_PAGED_SPEND_INPUTS);
+    }
+
+    #[test]
+    fn planner_reports_the_real_paged_spend_input_limit() {
+        let values = vec![10_000; MAX_PAGED_SPEND_INPUTS + 1];
+        let (_dir, handle) = handle_with_utxos(&values);
+        let error = handle
+            .plan_send(10_110_000, Some(100_000), 0, 24, 0)
+            .unwrap_err();
         assert_eq!(
             error,
-            WalletSendPlanError::InputLimitExceeded { max_inputs: 8 }
+            WalletSendPlanError::InputLimitExceeded {
+                max_inputs: MAX_PAGED_SPEND_INPUTS,
+            }
         );
     }
 

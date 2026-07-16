@@ -65,7 +65,6 @@ use crate::storage::{
     ConsensusMeta, FinalizedCheckpoint, FinalizedSnapshotStaging, MdbxStore,
     SnapshotHeaderInstallSource, StoreError, VerifiedSnapshotBoundary,
 };
-use noid_poseidon2b::primitives::TxBodyHash;
 
 fn canonical_genesis_parts() -> (ChainState, HashMap<u64, BlockHeader>, [u8; 32]) {
     let header = genesis_header();
@@ -758,7 +757,8 @@ impl MdbxChainContext {
         parent: &BlockHeader,
         parent_segment_summaries: &[ParentSegmentSummary],
     ) -> Result<(), MdbxContextError> {
-        let tx_hashes: Vec<TxBodyHash> = block.transactions.iter().map(|tx| tx.txid()).collect();
+        let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
+            .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?;
         let block_hash = block_id(&block.header);
         let new_tip_chain_work = add_work(
             &self.tip_chain_work,
@@ -1060,7 +1060,9 @@ impl MdbxChainContext {
             .map(|segment_id| (segment_id, self.state.state.cached_segment_root(segment_id)))
             .collect();
         self.preload_segment_ids(&touched_segment_ids)?;
-        let undo = build_undo_log(&self.state, block);
+        let undo = build_undo_log(&self.state, block).map_err(|_| {
+            MdbxContextError::Corrupt("accepted block has a non-canonical logical tx stream")
+        })?;
 
         let state_root = match materialize_state(block, &mut self.state) {
             Ok(state_root) => state_root,

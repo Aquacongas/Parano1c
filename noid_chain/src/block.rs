@@ -389,19 +389,27 @@ pub fn validate_block_page_stream(
         .map_err(BlockPageStreamError::PagedSpend)
 }
 
-/// Compute the final count-bound universal 256-leaf logical transaction root.
+/// Return the exact transaction-tree leaf identities.
 ///
-/// Coinbase occupies leaf zero. Complete PagedSpend groups occupy the
-/// following leaves; continuation pages never get independent leaves.
-/// Genesis alone uses the zero root.
-pub fn try_compute_tx_root(txs: &[Transaction]) -> Result<Digest, BlockPageStreamError> {
+/// Coinbase occupies position zero. Complete PagedSpend groups occupy the
+/// following positions; continuation pages never get independent identities.
+/// Genesis has no leaves.
+pub fn try_compute_logical_txids(
+    txs: &[Transaction],
+) -> Result<Vec<noid_poseidon2b::primitives::TxBodyHash>, BlockPageStreamError> {
     if txs.is_empty() {
-        return Ok([0u8; 32]);
+        return Ok(Vec::new());
     }
     let stream = validate_block_page_stream(txs)?;
-    let hashes: Vec<_> = std::iter::once(txs[0].txid().0)
-        .chain(stream.groups.iter().map(|group| group.spend.logical_txid.0))
-        .collect();
+    Ok(std::iter::once(txs[0].txid())
+        .chain(stream.groups.iter().map(|group| group.spend.logical_txid))
+        .collect())
+}
+
+/// Compute the final count-bound universal 256-leaf logical transaction root.
+pub fn try_compute_tx_root(txs: &[Transaction]) -> Result<Digest, BlockPageStreamError> {
+    let hashes = try_compute_logical_txids(txs)?;
+    let hashes: Vec<_> = hashes.into_iter().map(|hash| hash.0).collect();
     Ok(crate::tx_tree::root_from_hashes(&hashes))
 }
 

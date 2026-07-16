@@ -53,7 +53,8 @@ const T_UNDO_LOGS: &str = "undo";
 const T_SEGMENTS: &str = "segments";
 const T_STATE_META: &str = "state_meta";
 const T_RECENT_BLOCKS: &str = "recent";
-/// Transaction index for receipt lookup. Key: TxBodyHash (32B). Value: (height, tx_pos) (12B).
+/// Transaction index for receipt lookup. Key: canonical logical txid (32B).
+/// Value: `(height, logical_position)` (12B), with coinbase at position zero.
 const T_TX_INDEX: &str = "tx_index";
 /// Detached current-height HistoryStep terminals carried by every
 /// canonical non-genesis block. Retained and served with the block so peers
@@ -1843,9 +1844,26 @@ impl MdbxStore {
                     "accepted bundle does not bind the committed header",
                 ));
             }
-            let user_page_count = tx_hashes.len().checked_sub(1).ok_or(StoreError::Decode(
-                "accepted block is missing its coinbase tx hash",
-            ))?;
+            let block = crate::Block::from_bytes(bundle.block_bytes())
+                .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
+            let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
+                .map_err(|_| StoreError::Decode("accepted logical tx stream is malformed"))?;
+            if block.header != *header
+                || logical_txids != tx_hashes
+                || logical_txids != undo_log.tx_hashes
+            {
+                return Err(StoreError::Decode(
+                    "accepted logical txids do not bind the committed block",
+                ));
+            }
+            let user_page_count =
+                block
+                    .transactions
+                    .len()
+                    .checked_sub(1)
+                    .ok_or(StoreError::Decode(
+                        "accepted block is missing its coinbase record",
+                    ))?;
             let expected_class = history_step_class_slot(user_page_count).ok_or(
                 StoreError::Decode("accepted block page count has no canonical HistoryStep tier"),
             )?;
@@ -2050,9 +2068,9 @@ impl MdbxStore {
             )?;
         }
 
-        // --- 8.5. tx_index: TxBodyHash → (height, position_in_block) ---
-        // Enables O(1) receipt lookup: given a tx_body_hash, find the block
-        // and position to reconstruct the Merkle inclusion path. Reorg
+        // --- 8.5. tx_index: logical txid → (height, logical position) ---
+        // Enables O(1) receipt lookup in the same leaf namespace as tx_root.
+        // Reorg
         // deletions live in this same transaction as the ancestor checkpoint,
         // so a crash can never expose an orphan transaction as canonical.
         let tx_idx_tbl = txn.open_table(Some(T_TX_INDEX))?;
@@ -2246,7 +2264,10 @@ impl MdbxStore {
                 || staged.hash != crate::hash_block_header(&staged.header)
                 || bundle.height() != staged.header.height
                 || bundle.block_hash() != staged.hash
-                || staged.undo_log.tx_hashes.len() != block.transactions.len()
+                || match crate::block::try_compute_logical_txids(&block.transactions) {
+                    Ok(txids) => txids != staged.undo_log.tx_hashes,
+                    Err(_) => true,
+                }
             {
                 return Err(StoreError::Decode("invalid staged reorg block"));
             }
@@ -2482,9 +2503,8 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
             if staged.header.height != 0 {
-                let expected_class = staged
-                    .undo_log
-                    .tx_hashes
+                let expected_class = block
+                    .transactions
                     .len()
                     .checked_sub(1)
                     .and_then(history_step_class_slot)
@@ -2502,8 +2522,9 @@ impl MdbxStore {
                     ));
                 }
             }
-            for (position, transaction) in block.transactions.iter().enumerate() {
-                let tx_hash = transaction.txid();
+            let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
+                .map_err(|_| StoreError::Decode("staged logical tx stream is malformed"))?;
+            for (position, tx_hash) in logical_txids.iter().enumerate() {
                 txn.put(
                     &tx_idx_tbl,
                     tx_hash.0,
@@ -2674,7 +2695,8 @@ mod tests {
     use crate::storage::FinalizedCheckpoint;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
-        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+        PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
     };
 
     fn coinbase(tag: u8) -> Transaction {
@@ -2718,6 +2740,51 @@ mod tests {
             header,
             transactions: vec![transaction],
         }
+    }
+
+    fn two_page_group(tag: u8) -> [Transaction; 2] {
+        let owner = Address([tag; 32]);
+        let mut first_inputs = [TxInput::dummy(); TX_INPUTS];
+        for (index, input) in first_inputs.iter_mut().enumerate() {
+            *input = TxInput {
+                slot_index: 100 + index as u32,
+                amount: 2,
+                creation_id: index as u64 + 1,
+            };
+        }
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 1_000,
+            amount: 19,
+            owner: Address([tag.wrapping_add(1); 32]),
+        };
+        let first = Transaction::new(TxBody {
+            epoch_anchor: [0xA5; 32],
+            fee: 1,
+            input_owner: owner,
+            inputs: first_inputs,
+            outputs,
+            validity_bitmap: ((1u16 << TX_INPUTS) - 1)
+                | output_bitmap_bit(0)
+                | PAGED_SPEND_START_BIT,
+            is_coinbase: false,
+        });
+        let mut second_inputs = [TxInput::dummy(); TX_INPUTS];
+        second_inputs[0] = TxInput {
+            slot_index: 108,
+            amount: 4,
+            creation_id: 9,
+        };
+        let second = Transaction::new(TxBody {
+            epoch_anchor: [0xA5; 32],
+            fee: 0,
+            input_owner: owner,
+            inputs: second_inputs,
+            outputs: [TxOutput::dummy(); TX_OUTPUTS],
+            validity_bitmap: 1 | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        });
+        [first, second]
     }
 
     fn commit_genesis(store: &MdbxStore) -> (BlockHeader, ConsensusMeta) {
@@ -2889,11 +2956,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let tx_hashes = block
-            .transactions
-            .iter()
-            .map(|transaction| transaction.txid())
-            .collect::<Vec<_>>();
+        let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions).unwrap();
+        let mut undo = BlockUndoLog::empty(block.header.height, block.header.log_slots);
+        undo.tx_hashes.clone_from(&tx_hashes);
         let meta = ConsensusMeta {
             tip_height: block.header.height,
             tip_hash: hash,
@@ -2907,7 +2972,7 @@ mod tests {
             .commit_block(
                 &block.header,
                 &hash,
-                &BlockUndoLog::empty(block.header.height, block.header.log_slots),
+                &undo,
                 &[],
                 &tx_hashes,
                 &[],
@@ -2917,6 +2982,12 @@ mod tests {
             )
             .unwrap();
         meta
+    }
+
+    fn identity_only_undo(block: &crate::Block) -> BlockUndoLog {
+        let mut undo = BlockUndoLog::empty(block.header.height, block.header.log_slots);
+        undo.tx_hashes = crate::block::try_compute_logical_txids(&block.transactions).unwrap();
+        undo
     }
 
     #[test]
@@ -2946,7 +3017,7 @@ mod tests {
             .commit_block(
                 &block.header,
                 &hash,
-                &BlockUndoLog::empty(1, block.header.log_slots),
+                &identity_only_undo(&block),
                 &[],
                 &tx_hashes,
                 &[],
@@ -2962,6 +3033,26 @@ mod tests {
         );
         assert!(store.has_history_step_terminal_at(1, hash).unwrap());
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, hash)));
+    }
+
+    #[test]
+    fn tx_index_uses_one_logical_id_for_a_multipage_group() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let mut candidate = block(&genesis, 1, 9);
+        let pages = two_page_group(0x44);
+        let page_hashes = [pages[0].txid(), pages[1].txid()];
+        candidate.transactions.extend(pages);
+        candidate.header.tx_root = crate::compute_tx_root(&candidate.transactions);
+        let logical = crate::try_compute_logical_txids(&candidate.transactions).unwrap();
+        assert_eq!(logical.len(), 2);
+
+        commit_accepted_test_block(&store, &candidate, &genesis_meta);
+
+        assert_eq!(store.get_tx_index(&logical[1].0).unwrap(), Some((1, 1)));
+        assert_eq!(store.get_tx_index(&page_hashes[0].0).unwrap(), None);
+        assert_eq!(store.get_tx_index(&page_hashes[1].0).unwrap(), None);
     }
 
     #[test]

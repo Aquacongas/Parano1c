@@ -20,14 +20,14 @@
 use crate::block_header::BlockHeader;
 use crate::tx_tree;
 use noid_poseidon2b::primitives::Address;
-use noid_tx::TxBody;
+use noid_tx::{validate_paged_spend, PagedSpendIntent, Transaction, TxPage};
 
-const RECEIPT_CONSTRUCTION_MARKER: u8 = 0x01;
+const RECEIPT_CONSTRUCTION_MARKER: u8 = 0x02;
 
 /// Compact summary of a transaction (public on-chain data only).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TxSummary {
-    pub tx_body_hash: [u8; 32],
+    pub logical_txid: [u8; 32],
     pub inputs: Vec<(u32, Address)>,
     pub outputs: Vec<(u32, u64, Address)>,
     pub fee_micronoid: u64,
@@ -40,8 +40,9 @@ pub struct TxSummary {
 pub struct ParanoidReceipt {
     /// Fixed construction marker. This is not a negotiable protocol version.
     pub construction_marker: u8,
-    /// Canonical authenticated Tx8x2 body bytes. Its derived txid is the leaf.
-    pub tx_body: Vec<u8>,
+    /// Canonical PagedSpend intent encoding with an empty authorization field.
+    /// Its complete ordered page list derives the logical transaction leaf.
+    pub paged_spend: Vec<u8>,
     /// Logical position in the universal namespace. Directions derive from it.
     pub tx_index: u16,
     /// Real block transaction count, including the mandatory coinbase.
@@ -81,17 +82,27 @@ impl ReceiptVerifyResult {
 /// Generate a receipt for a confirmed transaction.
 pub fn generate_receipt(
     header: &BlockHeader,
-    tx_body: &TxBody,
+    pages: &[Transaction],
     tx_index: usize,
     block_tx_hashes: &[[u8; 32]],
 ) -> ParanoidReceipt {
-    let tx_body_hash = tx_body.txid().0;
-    assert_eq!(block_tx_hashes.get(tx_index), Some(&tx_body_hash));
+    let pages: Vec<_> = pages
+        .iter()
+        .map(|transaction| TxPage {
+            body: transaction.body.clone(),
+        })
+        .collect();
+    let intent = PagedSpendIntent::new(pages, Vec::new())
+        .expect("receipt source is one canonical PagedSpend group");
+    let logical_txid = intent.logical_txid().0;
+    assert_eq!(block_tx_hashes.get(tx_index), Some(&logical_txid));
     let merkle_path = tx_tree::path_from_hashes(block_tx_hashes, tx_index);
-    let summary = summary_from_body(tx_body, header.height, header.timestamp);
+    let summary = summary_from_pages(&intent.pages, header.height, header.timestamp);
     ParanoidReceipt {
         construction_marker: RECEIPT_CONSTRUCTION_MARKER,
-        tx_body: tx_body.to_bytes().to_vec(),
+        paged_spend: intent
+            .to_bytes()
+            .expect("canonical receipt PagedSpend encoding"),
         tx_index: tx_index as u16,
         tx_count: block_tx_hashes.len() as u16,
         merkle_path,
@@ -101,19 +112,32 @@ pub fn generate_receipt(
     }
 }
 
-/// Derive every payment-relevant summary field from the authenticated body.
-pub fn summary_from_body(body: &TxBody, confirmed_height: u64, confirmed_unix: u64) -> TxSummary {
+/// Derive every payment-relevant summary field from the authenticated group.
+pub fn summary_from_pages(
+    pages: &[TxPage],
+    confirmed_height: u64,
+    confirmed_unix: u64,
+) -> TxSummary {
+    let facts = validate_paged_spend(pages).expect("summary source is canonical PagedSpend");
     TxSummary {
-        tx_body_hash: body.txid().0,
-        inputs: body
-            .live_inputs()
-            .map(|(_, input)| (input.slot_index, body.input_owner))
+        logical_txid: facts.logical_txid.0,
+        inputs: pages
+            .iter()
+            .flat_map(|page| {
+                page.body
+                    .live_inputs()
+                    .map(|(_, input)| (input.slot_index, page.body.input_owner))
+            })
             .collect(),
-        outputs: body
-            .live_outputs()
-            .map(|(_, output)| (output.slot_index, output.amount, output.owner))
+        outputs: pages
+            .iter()
+            .flat_map(|page| {
+                page.body
+                    .live_outputs()
+                    .map(|(_, output)| (output.slot_index, output.amount, output.owner))
+            })
             .collect(),
-        fee_micronoid: body.fee,
+        fee_micronoid: facts.fee,
         confirmed_height,
         confirmed_unix,
     }
@@ -129,11 +153,14 @@ pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
     if receipt.construction_marker != RECEIPT_CONSTRUCTION_MARKER {
         return false;
     }
-    let Ok(body) = TxBody::from_bytes(&receipt.tx_body) else {
+    let Ok(intent) = PagedSpendIntent::from_bytes(&receipt.paged_spend) else {
         return false;
     };
-    let expected_summary = summary_from_body(
-        &body,
+    if !intent.authorization_bytes.is_empty() {
+        return false;
+    }
+    let expected_summary = summary_from_pages(
+        &intent.pages,
         receipt.claimed_height,
         receipt.summary.confirmed_unix,
     );
@@ -143,7 +170,7 @@ pub fn verify_merkle_inclusion(receipt: &ParanoidReceipt) -> bool {
 
     // Fixed-depth Merkle path plus the header's real-count wrapper.
     tx_tree::verify_path(
-        body.txid().0,
+        intent.logical_txid().0,
         &receipt.merkle_path,
         usize::from(receipt.tx_index),
         usize::from(receipt.tx_count),
@@ -158,7 +185,7 @@ pub fn verify_against_header(receipt: &ParanoidReceipt, canonical_header: &Block
         && canonical_header.timestamp == receipt.summary.confirmed_unix
 }
 
-/// Compute the tx_root from a list of tx_body_hashes.
+/// Compute the tx_root from a list of canonical logical leaf hashes.
 /// Mirrors `compute_tx_root` in `noid_chain::block`.
 pub fn tx_root(tx_hashes: &[[u8; 32]]) -> [u8; 32] {
     tx_tree::root_from_hashes(tx_hashes)
@@ -168,9 +195,12 @@ pub fn tx_root(tx_hashes: &[[u8; 32]]) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::consensus::params::GENESIS_TARGET;
-    use noid_tx::{output_bitmap_bit, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+    use noid_tx::{
+        output_bitmap_bit, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT,
+        TX_INPUTS, TX_OUTPUTS,
+    };
 
-    fn body(index: u16) -> TxBody {
+    fn one_page(index: u16) -> Transaction {
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
             slot_index: u32::from(index) + 1,
@@ -186,15 +216,59 @@ mod tests {
         let mut anchor = [0u8; 32];
         anchor[..2].copy_from_slice(&index.to_le_bytes());
         anchor[2] = 1;
-        TxBody {
+        Transaction::new(TxBody {
             epoch_anchor: anchor,
             fee: 1,
             input_owner: Address([1u8; 32]),
             inputs,
             outputs,
-            validity_bitmap: 1 | output_bitmap_bit(0),
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
             is_coinbase: false,
+        })
+    }
+
+    fn two_page_group() -> Vec<Transaction> {
+        let mut first_inputs = [TxInput::dummy(); TX_INPUTS];
+        for (index, input) in first_inputs.iter_mut().enumerate() {
+            *input = TxInput {
+                slot_index: index as u32 + 1,
+                amount: 10,
+                creation_id: index as u64 + 1,
+            };
         }
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 1_000,
+            amount: 89,
+            owner: Address([2u8; 32]),
+        };
+        let first = Transaction::new(TxBody {
+            epoch_anchor: [7u8; 32],
+            fee: 1,
+            input_owner: Address([1u8; 32]),
+            inputs: first_inputs,
+            outputs,
+            validity_bitmap: ((1u16 << TX_INPUTS) - 1)
+                | output_bitmap_bit(0)
+                | PAGED_SPEND_START_BIT,
+            is_coinbase: false,
+        });
+        let mut final_inputs = [TxInput::dummy(); TX_INPUTS];
+        final_inputs[0] = TxInput {
+            slot_index: 9,
+            amount: 10,
+            creation_id: 9,
+        };
+        let last = Transaction::new(TxBody {
+            epoch_anchor: [7u8; 32],
+            fee: 0,
+            input_owner: Address([1u8; 32]),
+            inputs: final_inputs,
+            outputs: [TxOutput::dummy(); TX_OUTPUTS],
+            validity_bitmap: 1 | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        });
+        vec![first, last]
     }
 
     fn header(height: u64, root: [u8; 32]) -> BlockHeader {
@@ -214,33 +288,57 @@ mod tests {
     }
 
     #[test]
-    fn all_256_positions_have_authenticated_fixed_paths() {
-        let bodies: Vec<_> = (0..256).map(body).collect();
-        let hashes: Vec<_> = bodies.iter().map(|body| body.txid().0).collect();
+    fn all_255_user_positions_have_authenticated_fixed_paths() {
+        let groups: Vec<_> = (0..255).map(one_page).collect();
+        let hashes: Vec<_> = std::iter::once([0xCB; 32])
+            .chain(groups.iter().map(|transaction| {
+                validate_paged_spend(&[TxPage {
+                    body: transaction.body.clone(),
+                }])
+                .unwrap()
+                .logical_txid
+                .0
+            }))
+            .collect();
         let header = header(10, tx_root(&hashes));
-        for (index, body) in bodies.iter().enumerate() {
-            let receipt = generate_receipt(&header, body, index, &hashes);
+        for (index, transaction) in groups.iter().enumerate() {
+            let receipt = generate_receipt(
+                &header,
+                std::slice::from_ref(transaction),
+                index + 1,
+                &hashes,
+            );
             assert_eq!(receipt.merkle_path.len(), 8);
             assert!(verify_merkle_inclusion(&receipt), "index {index}");
             assert!(verify_against_header(&receipt, &header));
             assert_eq!(
                 ParanoidReceipt::from_bytes(&receipt.to_bytes())
                     .unwrap()
-                    .tx_body,
-                receipt.tx_body
+                    .paged_spend,
+                receipt.paged_spend
             );
         }
     }
 
     #[test]
-    fn body_summary_count_index_and_header_tamper_fail() {
-        let bodies = [body(1), body(2), body(3)];
-        let hashes: Vec<_> = bodies.iter().map(|body| body.txid().0).collect();
+    fn multipage_summary_count_index_and_header_tamper_fail() {
+        let group = two_page_group();
+        let pages: Vec<_> = group
+            .iter()
+            .map(|transaction| TxPage {
+                body: transaction.body.clone(),
+            })
+            .collect();
+        let logical_txid = validate_paged_spend(&pages).unwrap().logical_txid.0;
+        let hashes = [[0xCB; 32], logical_txid];
         let header = header(5, tx_root(&hashes));
-        let receipt = generate_receipt(&header, &bodies[1], 1, &hashes);
+        let receipt = generate_receipt(&header, &group, 1, &hashes);
+        assert_eq!(receipt.summary.inputs.len(), 9);
+        assert_eq!(receipt.summary.outputs.len(), 1);
+        assert!(verify_merkle_inclusion(&receipt));
 
         let mut bad = receipt.clone();
-        bad.tx_body[80] ^= 1;
+        bad.paged_spend[80] ^= 1;
         assert!(!verify_merkle_inclusion(&bad));
 
         let mut bad = receipt.clone();
@@ -248,7 +346,7 @@ mod tests {
         assert!(!verify_merkle_inclusion(&bad));
 
         let mut bad = receipt.clone();
-        bad.tx_count = 2;
+        bad.tx_count = 1;
         assert!(!verify_merkle_inclusion(&bad));
 
         let mut bad = receipt.clone();
@@ -262,7 +360,7 @@ mod tests {
 
     #[test]
     fn real_count_is_bound_even_with_zero_suffix() {
-        let hashes = [body(1).txid().0, body(2).txid().0];
+        let hashes = [[1u8; 32], [2u8; 32]];
         assert_ne!(tx_root(&hashes[..1]), tx_root(&hashes));
         assert_eq!(tx_root(&[]), [0u8; 32]);
     }
