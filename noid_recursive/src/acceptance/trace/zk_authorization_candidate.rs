@@ -817,7 +817,7 @@ fn bind_selected_zk_authorization_all_tiles_trace(
     let wallet_b = *vk.wallet_b().slices();
 
     let ghost_statement = canonical_selected_zk_ghost_statement();
-    if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
+    if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_PAGES {
         assert_eq!(
             canonical.slot(geometry.auth_tiles - 1).native_statement(),
             ghost_statement

@@ -235,7 +235,7 @@ impl TemplateBuilder {
         Self { mempool }
     }
 
-    /// Build a new template using a pre-captured chain snapshot and top-fee mempool txs.
+    /// Build a B64-default template from a pre-captured chain snapshot.
     ///
     /// Computes the ASERT difficulty target correctly using `next_target()`.
     pub async fn build_from_snapshot(
@@ -248,20 +248,20 @@ impl TemplateBuilder {
             snapshot,
             miner_address,
             now_unix,
-            noid_chain::consensus::params::BLOCK_MAX_USER_TXS,
+            noid_chain::consensus::paged_spend::BlockProofClass::B64.page_capacity(),
         )
         .await
     }
 
-    /// Build a template while capping non-coinbase transactions.
-    /// Internal miners use this for adaptive block sizing; external mining keeps
-    /// the consensus maximum via `build_from_snapshot`.
+    /// Build a template while capping physical non-coinbase pages.
+    /// Complete PagedSpend groups remain indivisible while fee-packing into
+    /// this budget.
     pub async fn build_from_snapshot_with_limit(
         &self,
         snapshot: TemplateChainSnapshot,
         miner_address: Address,
         now_unix: u64,
-        max_user_txs: usize,
+        max_user_pages: usize,
     ) -> Option<BlockTemplate> {
         use noid_chain::consensus::median_time_past;
 
@@ -290,15 +290,15 @@ impl TemplateBuilder {
         );
 
         // Select top txs from mempool (coinbase is added separately by the chain template).
-        let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
-        let max_user_txs = max_user_txs.min(consensus_max);
+        let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_PAGES;
+        let max_user_pages = max_user_pages.min(consensus_max);
         let user_epoch_anchor = block_id(&snapshot.tx_epoch_anchor_header);
         // Filter against the captured anchor while entries are still borrowed
         // under the mempool lock. This preserves the same fee-ordered prefix
         // while cloning only the authorization bundles selected for this block.
         let entries = self
             .mempool
-            .select_for_block_at_anchor(max_user_txs, user_epoch_anchor)
+            .select_for_block_at_anchor(max_user_pages, user_epoch_anchor)
             .await;
         // Keep each authorization paired with its indivisible logical group;
         // flatten only the public pages passed into the chain template.

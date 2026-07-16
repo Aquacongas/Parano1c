@@ -291,8 +291,8 @@ impl TemplateResourceSelection {
         let live_output_count = self
             .live_output_count
             .checked_add(usize::from(spend.live_outputs))?;
-        if user_page_count > crate::consensus::params::BLOCK_MAX_USER_TXS
-            || logical_count > crate::consensus::params::BLOCK_MAX_USER_TXS
+        if user_page_count > crate::consensus::params::BLOCK_MAX_USER_PAGES
+            || logical_count > crate::consensus::params::BLOCK_MAX_USER_PAGES
             || live_input_count > crate::consensus::params::BLOCK_MAX_LIVE_INPUTS
             || live_output_count > crate::consensus::params::BLOCK_MAX_USER_OUTPUTS
             || live_input_count + live_output_count

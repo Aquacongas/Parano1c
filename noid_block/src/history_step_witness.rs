@@ -142,7 +142,7 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
         header
     }
 
-    pub fn user_transaction_count(&self) -> usize {
+    pub fn user_page_count(&self) -> usize {
         self.template.transactions.len().saturating_sub(1)
     }
 

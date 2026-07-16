@@ -7,18 +7,18 @@
 //!
 //! ```text
 //! loop {
-//!   template + nonce-independent witness preparation
+//!   template + complete nonce-independent HistoryStep proof
 //!   all-core PoW search
-//!   seal exact nonce/header
-//!   prove HistoryStep for the exact sealed block
+//!   seal exact nonce/header into the prepared terminal
 //!   atomic commit + broadcast
 //! }
 //! ```
 //!
 //! Internal mining has one Rayon pool containing every host-visible CPU. CPU
 //! heavy phases reuse that same pool in order; there is no permanent one-core
-//! PoW reservation and no independent prover pool. The transaction cap adapts
-//! to recent proof throughput instead of always trying to fill 256 txs.
+//! PoW reservation and no independent prover pool. Every process starts with
+//! a 64-page template budget and may jump directly to 255 pages only when
+//! complete proof-class timings support the 15-second target.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
 //! template and HistoryStep preparation, validation, RPC, and P2P while miners run elsewhere.
 //!
@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tokio::time::interval;
 
+use noid_chain::consensus::paged_spend::BlockProofClass;
 use noid_chain::consensus::pow::block_id;
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::{AsyncMempool, MempoolEvent};
@@ -46,6 +47,7 @@ use crate::cpu_budget::{
     configure_process_cpu_budget, install_history_step_phase_cpu, install_pow_phase_cpu,
     ProcessCpuBudgetMode,
 };
+use crate::proof_capacity::AdaptiveProofCapacity;
 use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
 
 // ---------------------------------------------------------------------------
@@ -111,26 +113,6 @@ pub enum MinerEvent {
     MiningCancelled { reason: String },
     /// Witness preparation or HistoryStep proving failed; the block is abandoned.
     ProveFailed { height: u64, error: String },
-}
-
-// ---------------------------------------------------------------------------
-// CPU split + adaptive block sizing
-// ---------------------------------------------------------------------------
-
-fn adaptive_user_tx_limit(ms_per_tx_ewma: Option<f64>) -> usize {
-    let consensus_max = noid_chain::consensus::params::BLOCK_MAX_TXS.saturating_sub(1);
-    if consensus_max == 0 {
-        return 0;
-    }
-
-    // Proving now runs entirely before PoW: keep the pre-PoW preparation
-    // (witness + complete HistoryStep proof) comfortably under the 15s
-    // block-time target so the template does not eat the whole interval.
-    let block_time_ms = noid_chain::consensus::params::BLOCK_TIME as f64 * 1_000.0;
-    let budget_ms = (block_time_ms * 0.70).max(1_000.0);
-    let ms_per_tx = ms_per_tx_ewma.unwrap_or(100.0).max(10.0);
-    let cap = (budget_ms / ms_per_tx).floor() as usize;
-    cap.clamp(1, consensus_max)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -361,7 +343,7 @@ impl BlockMiner {
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
         let mut mempool_events = self.mempool.subscribe();
-        let mut history_step_ms_per_tx_ewma: Option<f64> = None;
+        let mut proof_capacity = AdaptiveProofCapacity::default();
 
         tracing::debug!("BlockMiner started");
 
@@ -402,9 +384,9 @@ impl BlockMiner {
                     continue;
                 }
             };
-            let max_user_txs = adaptive_user_tx_limit(history_step_ms_per_tx_ewma);
+            let max_user_pages = proof_capacity.page_limit();
             let tmpl = match builder
-                .build_from_snapshot_with_limit(snapshot, addr, now, max_user_txs)
+                .build_from_snapshot_with_limit(snapshot, addr, now, max_user_pages)
                 .await
             {
                 Some(t) => t,
@@ -423,13 +405,7 @@ impl BlockMiner {
                 n_txs,
                 trigger: TemplateRefreshTrigger::Startup,
             });
-            tracing::debug!(
-                height,
-                n_txs,
-                max_user_txs,
-                history_step_ms_per_tx_ewma,
-                "mining template ready"
-            );
+            tracing::debug!(height, n_txs, max_user_pages, "mining template ready");
 
             let expected_parent_height = tmpl.parent.height;
             let expected_parent_hash = block_id(&tmpl.parent);
@@ -462,17 +438,27 @@ impl BlockMiner {
                 }
             };
 
-            let user_txs = attempt.user_transaction_count();
+            let user_pages = attempt.user_page_count();
+            let proof_class = attempt.proof_class();
 
-            // Preparation now contains the complete proof; it is the number
-            // that must stay under the block interval, so it feeds the
-            // adaptive per-transaction budget.
-            if user_txs > 0 && prepare_elapsed > Duration::ZERO {
-                let sample = prepare_elapsed.as_secs_f64() * 1_000.0 / user_txs as f64;
-                history_step_ms_per_tx_ewma = Some(match history_step_ms_per_tx_ewma {
-                    Some(previous) => previous * 0.75 + sample * 0.25,
-                    None => sample,
-                });
+            // Complete class cost is independent of live-page occupancy. A
+            // coinbase-only B64 therefore calibrates the hardware just as a
+            // full B64 block does.
+            let previous_page_limit = proof_capacity.page_limit();
+            proof_capacity.observe_preparation(proof_class, prepare_elapsed);
+            let next_page_limit = proof_capacity.page_limit();
+            let b64_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B64);
+            let b255_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B255);
+            if previous_page_limit != next_page_limit {
+                tracing::info!(
+                    ?proof_class,
+                    previous_page_limit,
+                    next_page_limit,
+                    prepare_ms = prepare_elapsed.as_millis(),
+                    b64_prepare_ms_ewma,
+                    b255_prepare_ms_ewma,
+                    "miner proof capacity changed"
+                );
             }
 
             // Preparation may be expensive. Refuse to spend PoW on a parent
@@ -491,13 +477,14 @@ impl BlockMiner {
             tracing::info!(
                 height,
                 txs = n_txs,
-                user_txs,
+                user_pages,
+                ?proof_class,
                 prepare_ms = prepare_elapsed.as_millis(),
                 "mining complete block"
             );
 
-            // Phase 2: all workers search the fixed semantic header.
-            // HistoryStep proving begins only after a winning nonce exists.
+            // Phase 2: all workers search the already-proven semantic header.
+            // A winning nonce only seals the nonce-free HistoryStep terminal.
             let pow_header = attempt.pow_header(0);
             let cancel_pow = Arc::clone(&cancel);
             cancel.store(false, Ordering::Relaxed);
@@ -536,36 +523,38 @@ impl BlockMiner {
                                 hash = %hex::encode(hash),
                                 n_txs,
                                 prepare_ms = prepare_elapsed.as_millis(),
-                                history_step_ms_per_tx_ewma,
+                                ?proof_class,
+                                b64_prepare_ms_ewma,
+                                b255_prepare_ms_ewma,
                                 pow_time = %format!("{elapsed_s:.2}s"),
                                 diff = %format!("lz{diff_lz}"),
-                                "PoW nonce found; proving HistoryStep"
+                                "PoW nonce found; sealing prepared HistoryStep"
                             );
 
-                            let prove_runtime = Arc::clone(&self.history_step_runtime);
-                            let prove_handle = tokio::task::spawn_blocking(move || {
+                            let seal_runtime = Arc::clone(&self.history_step_runtime);
+                            let seal_handle = tokio::task::spawn_blocking(move || {
                                 let started = Instant::now();
                                 let result = install_history_step_phase_cpu(|| {
-                                    attempt.prove(&prove_runtime, sol.nonce)
+                                    attempt.prove(&seal_runtime, sol.nonce)
                                 })
-                                .map_err(|error| format!("HistoryStep prove CPU phase: {error}"))
+                                .map_err(|error| format!("HistoryStep seal CPU phase: {error}"))
                                 .and_then(|result| result);
                                 (result, started.elapsed())
                             });
-                            let (proved, history_step_elapsed) = match prove_handle.await {
+                            let (proved, seal_elapsed) = match seal_handle.await {
                                 Ok((Ok(proved), elapsed)) => (proved, elapsed),
                                 Ok((Err(error), elapsed)) => {
                                     tracing::error!(
                                         height,
-                                        history_step_ms = elapsed.as_millis(),
+                                        seal_ms = elapsed.as_millis(),
                                         %error,
-                                        "HistoryStep proving failed"
+                                        "prepared HistoryStep sealing failed"
                                     );
                                     let _ = self.events.send(MinerEvent::ProveFailed { height, error });
                                     continue;
                                 }
                                 Err(error) => {
-                                    tracing::error!(height, ?error, "HistoryStep proving task panicked");
+                                    tracing::error!(height, ?error, "HistoryStep sealing task panicked");
                                     continue;
                                 }
                             };
@@ -586,7 +575,8 @@ impl BlockMiner {
                                 hash = %hex::encode(hash),
                                 txs = n_txs,
                                 pow_ms = elapsed.as_millis(),
-                                history_step_ms = history_step_elapsed.as_millis(),
+                                history_step_ms = prepare_elapsed.as_millis(),
+                                seal_ms = seal_elapsed.as_millis(),
                                 nonce_to_commit_ms = nonce_found_at.elapsed().as_millis(),
                                 "block accepted"
                             );
@@ -615,13 +605,13 @@ impl BlockMiner {
                     }
                 }
 
-                _ = heartbeat.tick(), if user_txs == 0 => {
+                _ = heartbeat.tick(), if user_pages == 0 => {
                     cancel.store(true, Ordering::Relaxed);
                     let _ = pow_handle.await;
                     tracing::debug!("heartbeat: refreshing coinbase-only template (safety net)");
                 }
 
-                refresh = next_mining_mempool_refresh(&mut mempool_events), if user_txs == 0 => {
+                refresh = next_mining_mempool_refresh(&mut mempool_events), if user_pages == 0 => {
                     // No blocking PoW task may escape this select branch. A
                     // new transaction must be included immediately. Lag is
                     // conservative because the missed range may contain an

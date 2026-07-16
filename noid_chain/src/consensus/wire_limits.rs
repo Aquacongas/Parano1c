@@ -150,7 +150,7 @@ mod tests {
     fn legal_depth32_b255_frontier_fits_resource_weight() {
         use crate::consensus::params::{
             BLOCK_MAX_ACTIONS, BLOCK_MAX_DISTINCT_SEGMENTS, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_TXS,
-            BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, LOG_SEGMENT_SIZE,
+            BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_PAGES, LOG_SEGMENT_SIZE,
         };
 
         let frontier = crate::sparse_merkle::maximum_sibling_count_with_segment_cap(
@@ -163,7 +163,7 @@ mod tests {
         let weight = block_resource_weight(
             MAX_BLOCK_BYTES,
             MAX_HISTORY_STEP_TERMINAL_BYTES,
-            BLOCK_MAX_USER_TXS,
+            BLOCK_MAX_USER_PAGES,
             BLOCK_MAX_LIVE_INPUTS,
             BLOCK_MAX_USER_OUTPUTS + 1,
             frontier,

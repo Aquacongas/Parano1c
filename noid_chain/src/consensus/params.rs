@@ -39,8 +39,8 @@ pub const MAX_INPUTS: usize = 8;
 /// Fixed output capacity of every transaction body.
 pub const MAX_OUTPUTS: usize = 2;
 
-/// Maximum non-coinbase transactions accepted by consensus.
-pub const BLOCK_MAX_USER_TXS: usize = BLOCK_MAX_TXS - 1;
+/// Maximum physical non-coinbase PagedSpend pages accepted by consensus.
+pub const BLOCK_MAX_USER_PAGES: usize = BLOCK_MAX_TXS - 1;
 
 /// Maximum live user inputs accepted in one block.
 pub const BLOCK_MAX_LIVE_INPUTS: usize = 1_020;
@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn final_block_caps_are_exact() {
         assert_eq!(BLOCK_MAX_TXS, 256);
-        assert_eq!(BLOCK_MAX_USER_TXS, 255);
+        assert_eq!(BLOCK_MAX_USER_PAGES, 255);
         assert_eq!(MAX_INPUTS, 8);
         assert_eq!(MAX_OUTPUTS, 2);
         assert_eq!(BLOCK_MAX_LIVE_INPUTS, 1_020);

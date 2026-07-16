@@ -25,7 +25,7 @@ use noid_chain::consensus::wire_limits::{
 use noid_chain::storage::MdbxChainContext;
 use noid_mempool::AsyncMempool;
 use noid_miner::template::{TemplateBuilder, TemplateChainSnapshot};
-use noid_miner::PreparedBlockAttempt;
+use noid_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 
 use crate::api::ParanoidApiServer;
 use crate::types::{
@@ -661,6 +661,9 @@ pub struct RpcHandler {
     >,
     /// Every handler clone shares the same one-attempt lifecycle owner.
     external_mining_attempts: ExternalMiningAttemptInvalidator,
+    /// Node-side proof capacity for external PoW templates. External workers
+    /// do not choose the B64/B255 class.
+    external_mining_capacity: Arc<Mutex<AdaptiveProofCapacity>>,
 }
 
 impl RpcHandler {
@@ -756,8 +759,13 @@ impl RpcHandler {
             (snapshot, addr)
         };
         drop(wallet_operation);
+        let max_user_pages = self
+            .external_mining_capacity
+            .lock()
+            .map_err(|_| rpc_err("external mining capacity lock poisoned"))?
+            .page_limit();
         let tmpl = builder
-            .build_from_snapshot(snapshot, addr, now)
+            .build_from_snapshot_with_limit(snapshot, addr, now, max_user_pages)
             .await
             .ok_or_else(|| rpc_err("template build failed"))?;
 
@@ -798,8 +806,8 @@ impl RpcHandler {
         let pow_fields_hex = encode_pow_fields_hex(&pow_header);
         let diff_target = pow_header.difficulty_target;
 
-        // Build every nonce-independent HistoryStep witness before exposing the
-        // capability. The worker's only remaining job is PoW nonce search.
+        // Build and prove the complete nonce-independent HistoryStep before
+        // exposing the capability. The worker's only remaining job is PoW.
         let runtime = self
             .history_step_runtime
             .as_ref()
@@ -810,15 +818,48 @@ impl RpcHandler {
             .as_ref()
             .cloned()
             .ok_or_else(|| rpc_err("HistoryStep producer authorization is unavailable"))?;
-        let prepared = tokio::task::spawn_blocking(move || {
-            noid_miner::install_history_step_phase_cpu(|| {
+        let (prepared, prepare_elapsed) = tokio::task::spawn_blocking(move || {
+            let started = Instant::now();
+            let result = noid_miner::install_history_step_phase_cpu(|| {
                 PreparedBlockAttempt::prepare(tmpl, &runtime, &ghost, now)
             })
-            .map_err(|error| format!("HistoryStep CPU admission failed: {error}"))?
+            .map_err(|error| format!("HistoryStep CPU admission failed: {error}"))
+            .and_then(|result| result);
+            (result, started.elapsed())
         })
         .await
-        .map_err(|error| rpc_err(format!("HistoryStep preparation task failed: {error}")))?
-        .map_err(|error| rpc_err(format!("HistoryStep preparation failed: {error}")))?;
+        .map_err(|error| rpc_err(format!("HistoryStep preparation task failed: {error}")))?;
+        let prepared = prepared
+            .map_err(|error| rpc_err(format!("HistoryStep preparation failed: {error}")))?;
+
+        let proof_class = prepared.proof_class();
+        let user_pages = prepared.user_page_count();
+        let (previous_page_limit, next_page_limit, b64_prepare_ms_ewma, b255_prepare_ms_ewma) = {
+            let mut capacity = self
+                .external_mining_capacity
+                .lock()
+                .map_err(|_| rpc_err("external mining capacity lock poisoned"))?;
+            let previous = capacity.page_limit();
+            capacity.observe_preparation(proof_class, prepare_elapsed);
+            (
+                previous,
+                capacity.page_limit(),
+                capacity.prepare_ms_ewma(noid_chain::consensus::paged_spend::BlockProofClass::B64),
+                capacity.prepare_ms_ewma(noid_chain::consensus::paged_spend::BlockProofClass::B255),
+            )
+        };
+        tracing::info!(
+            mining = "external",
+            user_pages,
+            ?proof_class,
+            max_user_pages,
+            previous_page_limit,
+            next_page_limit,
+            history_step_ms = prepare_elapsed.as_millis(),
+            b64_prepare_ms_ewma,
+            b255_prepare_ms_ewma,
+            "external mining template proved"
+        );
 
         let parent_height = prepared.expected_parent_height();
         let parent_id = prepared.expected_parent_id();
@@ -876,7 +917,7 @@ impl RpcHandler {
         validate_pow(&prepared.pow_header(nonce))
             .map_err(|error| rpc_err(format!("proof of work: {error}")))?;
 
-        let prove_started = Instant::now();
+        let seal_started = Instant::now();
         let runtime = self
             .history_step_runtime
             .as_ref()
@@ -889,7 +930,7 @@ impl RpcHandler {
         .await
         .map_err(|error| rpc_err(format!("HistoryStep task failed: {error}")))?
         .map_err(|error| rpc_err(format!("HistoryStep prove failed: {error}")))?;
-        let history_step_ms = prove_started.elapsed().as_millis();
+        let seal_ms = seal_started.elapsed().as_millis();
         // Serialize canonical commit + wallet delta + mempool view replacement.
         let wallet_operation = self.wallet_operation_gate.lock().await;
         let chain = Arc::clone(&self.chain);
@@ -928,7 +969,7 @@ impl RpcHandler {
             hash = %hex::encode(hash),
             txs = n_txs,
             mining = "external",
-            history_step_ms,
+            seal_ms,
             nonce_to_commit_ms = nonce_submitted_at.elapsed().as_millis(),
             "block accepted"
         );
@@ -1925,12 +1966,16 @@ mod tests {
     }
 
     #[test]
-    fn transaction_count_validation_matches_tx8x2() {
+    fn transaction_count_validation_matches_paged_spend() {
         assert!(validate_tx_counts(1, 1).is_ok());
-        assert!(validate_tx_counts(8, 2).is_ok());
+        assert!(validate_tx_counts(
+            noid_tx::MAX_PAGED_SPEND_INPUTS,
+            noid_tx::MAX_PAGED_SPEND_OUTPUTS,
+        )
+        .is_ok());
         assert!(validate_tx_counts(0, 1).is_err());
-        assert!(validate_tx_counts(9, 1).is_err());
-        assert!(validate_tx_counts(8, 3).is_err());
+        assert!(validate_tx_counts(noid_tx::MAX_PAGED_SPEND_INPUTS + 1, 1).is_err());
+        assert!(validate_tx_counts(1, noid_tx::MAX_PAGED_SPEND_OUTPUTS + 1).is_err());
     }
 
     #[test]
@@ -2038,6 +2083,7 @@ pub async fn start_rpc_server(
         history_step_runtime,
         history_step_ghost,
         external_mining_attempts,
+        external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::default())),
     };
 
     // Always add the Bearer-auth middleware layer.

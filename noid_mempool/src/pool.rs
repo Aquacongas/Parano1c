@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use tokio::sync::{broadcast, Mutex, Semaphore};
 
-use noid_chain::consensus::params::BLOCK_MAX_USER_TXS;
+use noid_chain::consensus::params::BLOCK_MAX_USER_PAGES;
 use noid_chain::consensus::wire_limits::{MAX_AUTHORIZATION_BYTES, MAX_TX_INTENT_BYTES_GLOBAL};
 use noid_chain::consensus::{fee_breakdown, tx_epoch_anchor_height_for_child};
 use noid_chain::fri_state::SlotValue;
@@ -400,7 +400,7 @@ impl AsyncMempool {
     /// Returned txs are in descending fee-rate order with txid tie-break.
     pub async fn select_for_block(&self, max_pages: usize) -> Vec<SelectedMempoolEntry> {
         let st = self.state.lock().await;
-        let limit = max_pages.min(BLOCK_MAX_USER_TXS);
+        let limit = max_pages.min(BLOCK_MAX_USER_PAGES);
         st.pool
             .select_for_block(limit)
             .into_iter()
@@ -425,7 +425,7 @@ impl AsyncMempool {
         epoch_anchor: [u8; 32],
     ) -> Vec<SelectedMempoolEntry> {
         let st = self.state.lock().await;
-        let limit = max_pages.min(BLOCK_MAX_USER_TXS);
+        let limit = max_pages.min(BLOCK_MAX_USER_PAGES);
         st.pool
             .select_for_block_at_anchor(limit, &epoch_anchor)
             .into_iter()

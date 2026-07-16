@@ -12,7 +12,7 @@ use std::collections::HashSet;
 use noid_tx::{validate_paged_spend, PagedSpendError, PagedSpendFacts, Transaction, TxPage};
 
 use super::params::{
-    BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, BLOCK_PAGE_CLASS_TIERS,
+    BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_PAGES, BLOCK_PAGE_CLASS_TIERS,
     MAX_INPUTS, MAX_OUTPUTS,
 };
 
@@ -197,7 +197,7 @@ pub fn validate_paged_spend_transaction_stream(
     let class = BlockProofClass::for_page_count(pages.len()).ok_or(
         PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
-            capacity: BLOCK_MAX_USER_TXS,
+            capacity: BLOCK_MAX_USER_PAGES,
         },
     )?;
     validate_stream_for_class(pages, class)
@@ -217,7 +217,7 @@ pub fn validate_paged_spend_tx_page_stream(
     let class = BlockProofClass::for_page_count(pages.len()).ok_or(
         PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
-            capacity: BLOCK_MAX_USER_TXS,
+            capacity: BLOCK_MAX_USER_PAGES,
         },
     )?;
     validate_stream_for_class(pages, class)
@@ -243,7 +243,7 @@ fn validate_stream_for_class<T: PageBody>(
     let expected = BlockProofClass::for_page_count(pages.len()).ok_or(
         PagedSpendStreamError::BlockPageLimit {
             actual: pages.len(),
-            capacity: BLOCK_MAX_USER_TXS,
+            capacity: BLOCK_MAX_USER_PAGES,
         },
     )?;
     if expected != proof_class {

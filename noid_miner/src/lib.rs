@@ -11,9 +11,9 @@
 //!  ┌────────────────────────────────────────────────────────────┐
 //!  │                   Block Production Loop                    │
 //!  │                                                            │
-//!  │  1. Build template + nonce-independent witness             │
+//!  │  1. Build template + complete nonce-free HistoryStep       │
 //!  │  2. Search PoW with every process CPU                      │
-//!  │  3. Seal nonce and prove the recursive HistoryStep         │
+//!  │  3. Seal the nonce into the prepared terminal              │
 //!  │  4. Atomically commit and broadcast AcceptedBlockBundle   │
 //!  └────────────────────────────────────────────────────────────┘
 //! ```
@@ -29,6 +29,7 @@ mod cpu_budget;
 pub mod history_step_artifacts;
 pub mod miner;
 pub mod pow;
+pub mod proof_capacity;
 pub mod template;
 
 pub use block_production::{CommittedBlock, PreparedBlockAttempt, ProvedBlock};
@@ -47,4 +48,5 @@ pub use history_step_artifacts::{
 };
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};
+pub use proof_capacity::AdaptiveProofCapacity;
 pub use template::{BlockTemplate, TemplateBuilder, TemplateRefreshTrigger};

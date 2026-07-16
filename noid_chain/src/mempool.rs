@@ -335,7 +335,7 @@ impl Mempool {
         max_pages: usize,
         keep: impl Fn(&MempoolEntry) -> bool,
     ) -> Vec<&MempoolEntry> {
-        let mut remaining_pages = max_pages.min(crate::consensus::params::BLOCK_MAX_USER_TXS);
+        let mut remaining_pages = max_pages.min(crate::consensus::params::BLOCK_MAX_USER_PAGES);
         let mut selected = Vec::new();
         for hash in self.fee_index.values() {
             let Some(entry) = self.entries.get(hash) else {
@@ -483,6 +483,46 @@ mod tests {
         .unwrap()]
     }
 
+    fn paged_tx(page_count: usize, slot_base: u32, fee: u64, seed: u8) -> Vec<TxPage> {
+        (0..page_count)
+            .map(|page_index| {
+                let mut inputs = [TxInput::dummy(); TX_INPUTS];
+                for (slot, input) in inputs.iter_mut().enumerate() {
+                    *input = TxInput {
+                        slot_index: slot_base + 10 * page_index as u32 + slot as u32,
+                        amount: 25 + u64::from(page_index == 0 && slot == 0) * fee,
+                        creation_id: 1,
+                    };
+                }
+                let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+                for (slot, output) in outputs.iter_mut().enumerate() {
+                    *output = TxOutput {
+                        slot_index: slot_base + 10 * page_index as u32 + 8 + slot as u32,
+                        amount: 100,
+                        owner: Address([seed; 32]),
+                    };
+                }
+                let mut validity_bitmap = 0x00ff | output_bitmap_bit(0) | output_bitmap_bit(1);
+                if page_index == 0 {
+                    validity_bitmap |= PAGED_SPEND_START_BIT;
+                }
+                if page_index + 1 == page_count {
+                    validity_bitmap |= PAGED_SPEND_END_BIT;
+                }
+                TxPage::new(TxBody {
+                    epoch_anchor: [9u8; 32],
+                    fee: if page_index == 0 { fee } else { 0 },
+                    input_owner: Address([seed; 32]),
+                    inputs,
+                    outputs,
+                    validity_bitmap,
+                    is_coinbase: false,
+                })
+                .unwrap()
+            })
+            .collect()
+    }
+
     fn id(pages: &[TxPage]) -> TxBodyHash {
         validate_paged_spend(pages).unwrap().logical_txid
     }
@@ -546,6 +586,31 @@ mod tests {
         assert_eq!(
             pool.admit(tx(5, 6, 10, 3, [9u8; 32]), 0),
             Err(MempoolError::Full)
+        );
+    }
+
+    #[test]
+    fn b64_skips_b255_only_group_without_slicing_or_waiting() {
+        let mut pool = Mempool::new(4);
+        let large = paged_tx(65, 1_000, 65_000, 7);
+        let large_id = id(&large);
+        let small = tx(1, 2, 1, 8, [9u8; 32]);
+        let small_id = id(&small);
+        pool.admit(large, 0).unwrap();
+        pool.admit(small, 0).unwrap();
+
+        let b64 = pool.select_for_block(64);
+        assert_eq!(b64.len(), 1);
+        assert_eq!(b64[0].spend.logical_txid, small_id);
+        assert_eq!(b64[0].pages.len(), 1);
+
+        let b255 = pool.select_for_block(255);
+        assert_eq!(b255.len(), 2);
+        assert_eq!(b255[0].spend.logical_txid, large_id);
+        assert_eq!(b255[0].pages.len(), 65);
+        assert_eq!(
+            b255.iter().map(|entry| entry.pages.len()).sum::<usize>(),
+            66
         );
     }
 

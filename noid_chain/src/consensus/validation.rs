@@ -38,7 +38,7 @@ use crate::consensus::{
     header::{validate_header, validate_header_template, validate_header_timeless},
     params::{
         BLOCK_MAX_ACTIONS, BLOCK_MAX_DISTINCT_SEGMENTS, BLOCK_MAX_LIVE_INPUTS, BLOCK_MAX_TXS,
-        BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_TXS, LOG_SEGMENT_SIZE,
+        BLOCK_MAX_USER_OUTPUTS, BLOCK_MAX_USER_PAGES, LOG_SEGMENT_SIZE,
     },
     ConsensusError,
 };
@@ -148,8 +148,8 @@ pub fn validate_block_resource_preflight(
         validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
     let user_page_count = usize::from(stream.page_count);
     let logical_tx_count = usize::from(stream.logical_count);
-    if user_page_count > BLOCK_MAX_USER_TXS {
-        return resource_limit("user_pages", user_page_count, BLOCK_MAX_USER_TXS);
+    if user_page_count > BLOCK_MAX_USER_PAGES {
+        return resource_limit("user_pages", user_page_count, BLOCK_MAX_USER_PAGES);
     }
 
     let mut live_input_count = 0usize;

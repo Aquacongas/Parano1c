@@ -212,7 +212,7 @@ pub fn legal_block_scenarios(
     seed_base: u128,
 ) -> Vec<BenchScenario> {
     assert!(noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS.contains(&user_txs));
-    if user_txs == noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
+    if user_txs == noid_chain::consensus::params::BLOCK_MAX_USER_PAGES {
         return b255_saturation_scenarios(label, seed_base);
     }
     (0..user_txs)

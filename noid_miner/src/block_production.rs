@@ -229,8 +229,13 @@ impl PreparedBlockAttempt {
         header
     }
 
-    pub fn user_transaction_count(&self) -> usize {
+    pub fn user_page_count(&self) -> usize {
         self.block.transactions.len().saturating_sub(1)
+    }
+
+    pub fn proof_class(&self) -> noid_chain::consensus::paged_spend::BlockProofClass {
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(self.user_page_count())
+            .expect("prepared block already selected a canonical proof class")
     }
 
     pub const fn expected_parent_id(&self) -> [u8; 32] {

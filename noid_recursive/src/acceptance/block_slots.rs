@@ -2007,7 +2007,7 @@ mod tx_epoch_anchor_tests {
         let start = start_accumulator();
         let mut natives = bodies(&start);
         let ghost = natives.pop().expect("small fixture ghost");
-        while natives.len() < 1 + noid_chain::consensus::params::BLOCK_MAX_USER_TXS {
+        while natives.len() < 1 + noid_chain::consensus::params::BLOCK_MAX_USER_PAGES {
             natives.push(ghost.clone());
         }
         let mut b = FieldR1csBuilder::new();
@@ -2016,8 +2016,10 @@ mod tx_epoch_anchor_tests {
             .iter()
             .map(|body| SpineInputsTrace::alloc(&mut b, body))
             .collect();
-        let auth_capacity =
-            super::tier_auth_slot_count(Some(noid_chain::consensus::params::BLOCK_MAX_USER_TXS), 1);
+        let auth_capacity = super::tier_auth_slot_count(
+            Some(noid_chain::consensus::params::BLOCK_MAX_USER_PAGES),
+            1,
+        );
         assert_eq!(auth_capacity, 256);
         let live_bits: Vec<_> = (0..auth_capacity)
             .map(|i| alloc_block(&mut b, Block128::from(u128::from(i == 0))))
