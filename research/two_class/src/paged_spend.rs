@@ -17,6 +17,11 @@ use noid_tx::{
     TX_VALIDITY_MASK,
 };
 
+use crate::geometry::{
+    ProofClass, B255_INPUT_CAPACITY, B255_LIVE_AUTHORIZATION_CAPACITY, B255_OUTPUT_CAPACITY,
+    B255_PAGE_CAPACITY,
+};
+
 const TAG_PAGEDTX: DomainTag = DomainTag::new(b"PAGEDTX_");
 
 pub const PAGEDTX_VERSION: u16 = 1;
@@ -26,9 +31,13 @@ const PAGEDSPEND_MARKER_MASK: u16 = PAGEDSPEND_START_BIT | PAGEDSPEND_END_BIT;
 const PAGEDSPEND_VALIDITY_MASK: u16 = TX_VALIDITY_MASK | PAGEDSPEND_MARKER_MASK;
 
 pub const MAX_PAGEDSPEND_PAGES: usize = 128;
-pub const MAX_PAGEDSPEND_GROUPS: usize = 128;
 pub const MAX_PAGEDSPEND_INPUTS: usize = 1_020;
 pub const MAX_PAGEDSPEND_OUTPUTS: usize = MAX_PAGEDSPEND_PAGES * TX_OUTPUTS;
+
+pub const MAX_BLOCK_USER_PAGES: usize = B255_PAGE_CAPACITY;
+pub const MAX_BLOCK_LOGICAL_TRANSACTIONS: usize = B255_LIVE_AUTHORIZATION_CAPACITY;
+pub const MAX_BLOCK_LIVE_INPUTS: usize = B255_INPUT_CAPACITY;
+pub const MAX_BLOCK_LIVE_OUTPUTS: usize = B255_OUTPUT_CAPACITY;
 
 pub const PAGEDSPEND_INTENT_MARKER: u8 = 0xA3;
 pub const MAX_PAGEDSPEND_AUTHORIZATION_BYTES: usize = 61_012;
@@ -43,6 +52,10 @@ const _: () = assert!(MAX_PAGEDSPEND_PAGES <= u16::MAX as usize);
 const _: () = assert!(MAX_PAGEDSPEND_INPUTS <= u16::MAX as usize);
 const _: () = assert!(MAX_PAGEDSPEND_OUTPUTS <= u16::MAX as usize);
 const _: () = assert!(MAX_PAGEDSPEND_INTENT_BYTES == 102_363);
+const _: () = assert!(MAX_BLOCK_USER_PAGES == 255);
+const _: () = assert!(MAX_BLOCK_LOGICAL_TRANSACTIONS == 255);
+const _: () = assert!(MAX_BLOCK_LIVE_INPUTS == 1_020);
+const _: () = assert!(MAX_BLOCK_LIVE_OUTPUTS == 510);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxPage {
@@ -104,6 +117,7 @@ pub struct PagedSpendFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PagedSpendStreamFacts {
+    pub proof_class: ProofClass,
     pub groups: Vec<PagedSpendFacts>,
     pub page_count: u16,
     pub logical_count: u16,
@@ -275,12 +289,23 @@ pub enum PagedSpendError {
     },
     TooManyGroups {
         actual: usize,
+        capacity: usize,
+    },
+    BlockPageLimit {
+        actual: usize,
+        capacity: usize,
+    },
+    ProofClassMismatch {
+        expected: ProofClass,
+        actual: ProofClass,
     },
     BlockInputLimit {
         actual: usize,
+        capacity: usize,
     },
     BlockOutputLimit {
         actual: usize,
+        capacity: usize,
     },
 }
 
@@ -332,13 +357,44 @@ pub fn canonical_paged_spend_auth(
 /// The returned groups are in physical order and are the exact logical leaves
 /// used by authorization compaction and the transaction root. This function
 /// does not activate a block wire format; it is the native twin for the
-/// exploratory P128 relation.
+/// production B64/B255 relation.
 pub fn validate_paged_spend_stream(
     pages: &[TxPage],
 ) -> Result<PagedSpendStreamFacts, PagedSpendError> {
-    if pages.len() > MAX_PAGEDSPEND_PAGES {
-        return Err(PagedSpendError::PageCount {
+    let Some(proof_class) = ProofClass::for_page_count(pages.len()) else {
+        return Err(PagedSpendError::BlockPageLimit {
             actual: pages.len(),
+            capacity: MAX_BLOCK_USER_PAGES,
+        });
+    };
+    validate_paged_spend_stream_for_class(pages, proof_class)
+}
+
+/// Validate a page stream against its authenticated proof class.
+///
+/// The class is canonical: 0..=64 pages are B64 and 65..=255 pages are B255.
+/// A caller cannot voluntarily place a small block in m24 or a large block in
+/// m23, which keeps class selection deterministic across consensus, proving
+/// and mining.
+pub fn validate_paged_spend_stream_for_class(
+    pages: &[TxPage],
+    proof_class: ProofClass,
+) -> Result<PagedSpendStreamFacts, PagedSpendError> {
+    if pages.len() > proof_class.page_capacity() {
+        return Err(PagedSpendError::BlockPageLimit {
+            actual: pages.len(),
+            capacity: proof_class.page_capacity(),
+        });
+    }
+    let expected =
+        ProofClass::for_page_count(pages.len()).ok_or(PagedSpendError::BlockPageLimit {
+            actual: pages.len(),
+            capacity: MAX_BLOCK_USER_PAGES,
+        })?;
+    if expected != proof_class {
+        return Err(PagedSpendError::ProofClassMismatch {
+            expected,
+            actual: proof_class,
         });
     }
     let mut groups = Vec::with_capacity(pages.len());
@@ -350,9 +406,10 @@ pub fn validate_paged_spend_stream(
         };
         let end = start + relative_end + 1;
         groups.push(validate_paged_spend(&pages[start..end])?);
-        if groups.len() > MAX_PAGEDSPEND_GROUPS {
+        if groups.len() > proof_class.live_authorization_capacity() {
             return Err(PagedSpendError::TooManyGroups {
                 actual: groups.len(),
+                capacity: proof_class.live_authorization_capacity(),
             });
         }
         cursor = end;
@@ -363,10 +420,14 @@ pub fn validate_paged_spend_stream(
         .try_fold(0usize, |sum, group| {
             sum.checked_add(group.live_inputs as usize)
         })
-        .ok_or(PagedSpendError::BlockInputLimit { actual: usize::MAX })?;
-    if live_inputs > MAX_PAGEDSPEND_INPUTS {
+        .ok_or(PagedSpendError::BlockInputLimit {
+            actual: usize::MAX,
+            capacity: proof_class.input_capacity(),
+        })?;
+    if live_inputs > proof_class.input_capacity() {
         return Err(PagedSpendError::BlockInputLimit {
             actual: live_inputs,
+            capacity: proof_class.input_capacity(),
         });
     }
     let live_outputs = groups
@@ -374,10 +435,14 @@ pub fn validate_paged_spend_stream(
         .try_fold(0usize, |sum, group| {
             sum.checked_add(group.live_outputs as usize)
         })
-        .ok_or(PagedSpendError::BlockOutputLimit { actual: usize::MAX })?;
-    if live_outputs > MAX_PAGEDSPEND_OUTPUTS {
+        .ok_or(PagedSpendError::BlockOutputLimit {
+            actual: usize::MAX,
+            capacity: proof_class.output_capacity(),
+        })?;
+    if live_outputs > proof_class.output_capacity() {
         return Err(PagedSpendError::BlockOutputLimit {
             actual: live_outputs,
+            capacity: proof_class.output_capacity(),
         });
     }
 
@@ -406,6 +471,7 @@ pub fn validate_paged_spend_stream(
     }
 
     Ok(PagedSpendStreamFacts {
+        proof_class,
         page_count: pages.len() as u16,
         logical_count: groups.len() as u16,
         live_inputs: live_inputs as u16,
@@ -770,6 +836,17 @@ mod tests {
             ],
             "PAGEDTX_ v1 1020-input/128-page vector drifted",
         );
+        assert_eq!(
+            validate_paged_spend_stream_for_class(&pages, ProofClass::B64),
+            Err(PagedSpendError::BlockPageLimit {
+                actual: 128,
+                capacity: 64,
+            })
+        );
+        let block = validate_paged_spend_stream_for_class(&pages, ProofClass::B255).unwrap();
+        assert_eq!(block.proof_class, ProofClass::B255);
+        assert_eq!(block.logical_count, 1);
+        assert_eq!(block.live_inputs, 1_020);
     }
 
     #[test]
@@ -861,10 +938,9 @@ mod tests {
         assert_eq!(MAX_PAGEDSPEND_INTENT_BYTES, 102_363);
     }
 
-    #[test]
-    fn flat_stream_yields_128_independent_logical_transactions() {
-        let mut stream = Vec::with_capacity(MAX_PAGEDSPEND_PAGES);
-        for index in 0..MAX_PAGEDSPEND_GROUPS {
+    fn independent_stream(count: usize) -> Vec<TxPage> {
+        let mut stream = Vec::with_capacity(count);
+        for index in 0..count {
             let mut group = pages(1, 1, 3);
             group[0].body.inputs[0].slot_index = index as u32 + 1;
             group[0].body.inputs[0].creation_id = index as u64 + 1;
@@ -872,21 +948,68 @@ mod tests {
             group[0].body.epoch_anchor[0] = index as u8;
             stream.push(group.remove(0));
         }
-        let facts = validate_paged_spend_stream(&stream).unwrap();
-        assert_eq!(facts.page_count, 128);
-        assert_eq!(facts.logical_count, 128);
-        assert_eq!(facts.groups.len(), 128);
-        let unique = facts
-            .groups
-            .iter()
-            .map(|group| group.logical_txid)
-            .collect::<HashSet<_>>();
-        assert_eq!(unique.len(), 128);
+        stream
+    }
+
+    #[test]
+    fn flat_stream_has_exact_64_65_255_class_boundary() {
+        for (count, class) in [
+            (64, ProofClass::B64),
+            (65, ProofClass::B255),
+            (255, ProofClass::B255),
+        ] {
+            let stream = independent_stream(count);
+            let facts = validate_paged_spend_stream(&stream).unwrap();
+            assert_eq!(facts.proof_class, class);
+            assert_eq!(facts.page_count as usize, count);
+            assert_eq!(facts.logical_count as usize, count);
+            assert_eq!(facts.groups.len(), count);
+            let unique = facts
+                .groups
+                .iter()
+                .map(|group| group.logical_txid)
+                .collect::<HashSet<_>>();
+            assert_eq!(unique.len(), count);
+        }
+
+        let b64 = independent_stream(64);
+        assert!(validate_paged_spend_stream_for_class(&b64, ProofClass::B64).is_ok());
+        assert_eq!(
+            validate_paged_spend_stream_for_class(&b64, ProofClass::B255),
+            Err(PagedSpendError::ProofClassMismatch {
+                expected: ProofClass::B64,
+                actual: ProofClass::B255,
+            })
+        );
+
+        let b255 = independent_stream(65);
+        assert_eq!(
+            validate_paged_spend_stream_for_class(&b255, ProofClass::B64),
+            Err(PagedSpendError::BlockPageLimit {
+                actual: 65,
+                capacity: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn block_decoder_rejects_the_256th_user_page() {
+        let stream = independent_stream(255);
+        let mut oversized = stream.clone();
+        oversized.push(stream[0].clone());
+        assert_eq!(
+            validate_paged_spend_stream(&oversized),
+            Err(PagedSpendError::BlockPageLimit {
+                actual: 256,
+                capacity: 255,
+            })
+        );
     }
 
     #[test]
     fn empty_user_page_stream_is_the_coinbase_only_boundary() {
         let facts = validate_paged_spend_stream(&[]).unwrap();
+        assert_eq!(facts.proof_class, ProofClass::B64);
         assert!(facts.groups.is_empty());
         assert_eq!(facts.page_count, 0);
         assert_eq!(facts.logical_count, 0);

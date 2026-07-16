@@ -17,28 +17,28 @@ use noid_ivc_core::pcs::{
 #[cfg(test)]
 use crate::circuit_support::{mul, pin_zero, FieldR1csBuilder, LinExpr, F128};
 
-pub const B128_OUTER_M: usize = 23;
-pub const B256_OUTER_M: usize = 24;
+pub const B64_OUTER_M: usize = 23;
+pub const B255_OUTER_M: usize = 24;
 pub const HISTORY_K_SKIP: usize = 6;
 pub const HISTORY_PCS_LOG_INV_RATE: usize = 2;
 pub const HISTORY_PCS_LOG_BATCH_SIZE: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParentProofClass {
-    B128,
-    B256,
+    B64,
+    B255,
 }
 
 impl ParentProofClass {
     pub const fn outer_m(self) -> usize {
         match self {
-            Self::B128 => B128_OUTER_M,
-            Self::B256 => B256_OUTER_M,
+            Self::B64 => B64_OUTER_M,
+            Self::B255 => B255_OUTER_M,
         }
     }
 
     pub const fn is_m24(self) -> bool {
-        matches!(self, Self::B256)
+        matches!(self, Self::B255)
     }
 }
 
@@ -127,26 +127,26 @@ impl ParentProofGeometry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentUnionLayout {
-    pub b128: ParentProofGeometry,
-    pub b256: ParentProofGeometry,
+    pub b64: ParentProofGeometry,
+    pub b255: ParentProofGeometry,
     /// Maximum-shape payload cells that are absent from canonical m23.
     pub inactive_m23_suffix_fields: usize,
 }
 
 impl ParentUnionLayout {
     pub fn canonical() -> Self {
-        let b128 = ParentProofGeometry::canonical(ParentProofClass::B128);
-        let b256 = ParentProofGeometry::canonical(ParentProofClass::B256);
-        assert_eq!(b128.fri_queries, b256.fri_queries);
-        assert_eq!(b128.fri_commitments, b256.fri_commitments);
-        assert_eq!(b128.region_query_leaf_fields, b256.region_query_leaf_fields);
-        let inactive_m23_suffix_fields = b256
+        let b64 = ParentProofGeometry::canonical(ParentProofClass::B64);
+        let b255 = ParentProofGeometry::canonical(ParentProofClass::B255);
+        assert_eq!(b64.fri_queries, b255.fri_queries);
+        assert_eq!(b64.fri_commitments, b255.fri_commitments);
+        assert_eq!(b64.region_query_leaf_fields, b255.region_query_leaf_fields);
+        let inactive_m23_suffix_fields = b255
             .path_free_proof_fields
-            .checked_sub(b128.path_free_proof_fields)
+            .checked_sub(b64.path_free_proof_fields)
             .expect("m24 parent payload contains m23");
         Self {
-            b128,
-            b256,
+            b64,
+            b255,
             inactive_m23_suffix_fields,
         }
     }
@@ -187,21 +187,21 @@ mod tests {
     #[test]
     fn production_shapes_have_one_canonical_union_delta() {
         let layout = ParentUnionLayout::canonical();
-        assert_eq!(layout.b128.fri_arities, [4, 4, 4, 4, 2]);
-        assert_eq!(layout.b256.fri_arities, [4, 4, 4, 4, 3]);
-        assert_eq!(layout.b128.fri_commitments, 2);
-        assert_eq!(layout.b256.fri_commitments, 2);
-        assert_eq!(layout.b128.plaintext_tail_fields, 256);
-        assert_eq!(layout.b256.plaintext_tail_fields, 512);
-        assert_eq!(layout.b128.region_query_leaf_fields, 80);
-        assert_eq!(layout.b256.region_query_leaf_fields, 80);
+        assert_eq!(layout.b64.fri_arities, [4, 4, 4, 4, 2]);
+        assert_eq!(layout.b255.fri_arities, [4, 4, 4, 4, 3]);
+        assert_eq!(layout.b64.fri_commitments, 2);
+        assert_eq!(layout.b255.fri_commitments, 2);
+        assert_eq!(layout.b64.plaintext_tail_fields, 256);
+        assert_eq!(layout.b255.plaintext_tail_fields, 512);
+        assert_eq!(layout.b64.region_query_leaf_fields, 80);
+        assert_eq!(layout.b255.region_query_leaf_fields, 80);
         assert_eq!(layout.inactive_m23_suffix_fields, 266);
     }
 
     #[test]
     fn parent_class_changes_witness_not_suffix_matrix() {
-        let (m23_matrix, m23_witness) = build_suffix_relation(ParentProofClass::B128, false);
-        let (m24_matrix, m24_witness) = build_suffix_relation(ParentProofClass::B256, false);
+        let (m23_matrix, m23_witness) = build_suffix_relation(ParentProofClass::B64, false);
+        let (m24_matrix, m24_witness) = build_suffix_relation(ParentProofClass::B255, false);
         assert!(m23_matrix.satisfies(&m23_witness));
         assert!(m24_matrix.satisfies(&m24_witness));
         assert_eq!(m23_matrix.useful_rows, m24_matrix.useful_rows);
@@ -210,7 +210,7 @@ mod tests {
             m24_matrix.structural_statement_digest()
         );
 
-        let (_, corrupt_m23) = build_suffix_relation(ParentProofClass::B128, true);
+        let (_, corrupt_m23) = build_suffix_relation(ParentProofClass::B64, true);
         assert!(!m23_matrix.satisfies(&corrupt_m23));
     }
 }

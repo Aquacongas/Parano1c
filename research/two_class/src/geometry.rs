@@ -1,63 +1,136 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Fixed two-class research geometry and capacity claims.
+//! Exact launch geometry after the A128 cancellation.
 
-pub const COMMODITY_PAGE_CAPACITY: usize = 128;
-pub const COMMODITY_AUTHORIZATION_CAPACITY: usize = 128;
-pub const EXTENDED_PAGE_CAPACITY: usize = 255;
-pub const EXTENDED_AUTHORIZATION_CAPACITY: usize = 256;
+pub const BLOCK_TARGET_SECONDS: usize = 15;
 
-pub const LOGICAL_PAGE_CAPACITY: usize = COMMODITY_PAGE_CAPACITY;
-pub const INPUT_CAPACITY: usize = 1_020;
+pub const B64_PAGE_CAPACITY: usize = 64;
+pub const B64_AUTHORIZATION_CAPACITY: usize = 64;
+pub const B64_INPUT_CAPACITY: usize = 512;
+pub const B64_OUTPUT_CAPACITY: usize = 128;
+pub const B64_TOUCHED_CAPACITY: usize = 641;
+pub const B64_ACTION_CANDIDATES: usize = 641;
+pub const B64_ACTION_SORT_CAPACITY: usize = 1_024;
+pub const B64_OUTER_M: usize = 23;
+
+pub const B255_PAGE_CAPACITY: usize = 255;
+pub const B255_LIVE_AUTHORIZATION_CAPACITY: usize = 255;
+pub const B255_AUTHORIZATION_TILE_CAPACITY: usize = 256;
+pub const B255_INPUT_CAPACITY: usize = 1_020;
+pub const B255_OUTPUT_CAPACITY: usize = 510;
+pub const B255_TOUCHED_CAPACITY: usize = 1_531;
+pub const B255_ACTION_CANDIDATES: usize = 2_551;
+pub const B255_ACTION_SORT_CAPACITY: usize = 4_096;
+pub const B255_OUTER_M: usize = 24;
+
+pub const LOGICAL_PAGE_CAPACITY: usize = 128;
+pub const LOGICAL_INPUT_CAPACITY: usize = 1_020;
 pub const LOGICAL_OUTPUT_CAPACITY: usize = 256;
-pub const BLOCK_OUTPUT_CAPACITY: usize = 510;
-pub const MEAN_BLOCK_SECONDS: u64 = 15;
 
-// Compatibility names used by the active B128 relation modules.
-pub const PAGE_CAPACITY: usize = COMMODITY_PAGE_CAPACITY;
-pub const AUTHORIZATION_CAPACITY: usize = COMMODITY_AUTHORIZATION_CAPACITY;
-pub const OUTPUT_CAPACITY: usize = LOGICAL_OUTPUT_CAPACITY;
-
-pub const B128_ACTION_CANDIDATES: usize = 1 + COMMODITY_PAGE_CAPACITY * 10;
-pub const B128_LIVE_ACTION_CAPACITY: usize = 1 + INPUT_CAPACITY + LOGICAL_OUTPUT_CAPACITY;
-pub const B128_ACTION_SORT_CAPACITY: usize = B128_ACTION_CANDIDATES.next_power_of_two();
-
-pub const B256_ACTION_CANDIDATES: usize = 1 + EXTENDED_PAGE_CAPACITY * 10;
-pub const B256_LIVE_ACTION_CAPACITY: usize = 1 + INPUT_CAPACITY + BLOCK_OUTPUT_CAPACITY;
-pub const B256_ACTION_SORT_CAPACITY: usize = B256_ACTION_CANDIDATES.next_power_of_two();
-
-// Compatibility names used by existing B128 tests.
-pub const ACTION_CANDIDATES: usize = B128_ACTION_CANDIDATES;
-pub const LIVE_ACTION_CAPACITY: usize = B128_LIVE_ACTION_CAPACITY;
-pub const ACTION_SORT_CAPACITY: usize = B128_ACTION_SORT_CAPACITY;
-
-pub fn reference_l1_tps() -> f64 {
-    COMMODITY_AUTHORIZATION_CAPACITY as f64 / MEAN_BLOCK_SECONDS as f64
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofClass {
+    B64,
+    B255,
 }
 
-pub fn protocol_l1_tps() -> f64 {
-    EXTENDED_PAGE_CAPACITY as f64 / MEAN_BLOCK_SECONDS as f64
+impl ProofClass {
+    pub const fn for_page_count(page_count: usize) -> Option<Self> {
+        if page_count <= B64_PAGE_CAPACITY {
+            Some(Self::B64)
+        } else if page_count <= B255_PAGE_CAPACITY {
+            Some(Self::B255)
+        } else {
+            None
+        }
+    }
+
+    pub const fn page_capacity(self) -> usize {
+        match self {
+            Self::B64 => B64_PAGE_CAPACITY,
+            Self::B255 => B255_PAGE_CAPACITY,
+        }
+    }
+
+    pub const fn live_authorization_capacity(self) -> usize {
+        match self {
+            Self::B64 => B64_AUTHORIZATION_CAPACITY,
+            Self::B255 => B255_LIVE_AUTHORIZATION_CAPACITY,
+        }
+    }
+
+    pub const fn authorization_tile_capacity(self) -> usize {
+        match self {
+            Self::B64 => B64_AUTHORIZATION_CAPACITY,
+            Self::B255 => B255_AUTHORIZATION_TILE_CAPACITY,
+        }
+    }
+
+    pub const fn input_capacity(self) -> usize {
+        match self {
+            Self::B64 => B64_INPUT_CAPACITY,
+            Self::B255 => B255_INPUT_CAPACITY,
+        }
+    }
+
+    pub const fn output_capacity(self) -> usize {
+        match self {
+            Self::B64 => B64_OUTPUT_CAPACITY,
+            Self::B255 => B255_OUTPUT_CAPACITY,
+        }
+    }
+
+    pub const fn outer_m(self) -> usize {
+        match self {
+            Self::B64 => B64_OUTER_M,
+            Self::B255 => B255_OUTER_M,
+        }
+    }
 }
 
-const _: () = assert!(LOGICAL_PAGE_CAPACITY == 128);
-const _: () = assert!(EXTENDED_PAGE_CAPACITY + 1 == 256);
-const _: () = assert!(B128_ACTION_CANDIDATES == 1_281);
-const _: () = assert!(B128_LIVE_ACTION_CAPACITY == 1_277);
-const _: () = assert!(B128_ACTION_SORT_CAPACITY == 2_048);
-const _: () = assert!(B256_ACTION_CANDIDATES == 2_551);
-const _: () = assert!(B256_LIVE_ACTION_CAPACITY == 1_531);
-const _: () = assert!(B256_ACTION_SORT_CAPACITY == 4_096);
+pub fn b64_saturated_tps() -> f64 {
+    B64_PAGE_CAPACITY as f64 / BLOCK_TARGET_SECONDS as f64
+}
+
+pub fn protocol_saturated_tps() -> f64 {
+    B255_PAGE_CAPACITY as f64 / BLOCK_TARGET_SECONDS as f64
+}
+
+const _: () = assert!(B64_PAGE_CAPACITY * noid_tx::TX_INPUTS == B64_INPUT_CAPACITY);
+const _: () = assert!(B64_PAGE_CAPACITY * noid_tx::TX_OUTPUTS == B64_OUTPUT_CAPACITY);
+const _: () = assert!(B64_INPUT_CAPACITY + B64_OUTPUT_CAPACITY + 1 == B64_TOUCHED_CAPACITY);
+const _: () = assert!(B64_PAGE_CAPACITY * noid_tx::TX_ACTIONS + 1 == B64_ACTION_CANDIDATES);
+const _: () = assert!(B64_ACTION_CANDIDATES.next_power_of_two() == B64_ACTION_SORT_CAPACITY);
+const _: () = assert!(B255_INPUT_CAPACITY + B255_OUTPUT_CAPACITY + 1 == B255_TOUCHED_CAPACITY);
+const _: () = assert!(B255_PAGE_CAPACITY * noid_tx::TX_ACTIONS + 1 == B255_ACTION_CANDIDATES);
+const _: () = assert!(B255_ACTION_CANDIDATES.next_power_of_two() == B255_ACTION_SORT_CAPACITY);
+const _: () = assert!(B255_AUTHORIZATION_TILE_CAPACITY.is_power_of_two());
+const _: () = assert!(LOGICAL_PAGE_CAPACITY > B64_PAGE_CAPACITY);
+const _: () = assert!(LOGICAL_PAGE_CAPACITY <= B255_PAGE_CAPACITY);
+const _: () = assert!(BLOCK_TARGET_SECONDS == noid_chain::consensus::params::BLOCK_TIME as usize);
+const _: () = assert!(B255_PAGE_CAPACITY == noid_chain::consensus::params::BLOCK_MAX_USER_TXS);
+const _: () = assert!(B255_INPUT_CAPACITY == noid_chain::consensus::params::BLOCK_MAX_LIVE_INPUTS);
+const _: () =
+    assert!(B255_OUTPUT_CAPACITY == noid_chain::consensus::params::BLOCK_MAX_USER_OUTPUTS);
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn two_class_geometry_and_capacity_claims_are_exact() {
-        assert!((reference_l1_tps() - 8.533_333_333_333_333).abs() < 1e-12);
-        assert!((protocol_l1_tps() - 17.0).abs() < 1e-12);
-        assert_eq!(LOGICAL_PAGE_CAPACITY * noid_tx::TX_INPUTS, 1_024);
-        assert_eq!(INPUT_CAPACITY, 1_020);
+    fn class_boundary_is_exact_and_non_overlapping() {
+        assert_eq!(ProofClass::for_page_count(0), Some(ProofClass::B64));
+        assert_eq!(ProofClass::for_page_count(64), Some(ProofClass::B64));
+        assert_eq!(ProofClass::for_page_count(65), Some(ProofClass::B255));
+        assert_eq!(ProofClass::for_page_count(255), Some(ProofClass::B255));
+        assert_eq!(ProofClass::for_page_count(256), None);
+    }
+
+    #[test]
+    fn launch_capacity_is_honest() {
+        assert!((b64_saturated_tps() - 4.266_666_666).abs() < 1e-9);
+        assert_eq!(protocol_saturated_tps(), 17.0);
+        assert_eq!(ProofClass::B64.outer_m(), 23);
+        assert_eq!(ProofClass::B255.outer_m(), 24);
     }
 }
