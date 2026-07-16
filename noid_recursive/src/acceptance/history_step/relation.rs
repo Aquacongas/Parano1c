@@ -1098,17 +1098,16 @@ struct ScratchParentRecordingPass {
     challenge_values: Vec<F128>,
 }
 
-/// Build-time one-hot gate constants for a known live parent tier: the
-/// witness-only scratch passes fold them into the same muxed-tail values the
-/// gated relation produces from its authenticated selector wires.
-fn scratch_parent_tier_gates(live_slot: usize) -> [LinExpr; HISTORY_STEP_TIER_SLOT_COUNT] {
-    std::array::from_fn(|slot| {
-        LinExpr::constant(if slot == live_slot {
-            F128::ONE
-        } else {
-            F128::ZERO
-        })
-    })
+/// One-hot gate wires for a known live parent tier.  Scratch passes must
+/// allocate them as WIRES, not constants: the banked claim stream absorbs
+/// gate-selected expressions, and a constant gate would fold them into the
+/// recorded transcript's constant schedule while the real relation (whose
+/// gates are authenticated selector wires) records them as data lanes.
+fn scratch_parent_tier_gates(
+    builder: &mut FieldR1csBuilder,
+    live_slot: usize,
+) -> [LinExpr; HISTORY_STEP_TIER_SLOT_COUNT] {
+    std::array::from_fn(|slot| LinExpr::from_wire(builder.alloc_bool(slot == live_slot)))
 }
 
 fn run_scratch_parent_recording_pass(
@@ -1120,8 +1119,8 @@ fn run_scratch_parent_recording_pass(
     allow_query_position_desync: bool,
 ) -> Result<ScratchParentRecordingPass, HistoryStepError> {
     let entry = runtime.bank().entry(class_id);
-    let gates = scratch_parent_tier_gates(class_id.current_slot());
     let mut builder = FieldR1csBuilder::new_witness_only();
+    let gates = scratch_parent_tier_gates(&mut builder, class_id.current_slot());
     let statement_digest = alloc_pinned_flat_digest(&mut builder, matrix_digest);
     let post_commit_digest = alloc_pinned_flat_digest(&mut builder, post_commit_digest);
     let root = alloc_flat_digest(&mut builder, &envelope.commitment.root);
