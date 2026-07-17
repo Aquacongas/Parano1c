@@ -770,6 +770,94 @@ mod tests {
     }
 
     #[test]
+    fn expansion_frontier_binds_parent_as_left_child_of_the_new_domain() {
+        use noid_chain::block_id;
+        use noid_chain::consensus::fees::required_fee_for_tx_body;
+        use noid_chain::exact_state_hash::{state_node_hash, zero_slot_roots};
+        use noid_chain::fri_state::SlotValue;
+        use noid_tx::{
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+        };
+
+        let owner = Address([0x31; 32]);
+        let occupied = (0..192u32)
+            .map(|slot| {
+                (
+                    slot,
+                    SlotValue::with_owner_fields(
+                        100_000_000,
+                        u64::from(slot) + 1,
+                        owner.as_fields(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = ChainState::from_sparse_utxos(8, &occupied, occupied.len() as u64)
+            .expect("threshold state");
+        let parent_root = state.state_root();
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: parent_root,
+            tx_root: [0u8; 32],
+            timestamp: 1_000,
+            height: 0,
+            miner_address: Address([0x11; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: 8,
+            active_slot_count: state.active_slot_count,
+            alloc_counter: state.alloc_counter,
+        };
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 0,
+            amount: 100_000_000,
+            creation_id: 1,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 220,
+            amount: 100_000_000,
+            owner,
+        };
+        let mut body = TxBody {
+            epoch_anchor: block_id(&parent),
+            fee: 0,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        };
+        body.fee = required_fee_for_tx_body(&body, parent.active_slot_count, parent.log_slots);
+        body.outputs[0].amount -= body.fee;
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[192; 18],
+            vec![Transaction::new(body)],
+            Address([0x22; 32]),
+            1_015,
+            GENESIS_TARGET,
+        )
+        .expect("expansion template");
+        let block = Block {
+            header: template.to_pow_header(0),
+            transactions: template.all_txs(),
+        };
+
+        let frontier = build_exact_state_frontier(&block, &state).expect("expansion frontier");
+        let empty_right = zero_slot_roots(8)[8];
+        assert_eq!(frontier.active_depth, 9);
+        assert_eq!(frontier.old_root, state_node_hash(parent_root, empty_right));
+        assert_eq!(frontier.new_root, block.header.state_root);
+        assert_eq!(frontier.touched_indices.len(), 3);
+        assert_eq!(block.header.active_slot_count, 193);
+        assert_eq!(block.header.alloc_counter, 194);
+    }
+
+    #[test]
     fn tx_root_paths_bind_every_real_body_to_the_count_wrapped_root() {
         let (block, _) = coinbase_only_fixture();
         let hashes = block

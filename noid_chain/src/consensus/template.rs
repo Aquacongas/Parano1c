@@ -532,15 +532,10 @@ fn build_block_template_with_post_state(
     );
     let should_expand = new_log_slots != parent.log_slots;
 
-    // Wallet proofs are bound to log_slots. If this block expands the state,
-    // mempool transactions proved against the parent log_slots cannot be valid
-    // under the expanded header. Produce a coinbase-only expansion block; wallets
-    // will re-prove after observing the new tip.
-    if should_expand {
-        candidates.clear();
-    }
-
     // 3. Apply non-coinbase txs to scratch state.
+    // PagedSpend authorization binds (logical_txid, owner), not the state
+    // depth.  Expansion therefore keeps valid parent-mempool work: the miner
+    // builds its exact-state frontier directly against the expanded domain.
     let mut selection_scratch = state.clone();
     if should_expand {
         selection_scratch.expand_one();
@@ -816,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn expansion_block_is_coinbase_only_and_grows_exact_domain_once() {
+    fn expansion_block_keeps_parent_mempool_and_grows_exact_domain_once() {
         use crate::fri_state::SlotValue;
 
         let owner = Address([4u8; 32]);
@@ -843,7 +838,7 @@ mod tests {
             &parent,
             &state,
             &[192; 18],
-            vec![candidate],
+            vec![candidate.clone()],
             Address([9u8; 32]),
             1,
             [0xff; 32],
@@ -851,12 +846,109 @@ mod tests {
         .unwrap();
 
         assert_eq!(template.log_slots, 9);
-        assert!(
-            template.txs.is_empty(),
-            "parent-depth proof must be re-proved"
-        );
+        assert_eq!(template.txs.len(), 1);
+        assert_eq!(template.txs[0].txid(), candidate.txid());
         assert_eq!(template.active_slot_count, 193);
+        assert_eq!(template.alloc_counter, 194);
         assert!(u64::from(template.coinbase.body.outputs[0].slot_index) < (1u64 << 9));
+    }
+
+    #[test]
+    fn competing_expansion_miners_include_pending_work_and_advance_once() {
+        use crate::fri_state::SlotValue;
+
+        let owner = Address([4u8; 32]);
+        let mut state = ChainState::with_log_slots(8);
+        let occupied = (0..192u32)
+            .map(|slot| {
+                (
+                    slot,
+                    SlotValue::with_owner_fields(
+                        100_000_000,
+                        u64::from(slot) + 1,
+                        owner.as_fields(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        state.state.apply_delta_unrooted(&occupied).unwrap();
+        state.active_slot_count = occupied.len() as u64;
+        state.alloc_counter = occupied.len() as u64;
+        let parent = parent(&mut state);
+
+        let pending = user(0, 220, 100_000_000, owner, &parent);
+
+        let first = build_block_template(
+            &parent,
+            &state,
+            &[192; 18],
+            vec![pending.clone()],
+            Address([9u8; 32]),
+            1,
+            [0xff; 32],
+        )
+        .unwrap();
+        let second = build_block_template(
+            &parent,
+            &state,
+            &[192; 18],
+            vec![pending.clone()],
+            Address([10u8; 32]),
+            1,
+            [0xff; 32],
+        )
+        .unwrap();
+        assert_eq!(first.log_slots, 9);
+        assert_eq!(second.log_slots, 9);
+        assert_eq!(first.txs.len(), 1);
+        assert_eq!(second.txs.len(), 1);
+        assert_eq!(first.txs[0].txid(), pending.txid());
+        assert_eq!(second.txs[0].txid(), pending.txid());
+        assert_ne!(first.state_root, second.state_root);
+
+        let winning = crate::block::Block {
+            header: first.to_pow_header(0),
+            transactions: first.all_txs(),
+        };
+        crate::block::apply_block(&mut state, &winning).unwrap();
+        assert_eq!(state.state.log_slots(), 9);
+        assert_eq!(state.active_slot_count, 193);
+        assert_eq!(state.alloc_counter, 194);
+        assert_eq!(state.state.slot(0), SlotValue::EMPTY);
+        assert!(!state.state.slot(220).is_empty());
+
+        // The competing block is now stale. Applying it must fail atomically:
+        // the winner's tip/state stays unchanged.
+        let losing = crate::block::Block {
+            header: second.to_pow_header(0),
+            transactions: second.all_txs(),
+        };
+        let winning_root = state.cached_state_root();
+        assert!(crate::block::apply_block(&mut state, &losing).is_err());
+        assert_eq!(state.cached_state_root(), winning_root);
+        assert_eq!(state.state.log_slots(), 9);
+
+        // The following block remains at the expanded depth and continues
+        // normally; the boundary was crossed exactly once.
+        let next = build_block_template(
+            &winning.header,
+            &state,
+            &[193; 18],
+            vec![],
+            Address([11u8; 32]),
+            2,
+            [0xff; 32],
+        )
+        .unwrap();
+        assert_eq!(next.log_slots, 9);
+        assert!(next.txs.is_empty());
+        let next_block = crate::block::Block {
+            header: next.to_pow_header(0),
+            transactions: next.all_txs(),
+        };
+        crate::block::apply_block(&mut state, &next_block).unwrap();
+        assert_eq!(state.state.log_slots(), 9);
+        assert_eq!(state.active_slot_count, 194);
     }
 
     #[test]
