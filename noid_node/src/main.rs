@@ -162,6 +162,19 @@ fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
         > local_height.saturating_add(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH)
 }
 
+fn retained_suffix_has_more(local_height: u64, announced_height: u64) -> bool {
+    local_height < announced_height
+}
+
+fn unavailable_block_requires_snapshot(
+    local_height: u64,
+    requested_height: u64,
+    announced_height: u64,
+) -> bool {
+    requested_height == local_height.saturating_add(1)
+        && retained_suffix_has_more(local_height, announced_height)
+}
+
 fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     let already_ready = *sender.borrow();
     if !already_ready {
@@ -1585,9 +1598,10 @@ mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
         mark_initial_sync_ready, p2p_listen_to_multiaddr, snapshot_header_next_action,
-        state_segment_response_matches_snapshot_boundary, validate_history_step_tip_future_drift,
-        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        state_segment_response_matches_snapshot_boundary, unavailable_block_requires_snapshot,
+        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
+        validate_snapshot_staged_header_boundary, NodeConfig, SnapshotHeaderBoundary,
+        SnapshotHeaderNextAction,
     };
 
     #[test]
@@ -1672,6 +1686,14 @@ mod tests {
         assert!(!gap_requires_snapshot_sync(local_height, local_height + 17));
         assert!(!gap_requires_snapshot_sync(local_height, local_height + 18));
         assert!(gap_requires_snapshot_sync(local_height, local_height + 19));
+    }
+
+    #[test]
+    fn caught_up_retained_suffix_does_not_fall_back_to_snapshot() {
+        assert!(!unavailable_block_requires_snapshot(10, 11, 10));
+        assert!(unavailable_block_requires_snapshot(10, 11, 11));
+        assert!(unavailable_block_requires_snapshot(10, 11, 20));
+        assert!(!unavailable_block_requires_snapshot(10, 12, 20));
     }
     #[test]
     fn snapshot_header_progress_rejects_delayed_and_oversized_batches() {
@@ -2758,18 +2780,22 @@ async fn handle_p2p_events(
                                 mark_initial_sync_ready(&initial_sync_ready);
                                 sync_ready.notify_one(); // cancel/rebuild any active stale template
 
-                                // Auto-continue sync: immediately request the next batch from
-                                // the same peer. This pulls the chain all the way to the peer's
-                                // tip without waiting for gossip mesh to propagate each block.
-                                // SyncBlocksFrom for heights beyond peer's recent_blocks returns
-                                // None and stops automatically — no infinite loop.
-                                let _ = p2p_cmd
-                                    .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                        peer: from,
-                                        from_height: height + 1,
-                                        count: noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16,
-                                    })
-                                    .await;
+                                // Continue only to the authenticated/announced target. Pulling
+                                // one height beyond a caught-up tip used to turn an ordinary
+                                // `unavailable` response into a needless snapshot-manifest
+                                // round after every live block.
+                                if retained_suffix_has_more(height, highest_announced) {
+                                    let remaining = highest_announced - height;
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                            peer: from,
+                                            from_height: height + 1,
+                                            count: remaining.min(
+                                                noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+                                            ) as u16,
+                                        })
+                                        .await;
+                                }
 
                                 // Apply the chain of orphans that build on the new block.
                                 let mut next_hash = applied.block_hash;
@@ -3160,11 +3186,12 @@ async fn handle_p2p_events(
                     let ctx = chain.read().await;
                     ctx.tip_height()
                 };
-                if height == our_tip.saturating_add(1) {
+                if unavailable_block_requires_snapshot(our_tip, height, highest_announced) {
                     tracing::info!(
                         peer = %from,
                         requested_height = height,
                         our_tip,
+                        highest_announced,
                         "next retained block unavailable — requesting fresh snapshot manifest"
                     );
                     if pending_manifest.is_none()
@@ -3195,7 +3222,8 @@ async fn handle_p2p_events(
                         peer = %from,
                         requested_height = height,
                         our_tip,
-                        "non-next retained block unavailable"
+                        highest_announced,
+                        "retained block unavailable outside an announced suffix gap"
                     );
                 }
             }
