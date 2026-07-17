@@ -270,6 +270,41 @@ pub const ENCODED_SEGMENT_SLOT_VALUE_BYTES: usize = SEGMENT_LANE_COUNT * SEGMENT
 pub const ENCODED_SEGMENT_ENTRY_BYTES: usize =
     ENCODED_SEGMENT_INDEX_BYTES + ENCODED_SEGMENT_SLOT_VALUE_BYTES;
 
+/// One borrowed canonical sparse segment payload.
+///
+/// Construction validates the complete frame once. Iteration then decodes
+/// only live entries and never allocates the dense `2^16` column image.
+#[derive(Clone, Copy, Debug)]
+pub struct SparseSegmentView<'a> {
+    effective_log_seg: u8,
+    live_count: u32,
+    entries: &'a [u8],
+}
+
+impl<'a> SparseSegmentView<'a> {
+    #[inline]
+    pub fn effective_log_segment(self) -> u8 {
+        self.effective_log_seg
+    }
+
+    #[inline]
+    pub fn live_count(self) -> u32 {
+        self.live_count
+    }
+
+    #[inline]
+    pub fn entries(self) -> impl ExactSizeIterator<Item = (u16, SlotValue)> + 'a {
+        self.entries
+            .chunks_exact(ENCODED_SEGMENT_ENTRY_BYTES)
+            .map(|entry| {
+                let local_index =
+                    u16::from_le_bytes(entry[..2].try_into().expect("validated sparse index"));
+                let slot = decode_slot_value(&entry[2..]).expect("validated sparse slot");
+                (local_index, slot)
+            })
+    }
+}
+
 #[inline]
 pub fn encoded_segment_len_for_live_count(effective_log_seg: u8, live_count: u32) -> Option<usize> {
     if effective_log_seg > 16 || effective_log_seg as u32 >= usize::BITS {
@@ -315,6 +350,71 @@ pub fn max_encoded_segments_total_len(
     segment_count.checked_mul(max_encoded_segment_len_for_eff_log(effective_log_seg)?)
 }
 
+/// Validate and borrow one canonical sparse segment without expanding it.
+pub fn decode_sparse_segment(bytes: &[u8]) -> Option<SparseSegmentView<'_>> {
+    if bytes.len() < ENCODED_SEGMENT_HEADER_BYTES || bytes[..4] != SEGMENT_ENCODING_MAGIC {
+        return None;
+    }
+    let effective_log_seg = bytes[4];
+    if effective_log_seg > 16 || effective_log_seg as u32 >= usize::BITS {
+        return None;
+    }
+    let live_count = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
+    let expected_len = encoded_segment_len_for_live_count(effective_log_seg, live_count)?;
+    if bytes.len() != expected_len {
+        return None;
+    }
+    let capacity = 1usize << effective_log_seg;
+    let entries = &bytes[ENCODED_SEGMENT_HEADER_BYTES..];
+    let mut previous = None;
+    for entry in entries.chunks_exact(ENCODED_SEGMENT_ENTRY_BYTES) {
+        let local_index = u16::from_le_bytes(entry[..2].try_into().ok()?);
+        if usize::from(local_index) >= capacity
+            || previous.is_some_and(|previous| local_index <= previous)
+        {
+            return None;
+        }
+        let slot = decode_slot_value(&entry[2..])?;
+        if slot.is_empty() {
+            return None;
+        }
+        previous = Some(local_index);
+    }
+    Some(SparseSegmentView {
+        effective_log_seg,
+        live_count,
+        entries,
+    })
+}
+
+/// Encode an already-sparse, strictly ordered live-entry sequence.
+pub fn encode_sparse_segment_entries(
+    effective_log_seg: u8,
+    entries: &[(u16, SlotValue)],
+) -> Option<Vec<u8>> {
+    let live_count = u32::try_from(entries.len()).ok()?;
+    let encoded_len = encoded_segment_len_for_live_count(effective_log_seg, live_count)?;
+    let capacity = 1usize.checked_shl(u32::from(effective_log_seg))?;
+    let mut previous = None;
+    let mut encoded = Vec::with_capacity(encoded_len);
+    encoded.extend_from_slice(&SEGMENT_ENCODING_MAGIC);
+    encoded.push(effective_log_seg);
+    encoded.extend_from_slice(&live_count.to_le_bytes());
+    for &(local_index, slot) in entries {
+        if slot.is_empty()
+            || usize::from(local_index) >= capacity
+            || previous.is_some_and(|previous| local_index <= previous)
+        {
+            return None;
+        }
+        encoded.extend_from_slice(&local_index.to_le_bytes());
+        encoded.extend_from_slice(&encode_slot_value(&slot));
+        previous = Some(local_index);
+    }
+    debug_assert_eq!(encoded.len(), encoded_len);
+    Some(encoded)
+}
+
 pub fn encode_segment(seg: &SegmentColumns, effective_log_seg: u8) -> Vec<u8> {
     let n = seg.values.len();
     debug_assert_eq!(n, seg.owners_hi.len());
@@ -358,42 +458,16 @@ pub fn encode_segment(seg: &SegmentColumns, effective_log_seg: u8) -> Vec<u8> {
 
 /// Returns `(effective_log_seg, SegmentColumns)`.
 pub fn decode_segment(bytes: &[u8]) -> Option<(u8, SegmentColumns)> {
-    if bytes.len() < ENCODED_SEGMENT_HEADER_BYTES || bytes[..4] != SEGMENT_ENCODING_MAGIC {
-        return None;
-    }
-    let effective_log_seg = bytes[4];
-    if effective_log_seg > 16 || effective_log_seg as u32 >= usize::BITS {
-        return None;
-    }
-    let live_count = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
-    let expected_len = encoded_segment_len_for_live_count(effective_log_seg, live_count)?;
-    if bytes.len() != expected_len {
-        return None;
-    }
+    let sparse = decode_sparse_segment(bytes)?;
+    let effective_log_seg = sparse.effective_log_segment();
     let capacity = 1usize << effective_log_seg;
     let mut columns = SegmentColumns::new_zero(capacity);
-    let mut previous = None;
-    let mut offset = ENCODED_SEGMENT_HEADER_BYTES;
-    for _ in 0..live_count {
-        let local_index = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?);
-        if usize::from(local_index) >= capacity
-            || previous.is_some_and(|previous| local_index <= previous)
-        {
-            return None;
-        }
-        offset += ENCODED_SEGMENT_INDEX_BYTES;
-        let slot = decode_slot_value(&bytes[offset..offset + ENCODED_SEGMENT_SLOT_VALUE_BYTES])?;
-        if slot.is_empty() {
-            return None;
-        }
+    for (local_index, slot) in sparse.entries() {
         let local = usize::from(local_index);
         columns.values[local] = slot.value;
         columns.owners_hi[local] = slot.owner_hi;
         columns.owners_lo[local] = slot.owner_lo;
-        previous = Some(local_index);
-        offset += ENCODED_SEGMENT_SLOT_VALUE_BYTES;
     }
-    debug_assert_eq!(offset, bytes.len());
     Some((effective_log_seg, columns))
 }
 
@@ -764,6 +838,16 @@ mod tests {
         seg.values[1] = Block128::ONE;
         seg.values[3] = Block128::from(2u128);
         let canonical = encode_segment(&seg, 2);
+        let sparse = decode_sparse_segment(&canonical).unwrap();
+        assert_eq!(sparse.effective_log_segment(), 2);
+        assert_eq!(sparse.live_count(), 2);
+        let entries = sparse.entries().collect::<Vec<_>>();
+        assert_eq!(entries[0].0, 1);
+        assert_eq!(entries[1].0, 3);
+        assert_eq!(
+            encode_sparse_segment_entries(2, &entries),
+            Some(canonical.clone())
+        );
 
         let mut duplicate = canonical.clone();
         let second_index = ENCODED_SEGMENT_HEADER_BYTES + ENCODED_SEGMENT_ENTRY_BYTES;

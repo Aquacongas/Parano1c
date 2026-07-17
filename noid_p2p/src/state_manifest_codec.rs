@@ -21,8 +21,8 @@ use noid_chain::{
 
 use crate::protocol::{GetStateManifestRequest, GetStateManifestResponse};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NMQ2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NMF2";
+const REQUEST_MAGIC: [u8; 4] = *b"NMQ3";
+const RESPONSE_MAGIC: [u8; 4] = *b"NMF3";
 const REQUEST_BYTES: usize = 4 + 8;
 const RESPONSE_HEADER_BYTES: usize = 4 + 8 + 32 + 32 + 4 + 8 + 8 + 1 + 4;
 const SEGMENT_DESCRIPTOR_BYTES: usize = 2 + 32 + 4;
@@ -404,7 +404,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/manifest/2")
+        StreamProtocol::new("/noid/test/sync/manifest/3")
     }
 
     fn populated_response() -> GetStateManifestResponse {

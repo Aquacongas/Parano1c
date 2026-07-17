@@ -23,18 +23,18 @@ use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
 use crate::consensus::params::{RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH};
 use crate::exact_state_hash::slot_leaf_hash;
-use crate::fri_state::{compute_segment_root, SlotValue};
+use crate::fri_state::SlotValue;
 use crate::header_anchor::{
     compute_header_chain_anchor, extend_header_chain_anchor, HeaderChainAnchor,
     HeaderChainAnchorError,
 };
 use crate::segmented_state::SegmentColumns;
-use crate::state::{exact_segment_root_from_columns, ChainState, StreamingSparseRoot};
+use crate::state::{ChainState, StreamingSparseRoot};
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header,
-    decode_header_chain_anchor, decode_segment, decode_segment_summary, decode_state_meta,
-    decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
+    decode_header_chain_anchor, decode_segment, decode_segment_summary, decode_sparse_segment,
+    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
     encode_consensus_meta, encode_header, encode_header_chain_anchor, encode_segment,
     encode_segment_summary, encode_state_meta, encode_tx_index_value, encode_undo_log,
     encoded_segment_live_count_from_len, u64_from_key, u64_key,
@@ -215,16 +215,25 @@ impl MdbxHistoricalReadSnapshot<'_> {
         Ok(raw.and_then(|raw| decode_undo_log(&raw)))
     }
 
+    pub(super) fn get_encoded_segment(
+        &self,
+        segment_id: u16,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let table = self.txn.open_table(Some(T_SEGMENTS))?;
+        let encoded = self.txn.get(&table, &segment_id.to_le_bytes())?;
+        Ok(encoded)
+    }
+
     pub(super) fn get_segment(
         &self,
         segment_id: u16,
     ) -> Result<Option<(u8, SegmentColumns)>, StoreError> {
-        let table = self.txn.open_table(Some(T_SEGMENTS))?;
-        let raw: Option<Vec<u8>> = self.txn.get(&table, &segment_id.to_le_bytes())?;
-        raw.map(|raw| {
-            decode_segment(&raw).ok_or(StoreError::Decode("invalid stored historical segment"))
-        })
-        .transpose()
+        self.get_encoded_segment(segment_id)?
+            .map(|encoded| {
+                decode_segment(&encoded)
+                    .ok_or(StoreError::Decode("invalid stored historical segment"))
+            })
+            .transpose()
     }
 
     pub(super) fn segment_ids(&self) -> Result<Vec<u16>, StoreError> {
@@ -839,11 +848,11 @@ impl MdbxStore {
         //
         // Sizing rationale:
         //   min_size  = 4 MB — enough for genesis + a few hundred blocks
-        //   max_size  = 1 TiB — a fully materialised log_slots=32 raw state is
-        //                        ~192 GiB (65,536 × 3 MiB), before the live-owner
-        //                        index, permanent headers/tx index and B+tree
-        //                        overhead. This is an address-space ceiling, not
-        //                        eager RAM or disk allocation; MDBX grows below.
+        //   max_size  = 1 TiB — at the theoretical 2^32 live-slot ceiling the
+        //                        sparse segment payloads are ~200 GiB and the
+        //                        mandatory owner index is another ~208 GiB before
+        //                        permanent indexes and B+tree overhead. This is
+        //                        an address-space ceiling, not eager allocation.
         //   growth_step = 64 MB — incremental growth to avoid resize churn
         let rw = ReadWriteOptions {
             sync_mode: SyncMode::Durable,
@@ -1221,10 +1230,10 @@ impl MdbxStore {
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         // Composite keys are strictly slot-sorted within this owner prefix,
         // hence segment-sorted. Verify records as the cursor yields them and
-        // retain only one decoded dense segment at a time.
+        // merge against one segment's live sparse entries at a time.
         let mut owner_cursor = txn.cursor(&owner_tbl)?;
         let mut item: Option<(Vec<u8>, Vec<u8>)> = owner_cursor.set_range(owner.as_slice())?;
-        let mut current_segment: Option<(u16, SegmentColumns)> = None;
+        let mut current_segment: Option<(u16, Vec<(u16, SlotValue)>, usize)> = None;
         let mut previous_slot = None;
         let mut verified = Vec::new();
         while let Some((key, raw_value)) = item {
@@ -1259,46 +1268,56 @@ impl MdbxStore {
             let segment_id = (slot_index >> effective_log) as u16;
             if current_segment
                 .as_ref()
-                .is_none_or(|(loaded_id, _)| *loaded_id != segment_id)
+                .is_none_or(|(loaded_id, _, _)| *loaded_id != segment_id)
             {
                 let segment_raw: Option<Vec<u8>> =
                     txn.get(&segment_tbl, &segment_id.to_le_bytes())?;
                 let segment_raw = segment_raw.ok_or(StoreError::Decode(
                     "owner-index slot references a missing durable segment",
                 ))?;
-                let (stored_effective_log, columns) = decode_segment(&segment_raw).ok_or(
-                    StoreError::Decode("invalid durable segment referenced by owner index"),
-                )?;
-                if u32::from(stored_effective_log) != effective_log {
+                let sparse = decode_sparse_segment(&segment_raw).ok_or(StoreError::Decode(
+                    "invalid durable segment referenced by owner index",
+                ))?;
+                if u32::from(sparse.effective_log_segment()) != effective_log {
                     return Err(StoreError::Decode(
                         "owner-index segment effective log mismatch",
                     ));
                 }
-                current_segment = Some((segment_id, columns));
+                current_segment = Some((segment_id, sparse.entries().collect(), 0));
             }
 
             let local_mask = (1u32 << effective_log) - 1;
-            let local = (slot_index & local_mask) as usize;
-            let columns = &current_segment
-                .as_ref()
-                .expect("segment was inserted above")
-                .1;
-            if local >= columns.values.len()
-                || local >= columns.owners_hi.len()
-                || local >= columns.owners_lo.len()
+            let local = (slot_index & local_mask) as u16;
+            let (_, entries, cursor) = current_segment
+                .as_mut()
+                .expect("segment was inserted above");
+            while entries
+                .get(*cursor)
+                .is_some_and(|(entry_local, _)| *entry_local < local)
             {
+                *cursor += 1;
+            }
+            let Some((entry_local, slot)) = entries.get(*cursor).copied() else {
                 return Err(StoreError::Decode(
-                    "owner-index slot exceeds durable segment columns",
+                    "owner-index slot is absent from durable sparse segment",
+                ));
+            };
+            if entry_local != local {
+                return Err(StoreError::Decode(
+                    "owner-index slot is absent from durable sparse segment",
                 ));
             }
-            let value = columns.values[local];
-            let owner_hi = columns.owners_hi[local];
-            let owner_lo = columns.owners_lo[local];
-            if value.0 == 0 && owner_hi.0 == 0 && owner_lo.0 == 0 {
+            *cursor += 1;
+            if slot.is_empty() {
                 return Err(StoreError::Decode(
                     "owner-index slot is empty in durable state",
                 ));
             }
+            let SlotValue {
+                value,
+                owner_hi,
+                owner_lo,
+            } = slot;
             if owner_key_from_fields(owner_hi, owner_lo) != *owner {
                 return Err(StoreError::Decode(
                     "owner-index owner does not match durable state",
@@ -1331,11 +1350,11 @@ impl MdbxStore {
 
     /// The staging handle has already passed receiver finalization, but every
     /// file is re-opened and independently checked inside this single RW
-    /// transaction.  Segment payload, composite owner-index records, exact and
-    /// FRI summaries are consumed one segment at a time.  Any error drops the
+    /// transaction. Segment payload, composite owner-index records and exact
+    /// summaries are consumed one sparse segment at a time. Any error drops the
     /// transaction, preserving the complete previous volatile state epoch.
     ///
-    /// The returned `ChainState` contains only compact exact/FRI summaries and
+    /// The returned `ChainState` contains only compact exact summaries and
     /// evicted-segment metadata.  It is returned only after MDBX commit, so the
     /// context can switch hot state without a fallible post-commit disk reload.
     pub(crate) fn install_finalized_snapshot_staging<S: SnapshotHeaderInstallSource>(
@@ -1402,12 +1421,6 @@ impl MdbxStore {
 
         let mut segmented =
             crate::segmented_state::SegmentedFriState::new_empty(tip_header.log_slots as usize);
-        let expected_segment_len =
-            1usize
-                .checked_shl(u32::from(effective_log))
-                .ok_or(StoreError::Decode(
-                    "staged snapshot segment geometry overflows",
-                ))?;
         let mut exact = StreamingSparseRoot::new(tip_header.log_slots)
             .map_err(|_| StoreError::Decode("invalid staged snapshot exact-root depth"))?;
         let mut exact_segment_roots = Vec::with_capacity(staging.descriptors().len());
@@ -1673,46 +1686,24 @@ impl MdbxStore {
                 ));
             }
 
-            // `read_encoded` closes finalize-to-install file corruption. Decode
-            // again here because MDBX installation and owner-index construction
-            // consume the typed columns; the encoded bytes are written directly
-            // after all checks, without a second state-sized collection.
+            // `read_encoded` closes finalize-to-install file corruption. Parse
+            // the canonical sparse entries again inside this transaction so
+            // owner-index construction and both exact roots consume precisely
+            // the bytes that are atomically installed.
             let encoded = staged_file.read_encoded()?;
-            let (encoded_log, columns) = decode_segment(&encoded).ok_or(StoreError::Decode(
-                "staged snapshot segment decode failed during install",
+            let sparse = decode_sparse_segment(&encoded).ok_or(StoreError::Decode(
+                "staged sparse segment decode failed during install",
             ))?;
-            if encoded_log != effective_log
-                || columns.values.len() != expected_segment_len
-                || columns.owners_hi.len() != expected_segment_len
-                || columns.owners_lo.len() != expected_segment_len
-            {
+            if sparse.effective_log_segment() != effective_log {
                 return Err(StoreError::Decode(
-                    "staged snapshot decoded segment shape mismatch",
-                ));
-            }
-            let fri_root = compute_segment_root(
-                effective_log as usize,
-                &columns.values,
-                &columns.owners_hi,
-                &columns.owners_lo,
-            );
-            if fri_root != descriptor.segment_root {
-                return Err(StoreError::Decode(
-                    "staged snapshot segment FRI root mismatch during install",
+                    "staged snapshot sparse segment shape mismatch",
                 ));
             }
 
             let segment_base = u64::from(descriptor.segment_id) << effective_log;
-            let mut segment_live = 0u32;
-            for local in 0..expected_segment_len {
-                let slot = SlotValue {
-                    value: columns.values[local],
-                    owner_hi: columns.owners_hi[local],
-                    owner_lo: columns.owners_lo[local],
-                };
-                if slot.is_empty() {
-                    continue;
-                }
+            let mut segment_exact = StreamingSparseRoot::new(u32::from(effective_log))
+                .map_err(|_| StoreError::Decode("invalid staged segment exact-root depth"))?;
+            for (local, slot) in sparse.entries() {
                 let creation_in_target = crate::consensus::params::creation_id_within_boundary(
                     slot.creation_id(),
                     tip_header.alloc_counter,
@@ -1723,14 +1714,11 @@ impl MdbxStore {
                         "staged snapshot creation_id exceeds target boundary",
                     ));
                 }
-                segment_live = segment_live.checked_add(1).ok_or(StoreError::Decode(
-                    "staged snapshot segment live-count overflow",
-                ))?;
                 counted_live = counted_live
                     .checked_add(1)
                     .ok_or(StoreError::Decode("staged snapshot active-count overflow"))?;
                 let global = segment_base
-                    .checked_add(local as u64)
+                    .checked_add(u64::from(local))
                     .and_then(|index| u32::try_from(index).ok())
                     .ok_or(StoreError::Decode(
                         "staged snapshot live slot exceeds u32 domain",
@@ -1738,6 +1726,9 @@ impl MdbxStore {
                 exact.push_leaf(global, slot_leaf_hash(slot)).map_err(|_| {
                     StoreError::Decode("staged snapshot exact leaf is out of range")
                 })?;
+                segment_exact
+                    .push_leaf(u32::from(local), slot_leaf_hash(slot))
+                    .map_err(|_| StoreError::Decode("staged segment exact leaf is out of range"))?;
                 let owner = owner_key_from_fields(slot.owner_hi, slot.owner_lo);
                 txn.put(
                     &owner_tbl,
@@ -1746,9 +1737,18 @@ impl MdbxStore {
                     WriteFlags::empty(),
                 )?;
             }
+            let segment_live = sparse.live_count();
             if segment_live == 0 {
                 return Err(StoreError::Decode(
                     "staged snapshot advertises an empty segment",
+                ));
+            }
+            let exact_root = segment_exact
+                .finish()
+                .map_err(|_| StoreError::Decode("staged segment exact-root build failed"))?;
+            if exact_root != descriptor.segment_root {
+                return Err(StoreError::Decode(
+                    "staged snapshot exact segment root mismatch during install",
                 ));
             }
 
@@ -1759,9 +1759,8 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
             segmented
-                .install_evicted_segment_summary(descriptor.segment_id, segment_live, fri_root)
+                .install_evicted_exact_summary(descriptor.segment_id, segment_live)
                 .map_err(StoreError::Decode)?;
-            let exact_root = exact_segment_root_from_columns(effective_log as usize, &columns);
             txn.put(
                 &summary_tbl,
                 descriptor.segment_id.to_le_bytes(),
@@ -1769,8 +1768,8 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
             exact_segment_roots.push((descriptor.segment_id, exact_root));
-            // `columns` and `encoded` drop here before the iterator opens the
-            // next file. Only compact roots/counts survive the pass.
+            // The encoded payload drops before the next file. Only compact
+            // exact roots/counts survive the pass.
         }
 
         if counted_live != tip_header.active_slot_count {
@@ -1786,7 +1785,7 @@ impl MdbxStore {
                 "staged snapshot exact root does not match target header",
             ));
         }
-        segmented.finish_evicted_segment_summaries();
+        segmented.finish_evicted_exact_summaries();
         let hot_state = ChainState::from_evicted_parts(
             segmented,
             tip_header.active_slot_count,

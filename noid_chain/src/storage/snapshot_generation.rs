@@ -8,8 +8,8 @@
 //! cloning that state. The first generation visits the numeric union of
 //! durable and touched segment IDs once. Later generations hard-link unchanged
 //! immutable payloads and reconstruct only segments touched since the previous
-//! finalized boundary. At most one decoded [`SegmentColumns`] plus its encoded
-//! bytes is resident at a time.
+//! finalized boundary. Sparse entries are rolled back and authenticated
+//! directly; no 3 MiB dense segment image is created by the snapshot path.
 //!
 //! Segment payloads are written and synced into a private temporary generation
 //! directory as they are reconstructed.  The manifest is created only after
@@ -32,18 +32,19 @@ use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::params::{BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, UNDO_RETENTION_DEPTH};
 use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
-use crate::fri_state::{compute_segment_root, SlotValue, LOG_SEGMENT_SIZE};
-use crate::segmented_state::SegmentColumns;
+use crate::fri_state::{SlotValue, LOG_SEGMENT_SIZE};
 use crate::state::StreamingSparseRoot;
 use crate::storage::mdbx_store::MdbxHistoricalReadSnapshot;
+#[cfg(test)]
+use crate::storage::serial::encoded_segment_len_for_live_count;
 use crate::storage::serial::{
-    decode_segment, encode_segment, encoded_segment_len_for_live_count,
-    max_encoded_segment_len_for_eff_log,
+    decode_sparse_segment, encode_sparse_segment_entries, encoded_segment_live_count_from_len,
+    max_encoded_segment_len_for_eff_log, SparseSegmentView,
 };
 use crate::storage::{MdbxStore, StoreError};
 
-const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V3";
-const SNAPSHOT_GENERATION_VERSION: u32 = 3;
+const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V4";
+const SNAPSHOT_GENERATION_VERSION: u32 = 4;
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const MANIFEST_TEMP_FILE_NAME: &str = ".manifest.tmp";
 const SEGMENTS_DIRECTORY_NAME: &str = "segments";
@@ -62,7 +63,7 @@ static NEXT_TEMP_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotSegmentDescriptor {
     pub segment_id: u16,
-    /// Raw FRI commitment over the three decoded segment columns.
+    /// Exact Poseidon sparse-Merkle root of this segment subtree.
     pub segment_root: [u8; 32],
     /// Exact byte length of `storage::encode_segment` output.
     pub encoded_len: u32,
@@ -83,12 +84,6 @@ pub struct SnapshotGenerationManifest {
     /// Strictly increasing non-empty segment descriptors.  Payloads live in
     /// separate files and are never accumulated in this vector.
     pub segments: Vec<SnapshotSegmentDescriptor>,
-    /// Live counts parallel to `segments`. Together with the exact roots below
-    /// they let an incremental publisher reauthenticate the complete state
-    /// boundary without reopening unchanged multi-megabyte payloads.
-    pub segment_live_counts: Vec<u32>,
-    /// Exact sparse-Merkle subtree roots parallel to `segments`.
-    pub exact_segment_roots: Vec<StateHash>,
 }
 
 impl SnapshotGenerationManifest {
@@ -137,19 +132,16 @@ impl SnapshotGeneration {
         self.manifest.generation_id()
     }
 
-    /// Read and authenticate one encoded segment.  Peak transient memory is
-    /// the encoded payload plus one decoded `SegmentColumns`; no other segment
-    /// is read.
+    /// Read and authenticate one encoded segment without expanding its empty
+    /// slots into dense columns.
     pub fn read_encoded_segment(
         &self,
         segment_id: u16,
     ) -> Result<Vec<u8>, SnapshotGenerationError> {
-        let descriptor_index = self
+        let descriptor = self
             .manifest
-            .segments
-            .binary_search_by_key(&segment_id, |entry| entry.segment_id)
-            .map_err(|_| SnapshotGenerationError::SegmentNotInManifest(segment_id))?;
-        let descriptor = &self.manifest.segments[descriptor_index];
+            .segment(segment_id)
+            .ok_or(SnapshotGenerationError::SegmentNotInManifest(segment_id))?;
         let path = segment_path(&self.directory, segment_id);
         let mut file = File::open(&path)?;
         let metadata_len = file.metadata()?.len();
@@ -172,40 +164,31 @@ impl SnapshotGeneration {
                 "short or overlong segment file",
             ));
         }
-        let (effective_log, columns) = decode_segment(&encoded).ok_or(
-            SnapshotGenerationError::InvalidSegment(segment_id, "segment decode failed"),
+        let sparse = decode_sparse_segment(&encoded).ok_or(
+            SnapshotGenerationError::InvalidSegment(segment_id, "sparse segment decode failed"),
         )?;
-        if effective_log != self.manifest.effective_log_segment_size {
+        if sparse.effective_log_segment() != self.manifest.effective_log_segment_size {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "effective segment log does not match manifest",
             ));
         }
-        let (live, root, exact_root) = validate_segment_columns(
+        let exact_root = validate_sparse_segment(
             segment_id,
-            effective_log,
-            &columns,
+            sparse,
             self.manifest.alloc_counter,
             self.manifest.target_height,
         )?;
-        if live == 0 {
+        if sparse.live_count() == 0 {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "manifest contains an empty segment",
             ));
         }
-        if root != descriptor.segment_root {
+        if exact_root != descriptor.segment_root {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
-                "raw segment root does not match manifest",
-            ));
-        }
-        if self.manifest.segment_live_counts[descriptor_index] != live
-            || self.manifest.exact_segment_roots[descriptor_index] != exact_root
-        {
-            return Err(SnapshotGenerationError::InvalidSegment(
-                segment_id,
-                "exact segment metadata does not match payload",
+                "exact segment root does not match manifest",
             ));
         }
         Ok(encoded)
@@ -435,7 +418,7 @@ pub fn export_snapshot_generation(
     // A preceding canonical generation is an authenticated state base. Only
     // segments touched between that boundary and the new finalized boundary
     // can differ; all other immutable files are linked into the new generation
-    // without reading, hashing, or copying their 3 MiB payloads.
+    // without reading, hashing, or copying their sparse payloads.
     let eligible_base = match previous {
         Some(candidate)
             if incremental_base_is_eligible(
@@ -494,12 +477,11 @@ pub fn export_snapshot_generation(
     fs::create_dir(&segments_directory)?;
 
     let target_segment_count = segment_count(target_header.log_slots)?;
-    let segment_size = 1usize << effective_log;
-    let mut entries: Vec<(SnapshotSegmentDescriptor, u32, StateHash)> = Vec::new();
+    let mut entries: Vec<SnapshotSegmentDescriptor> = Vec::new();
     let mut reused_segment_count = 0usize;
 
     if let Some(base) = incremental_base {
-        for (index, descriptor) in base.manifest.segments.iter().enumerate() {
+        for descriptor in &base.manifest.segments {
             if changed_segments.contains(&descriptor.segment_id) {
                 continue;
             }
@@ -515,30 +497,28 @@ pub fn export_snapshot_generation(
                 descriptor.segment_id,
                 descriptor.encoded_len,
             )?;
-            entries.push((
-                *descriptor,
-                base.manifest.segment_live_counts[index],
-                base.manifest.exact_segment_roots[index],
-            ));
+            entries.push(*descriptor);
             reused_segment_count += 1;
         }
     }
 
     for segment_id in union_ids {
         let was_durable = durable_ids.binary_search(&segment_id).is_ok();
-        let mut columns = match snapshot.get_segment(segment_id)? {
-            Some((stored_log, columns)) => {
-                if stored_log != effective_log
-                    || columns.values.len() != segment_size
-                    || columns.owners_hi.len() != segment_size
-                    || columns.owners_lo.len() != segment_size
-                {
+        let mut sparse_slots = match snapshot.get_encoded_segment(segment_id)? {
+            Some(encoded) => {
+                let sparse = decode_sparse_segment(&encoded).ok_or(
+                    SnapshotGenerationError::InvalidSegment(
+                        segment_id,
+                        "durable sparse segment decode failed",
+                    ),
+                )?;
+                if sparse.effective_log_segment() != effective_log {
                     return Err(SnapshotGenerationError::InvalidSegment(
                         segment_id,
                         "durable segment shape does not match tip geometry",
                     ));
                 }
-                columns
+                sparse.entries().collect::<BTreeMap<_, _>>()
             }
             None if was_durable => {
                 return Err(SnapshotGenerationError::InvalidSegment(
@@ -546,15 +526,15 @@ pub fn export_snapshot_generation(
                     "durable segment disappeared during export",
                 ));
             }
-            None => SegmentColumns::new_zero(segment_size),
+            None => BTreeMap::new(),
         };
 
         if let Some(changes) = rollback_by_segment.get(&segment_id) {
-            apply_segment_rollbacks(&mut columns, changes)?;
+            apply_sparse_segment_rollbacks(&mut sparse_slots, changes, effective_log)?;
         }
 
         if usize::from(segment_id) >= target_segment_count {
-            if segment_has_live_slots(&columns) {
+            if !sparse_slots.is_empty() {
                 return Err(SnapshotGenerationError::InvalidSegment(
                     segment_id,
                     "rollback left live data outside target slot domain",
@@ -563,18 +543,17 @@ pub fn export_snapshot_generation(
             continue;
         }
 
-        let (segment_live, segment_root, exact_segment_root) = validate_segment_columns(
-            segment_id,
-            effective_log,
-            &columns,
-            target_header.alloc_counter,
-            target_header.height,
-        )?;
-        if segment_live == 0 {
+        if sparse_slots.is_empty() {
             continue;
         }
 
-        let encoded = encode_segment(&columns, effective_log);
+        let ordered_entries = sparse_slots.into_iter().collect::<Vec<_>>();
+        let encoded = encode_sparse_segment_entries(effective_log, &ordered_entries).ok_or(
+            SnapshotGenerationError::InvalidSegment(
+                segment_id,
+                "sparse segment entries are noncanonical",
+            ),
+        )?;
         if encoded.len() > MAX_SEGMENT_BYTES {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
@@ -587,29 +566,28 @@ pub fn export_snapshot_generation(
                 "encoded segment length exceeds u32",
             )
         })?;
-        write_synced_file(&segment_path(temporary.path(), segment_id), &encoded)?;
-        entries.push((
-            SnapshotSegmentDescriptor {
+        let sparse =
+            decode_sparse_segment(&encoded).ok_or(SnapshotGenerationError::InvalidSegment(
                 segment_id,
-                segment_root,
-                encoded_len,
-            },
-            segment_live,
-            exact_segment_root,
-        ));
-        // `encoded` and `columns` drop here before the next segment is loaded.
+                "rebuilt sparse segment decode failed",
+            ))?;
+        let exact_segment_root = validate_sparse_segment(
+            segment_id,
+            sparse,
+            target_header.alloc_counter,
+            target_header.height,
+        )?;
+        write_synced_file(&segment_path(temporary.path(), segment_id), &encoded)?;
+        entries.push(SnapshotSegmentDescriptor {
+            segment_id,
+            segment_root: exact_segment_root,
+            encoded_len,
+        });
+        // `encoded` and sparse entry storage drop before the next segment.
     }
 
-    entries.sort_unstable_by_key(|(descriptor, _, _)| descriptor.segment_id);
+    entries.sort_unstable_by_key(|descriptor| descriptor.segment_id);
     sync_directory(&segments_directory)?;
-    let mut descriptors = Vec::with_capacity(entries.len());
-    let mut segment_live_counts = Vec::with_capacity(entries.len());
-    let mut exact_segment_roots = Vec::with_capacity(entries.len());
-    for (descriptor, live_count, exact_root) in entries {
-        descriptors.push(descriptor);
-        segment_live_counts.push(live_count);
-        exact_segment_roots.push(exact_root);
-    }
 
     let manifest = SnapshotGenerationManifest {
         version: SNAPSHOT_GENERATION_VERSION,
@@ -621,9 +599,7 @@ pub fn export_snapshot_generation(
         alloc_counter: target_header.alloc_counter,
         state_root: target_header.state_root,
         effective_log_segment_size: effective_log,
-        segments: descriptors,
-        segment_live_counts,
-        exact_segment_roots,
+        segments: entries,
     };
     validate_manifest(&manifest)?;
     tracing::info!(
@@ -911,71 +887,43 @@ fn collect_grouped_undo(
     Ok(grouped)
 }
 
-fn apply_segment_rollbacks(
-    columns: &mut SegmentColumns,
+fn apply_sparse_segment_rollbacks(
+    entries: &mut BTreeMap<u16, SlotValue>,
     changes: &[SegmentRollback],
+    effective_log: u8,
 ) -> Result<(), SnapshotGenerationError> {
+    let capacity =
+        1u32.checked_shl(u32::from(effective_log))
+            .ok_or(SnapshotGenerationError::Corrupt(
+                "segment-local rollback geometry overflows",
+            ))?;
     for &(local_index, previous) in changes {
-        let local = local_index as usize;
-        if local >= columns.values.len()
-            || local >= columns.owners_hi.len()
-            || local >= columns.owners_lo.len()
-        {
+        if local_index >= capacity {
             return Err(SnapshotGenerationError::Corrupt(
                 "segment-local undo index is out of range",
             ));
         }
-        columns.values[local] = previous.value;
-        columns.owners_hi[local] = previous.owner_hi;
-        columns.owners_lo[local] = previous.owner_lo;
+        let local_index = local_index as u16;
+        if previous.is_empty() {
+            entries.remove(&local_index);
+        } else {
+            entries.insert(local_index, previous);
+        }
     }
     Ok(())
 }
 
-fn slot_at(columns: &SegmentColumns, local: usize) -> SlotValue {
-    SlotValue {
-        value: columns.values[local],
-        owner_hi: columns.owners_hi[local],
-        owner_lo: columns.owners_lo[local],
-    }
-}
-
-fn segment_has_live_slots(columns: &SegmentColumns) -> bool {
-    (0..columns.values.len()).any(|index| !slot_at(columns, index).is_empty())
-}
-
-fn validate_segment_columns(
+fn validate_sparse_segment(
     segment_id: u16,
-    effective_log: u8,
-    columns: &SegmentColumns,
+    sparse: SparseSegmentView<'_>,
     alloc_counter: u64,
     target_height: u64,
-) -> Result<(u32, [u8; 32], StateHash), SnapshotGenerationError> {
-    let expected_len =
-        1usize
-            .checked_shl(effective_log as u32)
-            .ok_or(SnapshotGenerationError::InvalidSegment(
-                segment_id,
-                "effective log overflows usize",
-            ))?;
-    if columns.values.len() != expected_len
-        || columns.owners_hi.len() != expected_len
-        || columns.owners_lo.len() != expected_len
-    {
-        return Err(SnapshotGenerationError::InvalidSegment(
-            segment_id,
-            "decoded column lengths are inconsistent",
-        ));
-    }
-    let mut live = 0u32;
-    let mut exact = StreamingSparseRoot::new(u32::from(effective_log)).map_err(|_| {
-        SnapshotGenerationError::InvalidSegment(segment_id, "invalid exact segment depth")
-    })?;
-    for local in 0..expected_len {
-        let slot = slot_at(columns, local);
-        if slot.is_empty() {
-            continue;
-        }
+) -> Result<StateHash, SnapshotGenerationError> {
+    let mut exact =
+        StreamingSparseRoot::new(u32::from(sparse.effective_log_segment())).map_err(|_| {
+            SnapshotGenerationError::InvalidSegment(segment_id, "invalid exact segment depth")
+        })?;
+    for (local, slot) in sparse.entries() {
         // Same tag-aware namespace rule as the historical carrier.
         let creation_in_target = crate::consensus::params::creation_id_within_boundary(
             slot.creation_id(),
@@ -985,19 +933,13 @@ fn validate_segment_columns(
         if !creation_in_target {
             return Err(SnapshotGenerationError::CreationIdExceedsTarget {
                 segment_id,
-                local_index: local as u32,
+                local_index: u32::from(local),
                 creation_id: slot.creation_id(),
                 alloc_counter,
             });
         }
-        live = live
-            .checked_add(1)
-            .ok_or(SnapshotGenerationError::InvalidSegment(
-                segment_id,
-                "live count overflows u32",
-            ))?;
         exact
-            .push_leaf(local as u32, slot_leaf_hash(slot))
+            .push_leaf(u32::from(local), slot_leaf_hash(slot))
             .map_err(|_| {
                 SnapshotGenerationError::InvalidSegment(
                     segment_id,
@@ -1005,16 +947,10 @@ fn validate_segment_columns(
                 )
             })?;
     }
-    let root = compute_segment_root(
-        effective_log as usize,
-        &columns.values,
-        &columns.owners_hi,
-        &columns.owners_lo,
-    );
     let exact_root = exact.finish().map_err(|_| {
         SnapshotGenerationError::InvalidSegment(segment_id, "exact segment stream did not close")
     })?;
-    Ok((live, root, exact_root))
+    Ok(exact_root)
 }
 
 /// Reconstruct the consensus exact-state root from one compact exact subtree
@@ -1028,12 +964,8 @@ fn exact_state_root_from_manifest(
     let effective_log = usize::from(manifest.effective_log_segment_size);
     let zero_roots = zero_slot_roots(effective_log);
     let mut roots = vec![zero_roots[effective_log]; count];
-    for (descriptor, exact_root) in manifest
-        .segments
-        .iter()
-        .zip(manifest.exact_segment_roots.iter().copied())
-    {
-        roots[usize::from(descriptor.segment_id)] = exact_root;
+    for descriptor in &manifest.segments {
+        roots[usize::from(descriptor.segment_id)] = descriptor.segment_root;
     }
     while roots.len() > 1 {
         let parent_count = roots.len() / 2;
@@ -1067,13 +999,6 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
             "manifest segment count exceeds cap",
         ));
     }
-    if manifest.segment_live_counts.len() != manifest.segments.len()
-        || manifest.exact_segment_roots.len() != manifest.segments.len()
-    {
-        return Err(SnapshotGenerationError::Corrupt(
-            "manifest exact metadata vectors are not parallel",
-        ));
-    }
     if manifest.segments.len() as u64 > manifest.active_slot_count {
         return Err(SnapshotGenerationError::Corrupt(
             "manifest has more non-empty segments than live slots",
@@ -1098,39 +1023,26 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
             "manifest segment geometry exceeds segment byte cap",
         ));
     }
-    let segment_capacity = 1u32
-        .checked_shl(u32::from(manifest.effective_log_segment_size))
-        .ok_or(SnapshotGenerationError::Corrupt(
-            "manifest segment capacity overflows",
-        ))?;
     let mut counted_live = 0u64;
-    for (descriptor, live_count) in manifest
-        .segments
-        .iter()
-        .zip(manifest.segment_live_counts.iter().copied())
-    {
+    for descriptor in &manifest.segments {
         if usize::from(descriptor.segment_id) >= domain_segments {
             return Err(SnapshotGenerationError::InvalidSegment(
                 descriptor.segment_id,
                 "manifest id lies outside target domain",
             ));
         }
-        if live_count == 0 || live_count > segment_capacity {
+        let live_count = encoded_segment_live_count_from_len(
+            manifest.effective_log_segment_size,
+            descriptor.encoded_len as usize,
+        )
+        .ok_or(SnapshotGenerationError::InvalidSegment(
+            descriptor.segment_id,
+            "manifest encoded length has invalid sparse geometry",
+        ))?;
+        if live_count == 0 {
             return Err(SnapshotGenerationError::InvalidSegment(
                 descriptor.segment_id,
-                "manifest live count is outside segment capacity",
-            ));
-        }
-        let expected_encoded_len =
-            encoded_segment_len_for_live_count(manifest.effective_log_segment_size, live_count)
-                .ok_or(SnapshotGenerationError::InvalidSegment(
-                    descriptor.segment_id,
-                    "manifest live count has invalid segment geometry",
-                ))?;
-        if descriptor.encoded_len as usize != expected_encoded_len {
-            return Err(SnapshotGenerationError::InvalidSegment(
-                descriptor.segment_id,
-                "manifest encoded length does not match live count",
+                "manifest describes an empty segment",
             ));
         }
         counted_live = counted_live.checked_add(u64::from(live_count)).ok_or(
@@ -1300,13 +1212,11 @@ mod tests {
             state_root: crate::exact_state_hash::zero_slot_roots(16)[16],
             effective_log_segment_size: 16,
             segments: Vec::new(),
-            segment_live_counts: Vec::new(),
-            exact_segment_roots: Vec::new(),
         };
         let mut encoded = encode_manifest(&manifest).unwrap();
-        // Fixed-int bincode places the final exact-root Vec length in the last
-        // eight bytes for this empty fixture. The decoder limit and Serde
-        // cautious reserve must reject it without attempting that capacity.
+        // Fixed-int bincode places the descriptor Vec length in the final
+        // eight bytes for this empty fixture. The decoder limit and Serde's
+        // cautious reserve reject it without attempting that capacity.
         let length_offset = encoded.len() - core::mem::size_of::<u64>();
         encoded[length_offset..].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(
@@ -1356,8 +1266,6 @@ mod tests {
                     segment_root: [4; 32],
                     encoded_len: b"immutable-segment".len() as u32,
                 }],
-                segment_live_counts: vec![1],
-                exact_segment_roots: vec![[3; 32]],
             },
         };
 
@@ -1584,7 +1492,7 @@ mod tests {
         );
 
         let mut bad_exact_metadata = third.manifest().clone();
-        bad_exact_metadata.exact_segment_roots[0][0] ^= 1;
+        bad_exact_metadata.segments[0].segment_root[0] ^= 1;
         assert!(matches!(
             validate_manifest(&bad_exact_metadata),
             Err(SnapshotGenerationError::ExactStateRootMismatch)

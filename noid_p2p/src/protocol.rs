@@ -142,9 +142,9 @@ pub struct GetStateManifestResponse {
     pub eff_log: u8,
     /// IDs of all non-empty state segments.  Each must be fetched individually.
     pub segment_ids: Vec<u16>,
-    /// Raw FRI segment roots aligned with `segment_ids`. These authenticate
-    /// downloaded payloads; after decoding, the receiver independently rebuilds
-    /// the exact sparse UTXO root and compares it with the tip header.
+    /// Exact Poseidon subtree roots aligned with `segment_ids`. Each sparse
+    /// payload is checked directly against its subtree root; the receiver then
+    /// independently rebuilds the global root committed by the tip header.
     pub segment_roots: Vec<[u8; 32]>,
     /// Canonical sparse payload lengths aligned with `segment_ids`. The length
     /// commits the number of live entries before any payload allocation.

@@ -3,11 +3,10 @@
 
 //! Allocation-bounded receiver staging for authenticated state snapshots.
 //!
-//! Network payloads never accumulate in a `Vec<SegmentColumns>`.  One segment
-//! is decoded, checked against its authenticated descriptor, and atomically
-//! published into a private staging directory.  Finalization performs an
-//! independent numeric second pass, opening and decoding one file at a time to
-//! reconstruct the exact sparse UTXO root and active-slot count.
+//! Network payloads never expand into dense segment columns. Sparse entries
+//! are checked against their exact subtree descriptor and atomically published
+//! into a private staging directory. Finalization performs an independent
+//! numeric second pass to reconstruct the global exact UTXO root and count.
 //!
 //! The finalized handle owns the directory.  It is `Send`, so the receiver can
 //! move it into a blocking MDBX installation task; files remain alive until
@@ -23,13 +22,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
 use crate::exact_state_hash::{slot_leaf_hash, StateHash};
-use crate::fri_state::{compute_segment_root, SlotValue, LOG_SEGMENT_SIZE};
-use crate::segmented_state::SegmentColumns;
+use crate::fri_state::LOG_SEGMENT_SIZE;
 use crate::state::StreamingSparseRoot;
 
 use super::serial::{
-    decode_segment, encoded_segment_len_for_live_count, encoded_segment_live_count_from_len,
-    max_encoded_segment_len_for_eff_log,
+    decode_sparse_segment, encoded_segment_len_for_live_count, encoded_segment_live_count_from_len,
+    max_encoded_segment_len_for_eff_log, SparseSegmentView,
 };
 use super::snapshot_generation::SnapshotSegmentDescriptor;
 
@@ -192,7 +190,7 @@ pub enum SnapshotStagingError {
         expected: u8,
         actual: u8,
     },
-    FriRootMismatch {
+    ExactSegmentRootMismatch {
         segment_id: u16,
     },
     CreationIdExceedsBound {
@@ -309,8 +307,8 @@ impl fmt::Display for SnapshotStagingError {
                 f,
                 "snapshot segment {segment_id} encoded log {actual}, expected {expected}"
             ),
-            Self::FriRootMismatch { segment_id } => {
-                write!(f, "snapshot segment {segment_id} FRI root mismatch")
+            Self::ExactSegmentRootMismatch { segment_id } => {
+                write!(f, "snapshot segment {segment_id} exact root mismatch")
             }
             Self::CreationIdExceedsBound {
                 segment_id,
@@ -468,8 +466,7 @@ impl SnapshotStagingSession {
                 actual: actual_len,
             });
         }
-        let columns = decode_and_verify_segment(&self.metadata, &descriptor, encoded)?;
-        drop(columns);
+        decode_and_verify_segment(&self.metadata, &descriptor, encoded)?;
 
         let directory = self
             .directory
@@ -505,24 +502,15 @@ impl SnapshotStagingSession {
 
         for descriptor in &self.descriptors {
             let encoded = read_staged_file(directory, descriptor)?;
-            let columns = decode_and_verify_segment(&self.metadata, descriptor, &encoded)?;
-            drop(encoded);
+            let sparse = decode_and_verify_segment(&self.metadata, descriptor, &encoded)?;
 
             let base = u64::from(descriptor.segment_id) << effective_log;
-            for local in 0..columns.values.len() {
-                let slot = SlotValue {
-                    value: columns.values[local],
-                    owner_hi: columns.owners_hi[local],
-                    owner_lo: columns.owners_lo[local],
-                };
-                if slot.is_empty() {
-                    continue;
-                }
+            for (local, slot) in sparse.entries() {
                 active_count = active_count
                     .checked_add(1)
                     .ok_or(SnapshotStagingError::ActiveCountOverflow)?;
                 let global = base
-                    .checked_add(local as u64)
+                    .checked_add(u64::from(local))
                     .ok_or(SnapshotStagingError::ExactRootConstruction)?;
                 let global = u32::try_from(global)
                     .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
@@ -693,8 +681,7 @@ impl StagedEncodedSegmentFile<'_> {
     /// corruption window without retaining more than one segment.
     pub fn read_encoded(&self) -> Result<Vec<u8>, SnapshotStagingError> {
         let encoded = read_staged_file(self.directory, self.descriptor)?;
-        let columns = decode_and_verify_segment(self.metadata, self.descriptor, &encoded)?;
-        drop(columns);
+        decode_and_verify_segment(self.metadata, self.descriptor, &encoded)?;
         Ok(encoded)
     }
 }
@@ -769,15 +756,15 @@ fn validate_descriptors(
     Ok(())
 }
 
-fn decode_and_verify_segment(
+fn decode_and_verify_segment<'a>(
     metadata: &AuthenticatedSnapshotMetadata,
     descriptor: &SnapshotSegmentDescriptor,
-    encoded: &[u8],
-) -> Result<SegmentColumns, SnapshotStagingError> {
-    let (encoded_effective_log, columns) =
-        decode_segment(encoded).ok_or(SnapshotStagingError::SegmentDecode {
-            segment_id: descriptor.segment_id,
-        })?;
+    encoded: &'a [u8],
+) -> Result<SparseSegmentView<'a>, SnapshotStagingError> {
+    let sparse = decode_sparse_segment(encoded).ok_or(SnapshotStagingError::SegmentDecode {
+        segment_id: descriptor.segment_id,
+    })?;
+    let encoded_effective_log = sparse.effective_log_segment();
     if encoded_effective_log != metadata.effective_log_segment {
         return Err(SnapshotStagingError::EncodedEffectiveLogMismatch {
             segment_id: descriptor.segment_id,
@@ -785,29 +772,9 @@ fn decode_and_verify_segment(
             actual: encoded_effective_log,
         });
     }
-    let actual_root = compute_segment_root(
-        encoded_effective_log as usize,
-        &columns.values,
-        &columns.owners_hi,
-        &columns.owners_lo,
-    );
-    if actual_root != descriptor.segment_root {
-        return Err(SnapshotStagingError::FriRootMismatch {
-            segment_id: descriptor.segment_id,
-        });
-    }
-
-    let mut live = 0usize;
-    for local in 0..columns.values.len() {
-        let slot = SlotValue {
-            value: columns.values[local],
-            owner_hi: columns.owners_hi[local],
-            owner_lo: columns.owners_lo[local],
-        };
-        if slot.is_empty() {
-            continue;
-        }
-        live += 1;
+    let mut exact = StreamingSparseRoot::new(u32::from(encoded_effective_log))
+        .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
+    for (local, slot) in sparse.entries() {
         let creation_id = slot.creation_id();
         if !crate::consensus::params::creation_id_within_boundary(
             creation_id,
@@ -818,7 +785,7 @@ fn decode_and_verify_segment(
                 return Err(
                     SnapshotStagingError::CoinbaseCreationHeightExceedsBoundary {
                         segment_id: descriptor.segment_id,
-                        local_index: local as u32,
+                        local_index: u32::from(local),
                         mint_height: crate::consensus::params::coinbase_creation_height(
                             creation_id,
                         ),
@@ -828,18 +795,29 @@ fn decode_and_verify_segment(
             }
             return Err(SnapshotStagingError::CreationIdExceedsBound {
                 segment_id: descriptor.segment_id,
-                local_index: local as u32,
+                local_index: u32::from(local),
                 creation_id,
                 alloc_counter: metadata.header.alloc_counter,
             });
         }
+        exact
+            .push_leaf(u32::from(local), slot_leaf_hash(slot))
+            .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
     }
-    if live == 0 {
+    if sparse.live_count() == 0 {
         return Err(SnapshotStagingError::EmptyAdvertisedSegment {
             segment_id: descriptor.segment_id,
         });
     }
-    Ok(columns)
+    let actual_root = exact
+        .finish()
+        .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
+    if actual_root != descriptor.segment_root {
+        return Err(SnapshotStagingError::ExactSegmentRootMismatch {
+            segment_id: descriptor.segment_id,
+        });
+    }
+    Ok(sparse)
 }
 
 fn create_session_directory(
@@ -1003,8 +981,10 @@ mod tests {
 
     use super::*;
     use crate::exact_state_hash::zero_slot_roots;
-    use crate::state::ChainState;
-    use crate::storage::serial::encode_segment;
+    use crate::fri_state::SlotValue;
+    use crate::segmented_state::SegmentColumns;
+    use crate::state::{exact_segment_root_from_columns, ChainState};
+    use crate::storage::serial::{decode_segment, encode_segment, encode_sparse_segment_entries};
 
     fn slot(amount: u64, creation_id: u64, owner: u128) -> SlotValue {
         SlotValue::with_owner_fields(
@@ -1049,8 +1029,6 @@ mod tests {
         let second = slot(70, 5, 0xB2);
         let columns = columns(3, &[(1, first), (6, second)]);
         let encoded = encode_segment(&columns, 3);
-        let fri_root =
-            compute_segment_root(3, &columns.values, &columns.owners_hi, &columns.owners_lo);
         let exact =
             ChainState::from_sparse_utxos(3, &[(1, first), (6, second)], 5).expect("exact fixture");
         let header = header(3, exact.utxo_root, 2, 5);
@@ -1059,7 +1037,7 @@ mod tests {
                 .expect("authenticated fixture metadata");
         let descriptor = SnapshotSegmentDescriptor {
             segment_id: 0,
-            segment_root: fri_root,
+            segment_root: exact.cached_exact_segment_root(0).unwrap(),
             encoded_len: encoded.len() as u32,
         };
         (metadata, descriptor, encoded)
@@ -1092,6 +1070,60 @@ mod tests {
         assert!(files.next().is_none());
         drop(finalized);
         assert!(!directory.exists());
+    }
+
+    #[test]
+    fn sparse_snapshot_scales_across_all_256_genesis_segments() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut global = StreamingSparseRoot::new(24).unwrap();
+        let mut descriptors = Vec::with_capacity(256);
+        let mut payloads = Vec::with_capacity(256);
+
+        for segment_id in 0u16..=255 {
+            let creation_id = u64::from(segment_id) + 1;
+            let slot = SlotValue::from_parts(
+                1,
+                creation_id,
+                Block128::from(creation_id + 1),
+                Block128::from(creation_id + 2),
+            );
+            let mut segment_exact = StreamingSparseRoot::new(16).unwrap();
+            segment_exact.push_leaf(0, slot_leaf_hash(slot)).unwrap();
+            let segment_root = segment_exact.finish().unwrap();
+            global
+                .push_leaf(u32::from(segment_id) << 16, slot_leaf_hash(slot))
+                .unwrap();
+            let encoded = encode_sparse_segment_entries(16, &[(0, slot)]).unwrap();
+            assert_eq!(encoded.len(), 59);
+            descriptors.push(SnapshotSegmentDescriptor {
+                segment_id,
+                segment_root,
+                encoded_len: encoded.len() as u32,
+            });
+            payloads.push(encoded);
+        }
+
+        let root = global.finish().unwrap();
+        let hdr = header(24, root, 256, 256);
+        let metadata =
+            AuthenticatedSnapshotMetadata::from_authenticated_header(hdr, block_id(&hdr), 16)
+                .unwrap();
+        let mut session =
+            SnapshotStagingSession::new(parent.path(), metadata, descriptors).unwrap();
+        for (segment_id, encoded) in payloads.iter().enumerate() {
+            session
+                .accept_segment(segment_id as u16, 16, encoded)
+                .unwrap();
+        }
+        let finalized = session.finalize().unwrap();
+        assert_eq!(finalized.descriptors().len(), 256);
+        assert_eq!(
+            finalized
+                .encoded_files()
+                .map(|file| file.read_encoded().unwrap().len())
+                .sum::<usize>(),
+            256 * 59
+        );
     }
 
     #[test]
@@ -1170,15 +1202,14 @@ mod tests {
         let bad_slot = slot(1, 6, 0xCA);
         let columns = columns(3, &[(4, bad_slot)]);
         let encoded = encode_segment(&columns, 3);
-        let fri_root =
-            compute_segment_root(3, &columns.values, &columns.owners_hi, &columns.owners_lo);
+        let exact_root = exact_segment_root_from_columns(3, &columns);
         let hdr = header(3, zero_slot_roots(3)[3], 1, 5);
         let metadata =
             AuthenticatedSnapshotMetadata::from_authenticated_header(hdr, block_id(&hdr), 3)
                 .unwrap();
         let descriptor = SnapshotSegmentDescriptor {
             segment_id: 0,
-            segment_root: fri_root,
+            segment_root: exact_root,
             encoded_len: encoded.len() as u32,
         };
         let mut session =
@@ -1204,12 +1235,7 @@ mod tests {
         let coinbase = slot(1, coinbase_creation_id(7), 0xCB);
         let coinbase_columns = columns(3, &[(4, coinbase)]);
         let encoded = encode_segment(&coinbase_columns, 3);
-        let fri_root = compute_segment_root(
-            3,
-            &coinbase_columns.values,
-            &coinbase_columns.owners_hi,
-            &coinbase_columns.owners_lo,
-        );
+        let exact_root = exact_segment_root_from_columns(3, &coinbase_columns);
         let exact = ChainState::from_sparse_utxos(3, &[(4, coinbase)], 5)
             .expect("tagged coinbase snapshot state");
         let hdr = header(3, exact.utxo_root, 1, 5);
@@ -1218,7 +1244,7 @@ mod tests {
                 .unwrap();
         let descriptor = SnapshotSegmentDescriptor {
             segment_id: 0,
-            segment_root: fri_root,
+            segment_root: exact_root,
             encoded_len: encoded.len() as u32,
         };
         let mut session =
@@ -1231,12 +1257,7 @@ mod tests {
         let future = slot(1, coinbase_creation_id(8), 0xCC);
         let future_columns = columns(3, &[(4, future)]);
         let future_encoded = encode_segment(&future_columns, 3);
-        let future_root = compute_segment_root(
-            3,
-            &future_columns.values,
-            &future_columns.owners_hi,
-            &future_columns.owners_lo,
-        );
+        let future_root = exact_segment_root_from_columns(3, &future_columns);
         let future_descriptor = SnapshotSegmentDescriptor {
             segment_id: 0,
             segment_root: future_root,
@@ -1258,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn strict_length_and_fri_failures_abort_without_partial_files() {
+    fn strict_length_and_exact_root_failures_abort_without_partial_files() {
         let parent = tempfile::tempdir().unwrap();
         let (metadata, descriptor, mut encoded) = fixture();
         let mut short_session =
@@ -1273,14 +1294,14 @@ mod tests {
         let (_, mut changed_columns) = decode_segment(&encoded).unwrap();
         changed_columns.owners_hi[1] = Block128::from(0xC3u128);
         encoded = encode_segment(&changed_columns, 3);
-        let mut fri_session =
+        let mut root_session =
             SnapshotStagingSession::new(parent.path(), metadata, vec![descriptor]).unwrap();
-        let fri_dir = fri_session.staging_directory().unwrap().to_path_buf();
+        let root_dir = root_session.staging_directory().unwrap().to_path_buf();
         assert!(matches!(
-            fri_session.accept_segment(0, 3, &encoded),
-            Err(SnapshotStagingError::FriRootMismatch { segment_id: 0 })
+            root_session.accept_segment(0, 3, &encoded),
+            Err(SnapshotStagingError::ExactSegmentRootMismatch { segment_id: 0 })
         ));
-        assert!(!fri_dir.exists());
+        assert!(!root_dir.exists());
     }
 
     #[test]
@@ -1324,7 +1345,7 @@ mod tests {
         let staged = finalized.encoded_files().next().unwrap();
         assert!(matches!(
             staged.read_encoded(),
-            Err(SnapshotStagingError::FriRootMismatch { segment_id: 0 })
+            Err(SnapshotStagingError::ExactSegmentRootMismatch { segment_id: 0 })
         ));
         drop(finalized);
         assert!(!directory.exists());
