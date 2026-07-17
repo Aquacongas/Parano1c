@@ -88,10 +88,11 @@ def rpc(port, method, params=None, timeout=15):
 
 
 class Node:
-    def __init__(self, name, p2p_port, rpc_port):
+    def __init__(self, name, p2p_port, rpc_port, p2p_host="127.0.0.1"):
         self.name = name
         self.p2p_port = p2p_port
         self.rpc_port = rpc_port
+        self.p2p_host = p2p_host
         self.root = BASE / name
         self.data_dir = self.root / "data"
         self.config = self.root / "paranoid.toml"
@@ -105,6 +106,10 @@ class Node:
         return f"127.0.0.1:{self.p2p_port}"
 
     def start(self, label, mode="node", genesis=False, seeds=None):
+        started = self.spawn(label, mode=mode, genesis=genesis, seeds=seeds)
+        return self.wait_ready(label, started)
+
+    def spawn(self, label, mode="node", genesis=False, seeds=None):
         require(self.proc is None or self.proc.poll() is not None, f"{self.name} already runs")
         self.root.mkdir(parents=True, exist_ok=True)
         self.log_path = BASE / "logs" / f"{label}.log"
@@ -118,7 +123,7 @@ class Node:
             "--data-dir",
             str(self.data_dir),
             "--p2p-listen",
-            f"127.0.0.1:{self.p2p_port}",
+            f"{self.p2p_host}:{self.p2p_port}",
             "--rpc-listen",
             f"127.0.0.1:{self.rpc_port}",
             "--log",
@@ -135,7 +140,10 @@ class Node:
         )
         self.stopping = False
         print(f"[start] {label} pid={self.proc.pid} mode={mode} genesis={genesis}", flush=True)
-        deadline = time.monotonic() + 300
+        return started
+
+    def wait_ready(self, label, started, timeout=300):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
                 raise LiveForkReorgError(f"{label} exited during startup: {self.proc.returncode}")
