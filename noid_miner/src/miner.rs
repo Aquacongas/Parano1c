@@ -33,7 +33,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tokio::time::interval;
 
 use noid_chain::consensus::paged_spend::BlockProofClass;
@@ -179,7 +179,11 @@ pub struct BlockMiner {
     /// Permanent stop flag: set only by stop(), never reset. The main loop
     /// checks this at the top of each iteration and breaks cleanly.
     stopped: Arc<AtomicBool>,
-    /// Notified when the chain is sufficiently synced to begin mining.
+    /// Durable initial-sync state. Unlike `Notify`, a watch value cannot be
+    /// consumed by another waiter or lost before the miner task starts.
+    initial_sync_ready: watch::Receiver<bool>,
+    /// Notified whenever the canonical tip changes after startup so active
+    /// proof/PoW work is cancelled and rebuilt on the new parent.
     sync_ready: Arc<tokio::sync::Notify>,
     history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
     ghost_authorization:
@@ -203,6 +207,7 @@ impl BlockMiner {
         config: MinerConfig,
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
+        initial_sync_ready: watch::Receiver<bool>,
         sync_ready: Arc<tokio::sync::Notify>,
         history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
         ghost_authorization: Arc<
@@ -228,6 +233,7 @@ impl BlockMiner {
             events,
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
+            initial_sync_ready,
             sync_ready,
             history_step_runtime,
             ghost_authorization,
@@ -297,6 +303,7 @@ impl BlockMiner {
         // Sync guard: do not mine until chain is current.
         {
             use noid_chain::consensus::params::BLOCK_TIME;
+            const INITIAL_GENESIS_SYNC_GRACE: Duration = Duration::from_secs(5);
             let (height, tip_ts) = {
                 let ctx = self.chain.read().await;
                 (ctx.tip_height(), ctx.tip_header().timestamp)
@@ -307,16 +314,23 @@ impl BlockMiner {
                 .as_secs();
             // "Fresh" = tip within 3 block-times of wall clock.
             let is_fresh = tip_ts > 0 && now.saturating_sub(tip_ts) < BLOCK_TIME * 3;
+            let mut initial_sync_ready = self.initial_sync_ready.clone();
 
             if height > 0 && is_fresh {
                 tracing::debug!(height, "miner: chain current, starting");
+            } else if *initial_sync_ready.borrow() {
+                tracing::debug!(height, "miner: initial sync already ready, starting");
             } else if height > 0 {
                 let age = now.saturating_sub(tip_ts);
                 tracing::info!(height, age_secs = age, "waiting for peer sync (max 30s)");
                 tokio::select! {
-                    _ = self.sync_ready.notified() => {
+                    result = initial_sync_ready.changed() => {
                         let h = self.chain.read().await.tip_height();
-                        tracing::debug!(height = h, "miner: sync ready, starting");
+                        if result.is_ok() && *initial_sync_ready.borrow() {
+                            tracing::debug!(height = h, "miner: sync ready, starting");
+                        } else {
+                            tracing::info!(height = h, "miner: sync readiness channel closed, starting from local tip");
+                        }
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                         let h = self.chain.read().await.tip_height();
@@ -324,16 +338,22 @@ impl BlockMiner {
                     }
                 }
             } else {
-                // Fresh chain (height == 0): wait for either a peer snapshot or
-                // the sync_ready signal (fired immediately when --genesis is set).
-                tracing::debug!("miner: height=0, waiting for sync_ready or 60s timeout");
+                // Give discovery and the first authenticated header probe one
+                // short grace period. Explicit --genesis and a same-tip peer
+                // set the durable watch value immediately. Mining offline is
+                // valid, so a missing peer must not impose a one-minute UX tax.
+                tracing::debug!("miner: height=0, waiting for initial sync readiness or 5s grace");
                 tokio::select! {
-                    _ = self.sync_ready.notified() => {
+                    result = initial_sync_ready.changed() => {
                         let h = self.chain.read().await.tip_height();
-                        tracing::debug!(height = h, "miner: ready, starting");
+                        if result.is_ok() && *initial_sync_ready.borrow() {
+                            tracing::debug!(height = h, "miner: ready, starting");
+                        } else {
+                            tracing::info!(height = h, "miner: sync readiness channel closed, starting from local genesis");
+                        }
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        tracing::info!("miner: no peers after 60s, starting from genesis");
+                    _ = tokio::time::sleep(INITIAL_GENESIS_SYNC_GRACE) => {
+                        tracing::info!("miner: initial sync grace elapsed, starting from local genesis");
                     }
                 }
             }
