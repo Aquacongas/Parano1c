@@ -49,6 +49,18 @@ mod tests {
     }
 
     #[test]
+    fn production_log24_boundary_is_exact() {
+        const LOG24_EXPAND_AT: u64 = (1u64 << 24) * EXPAND_NUM / EXPAND_DENOM;
+
+        assert_eq!(LOG24_EXPAND_AT, 12_582_912);
+        assert_eq!(
+            expected_child_log_slots(24, 0, &[LOG24_EXPAND_AT - 1; 18]),
+            24
+        );
+        assert_eq!(expected_child_log_slots(24, 0, &[LOG24_EXPAND_AT; 18]), 25);
+    }
+
+    #[test]
     fn expansion_saturates_at_max() {
         assert_eq!(
             expected_child_log_slots(LOG_SLOTS_MAX, 0, &[u64::MAX; 18]),
