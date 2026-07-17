@@ -3,7 +3,8 @@
 
 The scenario deliberately uses one node so P2P/mempool propagation cannot
 hide the local wallet -> mempool -> miner -> canonical block path.  Network
-propagation is covered by a separate live scenario.
+propagation is covered by a separate live scenario. Environment parameters
+select the input/page shape, but every invocation remains one fresh scenario.
 """
 
 import datetime
@@ -23,14 +24,24 @@ ROOT = Path(__file__).resolve().parents[1]
 NODE_BIN = ROOT / "target" / "release" / "paranoid"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+SCENARIO = os.environ.get("NOID_LIVE_TX_SCENARIO", "single-input").strip()
 BASE = Path(
     os.environ.get(
-        "NOID_LIVE_SINGLE_TX_DIR", str(RUN_PARENT / f"single-tx-clean-{STAMP}")
+        "NOID_LIVE_SINGLE_TX_DIR",
+        str(RUN_PARENT / f"transaction-{SCENARIO}-clean-{STAMP}"),
     )
 )
 P2P_PORT = int(os.environ.get("NOID_LIVE_SINGLE_TX_P2P_PORT", "20400"))
 RPC_PORT = P2P_PORT + 1
-PAYMENT_MICRONOID = 1_000_000
+MINE_TO_HEIGHT = int(os.environ.get("NOID_LIVE_TX_MINE_TO_HEIGHT", "3"))
+PAYMENT_MICRONOID = int(os.environ.get("NOID_LIVE_TX_PAYMENT_MICRONOID", "1000000"))
+EXPECTED_INPUTS = int(os.environ.get("NOID_LIVE_TX_EXPECTED_INPUTS", "1"))
+EXPECTED_OUTPUTS = int(os.environ.get("NOID_LIVE_TX_EXPECTED_OUTPUTS", "2"))
+EXPECTED_PAGES = int(
+    os.environ.get("NOID_LIVE_TX_EXPECTED_PAGES", str((EXPECTED_INPUTS + 7) // 8))
+)
+EXPECTED_PROOF_CLASS = os.environ.get("NOID_LIVE_TX_EXPECTED_PROOF_CLASS", "B64")
+EXPECT_CHANGE = os.environ.get("NOID_LIVE_TX_EXPECT_CHANGE", "1") != "0"
 
 
 class LiveTxError(RuntimeError):
@@ -230,6 +241,7 @@ def main():
     require(port_is_free(RPC_PORT), f"RPC port occupied: {RPC_PORT}")
     (BASE / "logs").mkdir(parents=True)
     (RUN_PARENT / "LAST_SINGLE_TX_RUN").write_text(str(BASE) + "\n")
+    (RUN_PARENT / "LAST_TRANSACTION_RUN").write_text(str(BASE) + "\n")
 
     binary_hash = sha256(NODE_BIN)
     print(f"[run] {BASE}", flush=True)
@@ -239,6 +251,16 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": binary_hash,
         "binary_size": NODE_BIN.stat().st_size,
+        "scenario": SCENARIO,
+        "configuration": {
+            "mine_to_height": MINE_TO_HEIGHT,
+            "payment_micronoid": PAYMENT_MICRONOID,
+            "expected_inputs": EXPECTED_INPUTS,
+            "expected_outputs": EXPECTED_OUTPUTS,
+            "expected_pages": EXPECTED_PAGES,
+            "expected_proof_class": EXPECTED_PROOF_CLASS,
+            "expect_change": EXPECT_CHANGE,
+        },
         "status": "running",
     }
     error = None
@@ -257,23 +279,41 @@ def main():
         assert_clean_log("wallet setup", node.log_text())
 
         _, miner_startup = node.start("02-genesis-miner-single-tx", mode="miner", genesis=True)
-        reached = wait_height_at_least(3, timeout=300)
+        reached = wait_height_at_least(
+            MINE_TO_HEIGHT, timeout=max(300, MINE_TO_HEIGHT * 45)
+        )
         scan = rpc("walletScan", timeout=120)
         before = rpc("walletGetBalance")
         require(before["spendable_micronoid"] > PAYMENT_MICRONOID, f"sender not funded: {before}")
-        require(before["utxo_count"] >= 1, f"sender has no UTXO: {before}")
+        require(
+            before["utxo_count"] >= EXPECTED_INPUTS,
+            f"sender has too few UTXOs for requested shape: {before}",
+        )
 
         plan = rpc("walletPlanSend", [recipient["address"], PAYMENT_MICRONOID, 0], timeout=60)
-        require(plan["input_count"] == 1, f"single payment did not select one input: {plan}")
-        require(plan["output_count"] == 2, f"single payment should create pay+change: {plan}")
-        require(plan["change_micronoid"] > 0, f"single payment has no change: {plan}")
+        require(
+            plan["input_count"] == EXPECTED_INPUTS,
+            f"payment selected the wrong input count: {plan}",
+        )
+        require(
+            plan["output_count"] == EXPECTED_OUTPUTS,
+            f"payment selected the wrong output count: {plan}",
+        )
+        require(
+            (plan["change_micronoid"] > 0) == EXPECT_CHANGE,
+            f"payment change shape is wrong: {plan}",
+        )
 
         submit_height = int(rpc("getChainInfo")["height"])
         proof_started = time.monotonic()
         sent = rpc("walletSend", [recipient["address"], PAYMENT_MICRONOID, 0], timeout=300)
         proof_elapsed = time.monotonic() - proof_started
         txid = sent["txid"]
-        require(sent["input_count"] == 1 and sent["output_count"] == 2, f"send shape changed: {sent}")
+        require(
+            sent["input_count"] == EXPECTED_INPUTS
+            and sent["output_count"] == EXPECTED_OUTPUTS,
+            f"send shape changed: {sent}",
+        )
         require(sent["fee_micronoid"] == plan["fee_micronoid"], f"send fee changed: {sent} vs {plan}")
         print(f"[submitted] tx={txid} proof_and_admission={proof_elapsed:.3f}s", flush=True)
 
@@ -284,10 +324,20 @@ def main():
             timeout=30,
         )
         mempool_observed = time.monotonic() - mempool_started
-        require(entry["n_inputs"] == 1 and entry["n_outputs"] == 2, f"mempool shape wrong: {entry}")
-        require(entry["page_count"] == 1, f"single transaction is not one page: {entry}")
-        require(entry["minimum_proof_class"] == "B64", f"wrong proof class: {entry}")
-        require(not entry["requires_b255_miner"], f"single transaction requires B255: {entry}")
+        require(
+            entry["n_inputs"] == EXPECTED_INPUTS
+            and entry["n_outputs"] == EXPECTED_OUTPUTS,
+            f"mempool shape wrong: {entry}",
+        )
+        require(entry["page_count"] == EXPECTED_PAGES, f"page count wrong: {entry}")
+        require(
+            entry["minimum_proof_class"] == EXPECTED_PROOF_CLASS,
+            f"wrong proof class: {entry}",
+        )
+        require(
+            entry["requires_b255_miner"] == (EXPECTED_PROOF_CLASS == "B255"),
+            f"B255 producer flag is wrong: {entry}",
+        )
         require(entry["has_authorization"], f"authorization not cached: {entry}")
         require(int(rpc("getMempoolSize")) == 1, "local mempool size is not one")
 
@@ -311,12 +361,33 @@ def main():
         require(recipient_slots[0]["value"] == PAYMENT_MICRONOID, f"recipient amount wrong: {recipient_slots}")
 
         confirmation_height = int(confirmed["height"])
+        parent_header = rpc("getBlockHeader", [confirmation_height - 1])
+        confirming_header = rpc("getBlockHeader", [confirmation_height])
+        active_slot_delta = (
+            int(confirming_header["active_slot_count"])
+            - int(parent_header["active_slot_count"])
+        )
+        expected_active_slot_delta = 1 + EXPECTED_OUTPUTS - EXPECTED_INPUTS
+        require(
+            active_slot_delta == expected_active_slot_delta,
+            "confirming header does not account for exact coinbase+input/output shape: "
+            f"delta={active_slot_delta}, expected={expected_active_slot_delta}",
+        )
         miner_text = node.log_text()
         accepted = accepted_block_for_height(miner_text, confirmation_height)
         require(accepted is not None, f"no accepted-block log for h{confirmation_height}")
-        require(accepted["txs"] == 2, f"confirming block does not contain coinbase+payment: {accepted}")
+        expected_physical_txs = 1 + EXPECTED_PAGES
+        require(
+            accepted["txs"] == expected_physical_txs,
+            "confirming block does not contain coinbase plus every PagedSpend page: "
+            f"{accepted}, expected physical txs={expected_physical_txs}",
+        )
         require("wallet_send deterministic plan ready" in miner_text, "wallet plan missing from log")
-        require("mining template ready" in miner_text and "n_txs=2" in miner_text, "miner never selected payment")
+        require(
+            "mining template ready" in miner_text
+            and f"n_txs={expected_physical_txs}" in miner_text,
+            "miner never selected every page of the logical payment",
+        )
         assert_clean_log("miner transaction", miner_text)
         node.stop()
         miner_text = node.log_text()
@@ -375,7 +446,12 @@ def main():
                 "receipt": receipt_check,
             }
         )
-        print("[PASS] isolated fresh-chain single transaction", flush=True)
+        summary["active_slot_delta"] = active_slot_delta
+        print(
+            f"[PASS] isolated fresh-chain transaction scenario={SCENARIO} "
+            f"inputs={EXPECTED_INPUTS} outputs={EXPECTED_OUTPUTS} pages={EXPECTED_PAGES}",
+            flush=True,
+        )
     except Exception as caught:
         error = caught
         summary["status"] = "failed"
