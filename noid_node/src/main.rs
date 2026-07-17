@@ -2360,6 +2360,12 @@ async fn handle_p2p_events(
                     mut inbound_memory_permit,
                 },
             ) => {
+                let advertised_height = bundle.height();
+                if advertised_height > highest_announced {
+                    highest_announced = advertised_height;
+                    sync_phase_telemetry.extend_suffix_target(advertised_height);
+                    last_announcement_peer = Some(from);
+                }
                 if snapshot_install_inflight.is_some() {
                     // Atomic snapshot installation owns the chain/mempool/wallet
                     // replacement order.  Release this pulled payload now; the
@@ -2635,6 +2641,79 @@ async fn handle_p2p_events(
                                     our_tip,
                                     "dropping duplicate/stale block (already at tip)"
                                 );
+                                continue;
+                            }
+
+                            // Inline bundles are themselves block announcements.  A
+                            // gossip mesh may legitimately deliver height N+1 after
+                            // dropping N, so do not run the expensive state-bound
+                            // verification against the wrong pre-state.  Retain the
+                            // bounded orphan and use the same authenticated header
+                            // probe/direct suffix path as compact announcements.
+                            if block.header.height > our_tip.saturating_add(1) {
+                                let block_height = block.header.height;
+                                let candidate = AcceptedBlockCandidate { block, bundle };
+                                if gap_requires_snapshot_sync(our_tip, block_height) {
+                                    drop(candidate);
+                                    drop(inbound_memory_permit.take());
+                                    tracing::info!(
+                                        peer = %from,
+                                        our_tip,
+                                        peer_tip = block_height,
+                                        retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+                                        "complete block exposed deep gap — requesting snapshot manifest"
+                                    );
+                                    if pending_manifest.is_none()
+                                        && pending_snapshot_header_sync.is_none()
+                                        && snapshot_header_staging_inflight.is_none()
+                                        && history_step_verification_inflight.is_none()
+                                        && snapshot_staging_inflight.is_none()
+                                        && snapshot_install_inflight.is_none()
+                                        && pending_segment_ids.is_empty()
+                                        && segment_queue.is_empty()
+                                        && manifest_requested_peers.insert(from)
+                                    {
+                                        manifest_force_snapshot_peers.insert(from);
+                                        let _ = p2p_cmd
+                                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                                peer: from,
+                                                requester_height: our_tip,
+                                            })
+                                            .await;
+                                    }
+                                    continue;
+                                }
+
+                                // The orphan pool owns its own strict byte cap, so
+                                // release the transport reservation before probing.
+                                drop(inbound_memory_permit.take());
+                                insert_orphan(
+                                    &mut orphan_pool,
+                                    OrphanBlock::from_candidate(candidate),
+                                );
+
+                                let count = (block_height - our_tip + 1).min(512) as u16;
+                                let request_key = (from, our_tip, count);
+                                let recently_requested = recent_header_fetches
+                                    .get(&request_key)
+                                    .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
+                                if !fetch_in_progress.contains(&from) && !recently_requested {
+                                    fetch_in_progress.insert(from);
+                                    recent_header_fetches.insert(request_key, Instant::now());
+                                    tracing::info!(
+                                        peer = %from,
+                                        our_tip,
+                                        block_height,
+                                        "complete block exposed recent gap — fetching linked headers"
+                                    );
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                            peer: from,
+                                            start_height: our_tip,
+                                            count,
+                                        })
+                                        .await;
+                                }
                                 continue;
                             }
                         }
