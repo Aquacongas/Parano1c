@@ -37,6 +37,19 @@ serde_json  = "1"
 anyhow      = "1"
 thiserror   = "1"
 
+# HistoryStep is dominated by two large cross-crate prover phases. Thin LTO
+# plus one codegen unit removes enough abstraction/codegen overhead to keep the
+# sustained B64 p95 below the 15-second cadence target on the reference AVX2
+# laptop. This changes executable code only; proof relations and frozen matrix
+# bytes remain identical.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+
 # The release node's build script performs the one-time semantic
 # authentication of every embedded R1CS leaf. Cargo otherwise compiles build
 # scripts and build-dependencies at opt-level 0 even for `--release`, turning
