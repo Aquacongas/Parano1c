@@ -127,6 +127,38 @@ pub fn generate_slot_hints(alloc_counter: u64, log_slots: u32, count: usize) -> 
     hints
 }
 
+/// Generate a deterministic, duplicate-free probe order over state segments.
+///
+/// The first entry is the segment selected by the allocator's current zone.
+/// Later entries advance through successive zones. Since [`permute_zone`] is
+/// bijective modulo the power-of-two segment count, a full probe visits every
+/// segment exactly once. This is the bounded escape path when the current zone
+/// is full after long-lived churn or a `log_slots` expansion.
+///
+/// Slot hints remain non-authoritative. Callers use compact live counts to skip
+/// full segments and verify the selected raw slot before minting.
+pub fn generate_zone_segment_hints(alloc_counter: u64, log_slots: u32, count: usize) -> Vec<u16> {
+    debug_assert!(log_slots <= 32, "log_slots must fit in u32 slot index");
+    if count == 0 {
+        return Vec::new();
+    }
+    if log_slots <= 16 {
+        return vec![0];
+    }
+
+    let num_zones = 1u64 << (log_slots - 16);
+    let limit = count.min(num_zones as usize);
+    let first_zone = alloc_counter / ZONE_CAPACITY;
+    let perm_seed = 0xA076_1D64_78BD_642F ^ ((log_slots as u64) << 32);
+    (0..limit)
+        .map(|offset| {
+            let segment =
+                permute_zone(first_zone.wrapping_add(offset as u64), num_zones, perm_seed);
+            u16::try_from(segment).expect("log_slots <= 32 implies a u16 segment id")
+        })
+        .collect()
+}
+
 /// Deduplicate slot hints and remove any slots already in `reserved`.
 ///
 /// Preserves generation order. O(n log n).
@@ -301,6 +333,44 @@ mod tests {
             assert!(seen.insert(seg), "duplicate segment {seg} for zone {zone}");
         }
         assert_eq!(seen.len() as u64, num_zones);
+    }
+
+    #[test]
+    fn zone_segment_probe_visits_each_segment_once() {
+        for log_slots in [17u32, 24, 25, 32] {
+            let segment_count = 1usize << (log_slots - 16);
+            let hints = generate_zone_segment_hints(
+                193 * ZONE_CAPACITY + 17,
+                log_slots,
+                segment_count + 10,
+            );
+            assert_eq!(hints.len(), segment_count);
+            let unique = hints
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(unique.len(), segment_count);
+            assert!(hints
+                .iter()
+                .all(|segment| usize::from(*segment) < segment_count));
+        }
+    }
+
+    #[test]
+    fn zone_segment_probe_escapes_a_full_primary_after_expansion() {
+        let old_log_slots = 24u32;
+        let old_segment_count = 1usize << (old_log_slots - 16);
+        let old_seed = 0xA076_1D64_78BD_642F ^ ((old_log_slots as u64) << 32);
+        let old_filled = (0..192u64)
+            .map(|zone| permute_zone(zone, old_segment_count as u64, old_seed) as u16)
+            .collect::<std::collections::HashSet<_>>();
+
+        // At the expanded depth, zones 194 and 195 deterministically land in
+        // old full segments. The probe must still reach a free segment rather
+        // than treating one exhausted 65,536-slot zone as global exhaustion.
+        let hints = generate_zone_segment_hints(194 * ZONE_CAPACITY, 25, 512);
+        assert!(old_filled.contains(&hints[0]));
+        assert!(hints.iter().any(|segment| !old_filled.contains(segment)));
     }
 
     #[test]

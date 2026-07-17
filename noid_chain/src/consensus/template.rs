@@ -338,6 +338,68 @@ struct CandidatePagedSpend {
     spend: PagedSpendFacts,
 }
 
+/// Select one exact empty slot for the mandatory coinbase.
+///
+/// Loaded live segments are searched first so ordinary churn reuses holes and
+/// does not grow durable state. If none has an available hole, the allocator's
+/// duplicate-free segment probe skips full zones and opens one virtual-zero
+/// segment. Evicted live segments remain fail-closed; the miner snapshot must
+/// authenticate and hydrate one before calling the pure builder.
+fn select_coinbase_slot(
+    state: &ChainState,
+    reuse_seed: u64,
+    reserved: &HashSet<u32>,
+) -> Option<u32> {
+    if let Some(slot) = state
+        .state
+        .empty_slot_hints_in_populated_segments(reuse_seed, 1, reserved)
+        .into_iter()
+        .next()
+    {
+        return Some(slot);
+    }
+
+    let log_slots = state.state.log_slots() as u32;
+    let effective_log = state.state.effective_log_segment_size();
+    let segment_size = 1usize << effective_log;
+    let local_mask = segment_size - 1;
+    let segment_count = state.state.num_segments();
+    let local_start = if log_slots <= 16 {
+        crate::consensus::allocator::generate_slot_hints(state.alloc_counter, log_slots, 1)
+            .first()
+            .copied()
+            .unwrap_or(0) as usize
+    } else {
+        (state.alloc_counter as usize) & local_mask
+    };
+
+    for segment_id in crate::consensus::allocator::generate_zone_segment_hints(
+        state.alloc_counter,
+        log_slots,
+        segment_count,
+    ) {
+        // A non-zero evicted segment cannot be treated as empty. A resident
+        // non-full segment would already have produced a reuse hint above.
+        if state.state.segment_live_count(segment_id) != 0 || state.state.is_evicted(segment_id) {
+            continue;
+        }
+
+        let base = (u32::from(segment_id)) << effective_log;
+        // A virtual-zero segment needs only `reserved + 1` probes to prove one
+        // unreserved slot exists; never scan or allocate all 65,536 columns.
+        let probes = segment_size.min(reserved.len().saturating_add(1));
+        for step in 0..probes {
+            let slot = base | (((local_start + step) & local_mask) as u32);
+            if !reserved.contains(&slot)
+                && state.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
+            {
+                return Some(slot);
+            }
+        }
+    }
+    None
+}
+
 /// Build a `BlockTemplate` from a set of candidate transactions.
 ///
 /// Steps:
@@ -424,7 +486,6 @@ fn build_block_template_with_post_state(
     timestamp: u64,
     difficulty_target: Digest,
 ) -> Result<(BlockTemplate, ChainState), TemplateBuildError> {
-    use crate::consensus::allocator::generate_slot_hints;
     use crate::consensus::emission::block_reward;
     use crate::consensus::expected_child_log_slots;
     use crate::consensus::fees::fee_breakdown;
@@ -544,7 +605,6 @@ fn build_block_template_with_post_state(
     // Find an empty slot for coinbase output using the allocator.
     // Use the scratch state's actual capacity so hints are always in range.
     let coinbase_slot = {
-        let state_log_slots = scratch.state.log_slots() as u32;
         let reserved: HashSet<u32> = ordered_winners
             .iter()
             .flat_map(|group| {
@@ -563,42 +623,7 @@ fn build_block_template_with_post_state(
         let seed =
             scratch.alloc_counter ^ u64::from_le_bytes(parent.state_root[..8].try_into().unwrap());
 
-        // Best case: reuse a hole in an already-populated segment. This avoids
-        // materialising a new 3 MB segment just for coinbase.
-        let reuse_hints = scratch
-            .state
-            .empty_slot_hints_in_populated_segments(seed, 32, &reserved);
-        if let Some(slot) = reuse_hints
-            .into_iter()
-            .find(|&slot| scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY)
-        {
-            slot
-        } else {
-            // Fall back to the virgin-zone allocator. Grow the candidate window
-            // so a block is not rejected merely because the first 256 hints were
-            // occupied; NoCoinbaseSlot should mean genuinely no reachable empty slot.
-            let mut found = None;
-            let mut count = 256usize;
-            while found.is_none() && count <= 65_536 {
-                found = generate_slot_hints(scratch.alloc_counter, state_log_slots, count)
-                    .into_iter()
-                    .find(|&slot| {
-                        !reserved.contains(&slot)
-                            && !scratch.state.is_evicted(
-                                (slot >> scratch.state.effective_log_segment_size()) as u16,
-                            )
-                            && scratch.state.slot(slot) == crate::fri_state::SlotValue::EMPTY
-                    });
-                count *= 2;
-            }
-            // The residency filter above means callers must keep the
-            // allocator's hint-window segments resident (or hydrated from
-            // durable storage) — see the miner snapshot's
-            // hydrate_coinbase_allocator_segments. An all-evicted hint
-            // window otherwise reports NoCoinbaseSlot with the whole state
-            // nearly empty.
-            found.ok_or(TemplateBuildError::NoCoinbaseSlot)?
-        }
+        select_coinbase_slot(&scratch, seed, &reserved).ok_or(TemplateBuildError::NoCoinbaseSlot)?
     };
 
     // Sum only claimable fees. The deterministic state-growth component is burned.
@@ -769,6 +794,69 @@ mod tests {
             template.tx_root,
             crate::block::compute_tx_root(&template.all_txs())
         );
+    }
+
+    #[test]
+    fn coinbase_segment_probe_escapes_a_full_current_zone() {
+        use crate::consensus::allocator::generate_zone_segment_hints;
+
+        let mut state = ChainState::with_log_slots(17);
+        let primary = generate_zone_segment_hints(0, 17, 2)[0];
+        state
+            .state
+            .install_evicted_exact_summary(primary, 1u32 << 16)
+            .unwrap();
+        state.state.finish_evicted_exact_summaries();
+        state.active_slot_count = 1u64 << 16;
+
+        let slot = select_coinbase_slot(&state, 7, &HashSet::new())
+            .expect("the other production-size segment is virtual zero");
+        assert_ne!((slot >> 16) as u16, primary);
+        assert_eq!(state.state.slot(slot), crate::fri_state::SlotValue::EMPTY);
+    }
+
+    #[test]
+    fn expansion_block_is_coinbase_only_and_grows_exact_domain_once() {
+        use crate::fri_state::SlotValue;
+
+        let owner = Address([4u8; 32]);
+        let mut state = ChainState::with_log_slots(8);
+        let occupied = (0..192u32)
+            .map(|slot| {
+                (
+                    slot,
+                    SlotValue::with_owner_fields(
+                        100_000_000,
+                        u64::from(slot) + 1,
+                        owner.as_fields(),
+                    ),
+                )
+            })
+            .collect::<Vec<_>>();
+        state.state.apply_delta_unrooted(&occupied).unwrap();
+        state.active_slot_count = occupied.len() as u64;
+        state.alloc_counter = occupied.len() as u64;
+        let parent = parent(&mut state);
+        let candidate = user(0, 220, 100_000_000, owner, &parent);
+
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[192; 18],
+            vec![candidate],
+            Address([9u8; 32]),
+            1,
+            [0xff; 32],
+        )
+        .unwrap();
+
+        assert_eq!(template.log_slots, 9);
+        assert!(
+            template.txs.is_empty(),
+            "parent-depth proof must be re-proved"
+        );
+        assert_eq!(template.active_slot_count, 193);
+        assert!(u64::from(template.coinbase.body.outputs[0].slot_index) < (1u64 << 9));
     }
 
     #[test]

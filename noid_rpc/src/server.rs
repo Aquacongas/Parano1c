@@ -737,8 +737,7 @@ impl RpcHandler {
         let tip_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap());
         let seed = mix_slot_hint_seed(tip_seed, salt_seed);
 
-        collect_empty_slot_hints(&chain, &reserved, seed, count, (count * 64).max(512))
-            .map_err(rpc_err)
+        collect_empty_slot_hints(&chain, &reserved, seed, count).map_err(rpc_err)
     }
 
     /// Owned preparation coordinator. `getBlockTemplate` runs this in its own
@@ -1643,7 +1642,6 @@ impl ParanoidApiServer for RpcHandler {
                         &reserved_outputs,
                         unique_seed,
                         noid_tx::TX_OUTPUTS,
-                        256,
                     )
                     .map(|slot_hints| (epoch_anchor, tip.log_slots, slot_hints))
                 })

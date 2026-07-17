@@ -56,7 +56,9 @@ pub mod slot_expansion;
 pub mod timestamps;
 
 // Convenient re-exports.
-pub use allocator::{deduplicate_hints, generate_slot_hints, splitmix64};
+pub use allocator::{
+    deduplicate_hints, generate_slot_hints, generate_zone_segment_hints, splitmix64,
+};
 pub use checks::{validate_block_slot_conflicts, validate_tx_consensus};
 pub use conflict::resolve_slot_conflicts;
 pub use da_prune::{build_undo_log, prune_undo_logs, revert_block, BlockUndoLog};

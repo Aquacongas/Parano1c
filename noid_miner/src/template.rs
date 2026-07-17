@@ -15,7 +15,7 @@
 //!
 //! 1. Heartbeat every `refresh_interval_secs` seconds (safety net)
 //! 2. First `TxAdmitted` while a coinbase-only template is being mined
-//! 3. New chain tip from P2P (block received or snapshot applied via `sync_ready`)
+//! 3. New chain tip from P2P (block received or snapshot applied)
 
 use std::collections::{HashMap, HashSet};
 
@@ -177,27 +177,38 @@ impl TemplateChainSnapshot {
         self.hydrate_segments(state, needed)
     }
 
-    /// The coinbase allocator probes a bounded virgin-zone hint window that
-    /// touches at most two segments for the snapshot's `alloc_counter`. A
-    /// freshly committed chain evicts exactly those segments — only
-    /// block-dirty segments stay resident — so without hydrating them every
-    /// hint fails the template's residency filter and mining halts with
-    /// `NoCoinbaseSlot` on the next block while the state is almost empty
-    /// (live-test finding, 2026-07-12). The needed segments are derived from
-    /// the production hint stream itself, so any future allocator change
-    /// keeps this in lockstep; the cost is bounded by two 3-MiB segments.
-    fn hydrate_coinbase_allocator_segments(
+    /// Hydrate one evicted non-full segment so coinbase construction can reuse
+    /// a durable hole without retaining the complete state in RAM.
+    ///
+    /// Compact live counts identify the segment without raw reads. The segment
+    /// with the most holes is chosen, so one 3-MiB load is sufficient even when
+    /// selected transaction outputs reserve many candidate slots. If every
+    /// live segment is full, the pure template builder opens a virtual-zero
+    /// allocator segment and no hydration is needed.
+    fn hydrate_coinbase_reuse_segment(
         &self,
         state: &mut ChainState,
     ) -> Result<(), MdbxContextError> {
-        let effective_log = state.state.effective_log_segment_size();
-        let log_slots = state.state.log_slots() as u32;
-        let needed: HashSet<u16> =
-            noid_chain::consensus::generate_slot_hints(state.alloc_counter, log_slots, 65_536)
-                .into_iter()
-                .map(|slot| (slot >> effective_log) as u16)
-                .collect();
-        self.hydrate_segments(state, needed)
+        if !state
+            .state
+            .empty_slot_hints_in_populated_segments(0, 1, &HashSet::new())
+            .is_empty()
+        {
+            return Ok(());
+        }
+
+        let segment_capacity = 1u32 << state.state.effective_log_segment_size();
+        let candidate = (0..state.state.num_segments())
+            .map(|segment| segment as u16)
+            .filter(|segment| {
+                let live = state.state.segment_live_count(*segment);
+                live > 0 && live < segment_capacity
+            })
+            .min_by_key(|segment| state.state.segment_live_count(*segment));
+        match candidate {
+            Some(segment) => self.hydrate_segments(state, HashSet::from([segment])),
+            None => Ok(()),
+        }
     }
 
     fn hydrate_segments(
@@ -338,8 +349,8 @@ impl TemplateBuilder {
             tracing::warn!(err = %error, "template touched-segment hydration failed");
             return None;
         }
-        if let Err(error) = snapshot.hydrate_coinbase_allocator_segments(&mut state) {
-            tracing::warn!(err = %error, "template allocator-segment hydration failed");
+        if let Err(error) = snapshot.hydrate_coinbase_reuse_segment(&mut state) {
+            tracing::warn!(err = %error, "template coinbase-reuse hydration failed");
             return None;
         }
         let template_cpu_result = install_history_step_phase_cpu(|| {

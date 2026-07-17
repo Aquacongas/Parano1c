@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use noid_chain::consensus::allocator::generate_slot_hints;
+use noid_chain::consensus::allocator::{generate_zone_segment_hints, splitmix64};
 use noid_chain::consensus::pow::block_id;
 use noid_chain::storage::MdbxChainContext;
 use tokio::sync::Mutex;
@@ -73,45 +73,121 @@ pub(crate) fn collect_empty_slot_hints(
     reserved: &HashSet<u32>,
     seed: u64,
     count: usize,
-    fallback_candidates: usize,
 ) -> Result<Vec<u32>, String> {
     if count == 0 {
         return Ok(Vec::new());
     }
     let state = &chain.state.state;
-    let hints = state.empty_slot_hints_in_populated_segments(seed, count, reserved);
-    if hints.len() == count {
-        return Ok(hints);
+    let segment_log = state.effective_log_segment_size();
+    let segment_size = 1usize << segment_log;
+    let segment_full = segment_size as u32;
+    let local_mask = (segment_size - 1) as u32;
+    let mut rng = seed;
+    let mut hints = Vec::with_capacity(count);
+
+    // First refill holes in durable live segments. This is the important
+    // density invariant: restart eviction must not turn salted wallet hints
+    // back into one random 3-MiB segment per send. Salt rotates equal-density
+    // choices and the local scan, while compact live counts choose the segment.
+    let mut partial_segments = (0..state.num_segments())
+        .map(|segment| segment as u16)
+        .filter(|segment| {
+            let live = state.segment_live_count(*segment);
+            live > 0 && live < segment_full
+        })
+        .collect::<Vec<_>>();
+    if !partial_segments.is_empty() {
+        let rotation = (splitmix64(&mut rng) as usize) % partial_segments.len();
+        partial_segments.rotate_left(rotation);
+        // Stable ordering fills the densest segment first; the prior rotation
+        // supplies deterministic salt diversity between equal live counts.
+        partial_segments.sort_by(|left, right| {
+            state
+                .segment_live_count(*right)
+                .cmp(&state.segment_live_count(*left))
+        });
     }
 
-    let segment_log = state.effective_log_segment_size();
-    collect_empty_slot_hints_streaming(
-        hints,
-        reserved,
-        count,
-        state.num_slots(),
-        segment_log,
-        generate_slot_hints(seed, state.log_slots() as u32, fallback_candidates),
-        |segment_id| state.is_evicted(segment_id),
-        |index| state.slot(index) == noid_chain::fri_state::SlotValue::EMPTY,
-        |segment_id| {
-            let Some((stored_log, columns)) = chain
-                .store
-                .get_segment(segment_id)
-                .map_err(|error| error.to_string())?
-            else {
-                return Err(format!(
-                    "evicted segment {segment_id} is missing from durable state"
-                ));
-            };
-            if usize::from(stored_log) != segment_log {
-                return Err(format!(
-                    "segment {segment_id} depth mismatch: stored {stored_log}, expected {segment_log}"
-                ));
-            }
-            Ok(columns)
-        },
-    )
+    for segment_id in partial_segments {
+        let local_start = (splitmix64(&mut rng) as u32) & local_mask;
+        let base = u32::from(segment_id) << segment_log;
+        let candidates = (0..segment_size)
+            .map(move |step| base | (local_start.wrapping_add(step as u32) & local_mask));
+        hints = collect_empty_slot_hints_streaming(
+            hints,
+            reserved,
+            count,
+            state.num_slots(),
+            segment_log,
+            candidates,
+            |candidate_segment| state.is_evicted(candidate_segment),
+            |index| state.slot(index) == noid_chain::fri_state::SlotValue::EMPTY,
+            |candidate_segment| load_durable_segment(chain, candidate_segment, segment_log),
+        )?;
+        if hints.len() == count {
+            return Ok(hints);
+        }
+    }
+
+    // No durable hole was sufficient. Open a virtual-zero segment in the
+    // allocator's zone order, derived from the real monotone alloc_counter —
+    // never from the wallet salt. Full zones are skipped in O(segment_count).
+    for segment_id in generate_zone_segment_hints(
+        chain.state.alloc_counter,
+        state.log_slots() as u32,
+        state.num_segments(),
+    ) {
+        if state.segment_live_count(segment_id) != 0 || state.is_evicted(segment_id) {
+            continue;
+        }
+        let local_start = (splitmix64(&mut rng) as u32) & local_mask;
+        let base = u32::from(segment_id) << segment_log;
+        // Every candidate is empty, so `reserved + missing` probes guarantee
+        // enough unreserved hints without constructing a 65,536-entry list.
+        let missing = count.saturating_sub(hints.len());
+        let probes = segment_size.min(reserved.len().saturating_add(missing));
+        let candidates = (0..probes)
+            .map(move |step| base | (local_start.wrapping_add(step as u32) & local_mask));
+        hints = collect_empty_slot_hints_streaming(
+            hints,
+            reserved,
+            count,
+            state.num_slots(),
+            segment_log,
+            candidates,
+            |_| false,
+            |index| state.slot(index) == noid_chain::fri_state::SlotValue::EMPTY,
+            |_| -> Result<noid_chain::segmented_state::SegmentColumns, String> {
+                unreachable!("virtual-zero segment cannot require a durable load")
+            },
+        )?;
+        if hints.len() == count {
+            break;
+        }
+    }
+    Ok(hints)
+}
+
+fn load_durable_segment(
+    chain: &MdbxChainContext,
+    segment_id: u16,
+    expected_log: usize,
+) -> Result<noid_chain::segmented_state::SegmentColumns, String> {
+    let Some((stored_log, columns)) = chain
+        .store
+        .get_segment(segment_id)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err(format!(
+            "evicted segment {segment_id} is missing from durable state"
+        ));
+    };
+    if usize::from(stored_log) != expected_log {
+        return Err(format!(
+            "segment {segment_id} depth mismatch: stored {stored_log}, expected {expected_log}"
+        ));
+    }
+    Ok(columns)
 }
 
 trait ExactSegmentSlots {
@@ -461,5 +537,36 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error, "segment 3 is too short for local slot 1");
+    }
+
+    #[test]
+    fn salted_empty_state_hints_remain_dense_in_one_allocator_segment() {
+        let directory = tempfile::tempdir().unwrap();
+        let chain = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let first = collect_empty_slot_hints(&chain, &HashSet::new(), 11, 256)
+            .expect("first dense hint set");
+        let second = collect_empty_slot_hints(&chain, &HashSet::new(), 29, 256)
+            .expect("second dense hint set");
+        let segment_log = chain.state.state.effective_log_segment_size();
+        let first_segments = first
+            .iter()
+            .map(|slot| slot >> segment_log)
+            .collect::<HashSet<_>>();
+        let second_segments = second
+            .iter()
+            .map(|slot| slot >> segment_log)
+            .collect::<HashSet<_>>();
+
+        assert_eq!(first_segments.len(), 1);
+        assert_eq!(second_segments, first_segments);
+        assert_ne!(first, second, "salt must still diversify local positions");
+        assert_eq!(
+            first.len(),
+            first.iter().copied().collect::<HashSet<_>>().len()
+        );
+        assert_eq!(
+            second.len(),
+            second.iter().copied().collect::<HashSet<_>>().len()
+        );
     }
 }
