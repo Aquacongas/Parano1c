@@ -37,8 +37,9 @@ pub use serial::{
     decode_header_chain_anchor, decode_segment, decode_state_meta, decode_tx_index_value,
     decode_undo_log, encode_chain_tip, encode_chain_work, encode_consensus_meta, encode_header,
     encode_header_chain_anchor, encode_segment, encode_slot_value, encode_state_meta,
-    encode_tx_index_value, encode_undo_log, encoded_segment_len_for_eff_log,
-    encoded_segments_total_len, u64_key,
+    encode_tx_index_value, encode_undo_log, encoded_segment_len_for_live_count,
+    encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log,
+    max_encoded_segments_total_len, u64_key,
 };
 pub use snapshot_generation::{
     export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,

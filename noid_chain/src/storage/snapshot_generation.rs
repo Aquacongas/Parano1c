@@ -36,11 +36,14 @@ use crate::fri_state::{compute_segment_root, SlotValue, LOG_SEGMENT_SIZE};
 use crate::segmented_state::SegmentColumns;
 use crate::state::StreamingSparseRoot;
 use crate::storage::mdbx_store::MdbxHistoricalReadSnapshot;
-use crate::storage::serial::{decode_segment, encode_segment, encoded_segment_len_for_eff_log};
+use crate::storage::serial::{
+    decode_segment, encode_segment, encoded_segment_len_for_live_count,
+    max_encoded_segment_len_for_eff_log,
+};
 use crate::storage::{MdbxStore, StoreError};
 
-const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V1";
-const SNAPSHOT_GENERATION_VERSION: u32 = 2;
+const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V3";
+const SNAPSHOT_GENERATION_VERSION: u32 = 3;
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const MANIFEST_TEMP_FILE_NAME: &str = ".manifest.tmp";
 const SEGMENTS_DIRECTORY_NAME: &str = "segments";
@@ -1086,11 +1089,11 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
         ));
     }
     let domain_segments = segment_count(manifest.log_slots)?;
-    let expected_encoded_len = encoded_segment_len_for_eff_log(manifest.effective_log_segment_size)
-        .ok_or(SnapshotGenerationError::Corrupt(
-            "manifest segment geometry overflows",
-        ))?;
-    if expected_encoded_len > MAX_SEGMENT_BYTES {
+    let maximum_encoded_len =
+        max_encoded_segment_len_for_eff_log(manifest.effective_log_segment_size).ok_or(
+            SnapshotGenerationError::Corrupt("manifest segment geometry overflows"),
+        )?;
+    if maximum_encoded_len > MAX_SEGMENT_BYTES {
         return Err(SnapshotGenerationError::Corrupt(
             "manifest segment geometry exceeds segment byte cap",
         ));
@@ -1112,16 +1115,22 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
                 "manifest id lies outside target domain",
             ));
         }
-        if descriptor.encoded_len as usize != expected_encoded_len {
-            return Err(SnapshotGenerationError::InvalidSegment(
-                descriptor.segment_id,
-                "manifest encoded length is noncanonical",
-            ));
-        }
         if live_count == 0 || live_count > segment_capacity {
             return Err(SnapshotGenerationError::InvalidSegment(
                 descriptor.segment_id,
                 "manifest live count is outside segment capacity",
+            ));
+        }
+        let expected_encoded_len =
+            encoded_segment_len_for_live_count(manifest.effective_log_segment_size, live_count)
+                .ok_or(SnapshotGenerationError::InvalidSegment(
+                    descriptor.segment_id,
+                    "manifest live count has invalid segment geometry",
+                ))?;
+        if descriptor.encoded_len as usize != expected_encoded_len {
+            return Err(SnapshotGenerationError::InvalidSegment(
+                descriptor.segment_id,
+                "manifest encoded length does not match live count",
             ));
         }
         counted_live = counted_live.checked_add(u64::from(live_count)).ok_or(
@@ -1571,7 +1580,7 @@ mod tests {
         assert_eq!(third.manifest().state_root, changed_root);
         assert_eq!(
             third.read_encoded_segment(0).unwrap().len(),
-            3 * (1 << 8) * 16 + 5
+            encoded_segment_len_for_live_count(8, 1).unwrap()
         );
 
         let mut bad_exact_metadata = third.manifest().clone();
@@ -1581,7 +1590,7 @@ mod tests {
             Err(SnapshotGenerationError::ExactStateRootMismatch)
         ));
         let mut bad_live_metadata = third.manifest().clone();
-        bad_live_metadata.segment_live_counts[0] += 1;
+        bad_live_metadata.active_slot_count += 1;
         assert!(matches!(
             validate_manifest(&bad_live_metadata),
             Err(SnapshotGenerationError::ActiveSlotCountMismatch { .. })

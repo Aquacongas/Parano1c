@@ -37,7 +37,7 @@ use crate::storage::serial::{
     decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
     encode_consensus_meta, encode_header, encode_header_chain_anchor, encode_segment,
     encode_segment_summary, encode_state_meta, encode_tx_index_value, encode_undo_log,
-    u64_from_key, u64_key,
+    encoded_segment_live_count_from_len, u64_from_key, u64_key,
 };
 use crate::storage::snapshot_staging::{FinalizedSnapshotStaging, SnapshotStagingError};
 
@@ -1026,6 +1026,47 @@ impl MdbxStore {
         let tbl = txn.open_table(Some(T_SEGMENTS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &seg_id.to_le_bytes())?;
         Ok(raw.and_then(|b| decode_segment(&b)))
+    }
+
+    /// Sum the exact canonical bytes stored in the current-state segment
+    /// table without materializing any payload value.
+    ///
+    /// The operation is O(non-empty segments), not O(slot capacity) or
+    /// O(live UTXOs): MDBX exposes each value's length directly.
+    pub fn encoded_state_bytes(&self) -> Result<u64, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let meta_table = txn.open_table(Some(T_STATE_META))?;
+        let meta_raw: Option<Vec<u8>> = txn.get(&meta_table, KEY_META)?;
+        let (log_slots, _, _) = meta_raw
+            .as_deref()
+            .and_then(decode_state_meta)
+            .ok_or(StoreError::Decode("state metadata is missing"))?;
+        let effective_log = log_slots.min(crate::fri_state::LOG_SEGMENT_SIZE as u32) as u8;
+
+        let segment_table = txn.open_table(Some(T_SEGMENTS))?;
+        let mut cursor = txn.cursor(&segment_table)?;
+        let mut total = 0u64;
+        let mut item: Option<(Vec<u8>, ObjectLength)> = cursor.first()?;
+        while let Some((key, ObjectLength(length))) = item {
+            if key.len() != 2 {
+                return Err(StoreError::Decode("invalid stored segment key"));
+            }
+            if encoded_segment_live_count_from_len(effective_log, length)
+                .is_none_or(|live_count| live_count == 0)
+            {
+                return Err(StoreError::Decode(
+                    "stored segment has noncanonical sparse length",
+                ));
+            }
+            total = total
+                .checked_add(
+                    u64::try_from(length)
+                        .map_err(|_| StoreError::Decode("stored segment length exceeds u64"))?,
+                )
+                .ok_or(StoreError::Decode("encoded state byte count overflows"))?;
+            item = cursor.next()?;
+        }
+        Ok(total)
     }
 
     /// Read one segment from the same MDBX snapshot that still names the
@@ -3026,6 +3067,50 @@ mod tests {
             )
             .unwrap();
         (state, header, hash)
+    }
+
+    #[test]
+    fn sparse_disk_carrier_defeats_one_utxo_per_segment_amplification() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, _) = commit_genesis(&store);
+        assert_eq!(genesis.log_slots, 24);
+
+        // This is the hostile placement pattern: one live slot in every one
+        // of the 256 genesis-domain segments. Only one dense working segment
+        // is needed to produce the canonical carrier reused by the fixture.
+        let mut columns = SegmentColumns::new_zero(1usize << 16);
+        let slot = SlotValue::from_parts(1, 1, Block128::from(2u128), Block128::from(3u128));
+        columns.values[0] = slot.value;
+        columns.owners_hi[0] = slot.owner_hi;
+        columns.owners_lo[0] = slot.owner_lo;
+        let encoded = encode_segment(&columns, 16);
+        assert_eq!(encoded.len(), 59);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let segments = txn.open_table(Some(T_SEGMENTS)).unwrap();
+        for segment_id in 0u16..=255 {
+            txn.put(
+                &segments,
+                segment_id.to_le_bytes(),
+                encoded.as_slice(),
+                WriteFlags::empty(),
+            )
+            .unwrap();
+        }
+        let state_meta = txn.open_table(Some(T_STATE_META)).unwrap();
+        txn.put(
+            &state_meta,
+            KEY_META,
+            encode_state_meta(24, 256, 256),
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(store.encoded_state_bytes().unwrap(), 256 * 59);
+        assert!(store.encoded_state_bytes().unwrap() < 16 * 1024);
+        assert_eq!(256u64 * 3 * (1u64 << 16) * 16, 768 * 1024 * 1024);
     }
 
     #[test]

@@ -339,12 +339,13 @@ pub struct StateInfo {
     pub expand_trigger_pct: u8,
     /// Maximum allowed log_slots (slot space cannot grow beyond 2^log_slots_max).
     pub log_slots_max: u32,
-    /// Raw on-disk bytes for currently non-empty dense segments. Virtual-zero
-    /// segments, including a newly added expansion half, consume no bytes.
+    /// Exact canonical sparse bytes in the current-state segment table.
+    /// Virtual-zero segments consume no bytes; MDBX page/index overhead is
+    /// deliberately excluded.
     pub state_bytes: u64,
-    /// Human-readable resident/raw/current-domain/protocol-limit breakdown.
-    /// Raw segment bytes intentionally exclude MDBX page and owner-index
-    /// overhead, which depend on the storage engine and workload.
+    /// Human-readable resident/encoded/current-domain/protocol-limit breakdown.
+    /// Encoded bytes exclude MDBX page and owner-index overhead, which depend
+    /// on the storage engine and workload.
     pub state_size_human: String,
 }
 

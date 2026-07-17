@@ -15,17 +15,17 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
     consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS},
-    storage::encoded_segment_len_for_eff_log,
+    storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
     LOG_SEGMENT_SIZE,
 };
 
 use crate::protocol::{GetStateManifestRequest, GetStateManifestResponse};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NMQ1";
-const RESPONSE_MAGIC: [u8; 4] = *b"NMF1";
+const REQUEST_MAGIC: [u8; 4] = *b"NMQ2";
+const RESPONSE_MAGIC: [u8; 4] = *b"NMF2";
 const REQUEST_BYTES: usize = 4 + 8;
 const RESPONSE_HEADER_BYTES: usize = 4 + 8 + 32 + 32 + 4 + 8 + 8 + 1 + 4;
-const SEGMENT_DESCRIPTOR_BYTES: usize = 2 + 32;
+const SEGMENT_DESCRIPTOR_BYTES: usize = 2 + 32 + 4;
 
 /// Fixed-framing state-manifest request/response codec.
 #[derive(Debug, Clone, Copy, Default)]
@@ -89,8 +89,18 @@ impl request_response::Codec for StateManifestCodec {
                     "manifest segment-root allocation failed",
                 )
             })?;
+        let mut segment_lengths = Vec::new();
+        segment_lengths
+            .try_reserve_exact(segment_count)
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    "manifest segment-length allocation failed",
+                )
+            })?;
 
         let mut previous = None;
+        let mut declared_live_count = 0u64;
         for _ in 0..segment_count {
             let mut descriptor = [0u8; SEGMENT_DESCRIPTOR_BYTES];
             io.read_exact(&mut descriptor).await?;
@@ -107,8 +117,20 @@ impl request_response::Codec for StateManifestCodec {
                 ));
             }
             previous = Some(segment_id);
+            let encoded_len =
+                u32::from_le_bytes(descriptor[34..38].try_into().expect("fixed segment length"));
+            let live_count = validate_descriptor_length(fields.eff_log, encoded_len)?;
+            declared_live_count = declared_live_count
+                .checked_add(u64::from(live_count))
+                .ok_or_else(|| invalid_data("manifest live-entry count overflows"))?;
             segment_ids.push(segment_id);
             segment_roots.push(descriptor[2..34].try_into().expect("fixed segment root"));
+            segment_lengths.push(encoded_len);
+        }
+        if declared_live_count != fields.active_slot_count {
+            return Err(invalid_data(
+                "manifest sparse lengths do not match active slot count",
+            ));
         }
 
         ensure_eof(io).await?;
@@ -123,6 +145,7 @@ impl request_response::Codec for StateManifestCodec {
             eff_log: fields.eff_log,
             segment_ids,
             segment_roots,
+            segment_lengths,
         })
     }
 
@@ -152,13 +175,20 @@ impl request_response::Codec for StateManifestCodec {
     {
         let mut fields = ResponseFields::from_response(&response)?;
         validate_response_fields(&mut fields)?;
-        if response.segment_ids.len() != response.segment_roots.len() {
+        if response.segment_ids.len() != response.segment_roots.len()
+            || response.segment_ids.len() != response.segment_lengths.len()
+        {
             return Err(invalid_data(
-                "manifest segment-id and segment-root counts differ",
+                "manifest segment descriptor vector counts differ",
             ));
         }
         let mut previous = None;
-        for &segment_id in &response.segment_ids {
+        let mut declared_live_count = 0u64;
+        for (&segment_id, &encoded_len) in response
+            .segment_ids
+            .iter()
+            .zip(response.segment_lengths.iter())
+        {
             if previous.is_some_and(|previous| segment_id <= previous) {
                 return Err(invalid_data(
                     "manifest segment ids are not strictly increasing",
@@ -170,16 +200,29 @@ impl request_response::Codec for StateManifestCodec {
                 ));
             }
             previous = Some(segment_id);
+            let live_count = validate_descriptor_length(fields.eff_log, encoded_len)?;
+            declared_live_count = declared_live_count
+                .checked_add(u64::from(live_count))
+                .ok_or_else(|| invalid_data("manifest live-entry count overflows"))?;
+        }
+        if declared_live_count != fields.active_slot_count {
+            return Err(invalid_data(
+                "manifest sparse lengths do not match active slot count",
+            ));
         }
         // Validate every variable field before emitting the fixed header so an
         // invalid local response cannot create an ambiguous partial frame.
         let header = encode_response_header(&fields);
         io.write_all(&header).await?;
-        for (segment_id, segment_root) in
-            response.segment_ids.into_iter().zip(response.segment_roots)
+        for ((segment_id, segment_root), encoded_len) in response
+            .segment_ids
+            .into_iter()
+            .zip(response.segment_roots)
+            .zip(response.segment_lengths)
         {
             io.write_all(&segment_id.to_le_bytes()).await?;
             io.write_all(&segment_root).await?;
+            io.write_all(&encoded_len.to_le_bytes()).await?;
         }
         Ok(())
     }
@@ -280,10 +323,11 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
             "manifest effective segment log is noncanonical",
         ));
     }
-    let Some(encoded_segment_len) = encoded_segment_len_for_eff_log(fields.eff_log) else {
+    let Some(maximum_encoded_segment_len) = max_encoded_segment_len_for_eff_log(fields.eff_log)
+    else {
         return Err(invalid_data("manifest effective segment log is invalid"));
     };
-    if encoded_segment_len > MAX_SEGMENT_BYTES {
+    if maximum_encoded_segment_len > MAX_SEGMENT_BYTES {
         return Err(invalid_data("manifest segment geometry exceeds wire cap"));
     }
     let segment_bits = fields.log_slots - u32::from(fields.eff_log);
@@ -309,6 +353,21 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
         .checked_mul(SEGMENT_DESCRIPTOR_BYTES)
         .ok_or_else(|| invalid_data("manifest payload length overflows"))?;
     Ok(())
+}
+
+fn validate_descriptor_length(eff_log: u8, encoded_len: u32) -> io::Result<u32> {
+    let encoded_len = encoded_len as usize;
+    if encoded_len > MAX_SEGMENT_BYTES {
+        return Err(invalid_data("manifest segment length exceeds wire cap"));
+    }
+    let live_count = encoded_segment_live_count_from_len(eff_log, encoded_len)
+        .ok_or_else(|| invalid_data("manifest segment length is not canonical sparse framing"))?;
+    if live_count == 0 {
+        return Err(invalid_data(
+            "manifest advertises an empty segment descriptor",
+        ));
+    }
+    Ok(live_count)
 }
 
 fn encode_response_header(fields: &ResponseFields) -> [u8; RESPONSE_HEADER_BYTES] {
@@ -345,7 +404,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/manifest/1")
+        StreamProtocol::new("/noid/test/sync/manifest/2")
     }
 
     fn populated_response() -> GetStateManifestResponse {
@@ -359,6 +418,7 @@ mod tests {
             eff_log: 16,
             segment_ids: vec![0, 1],
             segment_roots: vec![[0x33; 32], [0x44; 32]],
+            segment_lengths: vec![209, 259],
         }
     }
 
@@ -435,6 +495,7 @@ mod tests {
         assert_eq!(decoded.cumulative_chainwork, [0x22; 32]);
         assert_eq!(decoded.segment_ids, vec![0, 1]);
         assert_eq!(decoded.segment_roots, vec![[0x33; 32], [0x44; 32]]);
+        assert_eq!(decoded.segment_lengths, vec![209, 259]);
     }
 
     #[tokio::test]
@@ -491,9 +552,10 @@ mod tests {
     async fn descriptor_ids_must_be_sorted_and_in_domain() {
         let fields = valid_fields();
         let mut wire = response_header(fields);
-        for (id, root) in [(1u16, [1u8; 32]), (0, [2u8; 32])] {
+        for (id, root, encoded_len) in [(1u16, [1u8; 32], 209u32), (0, [2u8; 32], 259u32)] {
             wire.extend_from_slice(&id.to_le_bytes());
             wire.extend_from_slice(&root);
+            wire.extend_from_slice(&encoded_len.to_le_bytes());
         }
         let error = StateManifestCodec
             .read_response(&protocol(), &mut Cursor::new(wire))
@@ -528,6 +590,26 @@ mod tests {
     async fn writer_validates_all_vectors_before_partial_output() {
         let mut response = populated_response();
         response.segment_ids.swap(0, 1);
+        let mut wire = Cursor::new(Vec::new());
+        let error = StateManifestCodec
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(wire.get_ref().is_empty());
+
+        let mut response = populated_response();
+        response.segment_lengths[0] += 1;
+        let mut wire = Cursor::new(Vec::new());
+        let error = StateManifestCodec
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(wire.get_ref().is_empty());
+
+        let mut response = populated_response();
+        response.segment_lengths.pop();
         let mut wire = Cursor::new(Vec::new());
         let error = StateManifestCodec
             .write_response(&protocol(), &mut wire, response)

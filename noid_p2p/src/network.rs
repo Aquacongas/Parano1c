@@ -24,7 +24,9 @@ use noid_chain::consensus::wire_limits::{
     MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS,
     MAX_TX_INTENT_BYTES_GLOBAL,
 };
-use noid_chain::storage::{encoded_segment_len_for_eff_log, MdbxChainContext};
+use noid_chain::storage::{
+    encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log, MdbxChainContext,
+};
 use noid_chain::storage::{
     export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,
 };
@@ -2180,6 +2182,11 @@ async fn handle_swarm_event(
                     .iter()
                     .map(|descriptor| descriptor.segment_root)
                     .collect();
+                let segment_lengths = manifest
+                    .segments
+                    .iter()
+                    .map(|descriptor| descriptor.encoded_len)
+                    .collect();
                 tracing::info!(
                     requester_height = request.requester_height,
                     snapshot_height,
@@ -2196,6 +2203,7 @@ async fn handle_swarm_event(
                     eff_log: manifest.effective_log_segment_size,
                     segment_ids,
                     segment_roots,
+                    segment_lengths,
                 }
             };
             let _ = swarm
@@ -2212,8 +2220,10 @@ async fn handle_swarm_event(
             },
         )) => {
             if response.tip_height > 0 {
-                if response.segment_ids.len() != response.segment_roots.len() {
-                    tracing::warn!(from = %peer, "manifest: segment_ids/segment_roots length mismatch, dropping");
+                if response.segment_ids.len() != response.segment_roots.len()
+                    || response.segment_ids.len() != response.segment_lengths.len()
+                {
+                    tracing::warn!(from = %peer, "manifest: descriptor vector length mismatch, dropping");
                     return;
                 }
                 if !response.segment_ids.windows(2).all(|w| w[0] < w[1]) {
@@ -2242,20 +2252,42 @@ async fn handle_swarm_event(
                     );
                     return;
                 }
-                let Some(expected_segment_bytes) =
-                    encoded_segment_len_for_eff_log(response.eff_log)
+                let Some(maximum_segment_bytes) =
+                    max_encoded_segment_len_for_eff_log(response.eff_log)
                 else {
                     tracing::warn!(from = %peer, eff_log = response.eff_log, "manifest: invalid effective segment log, dropping");
                     return;
                 };
-                if expected_segment_bytes > MAX_SEGMENT_BYTES {
+                if maximum_segment_bytes > MAX_SEGMENT_BYTES {
                     tracing::warn!(
                         from = %peer,
                         eff_log = response.eff_log,
-                        expected_segment_bytes,
+                        maximum_segment_bytes,
                         max_segment = MAX_SEGMENT_BYTES,
                         "manifest: segment encoding exceeds per-segment cap, dropping"
                     );
+                    return;
+                }
+                let mut declared_live_count = 0u64;
+                for &encoded_len in &response.segment_lengths {
+                    let Some(live_count) =
+                        encoded_segment_live_count_from_len(response.eff_log, encoded_len as usize)
+                    else {
+                        tracing::warn!(from = %peer, encoded_len, "manifest: non-canonical sparse segment length, dropping");
+                        return;
+                    };
+                    if live_count == 0 {
+                        tracing::warn!(from = %peer, "manifest: empty segment descriptor, dropping");
+                        return;
+                    }
+                    let Some(next) = declared_live_count.checked_add(u64::from(live_count)) else {
+                        tracing::warn!(from = %peer, "manifest: live-entry count overflow, dropping");
+                        return;
+                    };
+                    declared_live_count = next;
+                }
+                if declared_live_count != response.active_slot_count {
+                    tracing::warn!(from = %peer, declared_live_count, active_slot_count = response.active_slot_count, "manifest: sparse lengths disagree with active count, dropping");
                     return;
                 }
                 tracing::info!(
@@ -2340,9 +2372,11 @@ async fn handle_swarm_event(
                 return;
             };
             let effective_log = export.manifest().effective_log_segment_size;
-            let expected_len = encoded_segment_len_for_eff_log(effective_log);
             let declared_len = descriptor.encoded_len as usize;
-            if expected_len != Some(declared_len) || declared_len > MAX_SEGMENT_BYTES {
+            if declared_len > MAX_SEGMENT_BYTES
+                || encoded_segment_live_count_from_len(effective_log, declared_len)
+                    .is_none_or(|live_count| live_count == 0)
+            {
                 tracing::warn!(
                     segment = descriptor.segment_id,
                     declared_len,
@@ -2447,18 +2481,21 @@ async fn handle_swarm_event(
                 return;
             }
             if let Some(ref data) = response.data {
-                let Some(expected_len) = encoded_segment_len_for_eff_log(response.eff_log) else {
+                let Some(maximum_len) = max_encoded_segment_len_for_eff_log(response.eff_log)
+                else {
                     tracing::warn!(peer = %peer, segment = response.segment_id, eff_log = response.eff_log, "segment response has invalid effective segment log — dropped");
                     fail_peer!(pending.peer);
                     return;
                 };
-                if data.len() != expected_len {
+                if maximum_len > MAX_SEGMENT_BYTES
+                    || encoded_segment_live_count_from_len(response.eff_log, data.len())
+                        .is_none_or(|live_count| live_count == 0)
+                {
                     tracing::warn!(
                         peer = %peer,
                         segment = response.segment_id,
                         len = data.len(),
-                        expected = expected_len,
-                        "segment response encoded length mismatch — dropped"
+                        "segment response has non-canonical sparse length — dropped"
                     );
                     fail_peer!(pending.peer);
                     return;

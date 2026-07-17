@@ -13,8 +13,12 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
-    consensus::wire_limits::MAX_SEGMENT_BYTES, storage::encoded_segment_len_for_eff_log,
+    consensus::wire_limits::MAX_SEGMENT_BYTES,
+    storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
 };
+
+#[cfg(test)]
+use noid_chain::storage::encoded_segment_len_for_live_count;
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
@@ -22,8 +26,8 @@ use crate::{
     protocol::{GetStateSegmentRequest, GetStateSegmentResponse},
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"NSR3";
-const RESPONSE_MAGIC: [u8; 4] = *b"NSS3";
+const REQUEST_MAGIC: [u8; 4] = *b"NSR4";
+const RESPONSE_MAGIC: [u8; 4] = *b"NSS4";
 const REQUEST_HEADER_BYTES: usize = 48;
 const RESPONSE_HEADER_BYTES: usize = 52;
 const NONE_LEN: u32 = u32::MAX;
@@ -251,11 +255,14 @@ fn validate_response_length(eff_log: u8, encoded_len: u32) -> io::Result<()> {
     if len > MAX_SEGMENT_BYTES {
         return Err(invalid_data("declared state segment exceeds wire cap"));
     }
-    let expected = encoded_segment_len_for_eff_log(eff_log)
+    let maximum = max_encoded_segment_len_for_eff_log(eff_log)
         .ok_or_else(|| invalid_data("invalid state-segment effective log"))?;
-    if len != expected {
+    if maximum > MAX_SEGMENT_BYTES {
+        return Err(invalid_data("state-segment geometry exceeds wire cap"));
+    }
+    if encoded_segment_live_count_from_len(eff_log, len).is_none_or(|live_count| live_count == 0) {
         return Err(invalid_data(
-            "declared state-segment length is not canonical",
+            "declared state-segment length is not canonical sparse framing",
         ));
     }
     Ok(())
@@ -307,7 +314,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/segment/3")
+        StreamProtocol::new("/noid/test/sync/segment/4")
     }
 
     fn response_header(eff_log: u8, encoded_len: u32) -> Vec<u8> {
@@ -392,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_streams_one_canonical_segment() {
-        let len = encoded_segment_len_for_eff_log(10).unwrap();
+        let len = encoded_segment_len_for_live_count(10, 3).unwrap();
         let response = GetStateSegmentResponse {
             segment_id: 7,
             expected_tip_height: 77,
@@ -421,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn malicious_length_is_rejected_before_payload_read_or_allocation() {
-        let declared = encoded_segment_len_for_eff_log(16).unwrap() + 1;
+        let declared = max_encoded_segment_len_for_eff_log(16).unwrap() + 1;
         let error = StateSegmentCodec::default()
             .read_response(
                 &protocol(),
@@ -431,11 +438,22 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("not canonical"));
+
+        let empty_sparse_len = encoded_segment_len_for_live_count(16, 0).unwrap();
+        let error = StateSegmentCodec::default()
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(response_header(16, empty_sparse_len as u32)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not canonical"));
     }
 
     #[tokio::test]
     async fn inbound_budget_blocks_second_segment_until_first_is_consumed() {
-        let len = encoded_segment_len_for_eff_log(6).unwrap();
+        let len = encoded_segment_len_for_live_count(6, 3).unwrap();
         let codec = StateSegmentCodec::with_inbound_budget(len);
         let mut first_wire = response_header(6, len as u32);
         first_wire.extend(std::iter::repeat_n(1u8, len));
@@ -466,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn outbound_permit_lives_until_codec_write_completes() {
-        let len = encoded_segment_len_for_eff_log(6).unwrap();
+        let len = encoded_segment_len_for_live_count(6, 3).unwrap();
         let budget = OutboundResponseBudget::with_capacity(len);
         let permit = budget.acquire(len).await.unwrap().unwrap();
         let response = GetStateSegmentResponse {

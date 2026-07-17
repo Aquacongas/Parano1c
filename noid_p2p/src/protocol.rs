@@ -138,7 +138,7 @@ pub struct GetStateManifestResponse {
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
-    /// Effective log segment size (determines each segment's data size).
+    /// Effective log segment size (determines each segment's slot capacity).
     pub eff_log: u8,
     /// IDs of all non-empty state segments.  Each must be fetched individually.
     pub segment_ids: Vec<u16>,
@@ -146,6 +146,9 @@ pub struct GetStateManifestResponse {
     /// downloaded payloads; after decoding, the receiver independently rebuilds
     /// the exact sparse UTXO root and compares it with the tip header.
     pub segment_roots: Vec<[u8; 32]>,
+    /// Canonical sparse payload lengths aligned with `segment_ids`. The length
+    /// commits the number of live entries before any payload allocation.
+    pub segment_lengths: Vec<u32>,
 }
 
 // ---------------------------------------------------------------------------

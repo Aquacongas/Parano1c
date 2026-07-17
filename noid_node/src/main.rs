@@ -48,7 +48,8 @@ use noid_chain::storage::snapshot_staging::{
     AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingSession,
 };
 use noid_chain::storage::{
-    encoded_segment_len_for_eff_log, MdbxChainContext, SnapshotSegmentDescriptor,
+    encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log, MdbxChainContext,
+    SnapshotSegmentDescriptor,
 };
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
@@ -3799,12 +3800,15 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
-                    if manifest.segment_ids.len() != manifest.segment_roots.len() {
+                    if manifest.segment_ids.len() != manifest.segment_roots.len()
+                        || manifest.segment_ids.len() != manifest.segment_lengths.len()
+                    {
                         tracing::warn!(
                             from = %from,
                             ids = manifest.segment_ids.len(),
                             roots = manifest.segment_roots.len(),
-                            "manifest segment_ids/segment_roots length mismatch — dropping"
+                            lengths = manifest.segment_lengths.len(),
+                            "manifest descriptor vector length mismatch — dropping"
                         );
                         continue;
                     }
@@ -3827,8 +3831,8 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
-                    let Some(expected_segment_bytes) =
-                        encoded_segment_len_for_eff_log(manifest.eff_log)
+                    let Some(maximum_segment_bytes) =
+                        max_encoded_segment_len_for_eff_log(manifest.eff_log)
                     else {
                         tracing::warn!(
                             from = %from,
@@ -3837,13 +3841,46 @@ async fn handle_p2p_events(
                         );
                         continue;
                     };
-                    if expected_segment_bytes > MAX_SEGMENT_BYTES {
+                    if maximum_segment_bytes > MAX_SEGMENT_BYTES {
                         tracing::warn!(
                             from = %from,
                             eff_log = manifest.eff_log,
-                            expected_segment_bytes,
+                            maximum_segment_bytes,
                             max_segment = MAX_SEGMENT_BYTES,
                             "manifest segment encoding exceeds per-segment cap — dropping"
+                        );
+                        continue;
+                    }
+                    let mut declared_live_count = 0u64;
+                    let mut sparse_lengths_valid = true;
+                    for &encoded_len in &manifest.segment_lengths {
+                        let Some(live_count) = encoded_segment_live_count_from_len(
+                            manifest.eff_log,
+                            encoded_len as usize,
+                        ) else {
+                            sparse_lengths_valid = false;
+                            break;
+                        };
+                        if live_count == 0 {
+                            sparse_lengths_valid = false;
+                            break;
+                        }
+                        let Some(next) =
+                            declared_live_count.checked_add(u64::from(live_count))
+                        else {
+                            sparse_lengths_valid = false;
+                            break;
+                        };
+                        declared_live_count = next;
+                    }
+                    if !sparse_lengths_valid
+                        || declared_live_count != manifest.active_slot_count
+                    {
+                        tracing::warn!(
+                            from = %from,
+                            declared_live_count,
+                            active_slot_count = manifest.active_slot_count,
+                            "manifest sparse lengths are noncanonical or disagree with active count — dropping"
                         );
                         continue;
                     }
@@ -5090,20 +5127,24 @@ fn create_snapshot_staging_session(
         manifest.eff_log,
     )
     .map_err(|error| format!("snapshot staging metadata rejected: {error}"))?;
-    let encoded_len = encoded_segment_len_for_eff_log(manifest.eff_log)
-        .ok_or_else(|| "snapshot manifest effective segment log is invalid".to_owned())?;
-    let encoded_len = u32::try_from(encoded_len)
-        .map_err(|_| "snapshot segment encoding length does not fit u32".to_owned())?;
+    if manifest.segment_ids.len() != manifest.segment_roots.len()
+        || manifest.segment_ids.len() != manifest.segment_lengths.len()
+    {
+        return Err("snapshot manifest descriptor vectors are not parallel".into());
+    }
     let descriptors = manifest
         .segment_ids
         .iter()
         .copied()
         .zip(manifest.segment_roots.iter().copied())
-        .map(|(segment_id, segment_root)| SnapshotSegmentDescriptor {
-            segment_id,
-            segment_root,
-            encoded_len,
-        })
+        .zip(manifest.segment_lengths.iter().copied())
+        .map(
+            |((segment_id, segment_root), encoded_len)| SnapshotSegmentDescriptor {
+                segment_id,
+                segment_root,
+                encoded_len,
+            },
+        )
         .collect();
     SnapshotStagingSession::new(staging_root, metadata, descriptors)
         .map_err(|error| format!("snapshot staging session creation failed: {error}"))

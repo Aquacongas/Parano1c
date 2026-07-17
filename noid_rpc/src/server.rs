@@ -1134,29 +1134,35 @@ impl ParanoidApiServer for RpcHandler {
         // Populated = segments with at least one live UTXO. Fully-empty touched
         // segments are dematerialised and excluded from RAM, disk, and snapshots.
         let materialized_in_ram = chain.state.state.materialized_segment_ids().count();
-        let nonempty_segments = chain.state.state.active_segment_ids().count();
-
-        // Per-segment on-disk size:
+        // Per-materialized-segment RAM size:
         //   3 columns (values, owners_hi, owners_lo)
         //   × 2^LOG_SEGMENT_SIZE slots
         //   × 16 bytes per Block128
         // = 3 × 65536 × 16 = 3,145,728 bytes = 3 MB
         let seg_size_bytes: u64 = 3 * (1u64 << LOG_SEGMENT_SIZE) * 16;
 
-        // Actual current footprint = only segments that have been written.
-        // Virtual-zero segments cost nothing until their first UTXO lands.
+        // RAM is still materialized densely while a segment is hot. Durable
+        // state and snapshots use canonical sparse records instead.
         let state_bytes_ram = (materialized_in_ram as u64).saturating_mul(seg_size_bytes);
-        let state_bytes_disk = (nonempty_segments as u64).saturating_mul(seg_size_bytes);
+        let state_bytes_disk = chain
+            .store
+            .encoded_state_bytes()
+            .map_err(|error| rpc_err(error.to_string()))?;
         // Theoretical maxima are deliberately reported separately.  The
         // current slot domain grows at the consensus expansion boundary, so
         // its fully-materialised size is not the lifetime protocol ceiling.
-        let state_bytes_current_domain_max = (num_segments as u64).saturating_mul(seg_size_bytes);
+        let max_encoded_segment_bytes =
+            noid_chain::storage::max_encoded_segment_len_for_eff_log(LOG_SEGMENT_SIZE as u8)
+                .unwrap_or(usize::MAX) as u64;
+        let state_bytes_current_domain_max =
+            (num_segments as u64).saturating_mul(max_encoded_segment_bytes);
         let protocol_num_segments = if LOG_SLOTS_MAX as usize > LOG_SEGMENT_SIZE {
             1u64 << (LOG_SLOTS_MAX as usize - LOG_SEGMENT_SIZE)
         } else {
             1
         };
-        let state_bytes_protocol_max = protocol_num_segments.saturating_mul(seg_size_bytes);
+        let state_bytes_protocol_max =
+            protocol_num_segments.saturating_mul(max_encoded_segment_bytes);
 
         let fill_pct = if capacity > 0 {
             (active as f64 / capacity as f64 * 10000.0).round() / 100.0
@@ -1181,7 +1187,7 @@ impl ParanoidApiServer for RpcHandler {
             // Real current size (non-zero segments only)
             state_bytes: state_bytes_disk,
             state_size_human: format!(
-                "{} RAM  /  {} raw disk  /  {} at 2^{}  /  {} protocol max",
+                "{} materialized RAM  /  {} encoded state  /  {} encoded at 2^{}  /  {} encoded protocol max",
                 human_bytes(state_bytes_ram),
                 human_bytes(state_bytes_disk),
                 human_bytes(state_bytes_current_domain_max),

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Canonical byte serialization for MDBX-persisted chain data .
+//! Canonical byte serialization for MDBX-persisted chain data.
 //!
 //! All formats are little-endian, fixed-width where possible.
 //! These are NOT network formats — they are storage-internal and may evolve
@@ -250,101 +250,151 @@ pub fn decode_undo_log(bytes: &[u8]) -> Option<BlockUndoLog> {
 // SegmentColumns
 // ---------------------------------------------------------------------------
 //
-// Wire format:
-//   effective_log_seg : u8          (1 byte)
-//   n_elems           : u32 LE      (4 bytes) = 2^effective_log_seg
-//   values            : n_elems × 16 bytes
-//   owners_hi         : n_elems × 16 bytes
-//   owners_lo         : n_elems × 16 bytes
+// Sparse V1 format:
+//   magic             : "SGS1"       (4 bytes)
+//   effective_log_seg : u8            (1 byte)
+//   live_count        : u32 LE        (4 bytes)
+//   [local_index      : u16 LE        (2 bytes)
+//    slot_value       : 3 × 16 bytes (48 bytes)] × live_count
+//
+// Entries are strictly increasing and never encode an empty slot. A segment
+// with one live UTXO is therefore 59 bytes instead of 3 MiB. Even a completely
+// full 2^16-slot segment stays below 3.13 MiB, only ~4% above raw columns.
 
-pub const ENCODED_SEGMENT_HEADER_BYTES: usize = 5;
+pub const SEGMENT_ENCODING_MAGIC: [u8; 4] = *b"SGS1";
+pub const ENCODED_SEGMENT_HEADER_BYTES: usize = 9;
+pub const ENCODED_SEGMENT_INDEX_BYTES: usize = 2;
 pub const SEGMENT_LANE_COUNT: usize = 3;
 pub const SEGMENT_FIELD_BYTES: usize = 16;
-pub const ENCODED_SEGMENT_SLOT_BYTES: usize = SEGMENT_LANE_COUNT * SEGMENT_FIELD_BYTES;
+pub const ENCODED_SEGMENT_SLOT_VALUE_BYTES: usize = SEGMENT_LANE_COUNT * SEGMENT_FIELD_BYTES;
+pub const ENCODED_SEGMENT_ENTRY_BYTES: usize =
+    ENCODED_SEGMENT_INDEX_BYTES + ENCODED_SEGMENT_SLOT_VALUE_BYTES;
 
 #[inline]
-pub fn encoded_segment_len_for_eff_log(effective_log_seg: u8) -> Option<usize> {
-    if effective_log_seg as u32 >= usize::BITS {
+pub fn encoded_segment_len_for_live_count(effective_log_seg: u8, live_count: u32) -> Option<usize> {
+    if effective_log_seg > 16 || effective_log_seg as u32 >= usize::BITS {
         return None;
     }
-    let n = 1usize.checked_shl(effective_log_seg as u32)?;
-    ENCODED_SEGMENT_HEADER_BYTES.checked_add(n.checked_mul(ENCODED_SEGMENT_SLOT_BYTES)?)
+    let capacity = 1usize.checked_shl(effective_log_seg as u32)?;
+    let live_count = usize::try_from(live_count).ok()?;
+    if live_count > capacity {
+        return None;
+    }
+    ENCODED_SEGMENT_HEADER_BYTES.checked_add(live_count.checked_mul(ENCODED_SEGMENT_ENTRY_BYTES)?)
+}
+
+/// Recover the live-entry count from a canonical sparse segment length.
+///
+/// This validates only the public framing geometry. `decode_segment` also
+/// validates the embedded count, entry ordering and non-empty slot values.
+#[inline]
+pub fn encoded_segment_live_count_from_len(
+    effective_log_seg: u8,
+    encoded_len: usize,
+) -> Option<u32> {
+    let payload_len = encoded_len.checked_sub(ENCODED_SEGMENT_HEADER_BYTES)?;
+    if payload_len % ENCODED_SEGMENT_ENTRY_BYTES != 0 {
+        return None;
+    }
+    let live_count = u32::try_from(payload_len / ENCODED_SEGMENT_ENTRY_BYTES).ok()?;
+    (encoded_segment_len_for_live_count(effective_log_seg, live_count)? == encoded_len)
+        .then_some(live_count)
 }
 
 #[inline]
-pub fn encoded_segments_total_len(segment_count: usize, effective_log_seg: u8) -> Option<usize> {
-    segment_count.checked_mul(encoded_segment_len_for_eff_log(effective_log_seg)?)
+pub fn max_encoded_segment_len_for_eff_log(effective_log_seg: u8) -> Option<usize> {
+    let capacity = 1usize.checked_shl(effective_log_seg as u32)?;
+    encoded_segment_len_for_live_count(effective_log_seg, u32::try_from(capacity).ok()?)
+}
+
+#[inline]
+pub fn max_encoded_segments_total_len(
+    segment_count: usize,
+    effective_log_seg: u8,
+) -> Option<usize> {
+    segment_count.checked_mul(max_encoded_segment_len_for_eff_log(effective_log_seg)?)
 }
 
 pub fn encode_segment(seg: &SegmentColumns, effective_log_seg: u8) -> Vec<u8> {
     let n = seg.values.len();
     debug_assert_eq!(n, seg.owners_hi.len());
     debug_assert_eq!(n, seg.owners_lo.len());
-    let mut buf =
-        Vec::with_capacity(encoded_segment_len_for_eff_log(effective_log_seg).unwrap_or(0));
+    debug_assert_eq!(n, 1usize << effective_log_seg);
+    let live_count = (0..n)
+        .filter(|&index| {
+            !(SlotValue {
+                value: seg.values[index],
+                owner_hi: seg.owners_hi[index],
+                owner_lo: seg.owners_lo[index],
+            })
+            .is_empty()
+        })
+        .count();
+    let live_count = u32::try_from(live_count).expect("segment live count fits u32");
+    let mut buf = Vec::with_capacity(
+        encoded_segment_len_for_live_count(effective_log_seg, live_count).unwrap_or(0),
+    );
+    buf.extend_from_slice(&SEGMENT_ENCODING_MAGIC);
     buf.push(effective_log_seg);
-    buf.extend_from_slice(&(n as u32).to_le_bytes());
-    for b in &seg.values {
-        buf.extend_from_slice(&encode_b128(b));
+    buf.extend_from_slice(&live_count.to_le_bytes());
+    for index in 0..n {
+        let slot = SlotValue {
+            value: seg.values[index],
+            owner_hi: seg.owners_hi[index],
+            owner_lo: seg.owners_lo[index],
+        };
+        if slot.is_empty() {
+            continue;
+        }
+        buf.extend_from_slice(&(index as u16).to_le_bytes());
+        buf.extend_from_slice(&encode_slot_value(&slot));
     }
-    for b in &seg.owners_hi {
-        buf.extend_from_slice(&encode_b128(b));
-    }
-    for b in &seg.owners_lo {
-        buf.extend_from_slice(&encode_b128(b));
-    }
+    debug_assert_eq!(
+        buf.len(),
+        encoded_segment_len_for_live_count(effective_log_seg, live_count).unwrap_or(0)
+    );
     buf
 }
 
 /// Returns `(effective_log_seg, SegmentColumns)`.
 pub fn decode_segment(bytes: &[u8]) -> Option<(u8, SegmentColumns)> {
-    if bytes.len() < 5 {
+    if bytes.len() < ENCODED_SEGMENT_HEADER_BYTES || bytes[..4] != SEGMENT_ENCODING_MAGIC {
         return None;
     }
-    let effective_log_seg = bytes[0];
-    let n = u32::from_le_bytes(bytes[1..5].try_into().ok()?) as usize;
-    if effective_log_seg as usize >= usize::BITS as usize {
+    let effective_log_seg = bytes[4];
+    if effective_log_seg > 16 || effective_log_seg as u32 >= usize::BITS {
         return None;
     }
-    if n != (1usize << effective_log_seg) {
+    let live_count = u32::from_le_bytes(bytes[5..9].try_into().ok()?);
+    let expected_len = encoded_segment_len_for_live_count(effective_log_seg, live_count)?;
+    if bytes.len() != expected_len {
         return None;
     }
-    let values_end = 5usize.checked_add(n.checked_mul(16)?)?;
-    let hi_end = values_end.checked_add(n.checked_mul(16)?)?;
-    let lo_end = hi_end.checked_add(n.checked_mul(16)?)?;
-    if bytes.len() != lo_end {
-        return None;
+    let capacity = 1usize << effective_log_seg;
+    let mut columns = SegmentColumns::new_zero(capacity);
+    let mut previous = None;
+    let mut offset = ENCODED_SEGMENT_HEADER_BYTES;
+    for _ in 0..live_count {
+        let local_index = u16::from_le_bytes(bytes[offset..offset + 2].try_into().ok()?);
+        if usize::from(local_index) >= capacity
+            || previous.is_some_and(|previous| local_index <= previous)
+        {
+            return None;
+        }
+        offset += ENCODED_SEGMENT_INDEX_BYTES;
+        let slot = decode_slot_value(&bytes[offset..offset + ENCODED_SEGMENT_SLOT_VALUE_BYTES])?;
+        if slot.is_empty() {
+            return None;
+        }
+        let local = usize::from(local_index);
+        columns.values[local] = slot.value;
+        columns.owners_hi[local] = slot.owner_hi;
+        columns.owners_lo[local] = slot.owner_lo;
+        previous = Some(local_index);
+        offset += ENCODED_SEGMENT_SLOT_VALUE_BYTES;
     }
-    // Bounds are already verified above (bytes.len() >= lo_end), so unwrap is safe.
-    let values = (0..n)
-        .map(|i| decode_b128(bytes[5 + i * 16..5 + i * 16 + 16].try_into().unwrap()))
-        .collect::<Vec<_>>();
-    let owners_hi = (0..n)
-        .map(|i| {
-            decode_b128(
-                bytes[values_end + i * 16..values_end + i * 16 + 16]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let owners_lo = (0..n)
-        .map(|i| {
-            decode_b128(
-                bytes[hi_end + i * 16..hi_end + i * 16 + 16]
-                    .try_into()
-                    .unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    Some((
-        effective_log_seg,
-        SegmentColumns {
-            values,
-            owners_hi,
-            owners_lo,
-        },
-    ))
+    debug_assert_eq!(offset, bytes.len());
+    Some((effective_log_seg, columns))
 }
 
 // ---------------------------------------------------------------------------
@@ -656,22 +706,28 @@ mod tests {
     }
 
     #[test]
-    fn encoded_segment_size_matches_snapshot_caps() {
+    fn sparse_encoded_segment_size_matches_snapshot_caps() {
         use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
 
-        assert_eq!(encoded_segment_len_for_eff_log(16), Some(3_145_733));
-        assert!(encoded_segment_len_for_eff_log(16).unwrap() <= MAX_SEGMENT_BYTES);
+        assert_eq!(encoded_segment_len_for_live_count(16, 0), Some(9));
+        assert_eq!(encoded_segment_len_for_live_count(16, 1), Some(59));
+        assert_eq!(encoded_segment_live_count_from_len(16, 9), Some(0));
+        assert_eq!(encoded_segment_live_count_from_len(16, 59), Some(1));
+        assert_eq!(encoded_segment_live_count_from_len(16, 60), None);
+        assert_eq!(max_encoded_segment_len_for_eff_log(16), Some(3_276_809));
+        assert!(max_encoded_segment_len_for_eff_log(16).unwrap() <= MAX_SEGMENT_BYTES);
         assert_eq!(MAX_SNAPSHOT_MANIFEST_SEGMENTS, u16::MAX as usize + 1);
         assert_eq!(
-            encoded_segments_total_len(MAX_SNAPSHOT_MANIFEST_SEGMENTS, 16),
-            Some(206_158_757_888)
+            max_encoded_segments_total_len(MAX_SNAPSHOT_MANIFEST_SEGMENTS, 16),
+            Some(214_748_954_624)
         );
     }
 
     #[test]
     fn encoded_segment_size_rejects_impossible_logs() {
-        assert_eq!(encoded_segment_len_for_eff_log(usize::BITS as u8), None);
-        assert_eq!(encoded_segments_total_len(usize::MAX, 16), None);
+        assert_eq!(max_encoded_segment_len_for_eff_log(17), None);
+        assert_eq!(encoded_segment_len_for_live_count(16, 65_537), None);
+        assert_eq!(max_encoded_segments_total_len(usize::MAX, 16), None);
     }
 
     #[test]
@@ -685,13 +741,42 @@ mod tests {
                 Block128::ZERO,
             ],
             owners_hi: vec![Block128::ZERO; 4],
-            owners_lo: vec![Block128::ONE; 4],
+            owners_lo: vec![Block128::ZERO; 4],
         };
         let bytes = encode_segment(&seg, 2);
+        assert_eq!(
+            bytes.len(),
+            3 * ENCODED_SEGMENT_ENTRY_BYTES + ENCODED_SEGMENT_HEADER_BYTES
+        );
         let (els, seg2) = decode_segment(&bytes).expect("decode");
         assert_eq!(els, 2);
         assert_eq!(seg2.values.len(), 4);
         assert_eq!(seg2.values[0], Block128::from(1u128));
-        assert_eq!(seg2.owners_lo[0], Block128::ONE);
+        assert_eq!(seg2.owners_lo[0], Block128::ZERO);
+        assert_eq!(seg2.values, seg.values);
+        assert_eq!(seg2.owners_hi, seg.owners_hi);
+        assert_eq!(seg2.owners_lo, seg.owners_lo);
+    }
+
+    #[test]
+    fn sparse_segment_rejects_noncanonical_entries() {
+        let mut seg = SegmentColumns::new_zero(4);
+        seg.values[1] = Block128::ONE;
+        seg.values[3] = Block128::from(2u128);
+        let canonical = encode_segment(&seg, 2);
+
+        let mut duplicate = canonical.clone();
+        let second_index = ENCODED_SEGMENT_HEADER_BYTES + ENCODED_SEGMENT_ENTRY_BYTES;
+        duplicate[second_index..second_index + 2].copy_from_slice(&1u16.to_le_bytes());
+        assert!(decode_segment(&duplicate).is_none());
+
+        let mut empty_entry = canonical.clone();
+        let first_value = ENCODED_SEGMENT_HEADER_BYTES + ENCODED_SEGMENT_INDEX_BYTES;
+        empty_entry[first_value..first_value + ENCODED_SEGMENT_SLOT_VALUE_BYTES].fill(0);
+        assert!(decode_segment(&empty_entry).is_none());
+
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(decode_segment(&trailing).is_none());
     }
 }

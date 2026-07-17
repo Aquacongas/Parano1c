@@ -4,7 +4,7 @@
 This scenario intentionally covers one concern only: physical UTXO state
 lifecycle. It uses the production release binary and no saved fixture:
 
-- mine a fresh genesis state into one dense 2^16-slot segment;
+- mine a fresh genesis state into one hot 2^16-slot segment;
 - prove salted wallet hints differ locally without selecting other segments;
 - cold-restart through compact summaries;
 - confirm one ordinary payment and observe its spent input become empty;
@@ -35,7 +35,9 @@ BASE_PORT = int(os.environ.get("NOID_LIVE_STATE_SLOT_BASE_PORT", "22700"))
 INITIAL_HEIGHT = int(os.environ.get("NOID_LIVE_STATE_SLOT_INITIAL_HEIGHT", "3"))
 PAYMENT_MICRONOID = int(os.environ.get("NOID_LIVE_STATE_SLOT_PAYMENT", "1000000"))
 SEGMENT_LOG = 16
-SEGMENT_BYTES = 3 * (1 << SEGMENT_LOG) * 16
+SEGMENT_RAM_BYTES = 3 * (1 << SEGMENT_LOG) * 16
+SPARSE_SEGMENT_HEADER_BYTES = 9
+SPARSE_ENTRY_BYTES = 50
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT
@@ -91,12 +93,15 @@ def state_info(node):
     return rpc(node.rpc_port, "getStateInfo")
 
 
-def assert_one_dense_segment(node, label):
+def assert_one_sparse_segment(node, label):
     info = state_info(node)
     require(int(info["log_slots"]) == 24, f"{label}: unexpected depth: {info}")
+    expected_bytes = SPARSE_SEGMENT_HEADER_BYTES + (
+        int(info["active_slots"]) * SPARSE_ENTRY_BYTES
+    )
     require(
-        int(info["state_bytes"]) == SEGMENT_BYTES,
-        f"{label}: expected one {SEGMENT_BYTES}-byte segment: {info}",
+        int(info["state_bytes"]) == expected_bytes,
+        f"{label}: expected one canonical sparse segment ({expected_bytes} bytes): {info}",
     )
     print(
         f"[state] {label} active={info['active_slots']} bytes={info['state_bytes']} "
@@ -159,7 +164,9 @@ def main():
         "binary_size": live.NODE_BIN.stat().st_size,
         "initial_height_target": INITIAL_HEIGHT,
         "payment_micronoid": PAYMENT_MICRONOID,
-        "segment_bytes": SEGMENT_BYTES,
+        "dense_segment_ram_bytes": SEGMENT_RAM_BYTES,
+        "sparse_segment_header_bytes": SPARSE_SEGMENT_HEADER_BYTES,
+        "sparse_entry_bytes": SPARSE_ENTRY_BYTES,
         "status": "running",
     }
     print(f"[run] {BASE}", flush=True)
@@ -186,7 +193,7 @@ def main():
         labels.append(mining_label)
         live.wait_mined(node, INITIAL_HEIGHT, timeout=900)
         rpc(node.rpc_port, "walletScan", timeout=180)
-        initial_state = assert_one_dense_segment(node, "fresh mining")
+        initial_state = assert_one_sparse_segment(node, "fresh mining")
         initial_segment = assert_salted_hints_stay_dense(node, None, "fresh mining")
         node.stop()
 
@@ -239,7 +246,7 @@ def main():
             all(int(utxo["slot_index"]) >> SEGMENT_LOG == initial_segment for utxo in after_utxos),
             "sender change/rewards escaped dense segment",
         )
-        post_payment_state = assert_one_dense_segment(node, "post payment")
+        post_payment_state = assert_one_sparse_segment(node, "post payment")
         assert_salted_hints_stay_dense(node, initial_segment, "post payment")
         node.stop()
 
@@ -253,7 +260,7 @@ def main():
             f"final restart lost payment: {final_info}",
         )
         require(rpc(node.rpc_port, "getTx", [txid]) == confirmed, "tx index changed")
-        final_state = assert_one_dense_segment(node, "final restart")
+        final_state = assert_one_sparse_segment(node, "final restart")
         assert_salted_hints_stay_dense(node, initial_segment, "final restart")
         node.stop()
 

@@ -27,7 +27,10 @@ use crate::fri_state::{compute_segment_root, SlotValue, LOG_SEGMENT_SIZE};
 use crate::segmented_state::SegmentColumns;
 use crate::state::StreamingSparseRoot;
 
-use super::serial::{decode_segment, encoded_segment_len_for_eff_log};
+use super::serial::{
+    decode_segment, encoded_segment_len_for_live_count, encoded_segment_live_count_from_len,
+    max_encoded_segment_len_for_eff_log,
+};
 use super::snapshot_generation::SnapshotSegmentDescriptor;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
@@ -156,7 +159,8 @@ pub enum SnapshotStagingError {
     },
     DescriptorLength {
         segment_id: u16,
-        expected: u64,
+        minimum: u64,
+        maximum: u64,
         actual: u64,
     },
     SegmentTooLarge {
@@ -260,11 +264,12 @@ impl fmt::Display for SnapshotStagingError {
             } => write!(f, "snapshot segment {segment_id} is outside 0..{maximum}"),
             Self::DescriptorLength {
                 segment_id,
-                expected,
+                minimum,
+                maximum,
                 actual,
             } => write!(
                 f,
-                "snapshot segment {segment_id} descriptor length {actual}, expected {expected}"
+                "snapshot segment {segment_id} descriptor length {actual}, expected canonical sparse length in {minimum}..={maximum}"
             ),
             Self::SegmentTooLarge {
                 segment_id,
@@ -704,10 +709,13 @@ fn validate_descriptors(
             maximum: MAX_SNAPSHOT_MANIFEST_SEGMENTS,
         });
     }
-    let expected_len = encoded_segment_len_for_eff_log(metadata.effective_log_segment).ok_or(
+    let minimum_len = encoded_segment_len_for_live_count(metadata.effective_log_segment, 1).ok_or(
         SnapshotStagingError::InvalidMetadata("invalid effective segment logarithm"),
     )? as u64;
-    if expected_len > MAX_SEGMENT_BYTES as u64 {
+    let maximum_len = max_encoded_segment_len_for_eff_log(metadata.effective_log_segment).ok_or(
+        SnapshotStagingError::InvalidMetadata("invalid effective segment logarithm"),
+    )? as u64;
+    if maximum_len > MAX_SEGMENT_BYTES as u64 {
         return Err(SnapshotStagingError::InvalidMetadata(
             "canonical segment encoding exceeds wire limit",
         ));
@@ -736,18 +744,25 @@ fn validate_descriptors(
                 maximum: maximum_segments,
             });
         }
-        if u64::from(descriptor.encoded_len) != expected_len {
-            return Err(SnapshotStagingError::DescriptorLength {
-                segment_id: descriptor.segment_id,
-                expected: expected_len,
-                actual: u64::from(descriptor.encoded_len),
-            });
-        }
-        if u64::from(descriptor.encoded_len) > MAX_SEGMENT_BYTES as u64 {
+        let actual_len = u64::from(descriptor.encoded_len);
+        if actual_len > MAX_SEGMENT_BYTES as u64 {
             return Err(SnapshotStagingError::SegmentTooLarge {
                 segment_id: descriptor.segment_id,
-                bytes: u64::from(descriptor.encoded_len),
+                bytes: actual_len,
                 maximum: MAX_SEGMENT_BYTES,
+            });
+        }
+        if encoded_segment_live_count_from_len(
+            metadata.effective_log_segment,
+            descriptor.encoded_len as usize,
+        )
+        .is_none_or(|live_count| live_count == 0)
+        {
+            return Err(SnapshotStagingError::DescriptorLength {
+                segment_id: descriptor.segment_id,
+                minimum: minimum_len,
+                maximum: maximum_len,
+                actual: actual_len,
             });
         }
     }
@@ -1255,7 +1270,9 @@ mod tests {
         ));
         assert!(!short_dir.exists());
 
-        encoded[5] ^= 1;
+        let (_, mut changed_columns) = decode_segment(&encoded).unwrap();
+        changed_columns.owners_hi[1] = Block128::from(0xC3u128);
+        encoded = encode_segment(&changed_columns, 3);
         let mut fri_session =
             SnapshotStagingSession::new(parent.path(), metadata, vec![descriptor]).unwrap();
         let fri_dir = fri_session.staging_directory().unwrap().to_path_buf();
@@ -1299,8 +1316,9 @@ mod tests {
         let mut permissions = fs::metadata(&path).unwrap().permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&path, permissions).unwrap();
-        let mut tampered = encoded;
-        tampered[5] ^= 1;
+        let (_, mut changed_columns) = decode_segment(&encoded).unwrap();
+        changed_columns.owners_hi[1] = Block128::from(0xC3u128);
+        let tampered = encode_segment(&changed_columns, 3);
         fs::write(&path, tampered).unwrap();
 
         let staged = finalized.encoded_files().next().unwrap();
@@ -1377,7 +1395,8 @@ mod tests {
             LOG_SEGMENT_SIZE as u8,
         )
         .unwrap();
-        let encoded_len = encoded_segment_len_for_eff_log(LOG_SEGMENT_SIZE as u8).unwrap() as u32;
+        let encoded_len =
+            encoded_segment_len_for_live_count(LOG_SEGMENT_SIZE as u8, 1).unwrap() as u32;
         let descriptors = vec![
             SnapshotSegmentDescriptor {
                 segment_id: 1,
