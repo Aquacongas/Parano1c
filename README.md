@@ -1,498 +1,284 @@
-# Paranoid
+# ParanO(1)d
 
-Paranoid is a proof-native UTXO blockchain written in Rust. Every accepted
-non-genesis block is one atomic unit: native proof of work plus a recursive
-HistoryStep binding that exact header, nonce, transaction set and state
-transition. The HistoryStep terminal stays constant-size as the chain grows.
-Proof generation is part of mining whether nonce search runs inside the node
-or in an external worker.
+**Proof-Native transparent statechain (L1 PoW blockchain).**
 
-HistoryStep has four current-block tiers (B8, B32, B64 and B255) and four
-possible parent tiers, forming one release-pinned 4×4 class bank. Block 1 is
-the exact genesis-anchored base case of the same relation; there is no separate
-genesis proof or bootstrap class. The release binary contains the authenticated
-runtime metadata and matrix images; end users do not install or distribute
-matrix files.
+Blockchains have a fundamental architectural flaw: to validate the present,
+you must replay the past. Bitcoin, Ethereum, and nearly every major network
+inherit this property. A new full node downloads the chain from genesis and
+re-executes every transaction because the current state does not prove itself.
+This is not a temporary limitation. It is baked into the model.
 
-## Quick start
+ParanO(1)d is designed to remove this requirement.
 
-Node operators normally need only this section. The remaining sections are
-for release builders, matrix regeneration, and pipeline diagnostics.
+In ParanO(1)d, validity is established once, where the complete information
+already exists. Authorization is proved locally by the party with the private
+witness — the wallet owner. The miner proves the public transaction logic and
+the exact state transition. The network verifies those proofs instead of
+repeating the same execution.
 
-### Hardware and software
+Every accepted block carries a recursive `HistoryStep` that binds the block,
+its new UTXO root, and the validity of the preceding statechain. A new node can
+therefore authenticate the current state and verify the recent reorg suffix
+without executing the chain from genesis.
 
-| Role | Requirement |
-|---|---|
-| Node and wallet | The default `./paranoid` process. It validates and relays complete block bundles, serves P2P/RPC, and owns the wallet. It does not mine. |
-| Mining node | At least 16 GiB RAM and a multi-core CPU. The node creates a complete PoW + HistoryStep block with either built-in or external nonce search. Built-in mining reuses all host-visible CPUs for each ordered phase. |
-| Release builder | At least 16 GiB RAM, Linux, Rust with `rustfmt`, a C/C++ toolchain, `pkg-config`, libclang, OpenSSL development headers, Bash, GNU userland, and enough disk for a fresh matrix pack. |
+Once the present state carries its own proof, a different architecture becomes
+possible. Spent state can be deleted and reused. Ownership no longer needs a
+public key or digital signature. State growth can be priced directly. Proof of
+work can order transitions whose validity is already established. The result
+is an L1 whose age does not become a hardware requirement. Years later, an
+ordinary laptop can still hold the complete live state and independently
+verify the network without replaying the chain's lifetime.
 
-The tracked `.cargo/config.toml` applies `-C target-cpu=native` to every Cargo
-build and test started from the repository. `Cargo.lock` fixes dependency
-versions; compiler flags do not belong in it. Release compilation stops if the
-effective target loses the proof CPU contract: SSE4.1, PCLMULQDQ, AVX2, and
-VPCLMULQDQ on x86-64, or AES/PMULL on aarch64. This catches `RUSTFLAGS`
-overrides that remove those features and Cargo invoked from outside the
-repository. Build an official binary on the least capable supported CPU that
-still satisfies this contract.
-Python 3 and `rg` are optional conveniences used by later diagnostic examples.
+## The Fundamental Shift
 
-### Release contents
+| | Conventional blockchain | ParanO(1)d |
+|---|---|---|
+| Validation | Every full node re-executes | The witness holder proves; the network verifies |
+| Bootstrap | Rebuild state from genesis | Authenticate current state and verify the recent suffix |
+| Ownership | Public-key signature | Fresh ZK proof of a Poseidon2b preimage |
+| State | Derived from accumulated history | Exact live UTXO state is a consensus object |
+| Spent outputs | Remain part of required history | Slots are cleared and safely reused |
+| Proof of work | Orders an execution log | Orders proof-valid state transitions |
+| Post-quantum migration | Replace the ownership scheme | No elliptic-curve transaction scheme to replace |
 
-`paranoid-release.tar.gz` contains exactly two executables:
+ParanO(1)d is transparent, not a privacy chain. Current values and owners are
+public, and transactions are visible when relayed. The protocol turns history
+into proof: every node carries an authenticated present instead of an
+ever-growing transaction graph. Anyone may build an external tracer, but it
+must record the entire transaction stream for itself; the network does not
+make every node carry that burden. Privacy here comes from non-retention, not
+concealment. Zero knowledge protects the spending witness; proof-native
+validation removes redundant execution.
 
-```text
-paranoid
-noid-cli
+## How It Works
+
+### Execution Is Local
+
+When sending NOID, the wallet selects its UTXOs and creates one atomic
+`PagedSpend`. It then produces a freshly randomized, witness-hiding
+authorization for `{logical_txid, input_owner}`. The spending secret never
+leaves the wallet.
+
+The authorization is stateless: it contains no UTXO Merkle path and is not
+tied to one state root. The miner has the public state witness and proves
+separately that every input exists, every output slot is empty, values balance,
+fees are correct, and the resulting state root is exact.
+
+Private authorization is proved by the wallet. Public execution is proved by
+the miner. Neither task is repeated across the network.
+
+### The Network Verifies, Not Executes
+
+The mempool verifies the complete transaction intent before relaying it. A
+miner selects available intents immediately.
+
+The miner combines the selected transactions, exact state transition and
+preceding terminal into the next `HistoryStep`. It completes this proof before
+searching for a PoW nonce. Peers receive one atomic
+`{block, HistoryStep terminal}` bundle and accept it only after verifying both
+the proof and the nonce.
+
+Peers then apply the proven slot writes to advance their local UTXO set,
+materializing the proof's result without re-executing transaction logic.
+
+### History Collapses Recursively
+
+Each `HistoryStep` proves the current block relation and verifies the previous
+terminal inside the same relation. Proof size and verification work do not
+increase with block height.
+
+An active node keeps the exact live state, compact headers for cumulative work,
+and the latest 18 complete blocks for competing miners and reorgs. A joining
+node authenticates a finalized current state with its matching terminal, then
+verifies that recent suffix normally.
+
+ParanO(1)d is history-stateless, not state-free. State transfer scales with the
+live UTXO set. What no longer scales with chain age is the execution required
+to prove why that state is valid.
+
+## Architecture
+
+### A Living UTXO State
+
+The state is an exact sparse vector of indexed UTXOs. Spending clears a slot;
+the allocator reuses empty positions before opening new state. Every new output
+has a fresh `creation_id`, so reusing the same index can never revive an old
+reference.
+
+State is divided into `2^16`-slot segments. Empty segments are virtual and a
+segment disappears again when its last UTXO is spent. The slot domain begins
+at `2^24` and expands automatically at 75% occupancy by attaching a canonical
+empty half to the existing root. No state copy, migration or network pause is
+required.
+
+Fees distinguish ordinary I/O from net-new state. The state-growth component
+rises with occupancy and is burned; consolidation pays no growth burn. Block
+reward halves when the state domain actually expands, with a permanent 1 NOID
+floor.
+
+### Signatureless Ownership
+
+An address is the Poseidon2b image of a 256-bit spending secret. Ownership is a
+zero-knowledge proof of knowledge of that preimage, bound to the complete
+logical transaction. There is no public key or transaction signature on the
+wire.
+
+The capsule is independently randomized on every spend, including repeated use
+of the same address. Transaction consensus contains no elliptic curves. The
+Ed25519 key used by libp2p identifies a peer only and has no spending or
+consensus authority.
+
+### PagedSpend
+
+The proof system uses fixed physical pages with eight input and two output
+positions. `PagedSpend` joins up to 128 pages into one user transaction with
+one txid, one fee, one ZK capsule and one receipt.
+
+A single transaction may consume up to 1,020 UTXOs and create up to 256
+outputs. Continuation pages are internal proof geometry: they remain one
+indivisible transaction in the wallet, mempool, relay, block, receipt and reorg
+paths.
+
+### One Binary Proof Stack
+
+The protocol is built over the binary tower field `GF(2^128)`. Poseidon2b is
+the common permutation for addresses, transactions, Merkle trees, state roots,
+transcripts, block identifiers and PoW.
+
+For ParanO(1)d, we developed Kill-Shot GKR. It packs entire Poseidon2b batches
+and Merkle paths into direct degree-seven relations over shared Boolean
+hypercubes instead of running a low-degree sumcheck chain for every
+permutation. In a like-for-like 59-permutation benchmark, this reduces median
+prover time by 10.50× and raw algebraic proof bytes by 51.67×. Batched
+sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS relation
+without a trusted setup. The two authenticated launch matrices — B64 at
+`m=23` and B255 at `m=24` — are embedded in the official binary and can be
+regenerated from source. The [benchmark artifact](research/frost_gkr/README.md)
+pins the exact comparison revision and environment.
+
+This common arithmetic is what lets wallet authorization, exact state and
+recursive chain verification compose as one protocol instead of independent
+proof systems glued together afterward.
+
+### Proof-Native PoW
+
+PoW has one job: choose the order of valid transitions. Hash power cannot make
+an invalid `HistoryStep` acceptable.
+
+The miner proves the nonce-independent block first, then searches a fixed
+Poseidon2b header with a 128-bit nonce. ASERT targets a 15-second mean interval,
+and cumulative work selects the chain. An external miner receives an immutable,
+single-use template and returns only a nonce; it cannot alter the transactions
+or state root.
+
+## Launch Profile
+
+| Parameter | Value |
+|---|---:|
+| Mean block target | 15 seconds |
+| Default miner class | B64, `m=23`, up to 64 user pages |
+| Large miner class | B255, `m=24`, up to 255 user pages |
+| Maximum logical transactions per block | 255 |
+| Maximum one-page throughput | 17 TPS |
+| Maximum inputs in one transaction | 1,020 |
+| Maximum outputs in one transaction | 256 |
+| Recent block / reorg suffix | 18 blocks |
+| State domain | `2^24` to `2^32` slots |
+
+B64 is the laptop-class mining floor, not the protocol ceiling. On the
+reference 12-thread Intel Core i7-1365U, saturated B64 preparation measures
+14.387 seconds at p95 and verification measures 0.720 seconds at p95. Faster
+hardware may qualify B255; every node verifies both classes. Full measurements
+are in the [two-class benchmark](research/two_class/results/2026-07-17-history-step-lto-20-sample.md).
+
+## Network
+
+ParanO(1)d uses libp2p GossipSub for blocks and transaction intents, typed
+request-response protocols for synchronization, Kademlia and DNS seeds for
+discovery, and mDNS for local networks. Persistent peers, connection limits,
+and IPv4/IPv6 network-group diversity reduce simple eclipse and connection
+flood attacks without adding a consensus round.
+
+Finalized state transfer is authenticated by `HistoryStep`; short gaps use
+ordinary recent-block sync. Finalized transaction bodies are not required by
+active consensus. Exportable Merkle receipts preserve proof of inclusion after
+a body leaves the recent suffix.
+
+## Running ParanO(1)d
+
+The first node of a new network creates genesis and starts mining:
+
+```sh
+paranoid --miner --genesis
 ```
 
-`paranoid` is the node and owns the wallet key. `noid-cli` is its wallet-control
-and JSON-RPC client. No metadata or matrix files are required beside them.
+`--genesis` is only for the first node. Join an existing network as a node or
+miner:
 
-In a complete release directory, verify the distributable binaries and archive
-with:
-
-```bash
-sha256sum -c SHA256SUMS
+```sh
+paranoid --seed <host>:9400
+paranoid --miner --seed <host>:9400
 ```
 
-If only the archive is distributed, compare its digest with the published
-`paranoid-release.tar.gz` entry instead:
+External nonce search keeps transaction selection and proving inside the node:
 
-```bash
-sha256sum paranoid-release.tar.gz
+```sh
+paranoid --extminer --mining-key <token>
+noid-extminer --key <token>
 ```
 
-Then unpack the archive and start the node and wallet:
+Default ports are `9400` for P2P and `127.0.0.1:9401` for JSON-RPC. First start
+creates `~/.paranoid/paranoid.toml`, the MDBX state and the built-in wallet
+under `~/.paranoid/data/`.
 
-```bash
-tar -xzf paranoid-release.tar.gz
-./paranoid
+The current `wallet.key` is not password-encrypted. It is created with
+owner-only permissions; back it up and protect it.
+
+### CLI
+
+Addresses use bech32m and begin with `o1`. `1 NOID = 1,000,000 μNOID`.
+
+```sh
+noid-cli status
+noid-cli peers
+noid-cli state
+noid-cli mining
+noid-cli address
+noid-cli address --new
+noid-cli balance
+noid-cli utxos
+noid-cli send <o1-address> 10.5 --dry-run
+noid-cli send <o1-address> 10.5
+noid-cli mempool
+noid-cli history
+noid-cli receipt <txid> > receipt.hex
+noid-cli verify "$(tr -d '\n' < receipt.hex)"
+noid-cli stop
 ```
 
-On first start the node creates:
+Run `paranoid --help`, `noid-cli help` or `noid-extminer --help` for the full
+interface.
 
-```text
-~/.paranoid/paranoid.toml   node configuration
-~/.paranoid/data/           chain database and wallet
-```
+## Building from Source
 
-Default listeners are:
+The canonical release build supports Linux on x86-64 and AArch64. It requires
+Rust with `rustfmt`, a native C/C++ toolchain, `pkg-config`, libclang and OpenSSL
+development headers. Release proving requires AVX2, PCLMULQDQ and VPCLMULQDQ
+on x86-64, or AES/PMULL on AArch64.
 
-```text
-P2P  0.0.0.0:9400
-RPC  127.0.0.1:9401
-```
-
-The node tries its built-in DNS seeds automatically. To add a known peer
-explicitly:
-
-```bash
-./paranoid --seed SEED_IP:9400
-```
-
-The `--seed` option expects `IP:PORT`, not a DNS name or libp2p multiaddress.
-For example, use `127.0.0.1:9400`, not `/ip4/127.0.0.1/tcp/9400`.
-
-### Ways to run the node
-
-| Invocation | What it does |
-|---|---|
-| `./paranoid` | Ordinary node and wallet. Validates and relays the chain, serves P2P/RPC, and verifies remote proofs. It does not mine. |
-| `./paranoid --miner` | Mining node with built-in PoW. It uses all visible CPUs for PoW, then all CPUs for the block's required HistoryStep before accepting and announcing it. |
-| `./paranoid --extminer` | Mining node with an external PoW worker. The external worker only returns a nonce; the node builds, proves and atomically accepts the complete block. Requires `--mining-key`. |
-
-There is no separate proving-node role and no background proof backlog. A block
-is not accepted and creates no reward until its exact HistoryStep is complete.
-
-The release archive does not include the separate external-miner client.
-
-Bootstrap the first node of a new network:
-
-```bash
-./paranoid --miner --genesis
-```
-
-`--genesis` is only for the first node of a fresh network. A miner joining an
-existing network uses seeds instead:
-
-```bash
-./paranoid \
-  --miner \
-  --seed SEED_IP:9400
-```
-
-See every option with:
-
-```bash
-./paranoid --help
-```
-
-### Wallet and node control
-
-With the default RPC listener, the client needs no extra flags:
-
-```bash
-./noid-cli status
-./noid-cli peers
-./noid-cli address
-./noid-cli balance
-./noid-cli history
-./noid-cli mining
-./noid-cli proof
-```
-
-For a non-default endpoint, use `--rpc` or `NOID_RPC`:
-
-```bash
-NOID_RPC=http://127.0.0.1:9501 ./noid-cli status
-```
-
-Stop the node cleanly:
-
-```bash
-./noid-cli stop
-```
-
-### Isolated configuration
-
-Use explicit paths for tests or for multiple nodes on one machine. A missing
-config file is created automatically with defaults:
-
-```bash
-RUN="$PWD/target/my-node"
-mkdir -p "$RUN"
-
-./paranoid \
-  --config "$RUN/paranoid.toml" \
-  --data-dir "$RUN/data" \
-  --p2p-listen 127.0.0.1:9500 \
-  --rpc-listen 127.0.0.1:9501
-```
-
-Command-line overrides apply to that process only; they are not written back
-to the generated TOML. Pass `--miner` or `--extminer` on every start that
-should mine.
-
-## Build an official release
-
-The supported release path is one command from the repository root:
-
-```bash
+```sh
+git clone https://github.com/ignotusnemo/paranoid.git
+cd paranoid
 ./scripts/build_release.sh
 ```
 
-The script intentionally requires a new output directory. With no argument it
-creates a unique directory under `target/release-builds/`. An explicit output
-may be supplied, but it must not already exist:
+The build regenerates and authenticates both HistoryStep matrices, runs the
+release tests and produces `paranoid`, `noid-cli` and `noid-extminer`.
 
-```bash
-./scripts/build_release.sh target/release-builds/my-release
-```
+The frozen protocol construction is recorded in [DESIGN.md](DESIGN.md).
 
-The script checks the workspace, generates and authenticates the sixteen
-HistoryStep class matrices, embeds their runtime images, builds both binaries,
-runs the release test suite, and creates the archive and checksums. Matrix
-generation happens once at the final compression level; the release build
-does not regenerate or recompress an approved pack.
+## Status
 
-The result is:
+ParanO(1)d is version `0.1.0` and pre-genesis. No public network has launched.
 
-```text
-<release-directory>/
-├── pack/                         build evidence; not needed by deployed nodes
-│   ├── pins.env
-│   └── v1/
-│       ├── history-step.runtime
-│       └── sixteen history-step-*.field-r1cs.zst files
-├── bin/
-│   ├── paranoid
-│   └── noid-cli
-├── paranoid-release.tar.gz      contains only paranoid and noid-cli
-├── SHA256SUMS
-└── build.log
-```
-
-The last successful directory is written to:
-
-```text
-target/release-builds/LAST_RELEASE
-```
-
-`NOID_RELEASE_SKIP_TESTS=1` exists for local development only. Do not publish
-an archive built with that setting.
-
-`Cargo.lock` is part of the release source, and the script uses `--locked` so
-dependency resolution cannot drift during the build.
-
-## Build from an existing matrix pack
-
-The normal release script generates a fresh pack. A development build may use
-an existing pack containing `pins.env`, `v1/history-step.runtime`, and the
-sixteen class matrices.
-
-```text
-target/release-pack/
-├── pins.env
-└── v1/
-    ├── history-step.runtime
-    └── history-step-*.field-r1cs.zst
-```
-
-Build the self-contained node from it:
-
-```bash
-set -euo pipefail
-PACK_ROOT="$PWD/target/release-pack"
-source "$PACK_ROOT/pins.env"
-export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
-
-cargo build --locked --release -p noid_node --bins
-```
-
-The output is:
-
-```text
-target/release/paranoid
-target/release/noid-cli
-```
-
-A release build requires the authenticated pack directory plus the runtime
-metadata and leaf pins emitted by `noid_pack_pins`:
-
-```text
-NOID_HISTORY_STEP_PACK_DIR
-NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
-NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
-```
-
-`pins.env` supplies the two digest variables. The command supplies the pack
-directory. A pack-free debug node can exercise non-proof code, but it cannot
-mine or verify HistoryStep terminals.
-
-## Generate matrices manually
-
-This section explains what the release script automates. Do not perform both
-the automated and manual procedures for the same release.
-
-Build the tools:
-
-```bash
-cargo build --locked --release -p bench_prover \
-  --bin noid_matrix_gen \
-  --bin noid_matrix_stats \
-  --bin noid_pack_pins
-```
-
-Generate directly at the final compression level. The destination must not
-exist, which prevents an independent rebuild from overwriting an approved
-pack:
-
-```bash
-set -euo pipefail
-PACK_ROOT="$PWD/target/history-step-release"
-test ! -e "$PACK_ROOT"
-
-NOID_ARTIFACT_ZSTD_LEVEL=19 \
-  ./target/release/noid_matrix_gen "$PACK_ROOT"
-```
-
-The invocation freezes the four current tiers against the four possible parent
-tiers from mined, native-valid fixtures, exports the sixteen matrices, and
-writes `history-step.runtime`. `noid_pack_pins` below emits the exact pins for
-those final compressed bytes. Do not generate at one level and recompress
-later.
-
-Inspect or recompute the leaf pins with:
-
-```bash
-PACK_ROOT="${PACK_ROOT:-$PWD/target/history-step-release}"
-./target/release/noid_pack_pins "$PACK_ROOT"
-```
-
-For a reusable development pack, save the two emitted assignments as exported
-variables in `$PACK_ROOT/pins.env`; the release script does this automatically.
-
-`noid_matrix_stats` is an optional, expensive sizing tool. It is not part of a
-normal node build:
-
-```bash
-PACK_ROOT="${PACK_ROOT:-$PWD/target/history-step-release}"
-./target/release/noid_matrix_stats "$PACK_ROOT"/v1/*.field-r1cs.zst
-```
-
-## Benchmark production HistoryStep proofs
-
-Run the isolated prover benchmark against a completed, pinned pack:
-
-```bash
-set -euo pipefail
-PACK_ROOT="$PWD/target/release-pack"
-source "$PACK_ROOT/pins.env"
-export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
-
-cargo bench --locked -p bench_prover --bench history_step_proof
-```
-
-The benchmark authenticates all sixteen matrices, builds and verifies an
-honest B8 parent, then reports one uniform line for B8, B32, B64 and B255.
-Fixture construction and matrix assembly are outside `prove_ms`; `verify_ms`
-includes bounded terminal decoding and complete production verification.
-
-## How embedded artifacts work
-
-Canonical runtime metadata and matrix files are release-build inputs, not
-deployed node dependencies.
-
-At build time:
-
-1. The generator derives the fixed runtime metadata and final compressed leaves.
-2. `noid_node/build.rs` checks the supplied metadata and every leaf pin.
-3. The sixteen identities are decoded into the canonical HistoryStep bank.
-4. Every matrix is decompressed and checked against its pinned shape and
-   structural statement digest.
-5. Every checked matrix is converted to a fixed-width packed runtime image.
-6. The runtime images are compressed at zstd level 9 and embedded into the
-   executable with the metadata. The canonical build-input pack remains at
-   zstd level 19.
-
-At runtime, the official binary trusts those immutable build-produced bytes.
-It decompresses them and checks cheap image framing, lengths, ordering, and
-the requested identity against the build seal. It does not repeat the
-canonical row parse, compressed-leaf hash, structural Poseidon hash, or
-repack. The fixed-size metadata rebuilds the canonical runtime once.
-
-Both mining configurations use the release-pinned 4×4 HistoryStep class bank.
-Before PoW, the node loads the authenticated current matrix and assembles the
-complete HistoryStep witness except for the fixed 4,402-row direct-accumulator
-and `BLOCKHDR` suffix. Matrix loading is strictly one-at-a-time: the miner uses
-the current class and the terminal decider walks live bank lanes sequentially.
-
-This trust applies only to immutable artifacts built into the executable.
-Blocks, transactions, peer messages, and remote proofs remain untrusted and
-are verified at runtime.
-
-## Atomic HistoryStep production
-
-PoW and accepted history are one consensus unit. A non-genesis block cannot
-mutate state, create a reward or be announced as complete until a HistoryStep
-for that exact height, header and nonce is ready. There is no independent
-history-height cursor that can lag behind the chain tip.
-
-The mining loop is phase ordered:
-
-1. build the template, current-block relation and parent-recursion witness;
-2. search PoW with the complete shared CPU pool;
-3. seal the builder-branded nonce/block-id boundary cells and append the fixed
-   direct suffix;
-4. move that one complete witness directly into the all-core HistoryStep
-   prover;
-5. atomically commit block, terminal, state and receipt indexes;
-6. announce the complete bundle, then start the next height.
-
-There is no durable proof job, no asynchronous history worker and no partially
-accepted non-genesis block. A competing complete block drops the local
-in-memory carrier. Restarts either recover a fully committed bundle or no block
-at that height. The detailed consensus and sync design is in
-[`noid_chain/HISTORY_STEP.md`](noid_chain/HISTORY_STEP.md).
-
-## Live one-node test
-
-Use a clean data directory and an explicit config so the test cannot touch the
-normal node installation:
-
-```bash
-set -euo pipefail
-
-BIN_DIR="$PWD/target/release"
-RUN_PARENT="$PWD/target/live-tests"
-mkdir -p "$RUN_PARENT"
-RUN="$(mktemp -d "$RUN_PARENT/history-step-one-node.XXXXXX")"
-printf '%s\n' "$RUN" > "$RUN_PARENT/LAST_HISTORY_STEP_RUN"
-
-"$BIN_DIR/paranoid" \
-  --miner \
-  --genesis \
-  --config "$RUN/paranoid.toml" \
-  --data-dir "$RUN/data" \
-  --p2p-listen 127.0.0.1:19750 \
-  --rpc-listen 127.0.0.1:19751 \
-  --log info 2>&1 | tee "$RUN/node.log"
-```
-
-From another shell:
-
-```bash
-export NOID_RPC=http://127.0.0.1:19751
-./target/release/noid-cli status
-./target/release/noid-cli mining
-./target/release/noid-cli proof
-./target/release/noid-cli stop
-```
-
-At the default `info` level, the lifecycle is intentionally concise:
-
-```bash
-RUN="$(<"$PWD/target/live-tests/LAST_HISTORY_STEP_RUN")"
-rg 'mining complete block|block accepted' "$RUN/node.log"
-```
-
-`block accepted` includes `nonce_to_commit_ms`, the critical latency
-from the winning nonce through HistoryStep and the atomic MDBX commit. Detailed
-matrix, transcript, prefetch and proving timings stay at `debug`. The release
-gate requires p95 nonce-to-commit at or below 15 seconds and rejects any run
-that exposes a proof backlog or a lagging canonical history height.
-
-The embedded-artifact startup details are also available at `debug`:
-
-```text
-build-authenticated HistoryStep runtime images loaded from the executable
-HistoryStep verifier uses only executable-embedded metadata and matrices
-HistoryStep class bank ready
-```
-
-The expected libp2p `No known peers` bootstrap warning is suppressed for an
-isolated `--genesis` node.
-
-## Verification commands
-
-The release script is the primary gate. Useful focused commands are:
-
-```bash
-cargo fmt --all -- --check
-cargo check --locked --workspace --all-targets
-cargo test --locked -p noid_recursive --lib
-cargo test --locked -p noid_node -p noid_chain -p noid_miner
-```
-
-Release-profile tests need an authenticated pack environment:
-
-```bash
-set -euo pipefail
-PACK_ROOT="$PWD/target/release-pack"
-source "$PACK_ROOT/pins.env"
-export NOID_HISTORY_STEP_PACK_DIR="$PACK_ROOT"
-
-cargo test --locked --release \
-  -p noid_recursive \
-  -p noid_node \
-  -p noid_chain \
-  -p noid_miner
-```
-
-Do not make a digest failure pass by weakening a check or replacing a pin.
-Regenerate the artifacts independently and review the drift.
-
-## Optional wallet scenarios
-
-These scripts use `target/release/paranoid` and `target/release/noid-cli` and
-manage their own test directories:
-
-```bash
-python3 scripts/live_cli_wallet_scenarios.py
-python3 scripts/live_slot_mempool_wallet_scenarios.py
-```
-
-## License
-
-Apache-2.0.
+Designed and developed by **Ignotus Nemo**. Licensed under Apache-2.0.
