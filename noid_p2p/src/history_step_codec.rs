@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
-    consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES, HISTORY_STEP_TERMINAL_BINDING_BYTES,
-    HISTORY_STEP_TERMINAL_VERSION,
+    consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES, HistoryStepTerminalMetadata,
+    HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
 
 use crate::{
@@ -84,7 +84,7 @@ impl request_response::Codec for HistoryStepTerminalCodec {
         let terminal_bytes = read_optional(io, terminal_len).await?;
         ensure_eof(io).await?;
         if let Some(terminal) = terminal_bytes.as_deref() {
-            validate_terminal_binding(terminal, height, block_hash)?;
+            validate_terminal_envelope(terminal, height)?;
         }
         Ok(GetHistoryStepTerminalResponse {
             height,
@@ -128,7 +128,7 @@ impl request_response::Codec for HistoryStepTerminalCodec {
             outbound_memory_permit,
         } = response;
         if let Some(terminal) = terminal_bytes.as_deref() {
-            validate_terminal_binding(terminal, height, block_hash)?;
+            validate_terminal_envelope(terminal, height)?;
         }
         let terminal_len = optional_len(terminal_bytes.as_deref(), "HistoryStep terminal")?;
         validate_length(terminal_len)?;
@@ -209,27 +209,25 @@ fn validate_length(terminal_len: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_terminal_binding(
-    terminal: &[u8],
-    expected_height: u64,
-    expected_hash: [u8; 32],
-) -> io::Result<()> {
+fn validate_terminal_envelope(terminal: &[u8], expected_height: u64) -> io::Result<()> {
     if terminal.len() <= HISTORY_STEP_TERMINAL_BINDING_BYTES {
         return Err(invalid_data("HistoryStep terminal is truncated"));
     }
-    let version = terminal[0];
-    let height = u64::from_le_bytes(terminal[1..9].try_into().unwrap());
-    let block_hash: [u8; 32] = terminal[9..41].try_into().unwrap();
-    let class_id = terminal[41];
-    if version != HISTORY_STEP_TERMINAL_VERSION
-        || height != expected_height
-        || block_hash != expected_hash
-        || class_id >= noid_chain::HISTORY_STEP_CLASS_COUNT
-    {
+    let metadata = HistoryStepTerminalMetadata::decode_prefix(terminal).map_err(|error| {
+        invalid_data(&format!("invalid HistoryStep terminal metadata: {error}"))
+    })?;
+    if metadata.terminal_height() != expected_height {
         return Err(invalid_data(
-            "HistoryStep terminal does not bind its response boundary",
+            "HistoryStep terminal does not bind its response height",
         ));
     }
+
+    // The response header carries the nonce-bearing chain-link block id used
+    // to correlate this transport session. The terminal deliberately carries
+    // the nonce-free semantic header id so one proof can be built before PoW.
+    // Their exact relationship can only be checked against the authenticated
+    // staged header and is enforced by MdbxChainContext::verify_snapshot_boundary
+    // before the terminal is verified or any snapshot state is installed.
     Ok(())
 }
 
@@ -293,23 +291,29 @@ mod tests {
         StreamProtocol::new("/noid/test/sync/history-step/1")
     }
 
-    fn terminal(height: u64, block_hash: [u8; 32], fill: u8) -> Vec<u8> {
+    fn terminal(height: u64, semantic_id: [u8; 32], fill: u8) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.push(HISTORY_STEP_TERMINAL_VERSION);
-        bytes.extend_from_slice(&height.to_le_bytes());
-        bytes.extend_from_slice(&block_hash);
-        bytes.push(1);
+        bytes.extend_from_slice(
+            &HistoryStepTerminalMetadata::new(height, semantic_id, 1)
+                .unwrap()
+                .encode_prefix(),
+        );
         bytes.push(fill);
         bytes
     }
 
-    fn response_wire(height: u64, hash: [u8; 32], fill: u8) -> Vec<u8> {
-        let terminal = terminal(height, hash, fill);
+    fn response_wire(
+        height: u64,
+        block_hash: [u8; 32],
+        semantic_id: [u8; 32],
+        fill: u8,
+    ) -> Vec<u8> {
+        let terminal = terminal(height, semantic_id, fill);
         let mut wire = vec![0u8; RESPONSE_HEADER_BYTES];
         wire[..4].copy_from_slice(&RESPONSE_MAGIC);
         wire[4..8].copy_from_slice(&(terminal.len() as u32).to_le_bytes());
         wire[8..16].copy_from_slice(&height.to_le_bytes());
-        wire[16..48].copy_from_slice(&hash);
+        wire[16..48].copy_from_slice(&block_hash);
         wire.extend_from_slice(&terminal);
         wire
     }
@@ -335,11 +339,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_round_trip_preserves_exact_binding() {
+    async fn terminal_round_trip_preserves_distinct_chain_and_semantic_ids() {
         let response = GetHistoryStepTerminalResponse {
             height: 77,
             block_hash: [0xA5; 32],
-            terminal_bytes: Some(terminal(77, [0xA5; 32], 1)),
+            terminal_bytes: Some(terminal(77, [0x5A; 32], 1)),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -355,13 +359,15 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.height, 77);
         assert_eq!(decoded.block_hash, [0xA5; 32]);
-        assert_eq!(decoded.terminal_bytes.unwrap()[42], 1);
+        let terminal = decoded.terminal_bytes.unwrap();
+        assert_eq!(terminal[9..41], [0x5A; 32]);
+        assert_eq!(terminal[42], 1);
     }
 
     #[tokio::test]
-    async fn forged_terminal_binding_is_rejected() {
-        let mut wire = response_wire(77, [0xA5; 32], 1);
-        wire[RESPONSE_HEADER_BYTES + 9] ^= 1;
+    async fn terminal_with_wrong_response_height_is_rejected() {
+        let mut wire = response_wire(77, [0xA5; 32], [0x5A; 32], 1);
+        wire[RESPONSE_HEADER_BYTES + 1] ^= 1;
         assert_eq!(
             HistoryStepTerminalCodec::default()
                 .read_response(&protocol(), &mut Cursor::new(wire))
@@ -374,7 +380,7 @@ mod tests {
 
     #[tokio::test]
     async fn out_of_bank_class_is_rejected() {
-        let mut wire = response_wire(77, [0xA5; 32], 1);
+        let mut wire = response_wire(77, [0xA5; 32], [0x5A; 32], 1);
         wire[RESPONSE_HEADER_BYTES + 41] = noid_chain::HISTORY_STEP_CLASS_COUNT;
         assert_eq!(
             HistoryStepTerminalCodec::default()
@@ -403,7 +409,7 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_budget_follows_terminal_until_consumption() {
-        let wire = response_wire(77, [0xA5; 32], 1);
+        let wire = response_wire(77, [0xA5; 32], [0x5A; 32], 1);
         let terminal_len = HISTORY_STEP_TERMINAL_BINDING_BYTES + 1;
         let codec = HistoryStepTerminalCodec::with_inbound_budget(terminal_len);
         let first = codec

@@ -1256,7 +1256,6 @@ struct AppliedVerifiedSnapshot {
 fn validate_snapshot_staged_header_boundary(
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
     boundary: &SnapshotHeaderBoundary,
-    minimum_chainwork: &[u8; 32],
 ) -> Result<(), String> {
     if manifest.tip_height == 0 {
         return Err("snapshot manifest has no tip".into());
@@ -1275,9 +1274,6 @@ fn validate_snapshot_staged_header_boundary(
     }
     if boundary.cumulative_chainwork != manifest.cumulative_chainwork {
         return Err("snapshot manifest chainwork does not match staged headers".into());
-    }
-    if noid_chain::work_gt(minimum_chainwork, &boundary.cumulative_chainwork) {
-        return Err("snapshot chainwork below minimum snapshot work floor".into());
     }
     let expected_epoch_height = (manifest.tip_height
         / noid_chain::consensus::params::TX_EPOCH_BLOCKS)
@@ -1697,7 +1693,7 @@ mod tests {
             cumulative_chainwork: h1_work,
             epoch_anchor_header: h0,
         };
-        validate_snapshot_staged_header_boundary(&manifest, &boundary, &high_start_work)
+        validate_snapshot_staged_header_boundary(&manifest, &boundary)
             .expect("staged snapshot boundary preflight succeeds");
         assert_eq!(boundary.tip_header, h1);
         assert_eq!(boundary.epoch_anchor_header, h0);
@@ -1705,36 +1701,16 @@ mod tests {
         let mut wrong_fork = boundary;
         wrong_fork.tip_hash = h0_hash;
         assert!(
-            validate_snapshot_staged_header_boundary(&manifest, &wrong_fork, &high_start_work,)
+            validate_snapshot_staged_header_boundary(&manifest, &wrong_fork)
                 .expect_err("manifest for another staged fork must reject")
                 .contains("boundary")
         );
 
         let mut bad = manifest.clone();
         bad.cumulative_chainwork = [3u8; 32];
-        assert!(
-            validate_snapshot_staged_header_boundary(&bad, &boundary, &high_start_work,)
-                .expect_err("bad chainwork must reject")
-                .contains("chainwork")
-        );
-
-        let mut low_work = [0u8; 32];
-        low_work[0] = 1;
-        let low_work_manifest = noid_p2p::protocol::GetStateManifestResponse {
-            cumulative_chainwork: low_work,
-            ..manifest.clone()
-        };
-        let low_work_boundary = SnapshotHeaderBoundary {
-            cumulative_chainwork: low_work,
-            ..boundary
-        };
-        assert!(validate_snapshot_staged_header_boundary(
-            &low_work_manifest,
-            &low_work_boundary,
-            &high_start_work,
-        )
-        .expect_err("below minimum snapshot work must reject")
-        .contains("minimum snapshot work"));
+        assert!(validate_snapshot_staged_header_boundary(&bad, &boundary)
+            .expect_err("bad chainwork must reject")
+            .contains("chainwork"));
     }
 
     #[test]
@@ -2929,44 +2905,30 @@ async fn handle_p2p_events(
                     ctx.tip_height()
                 };
 
-                if our_height == 0 {
-                    // Fresh node: request the state MANIFEST (tiny, ~few KB).
-                    //
-                    // Paranoid is a HistoryStep statechain: nodes sync via
-                    // current state + HistoryStep, not full block replay.
-                    // Manifest tells us which segments to download next.
-                    // Segments are pulled in parallel after HistoryStep verification.
-                    //
-                    // Request from up to 3 distinct peers for eclipse mitigation.
-                    if manifest_candidates.len() < 3 && !manifest_requested_peers.contains(&peer) {
-                        tracing::info!(peer = %peer, "fresh node — requesting state manifest (Paranoid sync)");
-                        manifest_requested_peers.insert(peer);
-                        manifest_round_started_at.get_or_insert_with(Instant::now);
-                        p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                peer,
-                                requester_height: 0,
-                            })
-                            .await
-                            .ok();
-                    }
-                } else {
-                    // Already have persisted state. The manifest is a snapshot
-                    // boundary probe, not a live peer-tip probe: non-empty means
-                    // the peer can serve an O(1) snapshot at finalized F. Recent
-                    // gaps still use block/header announcements and retained
-                    // full-block replay.
-                    manifest_round_started_at.get_or_insert_with(Instant::now);
+                // A connection has no fresh block gossip to reveal the peer's
+                // current tip. Probe with the existing bounded header protocol,
+                // anchored at our exact tip (genesis for an empty node). The
+                // response selects direct retained-block sync for gaps <= 18
+                // and snapshot sync for deeper gaps. A manifest alone cannot
+                // do this because it intentionally describes finalized F, not
+                // the live peer tip; for chains shorter than finality it is
+                // empty even though direct blocks are available.
+                const CONNECTED_TIP_PROBE_HEADERS: u16 = 512;
+                let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
+                if fetch_in_progress.insert(peer) {
+                    recent_header_fetches.insert(request_key, Instant::now());
                     p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                        .send(noid_p2p::NetworkCommand::FetchHeaders {
                             peer,
-                            requester_height: our_height,
+                            start_height: our_height,
+                            count: CONNECTED_TIP_PROBE_HEADERS,
                         })
                         .await
                         .ok();
                     tracing::debug!(
-                        requester_height = our_height,
-                        "triggered manifest snapshot-boundary probe for persisted-state sync"
+                        peer = %peer,
+                        start_height = our_height,
+                        "probing connected peer tip with anchored headers"
                     );
                 }
 
@@ -3119,7 +3081,67 @@ async fn handle_p2p_events(
                         .unwrap_or(ancestor_height);
 
                     if new_tip_height > our_tip {
-                            // Shallow fork (≤ CONSENSUS_FINALITY_DEPTH): apply_reorg_mdbx can handle it.
+                        if new_tip_height > highest_announced {
+                            highest_announced = new_tip_height;
+                            sync_phase_telemetry.extend_suffix_target(new_tip_height);
+                            last_announcement_peer = Some(from);
+                        }
+
+                        if gap_requires_snapshot_sync(our_tip, new_tip_height) {
+                            tracing::info!(
+                                peer = %from,
+                                our_tip,
+                                peer_tip = new_tip_height,
+                                retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+                                "connected header probe found deep gap — requesting snapshot manifest"
+                            );
+                            if pending_manifest.is_none()
+                                && pending_snapshot_header_sync.is_none()
+                                && snapshot_header_staging_inflight.is_none()
+                                && history_step_verification_inflight.is_none()
+                                && snapshot_staging_inflight.is_none()
+                                && snapshot_install_inflight.is_none()
+                                && pending_segment_ids.is_empty()
+                                && segment_queue.is_empty()
+                                && manifest_requested_peers.insert(from)
+                            {
+                                manifest_force_snapshot_peers.insert(from);
+                                manifest_round_started_at.get_or_insert_with(Instant::now);
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                        peer: from,
+                                        requester_height: our_tip,
+                                    })
+                                    .await;
+                            }
+                            continue;
+                        }
+
+                        // The batch contains our exact current tip followed by
+                        // one linked extension. Pull it sequentially through
+                        // SyncBlocksFrom; that path keeps only one large
+                        // accepted bundle in flight and auto-continues after
+                        // each successful commit.
+                        if ancestor_height == our_tip {
+                            let gap = new_tip_height - our_tip;
+                            tracing::info!(
+                                peer = %from,
+                                our_tip,
+                                peer_tip = new_tip_height,
+                                gap,
+                                "connected header probe found recent extension — starting direct sync"
+                            );
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                    peer: from,
+                                    from_height: our_tip + 1,
+                                    count: gap as u16,
+                                })
+                                .await;
+                            continue;
+                        }
+
+                        // Shallow fork (≤ CONSENSUS_FINALITY_DEPTH): apply_reorg_mdbx can handle it.
                             // Fetch individual blocks; they arrive quickly and the orphan
                             // pool assembles them into a chain for the reorg comparison.
                             tracing::info!(
@@ -3713,11 +3735,7 @@ async fn handle_p2p_events(
                             )
                             .map_err(|error| error.to_string())?;
                         let boundary = validated_headers.boundary();
-                        validate_snapshot_staged_header_boundary(
-                            &manifest,
-                            &boundary,
-                            &noid_chain::consensus::params::MIN_SNAPSHOT_CHAINWORK,
-                        )?;
+                        validate_snapshot_staged_header_boundary(&manifest, &boundary)?;
                         validate_history_step_tip_future_drift(&boundary, unix_now())?;
                         header_validation_elapsed = header_started.elapsed();
                         if generation_guard.load(std::sync::atomic::Ordering::Acquire)
@@ -4117,7 +4135,6 @@ async fn handle_p2p_events(
                     let install_chain = Arc::clone(&chain);
                     let install_mempool = mempool.clone();
                     let install_wallet = Arc::clone(&wallet);
-                    let install_p2p_cmd = p2p_cmd.clone();
                     let install_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
                     let install_external_mining_attempts = external_mining_attempts.clone();
                     let completion = snapshot_install_completion_tx.clone();
@@ -4126,8 +4143,6 @@ async fn handle_p2p_events(
                             &install_chain,
                             &install_mempool,
                             &install_wallet,
-                            &install_p2p_cmd,
-                            from,
                             manifest,
                             finalized,
                             history_step,
@@ -4703,8 +4718,6 @@ async fn apply_verified_snapshot(
     chain: &Arc<RwLock<MdbxChainContext>>,
     mempool: &AsyncMempool,
     wallet: &SharedWallet,
-    p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
-    peer: libp2p::PeerId,
     manifest: noid_p2p::protocol::GetStateManifestResponse,
     staging: FinalizedSnapshotStaging,
     history_step: VerifiedHistoryStepSnapshot,
@@ -4778,13 +4791,6 @@ async fn apply_verified_snapshot(
     );
     drop(wallet_operation);
     let state_install_elapsed = state_install_started.elapsed();
-    let _ = p2p_cmd
-        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-            peer,
-            from_height: snapshot_height.saturating_add(1),
-            count: noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16,
-        })
-        .await;
     Ok(AppliedVerifiedSnapshot {
         height: snapshot_height,
         state_install_elapsed,

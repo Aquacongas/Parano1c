@@ -385,8 +385,7 @@ pub enum NetworkCommand {
         start_height: u64,
         count: u16, // max 512
     },
-    /// Request the state manifest from a peer (step 1 of snapshot sync, or a
-    /// lightweight snapshot-boundary probe for persisted-state catch-up).
+    /// Request the state manifest from a peer (step 1 of snapshot sync).
     /// Returns metadata + active segment IDs. Emits `NetworkEvent::StateManifest`.
     RequestStateManifest { peer: PeerId, requester_height: u64 },
     /// Request a single state segment from a peer (step 2, one per segment).
@@ -935,10 +934,28 @@ async fn run_swarm(
 
             prepared = history_step_response_rx.recv() => {
                 if let Some(prepared) = prepared {
-                    let _ = swarm
+                    let height = prepared.response.height;
+                    let terminal_len = prepared
+                        .response
+                        .terminal_bytes
+                        .as_ref()
+                        .map_or(0, Vec::len);
+                    match swarm
                         .behaviour_mut()
                         .history_step_sync
-                        .send_response(prepared.channel, prepared.response);
+                        .send_response(prepared.channel, prepared.response)
+                    {
+                        Ok(()) => tracing::debug!(
+                            height,
+                            terminal_len,
+                            "queued HistoryStep terminal response"
+                        ),
+                        Err(_) => tracing::warn!(
+                            height,
+                            terminal_len,
+                            "HistoryStep response channel closed before queueing"
+                        ),
+                    }
                 }
             }
 
@@ -1878,16 +1895,29 @@ async fn handle_swarm_event(
             request_response::Event::Message {
                 message:
                     request_response::Message::Request {
-                        request, channel, ..
+                        request,
+                        channel,
+                        request_id,
                     },
-                ..
+                peer,
             },
         )) => {
+            tracing::debug!(
+                %peer,
+                ?request_id,
+                height = request.height,
+                "received HistoryStep terminal request"
+            );
             let Ok(preparation_permit) = history_step_response_prepare_semaphore
                 .clone()
                 .try_acquire_owned()
             else {
-                tracing::debug!("HistoryStep response preparation saturated");
+                tracing::warn!(
+                    %peer,
+                    ?request_id,
+                    height = request.height,
+                    "HistoryStep response preparation saturated"
+                );
                 return;
             };
             let chain = chain.clone();
@@ -1915,6 +1945,14 @@ async fn handle_swarm_event(
                         None
                     }
                 };
+                let terminal_len = terminal_bytes.as_ref().map_or(0, Vec::len);
+                tracing::debug!(
+                    %peer,
+                    ?request_id,
+                    height = request_height,
+                    terminal_len,
+                    "prepared HistoryStep terminal response"
+                );
                 let response = GetHistoryStepTerminalResponse {
                     height: request_height,
                     block_hash: request_hash,
@@ -1922,9 +1960,18 @@ async fn handle_swarm_event(
                     inbound_memory_permit: None,
                     outbound_memory_permit: Some(outbound_memory_permit),
                 };
-                let _ = completion
+                if completion
                     .send(PendingHistoryStepTerminalResponse { channel, response })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        %peer,
+                        ?request_id,
+                        height = request_height,
+                        "HistoryStep response completion queue closed"
+                    );
+                }
             });
         }
 
@@ -2532,6 +2579,31 @@ async fn handle_swarm_event(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "HistoryStep terminal request failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+        )) => {
+            tracing::warn!(
+                %peer,
+                ?request_id,
+                err = %error,
+                "HistoryStep terminal response failed"
+            );
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
+            request_response::Event::ResponseSent { peer, request_id },
+        )) => {
+            tracing::debug!(
+                %peer,
+                ?request_id,
+                "HistoryStep terminal response flushed"
+            );
         }
 
         SwarmEvent::NewListenAddr { address, .. } => {

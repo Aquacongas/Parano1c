@@ -574,16 +574,6 @@ mod tests {
         let w = block_work(&GENESIS_TARGET);
         let val = u256_to_u128_low(&w);
         assert_eq!(val, 1u128 << 18, "GENESIS_TARGET work = 2^18");
-
-        // Cross-check: MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH × block_work(GENESIS_TARGET)
-        use crate::consensus::params::{CONSENSUS_FINALITY_DEPTH, MIN_SNAPSHOT_CHAINWORK};
-        let min_work = u256_to_u128_low(&MIN_SNAPSHOT_CHAINWORK);
-        let genesis_block_work = 1u128 << 19;
-        assert_eq!(
-            min_work,
-            CONSENSUS_FINALITY_DEPTH as u128 * genesis_block_work,
-            "MIN_SNAPSHOT_CHAINWORK must equal CONSENSUS_FINALITY_DEPTH({CONSENSUS_FINALITY_DEPTH}) × block_work(GENESIS_TARGET)"
-        );
     }
 
     #[test]

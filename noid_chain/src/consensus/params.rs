@@ -171,13 +171,13 @@ pub const EXPAND_DENOM: u64 = 4;
 // PoW
 // ---------------------------------------------------------------------------
 
-/// Genesis difficulty target = 2^237.
+/// Genesis difficulty target = 2^238.
 ///
 /// Calibrated to roughly the same wall-clock genesis solve time as the previous
 /// difficulty floor, using production Poseidon2b PoW on the current 12-core laptop:
 ///   measured parallel Poseidon2b PoW ≈ 186 KH/s
-///   avg_nonces = 2^(256-237) = 2^19 = 524,288
-///   time = 524K / 186K ≈ 2.8s
+///   avg_nonces = 2^(256-238) = 2^18 = 262,144
+///   time = 262K / 186K ≈ 1.4s
 ///
 /// LE 256-bit layout: byte 29 = 0x40 (bit 238 = bit 6 of byte 29).
 /// Bytes 30-31 = 0x00 so the target value equals 2^238.
@@ -190,44 +190,6 @@ pub const GENESIS_TARGET: [u8; 32] = {
     let mut t = [0u8; 32];
     t[29] = 0x40; // bit 6 of byte 29 -> 2^(8*29+6) = 2^238
     t
-};
-
-/// Minimum cumulative PoW work required to accept a state snapshot.
-///
-/// Stored as LE u256, matching `add_work`/`block_work` layout.
-///
-/// # Derivation
-///
-/// Chainwork accounting uses the strict-`< target` expected-trial-count
-/// formula:
-///   Work(T) = floor((2^256 - 1) / T) + 1.
-///
-/// For `GENESIS_TARGET = 2^237`, every block contributes:
-///   block_work(GENESIS_TARGET) = 2^19 = 524,288
-///
-/// We require CONSENSUS_FINALITY_DEPTH (18) blocks' worth of work:
-///
-///   MIN_SNAPSHOT_CHAINWORK = CONSENSUS_FINALITY_DEPTH * block_work(GENESIS_TARGET)
-///                          = 18 * 2^19 = 9,437,184 = 0x0090_0000
-///
-/// # Why CONSENSUS_FINALITY_DEPTH?
-///
-/// Public snapshot sync uses the finalized O(1) boundary, and this chainwork
-/// floor remains a resource/sanity guard:
-///
-///   tip < 18  -> no finalized history boundary and chainwork < threshold
-///   tip >= 18 -> the finalized HistoryStep boundary may serve snapshots
-///
-/// # Security vs fake snapshots
-///
-///   - 155 fake MAX_TARGET blocks (work=2/block) -> chainwork = 310 << 9.4M -> FAILS
-///   - 18 real blocks + genesis  -> chainwork >= 18 * 2^19 -> PASSES
-pub const MIN_SNAPSHOT_CHAINWORK: [u8; 32] = {
-    let mut w = [0u8; 32];
-    // 18 * 2^19 = 0x90_0000 = 9,437,184
-    // In LE bytes: byte[2] = 0x90.
-    w[2] = 0x90; // = CONSENSUS_FINALITY_DEPTH(18) * block_work(GENESIS_TARGET)
-    w
 };
 
 /// Minimum allowed target (maximum difficulty). Theoretical floor.

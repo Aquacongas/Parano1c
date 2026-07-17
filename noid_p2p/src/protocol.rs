@@ -94,10 +94,13 @@ pub struct GetHistoryStepTerminalRequest {
 #[derive(Debug, Clone)]
 pub struct GetHistoryStepTerminalResponse {
     /// Exact request boundary echoed by the server so delayed responses cannot
-    /// consume a newer manifest session for the same peer.
+    /// consume a newer manifest session for the same peer. This is the
+    /// nonce-bearing chain-link block id.
     pub height: u64,
     pub block_hash: [u8; 32],
-    /// Serialized fused HistoryStep terminal bound to `height, block_hash`.
+    /// Serialized fused HistoryStep terminal bound to `height` and the
+    /// nonce-free semantic id of the same header. Node-side snapshot
+    /// verification checks both ids against that authenticated staged header.
     pub terminal_bytes: Option<Vec<u8>>,
     /// Process-wide inbound byte admission retained until node-side terminal
     /// verification has consumed the response.
