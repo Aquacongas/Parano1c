@@ -33,6 +33,7 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::outbound_budget::OutboundResponseBudget;
+use crate::peer_diversity::PeerDiversity;
 use crate::protocol::{
     BlockGossipMsg, GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse,
     GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
@@ -837,17 +838,31 @@ async fn run_swarm(
     // routing table (populated when seeds connect and identify fires).
     // The bootstrap is a no-op if the routing table is empty; it will be
     // re-triggered automatically when the first peer is added via identify.
-    // Load persisted peers and add to Kademlia routing table.
-    // This makes cold restarts resilient when DNS seeds are temporarily down.
-    let cached_peers = crate::peer_store::load(&data_dir);
-    if !cached_peers.is_empty() {
+    // Load only previously successful outbound peers. They seed Kademlia and a
+    // randomized, network-diverse subset is dialled directly as restart
+    // anchors, so temporary DNS failure does not strand the node.
+    let mut successful_peer_cache = crate::peer_store::load(&data_dir);
+    let cached_peer_count = successful_peer_cache.entries().count();
+    if cached_peer_count > 0 {
         tracing::debug!(
-            count = cached_peers.len(),
-            "peer store: seeding Kademlia from cache"
+            count = cached_peer_count,
+            "peer store: seeding Kademlia from successful outbound cache"
         );
-        for (peer_id, addrs) in &cached_peers {
-            for addr in addrs {
-                swarm.behaviour_mut().kad.add_address(peer_id, addr.clone());
+        for peer in successful_peer_cache.entries() {
+            for addr in &peer.addrs {
+                swarm
+                    .behaviour_mut()
+                    .kad
+                    .add_address(&peer.peer_id, addr.clone());
+            }
+        }
+        for anchor in successful_peer_cache.randomized_startup_anchors() {
+            let options = libp2p::swarm::dial_opts::DialOpts::peer_id(anchor.peer_id)
+                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                .addresses(anchor.addrs)
+                .build();
+            if let Err(error) = swarm.dial(options) {
+                tracing::debug!(peer = %anchor.peer_id, err = %error, "startup anchor dial failed");
             }
         }
     }
@@ -882,6 +897,7 @@ async fn run_swarm(
         BoundedPendingRequests::new(MAX_PENDING_RETAINED_BLOCK_REQUESTS);
     let mut pending_state_segment_requests =
         BoundedPendingRequests::new(MAX_PENDING_STATE_SEGMENT_REQUESTS);
+    let mut peer_diversity = PeerDiversity::default();
 
     // One waiting response of each kind is sufficient: the request-response
     // behaviour owns the next response while its codec writes it. Byte permits
@@ -981,6 +997,8 @@ async fn run_swarm(
                     &mut snapshot_segment_rate,
                     &mut pending_retained_block_requests,
                     &mut pending_state_segment_requests,
+                    &mut peer_diversity,
+                    &mut successful_peer_cache,
                 )
                 .await;
             }
@@ -1105,26 +1123,12 @@ async fn run_swarm(
                 tracing::debug!("kad: periodic random walk");
             }
 
-            // Peer store: persist routing table for cold-restart resilience.
+            // Persist only peers confirmed by successful outbound transport.
             _ = peer_store_timer.tick() => {
-                // Collect addresses from Kademlia routing table.
-                // We iterate kbuckets and collect all known (peer, addrs) pairs.
-                let peers: Vec<(PeerId, Vec<Multiaddr>)> = swarm
-                    .behaviour_mut()
-                    .kad
-                    .kbuckets()
-                    .flat_map(|bucket| {
-                        bucket.iter().map(|entry| {
-                            let peer_id = *entry.node.key.preimage();
-                            let addrs: Vec<Multiaddr> = entry.node.value.iter().cloned().collect();
-                            (peer_id, addrs)
-                        }).collect::<Vec<_>>()
-                    })
-                    .filter(|(_, addrs)| !addrs.is_empty())
-                    .collect();
+                let cache = successful_peer_cache.clone();
                 let data_dir = data_dir.clone();
                 tokio::task::spawn_blocking(move || {
-                    crate::peer_store::save(&data_dir, &peers);
+                    crate::peer_store::save(&data_dir, &cache);
                 });
             }
 
@@ -1197,6 +1201,7 @@ async fn run_swarm(
             }
         }
     }
+    crate::peer_store::save(&data_dir, &successful_peer_cache);
     Ok(())
 }
 
@@ -1262,36 +1267,11 @@ fn allow_peer_rate(
 }
 
 fn is_routable_identify_addr(addr: &Multiaddr) -> bool {
-    for protocol in addr.iter() {
-        match protocol {
-            libp2p::multiaddr::Protocol::Ip4(ip) => {
-                if ip.is_loopback()
-                    || ip.is_private()
-                    || ip.is_link_local()
-                    || ip.is_multicast()
-                    || ip.is_broadcast()
-                    || ip.is_unspecified()
-                {
-                    return false;
-                }
-            }
-            libp2p::multiaddr::Protocol::Ip6(ip) => {
-                let octets = ip.octets();
-                let unique_local = (octets[0] & 0xfe) == 0xfc;
-                let link_local = octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80;
-                if ip.is_loopback()
-                    || ip.is_unspecified()
-                    || ip.is_multicast()
-                    || unique_local
-                    || link_local
-                {
-                    return false;
-                }
-            }
-            _ => {}
-        }
-    }
-    true
+    // DNS names advertised by an untrusted peer are cheap aliases around one
+    // attacker-controlled host and bypass IP-group diversity. Explicit DNS
+    // seeds remain supported by the node CLI; Identify learns only resolved,
+    // globally-routable transport addresses.
+    crate::peer_diversity::contains_public_ip(addr)
 }
 
 /// Process a single network command. Separated from the select! loop so that
@@ -1547,6 +1527,8 @@ async fn handle_swarm_event(
         request_response::OutboundRequestId,
         PendingStateSegmentRequest,
     >,
+    peer_diversity: &mut PeerDiversity,
+    successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
 ) {
     macro_rules! fail_peer {
         ($peer:expr) => {
@@ -2612,9 +2594,34 @@ async fn handle_swarm_event(
         // --- Connection events ---
         SwarmEvent::ConnectionEstablished {
             peer_id,
+            connection_id,
+            endpoint,
             num_established,
             ..
         } => {
+            if let Err(reason) = peer_diversity.try_admit(
+                connection_id,
+                peer_id,
+                endpoint.get_remote_address(),
+                endpoint.is_dialer(),
+            ) {
+                let _ = swarm.close_connection(connection_id);
+                // `BucketInserts::OnConnected` may have admitted the peer just
+                // before the outer swarm event reached us. Do not let a
+                // rejected Sybil occupy Kademlia and trigger repeated dials.
+                swarm.behaviour_mut().kad.remove_peer(&peer_id);
+                tracing::debug!(
+                    peer = %peer_id,
+                    address = %endpoint.get_remote_address(),
+                    ?reason,
+                    "closing connection that violates public peer diversity"
+                );
+                return;
+            }
+            if endpoint.is_dialer() {
+                successful_peer_cache
+                    .record_success(peer_id, endpoint.get_remote_address().clone());
+            }
             // Only emit PeerConnected on the FIRST connection to a peer.
             // Multiple connections to the same peer are common (simultaneous dials,
             // mDNS re-discovery, relay + direct). Emitting for each one causes
@@ -2627,11 +2634,19 @@ async fn handle_swarm_event(
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
+            connection_id,
             num_established,
             endpoint,
             cause,
             ..
         } => {
+            if !peer_diversity.remove(connection_id) {
+                tracing::debug!(
+                    peer = %peer_id,
+                    "diversity-rejected connection closed"
+                );
+                return;
+            }
             // Only emit PeerDisconnected when the LAST connection to a peer closes.
             if num_established == 0 {
                 let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer_id));

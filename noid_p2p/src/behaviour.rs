@@ -19,10 +19,13 @@
 //! 3. **mDNS** — UDP broadcast on the local network.  Useful for local dev
 //!    and private clusters; has no effect on the public internet.
 //!
-//! Additionally, **GossipSub peer exchange** (`do_px`) lets mesh peers share
-//! peer lists in PRUNE messages, giving organic topology growth on top of
-//! what Kademlia provides.
+//! GossipSub PX is intentionally not used with rust-libp2p 0.47: that version
+//! cannot consume the signed address records required to make PeerId-only PX a
+//! trustworthy discovery mechanism. Kademlia remains the address-bearing
+//! discovery layer.
 
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use libp2p::{
@@ -168,9 +171,11 @@ impl NodeBehaviour {
         //  mesh_n / _low / _high  scaled-down so a mesh FORMS with as few as
         //                         2 nodes in local tests; still works at scale.
         //
-        //  do_px()              enable peer exchange in PRUNE messages so nodes
-        //                       organically discover neighbours beyond their
-        //                       initial seed connections.
+        //  Kademlia             is the address-bearing discovery mechanism.
+        //                       PX is deliberately disabled: rust-libp2p 0.47
+        //                       cannot consume signed address records here, so
+        //                       unauthenticated PeerId-only PX is not a safe
+        //                       substitute for discovery.
         //
         //  heartbeat 700ms      fast mesh maintenance for dev/test; fine at
         //                       scale (Ethereum uses 700ms too).
@@ -201,11 +206,6 @@ impl NodeBehaviour {
             // every connected peer turns inbound spam into O(connected_peers)
             // outbound bandwidth even when downstream validation drops it.
             .flood_publish(false)
-            // Peer exchange: when the mesh prunes a peer it advertises up to 6
-            // alternative peers (PeerInfo with signed address records). The
-            // receiving node dials those peers automatically, enabling organic
-            // topology growth without DNS seeds or manual configuration.
-            .do_px()
             .validation_mode(gossipsub::ValidationMode::Strict)
             .message_id_fn(|msg| {
                 // Content-addressed: hash the message data (not author+seq).
@@ -215,9 +215,37 @@ impl NodeBehaviour {
             .build()
             .map_err(|e| format!("gossipsub config: {e}"))?;
 
-        let gossipsub =
+        let mut gossipsub =
             gossipsub::Behaviour::new(MessageAuthenticity::Signed(key.clone()), gossipsub_cfg)
                 .map_err(|e| format!("gossipsub: {e}"))?;
+
+        // Peer scoring is a topology control, not a consensus oracle. Even
+        // without application topic scores it provides two important v1.1
+        // defences: protocol-behaviour penalties and exact-IP colocation
+        // penalties. The threshold of eight follows Lighthouse's production
+        // profile: ordinary NAT/datacenter co-location remains usable while a
+        // large identity farm on one IP becomes expensive. Loopback is
+        // whitelisted so multi-process local networks retain realistic mesh
+        // behaviour.
+        let mut ip_colocation_whitelist = HashSet::new();
+        ip_colocation_whitelist.insert(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        ip_colocation_whitelist.insert(IpAddr::V6(Ipv6Addr::LOCALHOST));
+        let peer_score_params = gossipsub::PeerScoreParams {
+            ip_colocation_factor_threshold: 8.0,
+            ip_colocation_factor_whitelist: ip_colocation_whitelist,
+            ..gossipsub::PeerScoreParams::default()
+        };
+        let peer_score_thresholds = gossipsub::PeerScoreThresholds {
+            // With no trusted-bootstrap application score, accepting PX must
+            // fail closed. Kademlia carries actual transport addresses.
+            accept_px_threshold: 1.0,
+            // Trigger recovery only when the current mesh median is negative.
+            opportunistic_graft_threshold: 0.0,
+            ..gossipsub::PeerScoreThresholds::default()
+        };
+        gossipsub
+            .with_peer_score(peer_score_params, peer_score_thresholds)
+            .map_err(|e| format!("gossipsub peer score: {e}"))?;
 
         // ----------------------------------------------------------------
         // Request-response protocols

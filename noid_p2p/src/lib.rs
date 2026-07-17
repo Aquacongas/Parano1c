@@ -17,6 +17,7 @@ mod inbound_budget;
 pub mod mempool_sync_codec;
 pub mod network;
 mod outbound_budget;
+mod peer_diversity;
 pub mod peer_store;
 pub mod protocol;
 pub mod state_manifest_codec;
