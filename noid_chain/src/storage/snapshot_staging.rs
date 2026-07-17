@@ -1127,6 +1127,67 @@ mod tests {
     }
 
     #[test]
+    fn expanded_domain_snapshot_authenticates_sparse_lower_and_upper_segments() {
+        let parent = tempfile::tempdir().unwrap();
+        let cases = [(0u16, 7u16, 1u64), (511u16, u16::MAX, 2u64)];
+        let mut global = StreamingSparseRoot::new(25).unwrap();
+        let mut descriptors = Vec::with_capacity(cases.len());
+        let mut payloads = Vec::with_capacity(cases.len());
+
+        for (segment_id, local_index, creation_id) in cases {
+            let slot = SlotValue::from_parts(
+                5,
+                creation_id,
+                Block128::from(creation_id + 11),
+                Block128::from(creation_id + 12),
+            );
+            let mut segment_exact = StreamingSparseRoot::new(16).unwrap();
+            segment_exact
+                .push_leaf(u32::from(local_index), slot_leaf_hash(slot))
+                .unwrap();
+            let segment_root = segment_exact.finish().unwrap();
+            let global_index = (u32::from(segment_id) << 16) | u32::from(local_index);
+            global
+                .push_leaf(global_index, slot_leaf_hash(slot))
+                .unwrap();
+            let encoded = encode_sparse_segment_entries(16, &[(local_index, slot)]).unwrap();
+            descriptors.push(SnapshotSegmentDescriptor {
+                segment_id,
+                segment_root,
+                encoded_len: encoded.len() as u32,
+            });
+            payloads.push((segment_id, encoded));
+        }
+
+        let root = global.finish().unwrap();
+        let hdr = header(25, root, cases.len() as u64, 2);
+        let metadata =
+            AuthenticatedSnapshotMetadata::from_authenticated_header(hdr, block_id(&hdr), 16)
+                .unwrap();
+        let mut session =
+            SnapshotStagingSession::new(parent.path(), metadata, descriptors).unwrap();
+        for (segment_id, encoded) in &payloads {
+            session.accept_segment(*segment_id, 16, encoded).unwrap();
+        }
+        let finalized = session.finalize().unwrap();
+        assert_eq!(
+            finalized
+                .descriptors()
+                .iter()
+                .map(|descriptor| descriptor.segment_id)
+                .collect::<Vec<_>>(),
+            vec![0, 511]
+        );
+        assert_eq!(
+            finalized
+                .encoded_files()
+                .map(|file| file.read_encoded().unwrap().len())
+                .sum::<usize>(),
+            2 * 59
+        );
+    }
+
+    #[test]
     fn authenticated_manifest_boundary_and_geometry_fail_closed_before_staging() {
         let parent = tempfile::tempdir().unwrap();
         let (metadata, descriptor, _) = fixture();

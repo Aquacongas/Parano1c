@@ -499,6 +499,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expanded_domain_manifest_carries_sparse_upper_half_segment_ids() {
+        let response = GetStateManifestResponse {
+            tip_height: 88,
+            tip_hash: [0x51; 32],
+            cumulative_chainwork: [0x52; 32],
+            log_slots: 25,
+            active_slot_count: 2,
+            alloc_counter: 2,
+            eff_log: 16,
+            segment_ids: vec![0, 511],
+            segment_roots: vec![[0x53; 32], [0x54; 32]],
+            segment_lengths: vec![59, 59],
+        };
+        let mut wire = Cursor::new(Vec::new());
+        StateManifestCodec
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        wire.set_position(0);
+        let decoded = StateManifestCodec
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.log_slots, 25);
+        assert_eq!(decoded.eff_log, 16);
+        assert_eq!(decoded.segment_ids, vec![0, 511]);
+        assert_eq!(decoded.segment_lengths, vec![59, 59]);
+    }
+
+    #[tokio::test]
     async fn malicious_counts_reject_from_fixed_header_before_payload_allocation() {
         let mut segment_bomb = valid_fields();
         segment_bomb.segment_count = u32::MAX;

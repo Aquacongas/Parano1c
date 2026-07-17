@@ -569,4 +569,105 @@ mod tests {
             second.iter().copied().collect::<HashSet<_>>().len()
         );
     }
+
+    #[test]
+    fn production_allocator_returns_the_freed_slot_before_opening_a_new_segment() {
+        use noid_chain::fri_state::SlotValue;
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
+
+        const SEGMENT_SIZE: u32 = 1 << 16;
+        const FREED_SLOT: u32 = 31_337;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let owner = Address([0x5a; 32]);
+        let full_segment = (0..SEGMENT_SIZE)
+            .map(|slot| {
+                (
+                    slot,
+                    SlotValue::with_owner_fields(1, u64::from(slot) + 1, owner.as_fields()),
+                )
+            })
+            .collect::<Vec<_>>();
+        chain.state =
+            noid_chain::ChainState::from_sparse_utxos(24, &full_segment, u64::from(SEGMENT_SIZE))
+                .expect("full production segment");
+        let spend_only = |slot_index: u32, creation_id: u64| {
+            let mut inputs = [TxInput::dummy(); TX_INPUTS];
+            inputs[0] = TxInput {
+                slot_index,
+                amount: 1,
+                creation_id,
+            };
+            TxBody {
+                epoch_anchor: [0; 32],
+                fee: 1,
+                input_owner: owner,
+                inputs,
+                outputs: [TxOutput::dummy(); TX_OUTPUTS],
+                validity_bitmap: 1,
+                is_coinbase: false,
+            }
+        };
+        noid_chain::apply_tx(
+            &mut chain.state,
+            &spend_only(FREED_SLOT, u64::from(FREED_SLOT) + 1),
+        )
+        .unwrap();
+
+        let hint = collect_empty_slot_hints(&chain, &HashSet::new(), 0xdecafbad, 1)
+            .expect("the sole durable hole must be reusable");
+        assert_eq!(hint, vec![FREED_SLOT]);
+        assert_eq!(
+            chain
+                .state
+                .state
+                .materialized_segment_ids()
+                .collect::<Vec<_>>(),
+            vec![0],
+            "slot reuse must not materialize another production segment"
+        );
+        assert_eq!(chain.state.state.segment_live_count(0), SEGMENT_SIZE - 1);
+
+        // Once the last live value is spent, the segment is dematerialized and
+        // becomes indistinguishable from any other virtual-zero segment. When
+        // the deterministic zone permutation reaches it again, it is reusable
+        // without restoring or allocating a dense image merely to issue hints.
+        let sole_slot = SlotValue::with_owner_fields(1, 1, owner.as_fields());
+        chain.state = noid_chain::ChainState::from_sparse_utxos(24, &[(7, sole_slot)], 1)
+            .expect("one-slot production segment");
+        noid_chain::apply_tx(&mut chain.state, &spend_only(7, 1)).unwrap();
+        assert_eq!(chain.state.state.segment_live_count(0), 0);
+        assert!(chain
+            .state
+            .state
+            .materialized_segment_ids()
+            .next()
+            .is_none());
+
+        let first_zone_for_segment_zero = (0u64..256)
+            .find(|zone| {
+                generate_zone_segment_hints(
+                    zone * noid_chain::consensus::allocator::ZONE_CAPACITY,
+                    24,
+                    1,
+                ) == vec![0]
+            })
+            .expect("the zone permutation covers segment zero");
+        chain.state.alloc_counter =
+            (first_zone_for_segment_zero + 256) * noid_chain::consensus::allocator::ZONE_CAPACITY;
+        let recycled = collect_empty_slot_hints(&chain, &HashSet::new(), 0x55aa, 1)
+            .expect("fully cleared segment must re-enter allocation");
+        assert_eq!(recycled[0] >> 16, 0);
+        assert!(
+            chain
+                .state
+                .state
+                .materialized_segment_ids()
+                .next()
+                .is_none(),
+            "issuing a virtual-zero hint must stay allocation-free"
+        );
+    }
 }
