@@ -347,7 +347,7 @@ impl BlockMiner {
 
         tracing::debug!("BlockMiner started");
 
-        loop {
+        'mining: loop {
             // Clean shutdown: stop() sets `stopped` permanently; break before
             // starting a new template build so the task exits promptly.
             if self.stopped.load(Ordering::Acquire) {
@@ -461,6 +461,18 @@ impl BlockMiner {
                 );
             }
 
+            // HistoryStep preparation is deliberately atomic and therefore
+            // may finish after a shutdown request. Never turn that completed
+            // work into a new block: discard it before resetting the PoW
+            // cancellation flag.
+            if self.stopped.load(Ordering::Acquire) {
+                tracing::info!(
+                    height,
+                    "miner: shutdown requested during preparation; discarding prepared block"
+                );
+                break;
+            }
+
             // Preparation may be expensive. Refuse to spend PoW on a parent
             // that was replaced while it ran; the final commit repeats this
             // exact-parent check under the canonical write lock.
@@ -488,6 +500,17 @@ impl BlockMiner {
             let pow_header = attempt.pow_header(0);
             let cancel_pow = Arc::clone(&cancel);
             cancel.store(false, Ordering::Relaxed);
+            // Close the race where shutdown set cancel between the check
+            // above and the reset. A later shutdown cannot be lost because it
+            // sets cancel after this point and the PoW worker observes it.
+            if self.stopped.load(Ordering::Acquire) {
+                cancel.store(true, Ordering::SeqCst);
+                tracing::info!(
+                    height,
+                    "miner: shutdown requested before PoW; discarding prepared block"
+                );
+                break;
+            }
             heartbeat.reset();
             let pow_start = Instant::now();
             let mut pow_handle = tokio::task::spawn_blocking(move || {
@@ -498,6 +521,10 @@ impl BlockMiner {
                 pow_res = &mut pow_handle => {
                     match pow_res {
                         Ok(Ok(Some(sol))) => {
+                            if self.stopped.load(Ordering::Acquire) {
+                                tracing::info!(height, "miner: shutdown requested after PoW; discarding nonce");
+                                break 'mining;
+                            }
                             let nonce_found_at = Instant::now();
                             let sealed_header = attempt.pow_header(sol.nonce);
                             let hash = block_id(&sealed_header);
@@ -559,6 +586,10 @@ impl BlockMiner {
                                 }
                             };
 
+                            if self.stopped.load(Ordering::Acquire) {
+                                tracing::info!(height, "miner: shutdown requested during seal; discarding proved block");
+                                break 'mining;
+                            }
 
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
