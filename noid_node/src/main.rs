@@ -167,6 +167,14 @@ fn retained_suffix_has_more(local_height: u64, announced_height: u64) -> bool {
     local_height < announced_height
 }
 
+fn next_block_has_competing_parent(
+    local_height: u64,
+    local_tip_hash: [u8; 32],
+    header: &noid_chain::BlockHeader,
+) -> bool {
+    header.height == local_height.saturating_add(1) && header.prev_block_hash != local_tip_hash
+}
+
 fn unavailable_block_requires_snapshot(
     local_height: u64,
     requested_height: u64,
@@ -1602,11 +1610,11 @@ fn state_segment_response_matches_snapshot_boundary(
 mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
-        mark_initial_sync_ready, p2p_listen_to_multiaddr, snapshot_header_next_action,
-        state_segment_response_matches_snapshot_boundary, unavailable_block_requires_snapshot,
-        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, NodeConfig, SnapshotHeaderBoundary,
-        SnapshotHeaderNextAction,
+        mark_initial_sync_ready, next_block_has_competing_parent, p2p_listen_to_multiaddr,
+        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
+        unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
+        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
+        NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
     };
 
     #[test]
@@ -1699,6 +1707,37 @@ mod tests {
         assert!(unavailable_block_requires_snapshot(10, 11, 11));
         assert!(unavailable_block_requires_snapshot(10, 11, 20));
         assert!(!unavailable_block_requires_snapshot(10, 12, 20));
+    }
+
+    #[test]
+    fn next_full_block_on_competing_parent_requires_header_fork_choice() {
+        let local_tip_hash = [0x11; 32];
+        let mut header = noid_chain::consensus::genesis_header();
+        header.height = 11;
+        header.prev_block_hash = [0x22; 32];
+
+        assert!(next_block_has_competing_parent(10, local_tip_hash, &header));
+
+        header.prev_block_hash = local_tip_hash;
+        assert!(!next_block_has_competing_parent(
+            10,
+            local_tip_hash,
+            &header
+        ));
+
+        header.prev_block_hash = [0x22; 32];
+        header.height = 10;
+        assert!(!next_block_has_competing_parent(
+            10,
+            local_tip_hash,
+            &header
+        ));
+        header.height = 12;
+        assert!(!next_block_has_competing_parent(
+            10,
+            local_tip_hash,
+            &header
+        ));
     }
     #[test]
     fn snapshot_header_progress_rejects_delayed_and_oversized_batches() {
@@ -2659,8 +2698,11 @@ async fn handle_p2p_events(
 
                         // Skip blocks at or below our current tip — we already have them.
                         // This avoids expensive proof verification against a stale pre-state.
-                        {
-                            let our_tip = chain.read().await.tip_height();
+                        let next_block_competing_parent = {
+                            let (our_tip, our_tip_hash) = {
+                                let ctx = chain.read().await;
+                                (ctx.tip_height(), ctx.tip_hash())
+                            };
                             if block.header.height <= our_tip {
                                 tracing::debug!(
                                     peer = %from,
@@ -2743,19 +2785,39 @@ async fn handle_p2p_events(
                                 }
                                 continue;
                             }
-                        }
+
+                            next_block_has_competing_parent(
+                                our_tip,
+                                our_tip_hash,
+                                &block.header,
+                            )
+                        };
 
                         let suffix_apply_started = Instant::now();
                         let candidate = AcceptedBlockCandidate { block, bundle };
                         let suffix_block_bytes = candidate.retained_bytes() as u64;
-                        let apply_result = apply_p2p_block_offthread(
-                            &chain,
-                            &wallet,
-                            candidate,
-                            local_time,
-                            history_step_runtime.clone(),
-                        )
-                        .await;
+                        // Full bundle gossip can arrive without its compact header.
+                        // On a competing parent, state-bound validation may report a
+                        // coinbase/state-anchor error before it reaches parent hash
+                        // validation. Route the intact candidate directly into the
+                        // existing BadParentHash orphan/header-fork-choice path.
+                        let apply_result = if next_block_competing_parent {
+                            Err((
+                                noid_chain::storage::MdbxContextError::Consensus(
+                                    noid_chain::consensus::ConsensusError::BadParentHash,
+                                ),
+                                candidate,
+                            ))
+                        } else {
+                            apply_p2p_block_offthread(
+                                &chain,
+                                &wallet,
+                                candidate,
+                                local_time,
+                                history_step_runtime.clone(),
+                            )
+                            .await
+                        };
 
                         match apply_result {
                             Ok(applied) => {
