@@ -97,6 +97,46 @@ struct OrphanBlock {
     received_at: Instant,
 }
 
+/// One bounded shallow-fork download selected from an authenticated peer's
+/// linked header response.
+///
+/// Accepted bundles are deliberately pulled one at a time.  A block bundle
+/// can consume the complete process-wide inbound byte budget; opening one
+/// request per finality height both violates the block-sync stream limit and
+/// lets a many-miner race amplify memory pressure.  The complete replacement
+/// is applied atomically only after every expected bundle has arrived.
+struct PendingShallowFork {
+    peer: libp2p::PeerId,
+    ancestor_height: u64,
+    ancestor_hash: [u8; 32],
+    expected_headers: Vec<noid_chain::BlockHeader>,
+    candidates: Vec<AcceptedBlockCandidate>,
+    retained_bytes: usize,
+    advertised_work: [u8; 32],
+    started_at: Instant,
+}
+
+impl PendingShallowFork {
+    fn expected_header(&self) -> Option<&noid_chain::BlockHeader> {
+        self.expected_headers.get(self.candidates.len())
+    }
+
+    fn tip_height(&self) -> u64 {
+        self.expected_headers
+            .last()
+            .expect("a shallow-fork session is never empty")
+            .height
+    }
+
+    fn tip_hash(&self) -> [u8; 32] {
+        noid_chain::consensus::pow::block_id(
+            self.expected_headers
+                .last()
+                .expect("a shallow-fork session is never empty"),
+        )
+    }
+}
+
 impl OrphanBlock {
     fn from_candidate(candidate: AcceptedBlockCandidate) -> Self {
         Self {
@@ -1784,6 +1824,7 @@ async fn handle_p2p_events(
     use noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH;
     use std::collections::HashMap;
     let mut orphan_pool: HashMap<[u8; 32], OrphanBlock> = HashMap::new();
+    let mut pending_shallow_fork: Option<PendingShallowFork> = None;
 
     // --- Snapshot verification state ---
     //
@@ -1979,6 +2020,7 @@ async fn handle_p2p_events(
             }
             pending_segment_ids.clear();
             segment_queue.clear();
+            pending_shallow_fork = None;
             if history_step_verification_inflight.is_some() {
                 tracing::debug!(
                     "sync state reset — waiting for the bounded verifier to release its admission"
@@ -2188,12 +2230,45 @@ async fn handle_p2p_events(
                         )
                     };
                     if let Err(e) = precheck {
-                        tracing::debug!(
-                            peer = %from,
-                            height,
-                            err = %e,
-                            "compact block header precheck failed — not pulling block body"
-                        );
+                        if e == noid_chain::consensus::ConsensusError::BadParentHash {
+                            // A valid-looking child of another same-height tip is
+                            // the normal shape of a two-miner race.  Do not pull
+                            // its large body against the wrong pre-state; first
+                            // recover a linked header suffix and common ancestor.
+                            let fetch_from =
+                                our_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
+                            let fetch_count =
+                                (CONSENSUS_FINALITY_DEPTH as u16 * 2).min(512);
+                            let request_key = (from, fetch_from, fetch_count);
+                            let recently_requested = recent_header_fetches
+                                .get(&request_key)
+                                .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
+                            if !recently_requested && !fetch_in_progress.contains(&from) {
+                                fetch_in_progress.insert(from);
+                                recent_header_fetches.insert(request_key, Instant::now());
+                                tracing::info!(
+                                    peer = %from,
+                                    our_height,
+                                    announced_height = height,
+                                    fetch_from,
+                                    "competing parent announced — fetching headers for fork choice"
+                                );
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                        peer: from,
+                                        start_height: fetch_from,
+                                        count: fetch_count,
+                                    })
+                                    .await;
+                            }
+                        } else {
+                            tracing::debug!(
+                                peer = %from,
+                                height,
+                                err = %e,
+                                "compact block header precheck failed — not pulling block body"
+                            );
+                        }
                         continue;
                     }
 
@@ -2296,6 +2371,226 @@ async fn handle_p2p_events(
                         let local_time = unix_now();
                         let block_hash = noid_chain::consensus::pow::block_id(&block.header);
                         pending_block_fetches.remove(&(block.header.height, block_hash));
+
+                        // A shallow-fork session owns exactly one requested
+                        // bundle at a time.  Do not validate that bundle against
+                        // the current competing state: coinbase/state anchors
+                        // necessarily belong to the common ancestor branch and
+                        // would fail before BadParentHash.  Instead bind every
+                        // response to the already linked header suffix, retain
+                        // it under the orphan-byte cap, and atomically validate
+                        // the complete replacement through apply_reorg_mdbx.
+                        let expected_shallow = pending_shallow_fork
+                            .as_ref()
+                            .filter(|pending| pending.peer == from)
+                            .and_then(|pending| pending.expected_header().copied());
+                        if let Some(expected_header) = expected_shallow {
+                            if block.header.height == expected_header.height {
+                                let expected_hash =
+                                    noid_chain::consensus::pow::block_id(&expected_header);
+                                if block_hash != expected_hash {
+                                    tracing::warn!(
+                                        peer = %from,
+                                        height = block.header.height,
+                                        expected_hash = %hex::encode(expected_hash),
+                                        received_hash = %hex::encode(block_hash),
+                                        "shallow-fork bundle does not match requested header"
+                                    );
+                                    pending_shallow_fork = None;
+                                    drop(bundle);
+                                    drop(inbound_memory_permit.take());
+                                    continue;
+                                }
+
+                                let candidate = AcceptedBlockCandidate { block, bundle };
+                                let candidate_bytes = candidate.retained_bytes();
+                                let exceeds_bound = pending_shallow_fork
+                                    .as_ref()
+                                    .is_none_or(|pending| {
+                                        pending
+                                            .retained_bytes
+                                            .checked_add(candidate_bytes)
+                                            .is_none_or(|total| total > MAX_ORPHAN_POOL_BYTES)
+                                    });
+                                if exceeds_bound {
+                                    tracing::warn!(
+                                        peer = %from,
+                                        height = candidate.block.header.height,
+                                        candidate_bytes,
+                                        max_bytes = MAX_ORPHAN_POOL_BYTES,
+                                        "shallow-fork replacement exceeds bounded retained bytes"
+                                    );
+                                    pending_shallow_fork = None;
+                                    drop(candidate);
+                                    drop(inbound_memory_permit.take());
+                                    continue;
+                                }
+
+                                {
+                                    let pending = pending_shallow_fork
+                                        .as_mut()
+                                        .expect("matched shallow-fork session exists");
+                                    pending.retained_bytes += candidate_bytes;
+                                    pending.candidates.push(candidate);
+                                }
+                                // From here the explicit fork-session byte cap
+                                // owns accounting for retained candidate bytes.
+                                drop(inbound_memory_permit.take());
+
+                                if let Some(next_header) = pending_shallow_fork
+                                    .as_ref()
+                                    .and_then(|pending| pending.expected_header().copied())
+                                {
+                                    let next_hash =
+                                        noid_chain::consensus::pow::block_id(&next_header);
+                                    let peer = pending_shallow_fork
+                                        .as_ref()
+                                        .expect("shallow-fork session remains active")
+                                        .peer;
+                                    pending_block_fetches.insert(
+                                        (next_header.height, next_hash),
+                                        PendingBlockFetch {
+                                            peer,
+                                            requested_at: Instant::now(),
+                                        },
+                                    );
+                                    tracing::debug!(
+                                        peer = %peer,
+                                        height = next_header.height,
+                                        "requesting next shallow-fork bundle"
+                                    );
+                                    let _ = p2p_cmd
+                                        .send(noid_p2p::NetworkCommand::RequestBlock {
+                                            peer,
+                                            height: next_header.height,
+                                        })
+                                        .await;
+                                    continue;
+                                }
+
+                                let completed = pending_shallow_fork
+                                    .take()
+                                    .expect("complete shallow-fork session exists");
+                                let new_tip_height = completed.tip_height();
+                                let new_tip_hash = completed.tip_hash();
+                                let (our_tip_height, canonical_ancestor, our_extra_work) = {
+                                    use noid_chain::{add_work, block_work};
+                                    let ctx = chain.read().await;
+                                    let our_tip_height = ctx.tip_height();
+                                    let canonical_ancestor = ctx
+                                        .recent_headers
+                                        .get(&completed.ancestor_height)
+                                        .map(noid_chain::consensus::pow::block_id);
+                                    let mut work = [0u8; 32];
+                                    if completed.ancestor_height <= our_tip_height {
+                                        for height in
+                                            (completed.ancestor_height + 1)..=our_tip_height
+                                        {
+                                            let Some(header) = ctx.recent_headers.get(&height)
+                                            else {
+                                                work = [0xFF; 32];
+                                                break;
+                                            };
+                                            work = add_work(
+                                                &work,
+                                                &block_work(&header.difficulty_target),
+                                            );
+                                        }
+                                    } else {
+                                        work = [0xFF; 32];
+                                    }
+                                    (our_tip_height, canonical_ancestor, work)
+                                };
+
+                                if canonical_ancestor != Some(completed.ancestor_hash) {
+                                    tracing::debug!(
+                                        peer = %completed.peer,
+                                        ancestor = completed.ancestor_height,
+                                        "shallow-fork ancestor changed while bundles were downloading"
+                                    );
+                                    drop(completed);
+                                    continue;
+                                }
+                                let should_reorg = noid_chain::work_gt(
+                                    &completed.advertised_work,
+                                    &our_extra_work,
+                                ) || (completed.advertised_work == our_extra_work
+                                    && new_tip_height > our_tip_height);
+                                if !should_reorg {
+                                    tracing::debug!(
+                                        peer = %completed.peer,
+                                        our_tip = our_tip_height,
+                                        competing_tip = new_tip_height,
+                                        "downloaded shallow fork no longer beats canonical work"
+                                    );
+                                    drop(completed);
+                                    continue;
+                                }
+
+                                tracing::info!(
+                                    our_tip = our_tip_height,
+                                    new_tip = new_tip_height,
+                                    ancestor = completed.ancestor_height,
+                                    blocks = completed.candidates.len(),
+                                    peer = %completed.peer,
+                                    "reorg: downloaded shallow fork has more work, reorganising"
+                                );
+                                let _wallet_operation = wallet_operation_gate.lock().await;
+                                let (reorg_reserved_inputs, reorg_reserved_outputs) =
+                                    mempool.reserved_slots().await;
+                                let reorg_result = apply_reorg_offthread(
+                                    &chain,
+                                    &wallet,
+                                    reorg_reserved_inputs,
+                                    reorg_reserved_outputs,
+                                    completed.ancestor_height,
+                                    completed.candidates,
+                                    unix_now(),
+                                    history_step_runtime.clone(),
+                                )
+                                .await;
+
+                                match reorg_result {
+                                    Ok(applied_reorg) => {
+                                        external_mining_attempts
+                                            .invalidate_for_tip(new_tip_height, new_tip_hash);
+                                        mempool
+                                            .on_new_block(
+                                                &applied_reorg.confirmed_tx_hashes,
+                                                new_tip_height,
+                                                applied_reorg.view,
+                                            )
+                                            .await;
+                                        let reverted =
+                                            applied_reorg.result.reverted_heights.len();
+                                        let applied =
+                                            applied_reorg.result.applied_heights.len();
+                                        mempool
+                                            .readmit_after_reorg(
+                                                applied_reorg.result.reclaimed_tx_hashes,
+                                            )
+                                            .await;
+                                        last_tip_advance = Instant::now();
+                                        sync_ready.notify_one();
+                                        tracing::info!(
+                                            new_tip = new_tip_height,
+                                            reverted,
+                                            applied,
+                                            "reorg complete"
+                                        );
+                                    }
+                                    Err((error, rejected_chain)) => {
+                                        drop(rejected_chain);
+                                        tracing::warn!(
+                                            peer = %from,
+                                            err = ?error,
+                                            "downloaded shallow-fork reorg failed, keeping current chain"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                        }
 
                         // Skip blocks at or below our current tip — we already have them.
                         // This avoids expensive proof verification against a stale pre-state.
@@ -2555,6 +2850,8 @@ async fn handle_p2p_events(
                                                         .readmit_after_reorg(reclaimed)
                                                         .await;
 
+                                                    last_tip_advance = Instant::now();
+                                                    sync_ready.notify_one();
                                                     let new_tip = new_tip_height;
                                                     tracing::info!(
                                                         new_tip,
@@ -2723,6 +3020,21 @@ async fn handle_p2p_events(
                         }
             }
             Ok(NetworkEvent::RecentBlockUnavailable { from, height }) => {
+                let unavailable_shallow = pending_shallow_fork
+                    .as_ref()
+                    .filter(|pending| pending.peer == from)
+                    .and_then(|pending| pending.expected_header())
+                    .is_some_and(|expected| expected.height == height);
+                if unavailable_shallow {
+                    tracing::warn!(
+                        peer = %from,
+                        height,
+                        "peer cannot serve the selected shallow-fork bundle — aborting session"
+                    );
+                    pending_shallow_fork = None;
+                    pending_block_fetches.retain(|_, pending| pending.peer != from);
+                    continue;
+                }
                 if snapshot_install_inflight.is_some() {
                     tracing::debug!(
                         peer = %from,
@@ -3064,7 +3376,7 @@ async fn handle_p2p_events(
                     (our_tip, found)
                 };
 
-                if let Some((ancestor_height, _ancestor_hash)) = ancestor_opt {
+                if let Some((ancestor_height, ancestor_hash)) = ancestor_opt {
                     // Found a common ancestor — reset the depth counter for this peer.
                     *fetch_depth.entry(from).or_insert(0) = 0;
                     // Found common ancestor. The competing chain:
@@ -3141,59 +3453,111 @@ async fn handle_p2p_events(
                             continue;
                         }
 
-                        // Shallow fork (≤ CONSENSUS_FINALITY_DEPTH): apply_reorg_mdbx can handle it.
-                            // Fetch individual blocks; they arrive quickly and the orphan
-                            // pool assembles them into a chain for the reorg comparison.
+                        let reorg_depth = our_tip.saturating_sub(ancestor_height);
+                        if reorg_depth > CONSENSUS_FINALITY_DEPTH {
                             tracing::info!(
                                 ancestor = ancestor_height,
                                 our_tip,
                                 competing_tip = new_tip_height,
+                                reorg_depth,
                                 peer = %from,
-                                "shallow fork: fetching {} competing blocks for reorg",
-                                competing.len()
+                                "competing fork crosses finalized depth — keeping canonical chain"
                             );
-                            for hdr in &competing {
-                                let hdr_hash = noid_chain::consensus::pow::block_id(hdr);
-                                let inflight_key = (hdr.height, hdr_hash);
-                                if let Some(pending) = pending_block_fetches.get(&inflight_key) {
-                                    if pending.requested_at.elapsed() < BLOCK_FETCH_INFLIGHT_TTL {
-                                        tracing::debug!(
-                                            peer = %from,
-                                            pending_peer = %pending.peer,
-                                            height = hdr.height,
-                                            "fork accepted bundle already in-flight"
-                                        );
-                                        continue;
-                                    }
-                                }
+                            continue;
+                        }
 
-                                let request_key = (from, hdr.height);
-                                let recently_requested = recent_block_fetches
-                                    .get(&request_key)
-                                    .is_some_and(|t| t.elapsed() < FETCH_DEDUP_TTL);
-                                if recently_requested {
-                                    tracing::debug!(
-                                        peer = %from,
-                                        height = hdr.height,
-                                        "fork block fetch already requested"
-                                    );
-                                    continue;
-                                }
-                                pending_block_fetches.insert(
-                                    inflight_key,
-                                    PendingBlockFetch {
-                                        peer: from,
-                                        requested_at: Instant::now(),
-                                    },
+                        let (competing_work, our_extra_work) = {
+                            use noid_chain::{add_work, block_work};
+                            let mut competing_work = [0u8; 32];
+                            for header in &competing {
+                                competing_work = add_work(
+                                    &competing_work,
+                                    &block_work(&header.difficulty_target),
                                 );
-                                recent_block_fetches.insert(request_key, Instant::now());
-                                let _ = p2p_cmd
-                                    .send(noid_p2p::NetworkCommand::RequestBlock {
-                                        peer: from,
-                                        height: hdr.height,
-                                    })
-                                    .await;
                             }
+                            let mut our_extra_work = [0u8; 32];
+                            let ctx = chain.read().await;
+                            for height in (ancestor_height + 1)..=our_tip {
+                                let Some(header) = ctx.recent_headers.get(&height) else {
+                                    tracing::warn!(
+                                        height,
+                                        ancestor = ancestor_height,
+                                        our_tip,
+                                        "canonical reorg comparison header is unavailable"
+                                    );
+                                    our_extra_work = [0xFF; 32];
+                                    break;
+                                };
+                                our_extra_work = add_work(
+                                    &our_extra_work,
+                                    &block_work(&header.difficulty_target),
+                                );
+                            }
+                            (competing_work, our_extra_work)
+                        };
+                        let advertises_better_chain =
+                            noid_chain::work_gt(&competing_work, &our_extra_work)
+                                || (competing_work == our_extra_work
+                                    && new_tip_height > our_tip);
+                        if !advertises_better_chain {
+                            tracing::debug!(
+                                ancestor = ancestor_height,
+                                our_tip,
+                                competing_tip = new_tip_height,
+                                peer = %from,
+                                "shallow fork headers do not beat canonical work"
+                            );
+                            continue;
+                        }
+
+                        if let Some(active) = pending_shallow_fork.as_ref() {
+                            tracing::debug!(
+                                active_peer = %active.peer,
+                                active_tip = active.tip_height(),
+                                candidate_peer = %from,
+                                candidate_tip = new_tip_height,
+                                "bounded shallow-fork download already active"
+                            );
+                            continue;
+                        }
+
+                        let expected_headers: Vec<noid_chain::BlockHeader> =
+                            competing.into_iter().copied().collect();
+                        let first = *expected_headers
+                            .first()
+                            .expect("a competing header suffix is non-empty");
+                        let first_hash = noid_chain::consensus::pow::block_id(&first);
+                        tracing::info!(
+                            ancestor = ancestor_height,
+                            our_tip,
+                            competing_tip = new_tip_height,
+                            peer = %from,
+                            bundles = expected_headers.len(),
+                            "shallow fork has more work — starting sequential bundle download"
+                        );
+                        pending_shallow_fork = Some(PendingShallowFork {
+                            peer: from,
+                            ancestor_height,
+                            ancestor_hash,
+                            expected_headers,
+                            candidates: Vec::new(),
+                            retained_bytes: 0,
+                            advertised_work: competing_work,
+                            started_at: Instant::now(),
+                        });
+                        pending_block_fetches.insert(
+                            (first.height, first_hash),
+                            PendingBlockFetch {
+                                peer: from,
+                                requested_at: Instant::now(),
+                            },
+                        );
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestBlock {
+                                peer: from,
+                                height: first.height,
+                            })
+                            .await;
                     } else {
                         tracing::debug!(
                             our_tip,
@@ -3802,6 +4166,16 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::PeerDisconnected(peer)) => {
                 tracing::debug!(peer = %peer, "peer disconnected");
                 manifest_peers.remove(&peer);
+                if pending_shallow_fork
+                    .as_ref()
+                    .is_some_and(|pending| pending.peer == peer)
+                {
+                    tracing::debug!(
+                        peer = %peer,
+                        "selected shallow-fork peer disconnected; discarding bounded session"
+                    );
+                    pending_shallow_fork = None;
+                }
                 let snapshot_sync_lost = pending_manifest
                     .as_ref()
                     .is_some_and(|pending| pending.from == peer)
@@ -4353,6 +4727,22 @@ async fn handle_p2p_events(
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
+
+            if pending_shallow_fork
+                .as_ref()
+                .is_some_and(|pending| pending.started_at.elapsed() >= Duration::from_secs(45))
+            {
+                let peer = pending_shallow_fork
+                    .as_ref()
+                    .expect("timed-out shallow-fork session exists")
+                    .peer;
+                tracing::warn!(
+                    peer = %peer,
+                    "shallow-fork bundle download timed out — discarding bounded session"
+                );
+                pending_shallow_fork = None;
+                pending_block_fetches.retain(|_, pending| pending.peer != peer);
+            }
 
             // A manifest round that produced zero responses is dead air — a
             // dropped response stream, a peer that never served it. Reset and
