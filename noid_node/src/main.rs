@@ -744,7 +744,8 @@ async fn main() -> anyhow::Result<()> {
         mempool.clone(),
         topics,
         data_dir.clone(),
-    );
+    )
+    .context("start P2P network")?;
     tracing::debug!(listen = %listen_addr, "P2P started");
 
     // Dial seeds: CLI seeds + config seeds + DNS seeds.

@@ -115,6 +115,7 @@ pub struct NodeBehaviour {
     ///    64 established outbound — we initiate fewer than we accept
     ///    64 pending inbound      — cap half-open handshakes
     ///    32 pending outbound     — cap simultaneous dial attempts
+    ///     2 established per peer — direct plus relay during path upgrade
     pub connection_limits: connection_limits::Behaviour,
 
     /// State manifest sync — step 1: request chain metadata + active segment IDs.
@@ -293,8 +294,14 @@ impl NodeBehaviour {
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(10))
-                .with_max_concurrent_streams(1),
+                // A full bounded response is 16 MiB; permit ordinary
+                // residential links to complete without weakening byte caps.
+                .with_request_timeout(Duration::from_secs(30))
+                // Both peers request the other's pre-existing pool on first
+                // connection. Two streams permit that symmetric exchange;
+                // response preparation and bytes remain process-globally
+                // serialized by the network-layer semaphore and budget.
+                .with_max_concurrent_streams(2),
         );
 
         // ----------------------------------------------------------------
@@ -394,7 +401,11 @@ impl NodeBehaviour {
                 .with_max_established_incoming(Some(128))
                 .with_max_established_outgoing(Some(64))
                 .with_max_pending_incoming(Some(64))
-                .with_max_pending_outgoing(Some(32)),
+                .with_max_pending_outgoing(Some(32))
+                // Simultaneous dials and direct/relay upgrades can briefly
+                // require two paths. More paths from one identity must not be
+                // able to consume a node's connection budget.
+                .with_max_established_per_peer(Some(2)),
         );
 
         Ok(Self {

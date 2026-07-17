@@ -2749,6 +2749,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "libc",
  "libp2p",
  "libp2p-connection-limits",
  "noid_chain",

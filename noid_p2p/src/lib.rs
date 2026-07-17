@@ -12,6 +12,7 @@ pub mod behaviour;
 pub mod block_sync_codec;
 pub mod header_sync_codec;
 pub mod history_step_codec;
+mod identity_store;
 mod inbound_budget;
 pub mod mempool_sync_codec;
 pub mod network;

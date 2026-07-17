@@ -114,6 +114,49 @@ struct PendingStateSegmentRequest {
     expected_tip_hash: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug)]
+struct MempoolSyncRetry {
+    failures: u8,
+    next_attempt: Instant,
+}
+
+const MAX_MEMPOOL_SYNC_FAILURES: u8 = 7;
+const MEMPOOL_SYNC_RETRY_INFLIGHT: Duration = Duration::from_secs(35);
+
+fn mempool_sync_retry_jitter(local: PeerId, remote: PeerId) -> Duration {
+    // Every client requesting the same busy peer must get a different retry
+    // phase. Hashing only `remote` synchronizes the entire fan-in on one tick.
+    // FNV-1a is sufficient here: this is load spreading, not authentication.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in local.to_bytes().iter().chain(remote.to_bytes().iter()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Duration::from_millis(hash % 4_000)
+}
+
+fn schedule_mempool_sync_retry(
+    retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
+    local: PeerId,
+    peer: PeerId,
+) -> Option<MempoolSyncRetry> {
+    let previous_failures = retries.get(&peer).map_or(0, |retry| retry.failures);
+    if previous_failures >= MAX_MEMPOOL_SYNC_FAILURES {
+        retries.remove(&peer);
+        return None;
+    }
+    let failures = previous_failures + 1;
+    let exponential_secs = 1u64 << failures.saturating_sub(1).min(5);
+    let retry = MempoolSyncRetry {
+        failures,
+        next_attempt: Instant::now()
+            + Duration::from_secs(exponential_secs)
+            + mempool_sync_retry_jitter(local, peer),
+    };
+    retries.insert(peer, retry);
+    Some(retry)
+}
+
 /// A fixed-capacity request correlation table. Request IDs are local transport
 /// capabilities: a response is consumed exactly once and only by the peer and
 /// request tuple recorded when `send_request` returned that ID.
@@ -573,7 +616,13 @@ impl P2PNetwork {
         mempool: AsyncMempool,
         topics: NetworkTopics,
         data_dir: std::path::PathBuf,
-    ) -> (Self, tokio::task::JoinHandle<()>) {
+    ) -> anyhow::Result<(Self, tokio::task::JoinHandle<()>)> {
+        // Load before spawning so an absent, corrupt, symlinked, or publicly
+        // readable private identity fails node startup instead of silently
+        // leaving RPC alive with a dead P2P task.
+        let identity = crate::identity_store::load_or_create(&data_dir)?;
+        let local_peer_id = identity.public().to_peer_id();
+        tracing::info!(peer = %local_peer_id, "loaded persistent P2P identity");
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (gossip_event_tx, _) = tokio::sync::broadcast::channel(GOSSIP_EVENT_QUEUE_CAPACITY);
         let (required_event_tx, required_event_rx) = mpsc::channel(REQUIRED_EVENT_QUEUE_CAPACITY);
@@ -589,6 +638,7 @@ impl P2PNetwork {
                 mempool,
                 topics,
                 data_dir,
+                identity,
             )
             .await
             {
@@ -596,14 +646,14 @@ impl P2PNetwork {
             }
         });
 
-        (
+        Ok((
             Self {
                 cmd_tx,
                 gossip_event_tx,
                 required_event_rx: std::sync::Mutex::new(Some(required_event_rx)),
             },
             handle,
-        )
+        ))
     }
 
     /// Attach the node's single authoritative event consumer.
@@ -751,11 +801,12 @@ async fn run_swarm(
     mempool: AsyncMempool,
     topics: NetworkTopics,
     data_dir: std::path::PathBuf,
+    identity: libp2p::identity::Keypair,
 ) -> anyhow::Result<()> {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
     let protocol_id = topics.protocol_id.clone();
-    let mut swarm = SwarmBuilder::with_new_identity()
+    let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -821,6 +872,8 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut mempool_sync_last_request: std::collections::HashMap<PeerId, Instant> =
         std::collections::HashMap::new();
+    let mut mempool_sync_retries: std::collections::HashMap<PeerId, MempoolSyncRetry> =
+        std::collections::HashMap::new();
     let mut snapshot_manifest_last_request: std::collections::HashMap<PeerId, Instant> =
         std::collections::HashMap::new();
     let mut snapshot_segment_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
@@ -859,6 +912,13 @@ async fn run_swarm(
     reconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     reconnect_timer.tick().await; // skip first immediate tick
 
+    // Keep retry jitter effective under a large simultaneous fan-in. Folding
+    // this into the five-second reconnect tick would release every due peer
+    // as one batch and recreate the handshake herd we are avoiding.
+    let mut mempool_retry_timer = tokio::time::interval(Duration::from_millis(250));
+    mempool_retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    mempool_retry_timer.tick().await; // skip first immediate tick
+
     // Peer store save timer: persist routing table every 5 minutes.
     let mut peer_store_timer = tokio::time::interval(std::time::Duration::from_secs(5 * 60));
     peer_store_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -884,6 +944,7 @@ async fn run_swarm(
                 cmd,
                 &topics,
                 &mut mempool_sync_last_request,
+                &mut mempool_sync_retries,
                 &gossip_event_tx,
                 &mut pending_retained_block_requests,
                 &mut pending_state_segment_requests,
@@ -915,6 +976,7 @@ async fn run_swarm(
                     &mut block_event_rate,
                     &mut tx_gossip_rate,
                     &mut mempool_sync_last_request,
+                    &mut mempool_sync_retries,
                     &mut snapshot_manifest_last_request,
                     &mut snapshot_segment_rate,
                     &mut pending_retained_block_requests,
@@ -1027,6 +1089,7 @@ async fn run_swarm(
                         cmd,
                         &topics,
                         &mut mempool_sync_last_request,
+                        &mut mempool_sync_retries,
                         &gossip_event_tx,
                         &mut pending_retained_block_requests,
                         &mut pending_state_segment_requests,
@@ -1102,6 +1165,35 @@ async fn run_swarm(
                 }
                 // Remove peers that are now connected (reconnect succeeded).
                 reconnect.retain(|peer, _| !swarm.is_connected(peer));
+            }
+
+            // Recover a mempool exchange rejected during a busy simultaneous
+            // multi-peer handshake. State is bounded by connected PeerIds,
+            // attempts are finite, and local+remote jitter spreads clients
+            // requesting the same server across timer ticks.
+            _ = mempool_retry_timer.tick() => {
+                let mempool_now = Instant::now();
+                let retry_peers: Vec<_> = mempool_sync_retries
+                    .iter()
+                    .filter(|(peer, retry)| {
+                        mempool_now >= retry.next_attempt && swarm.is_connected(peer)
+                    })
+                    .map(|(peer, retry)| (*peer, retry.failures))
+                    .collect();
+                mempool_sync_retries.retain(|peer, _| swarm.is_connected(peer));
+                for (peer, failures) in retry_peers {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .mempool_sync
+                        .send_request(&peer, crate::protocol::GetMempoolRequest);
+                    mempool_sync_last_request.insert(peer, mempool_now);
+                    if let Some(retry) = mempool_sync_retries.get_mut(&peer) {
+                        // Do not issue a duplicate while the request-response
+                        // timeout is still in flight.
+                        retry.next_attempt = mempool_now + MEMPOOL_SYNC_RETRY_INFLIGHT;
+                    }
+                    tracing::debug!(peer = %peer, failures, "retrying mempool sync");
+                }
             }
         }
     }
@@ -1209,6 +1301,7 @@ fn handle_network_command(
     cmd: NetworkCommand,
     topics: &NetworkTopics,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
+    mempool_sync_retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
     failure_event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
     pending_retained_block_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
@@ -1407,6 +1500,7 @@ fn handle_network_command(
                 }
             }
             mempool_sync_last_request.insert(peer, now);
+            mempool_sync_retries.remove(&peer);
             let _ = swarm
                 .behaviour_mut()
                 .mempool_sync
@@ -1442,6 +1536,7 @@ async fn handle_swarm_event(
     block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
+    mempool_sync_retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
     snapshot_manifest_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     snapshot_segment_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     pending_retained_block_requests: &mut BoundedPendingRequests<
@@ -1583,12 +1678,11 @@ async fn handle_swarm_event(
                 accepted_addrs += 1;
             }
 
-            // 2. Add to gossipsub explicit peers so the mesh can form even
-            //    with fewer than mesh_n connections.
-            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-
-            // 3. If this was the first peer added to an empty routing table,
-            //    kick off the bootstrap walk now.
+            // 2. Kick off the bootstrap walk now that at least one routable
+            //    peer may be present. Ordinary peers intentionally stay out
+            //    of GossipSub's explicit set: explicit peers receive every
+            //    publication outside the bounded mesh, producing O(degree)
+            //    block and transaction fan-out on large networks.
             let _ = swarm.behaviour_mut().kad.bootstrap();
 
             tracing::debug!(
@@ -1606,13 +1700,30 @@ async fn handle_swarm_event(
         // Discovered peers are on the same LAN — dial them directly.
         // On the public internet mDNS never fires (UDP broadcast is LAN-scoped).
         SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+            let mut dial_addresses: std::collections::HashMap<PeerId, Vec<Multiaddr>> =
+                std::collections::HashMap::new();
             for (peer_id, addr) in peers {
                 tracing::debug!(peer = %peer_id, addr = %addr, "mDNS: discovered LAN peer");
                 swarm
                     .behaviour_mut()
                     .kad
                     .add_address(&peer_id, addr.clone());
-                if let Err(e) = swarm.dial(addr) {
+                dial_addresses.entry(peer_id).or_default().push(addr);
+            }
+            for (peer_id, addresses) in dial_addresses {
+                if peer_id == *swarm.local_peer_id() || swarm.is_connected(&peer_id) {
+                    continue;
+                }
+                // One mDNS answer commonly contains the same PeerId on Wi-Fi,
+                // Ethernet and container bridges. Treat those as alternative
+                // paths in one conditional attempt; dialing each address as a
+                // separate connection races request streams against paths the
+                // per-peer limit then closes.
+                let options = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                    .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+                    .addresses(addresses)
+                    .build();
+                if let Err(e) = swarm.dial(options) {
                     tracing::debug!("mDNS dial: {e}");
                 }
             }
@@ -2441,11 +2552,17 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
+            mempool_sync_retries.remove(&peer);
             let GetMempoolResponse {
                 txs,
                 inbound_memory_permit,
                 outbound_memory_permit: _,
             } = response;
+            tracing::debug!(
+                from = %peer,
+                tx_count = txs.len(),
+                "mempool sync response complete"
+            );
             if !txs.is_empty() {
                 tracing::debug!(
                     from = %peer,
@@ -2469,7 +2586,27 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
-            tracing::debug!(peer = %peer, err = %error, "mempool sync request failed");
+            // A simultaneous handshake or a busy bounded response worker is
+            // transient. Keep the one-stream memory discipline and retry with
+            // bounded exponential backoff plus per-peer jitter.
+            mempool_sync_last_request.remove(&peer);
+            let local = *swarm.local_peer_id();
+            if let Some(retry) = schedule_mempool_sync_retry(mempool_sync_retries, local, peer) {
+                tracing::debug!(
+                    peer = %peer,
+                    err = %error,
+                    failures = retry.failures,
+                    retry_ms = retry.next_attempt.saturating_duration_since(Instant::now()).as_millis(),
+                    "mempool sync request failed — retry scheduled"
+                );
+            } else {
+                tracing::debug!(
+                    peer = %peer,
+                    err = %error,
+                    failures = MAX_MEMPOOL_SYNC_FAILURES,
+                    "mempool sync request failed — retry limit reached"
+                );
+            }
         }
 
         // --- Connection events ---
@@ -2481,7 +2618,6 @@ async fn handle_swarm_event(
             // Only emit PeerConnected on the FIRST connection to a peer.
             // Multiple connections to the same peer are common (simultaneous dials,
             // mDNS re-discovery, relay + direct). Emitting for each one causes
-            // redundant SyncBlocksFrom and RequestMempoolSync from the node handler.
             if num_established.get() == 1 {
                 let _ = gossip_event_tx.send(NetworkEvent::PeerConnected(peer_id));
                 tracing::debug!(peer = %peer_id, "peer connected");
@@ -2503,6 +2639,7 @@ async fn handle_swarm_event(
                 block_event_rate.remove(&peer_id);
                 tx_gossip_rate.remove(&peer_id);
                 mempool_sync_last_request.remove(&peer_id);
+                mempool_sync_retries.remove(&peer_id);
                 snapshot_manifest_last_request.remove(&peer_id);
                 snapshot_segment_rate.remove(&peer_id);
                 clear_peer_request_correlations(
@@ -2900,5 +3037,34 @@ mod tests {
         assert_eq!(budget.available_bytes(), 0);
         drop(response);
         assert_eq!(budget.available_bytes(), MAX_MEMPOOL_SYNC_BYTES);
+    }
+
+    #[test]
+    fn mempool_retry_is_per_peer_bounded_and_exponential() {
+        let local = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let peer = libp2p::identity::Keypair::generate_ed25519()
+            .public()
+            .to_peer_id();
+        let mut retries = std::collections::HashMap::new();
+        let before = Instant::now();
+        schedule_mempool_sync_retry(&mut retries, local, peer).unwrap();
+        let first = retries[&peer];
+        assert_eq!(first.failures, 1);
+        assert!(first.next_attempt >= before + Duration::from_secs(1));
+        assert!(first.next_attempt <= before + Duration::from_secs(5));
+
+        schedule_mempool_sync_retry(&mut retries, local, peer).unwrap();
+        let second = retries[&peer];
+        assert_eq!(second.failures, 2);
+        assert!(second.next_attempt > first.next_attempt);
+        for expected_failures in 3..=MAX_MEMPOOL_SYNC_FAILURES {
+            let retry = schedule_mempool_sync_retry(&mut retries, local, peer).unwrap();
+            assert_eq!(retry.failures, expected_failures);
+        }
+        assert!(schedule_mempool_sync_retry(&mut retries, local, peer).is_none());
+        assert!(retries.is_empty());
+        assert!(mempool_sync_retry_jitter(local, peer) < Duration::from_secs(4));
     }
 }
