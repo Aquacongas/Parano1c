@@ -203,6 +203,12 @@ impl MdbxHistoricalReadSnapshot<'_> {
         Ok(raw.and_then(|raw| decode_header(&raw)))
     }
 
+    pub(super) fn get_chain_work(&self, height: u64) -> Result<Option<[u8; 32]>, StoreError> {
+        let table = self.txn.open_table(Some(T_CHAIN_WORK))?;
+        let raw: Option<Vec<u8>> = self.txn.get(&table, &u64_key(height))?;
+        Ok(raw.and_then(|raw| decode_chain_work(&raw)))
+    }
+
     pub(super) fn get_undo_log(&self, height: u64) -> Result<Option<BlockUndoLog>, StoreError> {
         let table = self.txn.open_table(Some(T_UNDO_LOGS))?;
         let raw: Option<Vec<u8>> = self.txn.get(&table, &u64_key(height))?;
@@ -219,6 +225,21 @@ impl MdbxHistoricalReadSnapshot<'_> {
             decode_segment(&raw).ok_or(StoreError::Decode("invalid stored historical segment"))
         })
         .transpose()
+    }
+
+    pub(super) fn segment_ids(&self) -> Result<Vec<u16>, StoreError> {
+        let table = self.txn.open_table(Some(T_SEGMENTS))?;
+        let mut cursor = self.txn.cursor(&table)?;
+        let mut segment_ids = Vec::new();
+        let mut item: Option<(Vec<u8>, ())> = cursor.first()?;
+        while let Some((key, ())) = item {
+            if key.len() != 2 {
+                return Err(StoreError::Decode("invalid stored segment key"));
+            }
+            segment_ids.push(u16::from_le_bytes([key[0], key[1]]));
+            item = cursor.next()?;
+        }
+        sort_unique_segment_ids(segment_ids)
     }
 }
 
@@ -1920,8 +1941,8 @@ impl MdbxStore {
     ///
     /// After commit (non-atomic, re-runnable):
     ///   - Prune old undo_logs beyond UNDO_RETENTION_DEPTH.
-    ///   - Prune the retained block + terminal pair outside the shared
-    ///     finality/undo serving window.
+    ///   - Prune block bodies outside the shorter recent peer-serving window,
+    ///     while retaining its preceding HistoryStep terminal.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_block(
         &self,

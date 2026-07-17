@@ -127,17 +127,21 @@ const _: () = assert!(
 /// Pre-launch provisional value; publication freeze must ratify it independently.
 pub const CONSENSUS_FINALITY_DEPTH: u64 = 18;
 
-/// Undo-log retention depth for local shallow reorg recovery.
+/// Undo-log retention depth for local shallow reorg recovery and incremental
+/// finalized-state snapshot generation.
 ///
 /// This is intentionally separate from consensus finality. Retention may be
 /// tuned for operational needs; it must not silently define finality.
-pub const UNDO_RETENTION_DEPTH: u64 = 18;
+/// Two finality windows let the snapshot publisher advance from its preceding
+/// finalized generation without rescanning the complete live state.
+pub const UNDO_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH * 2;
 
 /// Recent full-block retention depth for peer serving and normal catch-up.
 ///
-/// Nodes keep accepted block bodies and undo material only for this recent
-/// window, plus the preceding HistoryStep terminal. Headers remain permanent.
-pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = UNDO_RETENTION_DEPTH;
+/// Nodes keep accepted block bodies for this recent window, plus the preceding
+/// HistoryStep terminal. Undo metadata has its own longer operational window;
+/// headers remain permanent.
+pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
 
 /// Number of finalised block headers used for the expansion trigger median.
 /// Using median over this window makes the trigger immune to single-block spam.

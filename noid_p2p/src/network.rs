@@ -1082,17 +1082,27 @@ async fn run_swarm(
                             if snapshot_exports.contains_key(&key) {
                                 None
                             } else {
-                                Some((key, ctx.store.clone()))
+                                let previous = snapshot_exports
+                                    .iter()
+                                    .filter(|((height, _), _)| *height < key.0)
+                                    .max_by_key(|((height, _), _)| *height)
+                                    .map(|(_, generation)| generation.clone());
+                                Some((key, ctx.store.clone(), previous))
                             }
                         })
                     };
-                    if let Some((key, store)) = candidate {
+                    if let Some((key, store, previous)) = candidate {
                         snapshot_export_inflight = Some(key);
                         let export_root = snapshot_export_root.clone();
                         let completion = snapshot_export_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let result = export_snapshot_generation(&store, &export_root, key.0)
-                                .map_err(|error| error.to_string());
+                            let result = export_snapshot_generation(
+                                &store,
+                                &export_root,
+                                key.0,
+                                previous.as_deref(),
+                            )
+                            .map_err(|error| error.to_string());
                             let _ = completion.blocking_send((key, result));
                         });
                     }

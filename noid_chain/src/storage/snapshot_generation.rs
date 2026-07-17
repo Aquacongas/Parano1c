@@ -5,9 +5,11 @@
 //!
 //! The durable MDBX state always describes the current canonical tip.  This
 //! module reconstructs any target inside the retained undo window without
-//! cloning that state: undo pre-images are grouped by segment, the numeric
-//! union of durable and touched segment IDs is visited once, and at most one
-//! decoded [`SegmentColumns`] plus its encoded bytes is resident at a time.
+//! cloning that state. The first generation visits the numeric union of
+//! durable and touched segment IDs once. Later generations hard-link unchanged
+//! immutable payloads and reconstruct only segments touched since the previous
+//! finalized boundary. At most one decoded [`SegmentColumns`] plus its encoded
+//! bytes is resident at a time.
 //!
 //! Segment payloads are written and synced into a private temporary generation
 //! directory as they are reconstructed.  The manifest is created only after
@@ -29,21 +31,22 @@ use serde::{Deserialize, Serialize};
 use crate::block_header::{block_id, BlockHeader};
 use crate::consensus::params::{BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, UNDO_RETENTION_DEPTH};
 use crate::consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS};
-use crate::exact_state_hash::slot_leaf_hash;
+use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use crate::fri_state::{compute_segment_root, SlotValue, LOG_SEGMENT_SIZE};
 use crate::segmented_state::SegmentColumns;
 use crate::state::StreamingSparseRoot;
+use crate::storage::mdbx_store::MdbxHistoricalReadSnapshot;
 use crate::storage::serial::{decode_segment, encode_segment, encoded_segment_len_for_eff_log};
 use crate::storage::{MdbxStore, StoreError};
 
 const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V1";
-const SNAPSHOT_GENERATION_VERSION: u32 = 1;
+const SNAPSHOT_GENERATION_VERSION: u32 = 2;
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const MANIFEST_TEMP_FILE_NAME: &str = ".manifest.tmp";
 const SEGMENTS_DIRECTORY_NAME: &str = "segments";
 
 /// A manifest contains only bounded segment metadata, never segment payloads.
-/// The complete `u16` segment namespace occupies less than 4 MiB here.
+/// The complete `u16` segment namespace occupies less than 8 MiB here.
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Consensus bounds make the retained rollback journal independent of state
@@ -77,6 +80,12 @@ pub struct SnapshotGenerationManifest {
     /// Strictly increasing non-empty segment descriptors.  Payloads live in
     /// separate files and are never accumulated in this vector.
     pub segments: Vec<SnapshotSegmentDescriptor>,
+    /// Live counts parallel to `segments`. Together with the exact roots below
+    /// they let an incremental publisher reauthenticate the complete state
+    /// boundary without reopening unchanged multi-megabyte payloads.
+    pub segment_live_counts: Vec<u32>,
+    /// Exact sparse-Merkle subtree roots parallel to `segments`.
+    pub exact_segment_roots: Vec<StateHash>,
 }
 
 impl SnapshotGenerationManifest {
@@ -132,10 +141,12 @@ impl SnapshotGeneration {
         &self,
         segment_id: u16,
     ) -> Result<Vec<u8>, SnapshotGenerationError> {
-        let descriptor = self
+        let descriptor_index = self
             .manifest
-            .segment(segment_id)
-            .ok_or(SnapshotGenerationError::SegmentNotInManifest(segment_id))?;
+            .segments
+            .binary_search_by_key(&segment_id, |entry| entry.segment_id)
+            .map_err(|_| SnapshotGenerationError::SegmentNotInManifest(segment_id))?;
+        let descriptor = &self.manifest.segments[descriptor_index];
         let path = segment_path(&self.directory, segment_id);
         let mut file = File::open(&path)?;
         let metadata_len = file.metadata()?.len();
@@ -167,7 +178,7 @@ impl SnapshotGeneration {
                 "effective segment log does not match manifest",
             ));
         }
-        let (live, root) = validate_segment_columns(
+        let (live, root, exact_root) = validate_segment_columns(
             segment_id,
             effective_log,
             &columns,
@@ -184,6 +195,14 @@ impl SnapshotGeneration {
             return Err(SnapshotGenerationError::InvalidSegment(
                 segment_id,
                 "raw segment root does not match manifest",
+            ));
+        }
+        if self.manifest.segment_live_counts[descriptor_index] != live
+            || self.manifest.exact_segment_roots[descriptor_index] != exact_root
+        {
+            return Err(SnapshotGenerationError::InvalidSegment(
+                segment_id,
+                "exact segment metadata does not match payload",
             ));
         }
         Ok(encoded)
@@ -321,13 +340,19 @@ impl From<io::Error> for SnapshotGenerationError {
 /// Export `target_height` from the current durable MDBX tip into `export_root`.
 ///
 /// The target must be canonical and no deeper than `UNDO_RETENTION_DEPTH`.
-/// Published generations are content-addressed and never overwritten.
+/// A canonical `previous` generation enables delta reconstruction; otherwise
+/// a complete self-authenticating generation is built. Published generations
+/// are content-addressed and never overwritten.
 pub fn export_snapshot_generation(
     store: &MdbxStore,
     export_root: &Path,
     target_height: u64,
+    previous: Option<&SnapshotGeneration>,
 ) -> Result<SnapshotGeneration, SnapshotGenerationError> {
-    let (tip_height, tip_hash) = store
+    // One MVCC transaction pins all source metadata and segment bytes. Mining
+    // may advance concurrently without making a long export internally mixed.
+    let snapshot = store.historical_read_snapshot()?;
+    let (tip_height, tip_hash) = snapshot
         .get_chain_tip()?
         .ok_or(SnapshotGenerationError::MissingChainTip)?;
     if target_height > tip_height {
@@ -343,13 +368,13 @@ pub fn export_snapshot_generation(
         });
     }
 
-    let tip_header = canonical_header(store, tip_height)?;
+    let tip_header = canonical_header(&snapshot, tip_height)?;
     if block_id(&tip_header) != tip_hash {
         return Err(SnapshotGenerationError::Corrupt(
             "tip hash does not match canonical tip header",
         ));
     }
-    let state_meta = store
+    let state_meta = snapshot
         .get_state_meta()?
         .ok_or(SnapshotGenerationError::MissingStateMeta)?;
     if state_meta
@@ -364,9 +389,9 @@ pub fn export_snapshot_generation(
         ));
     }
 
-    let target_header = canonical_header(store, target_height)?;
+    let target_header = canonical_header(&snapshot, target_height)?;
     let target_hash = block_id(&target_header);
-    let cumulative_chainwork = store
+    let cumulative_chainwork = snapshot
         .get_chain_work(target_height)?
         .ok_or(SnapshotGenerationError::MissingChainwork(target_height))?;
     validate_log_slots(tip_header.log_slots)?;
@@ -382,12 +407,17 @@ pub fn export_snapshot_generation(
     }
     let effective_log = tip_effective_log;
 
-    let rollback_by_segment =
-        collect_grouped_undo(store, target_height, tip_height, tip_hash, effective_log)?;
+    let rollback_by_segment = collect_grouped_undo(
+        &snapshot,
+        target_height,
+        tip_height,
+        tip_hash,
+        effective_log,
+    )?;
 
     // Discover only the strict numeric u16 key set. Segment payloads remain in
     // MDBX until the one-segment reconstruction loop below needs each one.
-    let durable_ids = store.segment_ids()?;
+    let durable_ids = snapshot.segment_ids()?;
 
     let tip_segment_count = segment_count(tip_header.log_slots)?;
     if durable_ids
@@ -399,17 +429,61 @@ pub fn export_snapshot_generation(
         ));
     }
 
-    // Payload-free metadata union.  The ordered vector drives both exact-root
-    // streaming and deterministic file/manifest order.
-    let mut union_ids = durable_ids.clone();
-    union_ids.extend(rollback_by_segment.keys().copied());
+    // A preceding canonical generation is an authenticated state base. Only
+    // segments touched between that boundary and the new finalized boundary
+    // can differ; all other immutable files are linked into the new generation
+    // without reading, hashing, or copying their 3 MiB payloads.
+    let eligible_base = match previous {
+        Some(candidate)
+            if incremental_base_is_eligible(
+                &snapshot,
+                candidate,
+                &target_header,
+                tip_height,
+                effective_log,
+            )? =>
+        {
+            Some(candidate)
+        }
+        _ => None,
+    };
+    let (incremental_base, changed_segments) = match eligible_base {
+        Some(base) => match collect_grouped_undo(
+            &snapshot,
+            base.manifest.target_height,
+            target_height,
+            target_hash,
+            effective_log,
+        ) {
+            Ok(changes) => (Some(base), changes.into_keys().collect::<BTreeSet<_>>()),
+            // A database upgraded from the former one-window retention may
+            // not yet have the small previous->target delta. The full path is
+            // self-authenticating and provides a clean new incremental base.
+            Err(SnapshotGenerationError::MissingUndo(_)) => (None, BTreeSet::new()),
+            Err(error) => return Err(error),
+        },
+        None => (None, BTreeSet::new()),
+    };
+
+    // The full first generation visits the durable/touched numeric union. An
+    // incremental generation reconstructs only its changed segment set.
+    let mut union_ids = if incremental_base.is_some() {
+        changed_segments.iter().copied().collect::<Vec<_>>()
+    } else {
+        let mut ids = durable_ids.clone();
+        ids.extend(rollback_by_segment.keys().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
     union_ids.sort_unstable();
-    union_ids.dedup();
     if union_ids.len() > MAX_SNAPSHOT_MANIFEST_SEGMENTS {
         return Err(SnapshotGenerationError::Corrupt(
             "segment id union exceeds manifest cap",
         ));
     }
+    let rebuilt_segment_count = union_ids.len();
+    let incremental_base_height = incremental_base.map(|base| base.manifest.target_height);
 
     fs::create_dir_all(export_root)?;
     let mut temporary = TemporaryGeneration::create(export_root)?;
@@ -418,14 +492,38 @@ pub fn export_snapshot_generation(
 
     let target_segment_count = segment_count(target_header.log_slots)?;
     let segment_size = 1usize << effective_log;
-    let mut exact = StreamingSparseRoot::new(target_header.log_slots)
-        .map_err(|_| SnapshotGenerationError::Corrupt("invalid target exact-root depth"))?;
-    let mut counted_live = 0u64;
-    let mut descriptors = Vec::new();
+    let mut entries: Vec<(SnapshotSegmentDescriptor, u32, StateHash)> = Vec::new();
+    let mut reused_segment_count = 0usize;
+
+    if let Some(base) = incremental_base {
+        for (index, descriptor) in base.manifest.segments.iter().enumerate() {
+            if changed_segments.contains(&descriptor.segment_id) {
+                continue;
+            }
+            if usize::from(descriptor.segment_id) >= target_segment_count {
+                return Err(SnapshotGenerationError::InvalidSegment(
+                    descriptor.segment_id,
+                    "incremental base contains state outside target domain",
+                ));
+            }
+            reuse_snapshot_segment(
+                base,
+                temporary.path(),
+                descriptor.segment_id,
+                descriptor.encoded_len,
+            )?;
+            entries.push((
+                *descriptor,
+                base.manifest.segment_live_counts[index],
+                base.manifest.exact_segment_roots[index],
+            ));
+            reused_segment_count += 1;
+        }
+    }
 
     for segment_id in union_ids {
         let was_durable = durable_ids.binary_search(&segment_id).is_ok();
-        let mut columns = match store.get_segment_at_tip(tip_height, tip_hash, segment_id)? {
+        let mut columns = match snapshot.get_segment(segment_id)? {
             Some((stored_log, columns)) => {
                 if stored_log != effective_log
                     || columns.values.len() != segment_size
@@ -462,55 +560,17 @@ pub fn export_snapshot_generation(
             continue;
         }
 
-        let base = (u32::from(segment_id)) << effective_log;
-        let mut segment_live = 0u32;
-        for local_index in 0..segment_size {
-            let slot = slot_at(&columns, local_index);
-            if slot.is_empty() {
-                continue;
-            }
-            // Tagged coinbase ids live in the `TAG | mint_height` namespace
-            // and are bounded by the target height, not the allocator counter.
-            let creation_in_target = crate::consensus::params::creation_id_within_boundary(
-                slot.creation_id(),
-                target_header.alloc_counter,
-                target_header.height,
-            );
-            if !creation_in_target {
-                return Err(SnapshotGenerationError::CreationIdExceedsTarget {
-                    segment_id,
-                    local_index: local_index as u32,
-                    creation_id: slot.creation_id(),
-                    alloc_counter: target_header.alloc_counter,
-                });
-            }
-            segment_live = segment_live
-                .checked_add(1)
-                .ok_or(SnapshotGenerationError::Corrupt(
-                    "segment live count overflow",
-                ))?;
-            exact
-                .push_leaf(base | local_index as u32, slot_leaf_hash(slot))
-                .map_err(|_| {
-                    SnapshotGenerationError::InvalidSegment(
-                        segment_id,
-                        "live slot lies outside target exact-state domain",
-                    )
-                })?;
-        }
-        counted_live = counted_live.checked_add(u64::from(segment_live)).ok_or(
-            SnapshotGenerationError::Corrupt("snapshot live count overflow"),
+        let (segment_live, segment_root, exact_segment_root) = validate_segment_columns(
+            segment_id,
+            effective_log,
+            &columns,
+            target_header.alloc_counter,
+            target_header.height,
         )?;
         if segment_live == 0 {
             continue;
         }
 
-        let segment_root = compute_segment_root(
-            effective_log as usize,
-            &columns.values,
-            &columns.owners_hi,
-            &columns.owners_lo,
-        );
         let encoded = encode_segment(&columns, effective_log);
         if encoded.len() > MAX_SEGMENT_BYTES {
             return Err(SnapshotGenerationError::InvalidSegment(
@@ -525,26 +585,27 @@ pub fn export_snapshot_generation(
             )
         })?;
         write_synced_file(&segment_path(temporary.path(), segment_id), &encoded)?;
-        descriptors.push(SnapshotSegmentDescriptor {
-            segment_id,
-            segment_root,
-            encoded_len,
-        });
+        entries.push((
+            SnapshotSegmentDescriptor {
+                segment_id,
+                segment_root,
+                encoded_len,
+            },
+            segment_live,
+            exact_segment_root,
+        ));
         // `encoded` and `columns` drop here before the next segment is loaded.
     }
 
+    entries.sort_unstable_by_key(|(descriptor, _, _)| descriptor.segment_id);
     sync_directory(&segments_directory)?;
-    if counted_live != target_header.active_slot_count {
-        return Err(SnapshotGenerationError::ActiveSlotCountMismatch {
-            expected: target_header.active_slot_count,
-            actual: counted_live,
-        });
-    }
-    let exact_root = exact
-        .finish()
-        .map_err(|_| SnapshotGenerationError::Corrupt("exact-root stream did not close"))?;
-    if exact_root != target_header.state_root {
-        return Err(SnapshotGenerationError::ExactStateRootMismatch);
+    let mut descriptors = Vec::with_capacity(entries.len());
+    let mut segment_live_counts = Vec::with_capacity(entries.len());
+    let mut exact_segment_roots = Vec::with_capacity(entries.len());
+    for (descriptor, live_count, exact_root) in entries {
+        descriptors.push(descriptor);
+        segment_live_counts.push(live_count);
+        exact_segment_roots.push(exact_root);
     }
 
     let manifest = SnapshotGenerationManifest {
@@ -558,15 +619,26 @@ pub fn export_snapshot_generation(
         state_root: target_header.state_root,
         effective_log_segment_size: effective_log,
         segments: descriptors,
+        segment_live_counts,
+        exact_segment_roots,
     };
     validate_manifest(&manifest)?;
+    tracing::info!(
+        target_height,
+        incremental_base_height = ?incremental_base_height,
+        reused_segments = reused_segment_count,
+        rebuilt_segments = rebuilt_segment_count,
+        output_segments = manifest.segments.len(),
+        "assembled bounded disk snapshot generation"
+    );
 
-    // This is deliberately the last MDBX check before manifest publication.
-    // Every segment read was also pinned to this exact tip.
-    if store.get_chain_tip()? != Some((tip_height, tip_hash))
-        || store.get_state_meta()? != Some(state_meta)
-        || canonical_header(store, target_height)? != target_header
-        || store.get_chain_work(target_height)? != Some(cumulative_chainwork)
+    // Recheck the pinned MVCC source before publication. A concurrent writer
+    // may have advanced the live tip, which does not invalidate this exact
+    // internally-consistent generation.
+    if snapshot.get_chain_tip()? != Some((tip_height, tip_hash))
+        || snapshot.get_state_meta()? != Some(state_meta)
+        || canonical_header(&snapshot, target_height)? != target_header
+        || snapshot.get_chain_work(target_height)? != Some(cumulative_chainwork)
     {
         return Err(SnapshotGenerationError::SourceChanged);
     }
@@ -637,11 +709,73 @@ pub fn open_snapshot_generation(
     })
 }
 
+fn incremental_base_is_eligible(
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
+    previous: &SnapshotGeneration,
+    target: &BlockHeader,
+    source_tip_height: u64,
+    effective_log: u8,
+) -> Result<bool, SnapshotGenerationError> {
+    let manifest = previous.manifest();
+    if manifest.target_height >= target.height
+        || source_tip_height.saturating_sub(manifest.target_height) > UNDO_RETENTION_DEPTH
+        || manifest.effective_log_segment_size != effective_log
+        || manifest.log_slots > target.log_slots
+    {
+        return Ok(false);
+    }
+    let Some(canonical) = snapshot.get_header(manifest.target_height)? else {
+        return Ok(false);
+    };
+    let canonical_work = snapshot.get_chain_work(manifest.target_height)?;
+    Ok(block_id(&canonical) == manifest.target_hash
+        && canonical_work == Some(manifest.cumulative_chainwork)
+        && canonical.state_root == manifest.state_root
+        && canonical.log_slots == manifest.log_slots
+        && canonical.active_slot_count == manifest.active_slot_count
+        && canonical.alloc_counter == manifest.alloc_counter)
+}
+
+/// Reuse one immutable payload through a hard link. Snapshot generations live
+/// under one export root, so this is normally metadata-only and consumes no
+/// additional segment blocks. The copy fallback keeps the implementation
+/// portable to filesystems that do not implement hard links.
+fn reuse_snapshot_segment(
+    previous: &SnapshotGeneration,
+    target_directory: &Path,
+    segment_id: u16,
+    encoded_len: u32,
+) -> Result<(), SnapshotGenerationError> {
+    let source = segment_path(previous.directory(), segment_id);
+    let metadata = fs::symlink_metadata(&source)?;
+    if !metadata.file_type().is_file() || metadata.len() != u64::from(encoded_len) {
+        return Err(SnapshotGenerationError::InvalidSegment(
+            segment_id,
+            "incremental base payload length is invalid",
+        ));
+    }
+    let target = segment_path(target_directory, segment_id);
+    match fs::hard_link(&source, &target) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let copied = fs::copy(&source, &target)?;
+            if copied != u64::from(encoded_len) {
+                return Err(SnapshotGenerationError::InvalidSegment(
+                    segment_id,
+                    "incremental payload copy was truncated",
+                ));
+            }
+            File::open(&target)?.sync_all()?;
+            Ok(())
+        }
+    }
+}
+
 fn canonical_header(
-    store: &MdbxStore,
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
     height: u64,
 ) -> Result<crate::block_header::BlockHeader, SnapshotGenerationError> {
-    store
+    snapshot
         .get_header(height)?
         .ok_or(SnapshotGenerationError::MissingHeader(height))
 }
@@ -694,7 +828,7 @@ fn validate_undo_preimage_creation_boundary(
 type SegmentRollback = (u32, SlotValue);
 
 fn collect_grouped_undo(
-    store: &MdbxStore,
+    snapshot: &MdbxHistoricalReadSnapshot<'_>,
     target_height: u64,
     tip_height: u64,
     tip_hash: [u8; 32],
@@ -704,8 +838,8 @@ fn collect_grouped_undo(
     let mut total_changes = 0usize;
 
     for height in (target_height + 1..=tip_height).rev() {
-        let child = canonical_header(store, height)?;
-        let parent = canonical_header(store, height - 1)?;
+        let child = canonical_header(snapshot, height)?;
+        let parent = canonical_header(snapshot, height - 1)?;
         if child.prev_block_hash != block_id(&parent) {
             return Err(SnapshotGenerationError::Corrupt(
                 "retained canonical headers are not linked",
@@ -720,7 +854,7 @@ fn collect_grouped_undo(
                 tip_log: child.log_slots,
             });
         }
-        let undo = store
+        let undo = snapshot
             .get_undo_log(height)?
             .ok_or(SnapshotGenerationError::MissingUndo(height))?;
         if undo.block_height != height
@@ -813,7 +947,7 @@ fn validate_segment_columns(
     columns: &SegmentColumns,
     alloc_counter: u64,
     target_height: u64,
-) -> Result<(u32, [u8; 32]), SnapshotGenerationError> {
+) -> Result<(u32, [u8; 32], StateHash), SnapshotGenerationError> {
     let expected_len =
         1usize
             .checked_shl(effective_log as u32)
@@ -831,6 +965,9 @@ fn validate_segment_columns(
         ));
     }
     let mut live = 0u32;
+    let mut exact = StreamingSparseRoot::new(u32::from(effective_log)).map_err(|_| {
+        SnapshotGenerationError::InvalidSegment(segment_id, "invalid exact segment depth")
+    })?;
     for local in 0..expected_len {
         let slot = slot_at(columns, local);
         if slot.is_empty() {
@@ -856,6 +993,14 @@ fn validate_segment_columns(
                 segment_id,
                 "live count overflows u32",
             ))?;
+        exact
+            .push_leaf(local as u32, slot_leaf_hash(slot))
+            .map_err(|_| {
+                SnapshotGenerationError::InvalidSegment(
+                    segment_id,
+                    "live slot lies outside exact segment domain",
+                )
+            })?;
     }
     let root = compute_segment_root(
         effective_log as usize,
@@ -863,7 +1008,43 @@ fn validate_segment_columns(
         &columns.owners_hi,
         &columns.owners_lo,
     );
-    Ok((live, root))
+    let exact_root = exact.finish().map_err(|_| {
+        SnapshotGenerationError::InvalidSegment(segment_id, "exact segment stream did not close")
+    })?;
+    Ok((live, root, exact_root))
+}
+
+/// Reconstruct the consensus exact-state root from one compact exact subtree
+/// root per non-empty segment. Missing segments are canonical zero subtrees.
+/// At the maximum 32-bit slot domain this touches only 65,536 hashes/roots,
+/// independent of the number of live UTXOs and raw snapshot bytes.
+fn exact_state_root_from_manifest(
+    manifest: &SnapshotGenerationManifest,
+) -> Result<StateHash, SnapshotGenerationError> {
+    let count = segment_count(manifest.log_slots)?;
+    let effective_log = usize::from(manifest.effective_log_segment_size);
+    let zero_roots = zero_slot_roots(effective_log);
+    let mut roots = vec![zero_roots[effective_log]; count];
+    for (descriptor, exact_root) in manifest
+        .segments
+        .iter()
+        .zip(manifest.exact_segment_roots.iter().copied())
+    {
+        roots[usize::from(descriptor.segment_id)] = exact_root;
+    }
+    while roots.len() > 1 {
+        let parent_count = roots.len() / 2;
+        for index in 0..parent_count {
+            roots[index] = state_node_hash(roots[2 * index], roots[2 * index + 1]);
+        }
+        roots.truncate(parent_count);
+    }
+    roots
+        .into_iter()
+        .next()
+        .ok_or(SnapshotGenerationError::Corrupt(
+            "snapshot exact-root tree is empty",
+        ))
 }
 
 fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), SnapshotGenerationError> {
@@ -881,6 +1062,18 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
     if manifest.segments.len() > MAX_SNAPSHOT_MANIFEST_SEGMENTS {
         return Err(SnapshotGenerationError::Corrupt(
             "manifest segment count exceeds cap",
+        ));
+    }
+    if manifest.segment_live_counts.len() != manifest.segments.len()
+        || manifest.exact_segment_roots.len() != manifest.segments.len()
+    {
+        return Err(SnapshotGenerationError::Corrupt(
+            "manifest exact metadata vectors are not parallel",
+        ));
+    }
+    if manifest.segments.len() as u64 > manifest.active_slot_count {
+        return Err(SnapshotGenerationError::Corrupt(
+            "manifest has more non-empty segments than live slots",
         ));
     }
     if !manifest
@@ -902,7 +1095,17 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
             "manifest segment geometry exceeds segment byte cap",
         ));
     }
-    for descriptor in &manifest.segments {
+    let segment_capacity = 1u32
+        .checked_shl(u32::from(manifest.effective_log_segment_size))
+        .ok_or(SnapshotGenerationError::Corrupt(
+            "manifest segment capacity overflows",
+        ))?;
+    let mut counted_live = 0u64;
+    for (descriptor, live_count) in manifest
+        .segments
+        .iter()
+        .zip(manifest.segment_live_counts.iter().copied())
+    {
         if usize::from(descriptor.segment_id) >= domain_segments {
             return Err(SnapshotGenerationError::InvalidSegment(
                 descriptor.segment_id,
@@ -915,6 +1118,24 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
                 "manifest encoded length is noncanonical",
             ));
         }
+        if live_count == 0 || live_count > segment_capacity {
+            return Err(SnapshotGenerationError::InvalidSegment(
+                descriptor.segment_id,
+                "manifest live count is outside segment capacity",
+            ));
+        }
+        counted_live = counted_live.checked_add(u64::from(live_count)).ok_or(
+            SnapshotGenerationError::Corrupt("manifest live count overflows"),
+        )?;
+    }
+    if counted_live != manifest.active_slot_count {
+        return Err(SnapshotGenerationError::ActiveSlotCountMismatch {
+            expected: manifest.active_slot_count,
+            actual: counted_live,
+        });
+    }
+    if exact_state_root_from_manifest(manifest)? != manifest.state_root {
+        return Err(SnapshotGenerationError::ExactStateRootMismatch);
     }
     Ok(())
 }
@@ -1022,9 +1243,14 @@ mod tests {
     use super::*;
 
     use noid_core::Block128;
+    use noid_poseidon2b::primitives::Address;
+    use noid_tx::{
+        output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
+    };
 
     use crate::consensus::genesis::genesis_header;
     use crate::consensus::params::coinbase_creation_id;
+    use crate::storage::{ConsensusMeta, FinalizedCheckpoint};
 
     #[test]
     fn spent_coinbase_undo_preimage_uses_parent_height_boundary() {
@@ -1065,11 +1291,13 @@ mod tests {
             state_root: crate::exact_state_hash::zero_slot_roots(16)[16],
             effective_log_segment_size: 16,
             segments: Vec::new(),
+            segment_live_counts: Vec::new(),
+            exact_segment_roots: Vec::new(),
         };
         let mut encoded = encode_manifest(&manifest).unwrap();
-        // Fixed-int bincode places the Vec length in the final eight bytes for
-        // this empty fixture.  The decoder limit and Serde cautious reserve
-        // must reject the hostile declaration without attempting that capacity.
+        // Fixed-int bincode places the final exact-root Vec length in the last
+        // eight bytes for this empty fixture. The decoder limit and Serde
+        // cautious reserve must reject it without attempting that capacity.
         let length_offset = encoded.len() - core::mem::size_of::<u64>();
         encoded[length_offset..].copy_from_slice(&u64::MAX.to_le_bytes());
         assert!(matches!(
@@ -1090,6 +1318,273 @@ mod tests {
             Err(SnapshotGenerationError::Corrupt(
                 "snapshot manifest length is outside bounds"
             ))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incremental_generation_hard_links_unchanged_payload() {
+        use std::os::unix::fs::MetadataExt;
+
+        let previous_root = tempfile::tempdir().unwrap();
+        fs::create_dir(previous_root.path().join(SEGMENTS_DIRECTORY_NAME)).unwrap();
+        let source = segment_path(previous_root.path(), 7);
+        fs::write(&source, b"immutable-segment").unwrap();
+        let previous = SnapshotGeneration {
+            directory: previous_root.path().to_path_buf(),
+            manifest: SnapshotGenerationManifest {
+                version: SNAPSHOT_GENERATION_VERSION,
+                target_height: 1,
+                target_hash: [1; 32],
+                cumulative_chainwork: [2; 32],
+                log_slots: 24,
+                active_slot_count: 1,
+                alloc_counter: 1,
+                state_root: [3; 32],
+                effective_log_segment_size: 16,
+                segments: vec![SnapshotSegmentDescriptor {
+                    segment_id: 7,
+                    segment_root: [4; 32],
+                    encoded_len: b"immutable-segment".len() as u32,
+                }],
+                segment_live_counts: vec![1],
+                exact_segment_roots: vec![[3; 32]],
+            },
+        };
+
+        let target = tempfile::tempdir().unwrap();
+        fs::create_dir(target.path().join(SEGMENTS_DIRECTORY_NAME)).unwrap();
+        reuse_snapshot_segment(
+            &previous,
+            target.path(),
+            7,
+            b"immutable-segment".len() as u32,
+        )
+        .unwrap();
+        let linked = segment_path(target.path(), 7);
+        assert_eq!(fs::read(&linked).unwrap(), b"immutable-segment");
+        assert_eq!(
+            fs::metadata(&source).unwrap().ino(),
+            fs::metadata(linked).unwrap().ino()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unchanged_canonical_state_exports_incrementally_end_to_end() {
+        use std::os::unix::fs::MetadataExt;
+
+        let database = tempfile::tempdir().unwrap();
+        let exports = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(database.path()).unwrap();
+        let slot = SlotValue::from_parts(11, 1, Block128(0x22), Block128(0x33));
+        let state = crate::state::ChainState::from_sparse_utxos(8, &[(7, slot)], 1).unwrap();
+        let mut genesis = genesis_header();
+        genesis.state_root = state.cached_state_root();
+        genesis.log_slots = 8;
+        genesis.active_slot_count = 1;
+        genesis.alloc_counter = 1;
+        let genesis_hash = block_id(&genesis);
+        let genesis_work = crate::block_work(&genesis.difficulty_target);
+        let genesis_meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: genesis_hash,
+            cumulative_chainwork: genesis_work,
+            finalized: FinalizedCheckpoint {
+                height: 0,
+                hash: genesis_hash,
+            },
+        };
+        let columns = state.state.try_get_segment_columns(0).unwrap();
+        store
+            .commit_block(
+                &genesis,
+                &genesis_hash,
+                &crate::consensus::da_prune::BlockUndoLog::empty(0, 8),
+                &[(0, 8, Some(columns))],
+                &[(0, 1, state.cached_exact_segment_root(0).unwrap())],
+                &[],
+                &[],
+                None,
+                &genesis_meta,
+                true,
+            )
+            .unwrap();
+        let first = export_snapshot_generation(&store, exports.path(), 0, None).unwrap();
+
+        let mut child = genesis;
+        child.height = 1;
+        child.prev_block_hash = genesis_hash;
+        child.timestamp += 1;
+        child.nonce = 1;
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 7,
+            amount: 11,
+            owner: Address([0x33; 32]),
+        };
+        let coinbase = Transaction::new(TxBody {
+            epoch_anchor: genesis_hash,
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        child.tx_root = crate::compute_tx_root(std::slice::from_ref(&coinbase));
+        let child_hash = block_id(&child);
+        let block = crate::Block {
+            header: child,
+            transactions: vec![coinbase],
+        };
+        let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
+            1,
+            crate::block_header::semantic_header_id(&child),
+            0,
+        )
+        .unwrap()
+        .encode_prefix()
+        .to_vec();
+        terminal.push(1);
+        let bundle =
+            crate::AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap();
+        let child_meta = ConsensusMeta {
+            tip_height: 1,
+            tip_hash: child_hash,
+            cumulative_chainwork: crate::add_work(
+                &genesis_work,
+                &crate::block_work(&child.difficulty_target),
+            ),
+            finalized: genesis_meta.finalized,
+        };
+        let mut undo = crate::consensus::da_prune::BlockUndoLog::empty(1, 8);
+        undo.active_slot_count_before = 1;
+        undo.alloc_counter_before = 1;
+        undo.tx_hashes = crate::block::try_compute_logical_txids(&block.transactions).unwrap();
+        let tx_hashes = undo.tx_hashes.clone();
+        store
+            .commit_block(
+                &child,
+                &child_hash,
+                &undo,
+                &[],
+                &[],
+                &tx_hashes,
+                &[],
+                Some(&bundle),
+                &child_meta,
+                false,
+            )
+            .unwrap();
+
+        let second = export_snapshot_generation(&store, exports.path(), 1, Some(&first)).unwrap();
+        assert_eq!(
+            second.read_encoded_segment(0).unwrap(),
+            first.read_encoded_segment(0).unwrap()
+        );
+        assert_eq!(
+            fs::metadata(segment_path(first.directory(), 0))
+                .unwrap()
+                .ino(),
+            fs::metadata(segment_path(second.directory(), 0))
+                .unwrap()
+                .ino()
+        );
+        assert_eq!(second.manifest().target_height, 1);
+        assert_eq!(second.manifest().state_root, child.state_root);
+
+        let mut changed_state = state.clone();
+        let changed_slot = SlotValue::from_parts(12, 1, Block128(0x22), Block128(0x33));
+        changed_state
+            .state
+            .apply_delta_unrooted(&[(7, changed_slot)])
+            .unwrap();
+        let changed_root = changed_state.try_state_root().unwrap();
+        let mut grandchild = child;
+        grandchild.height = 2;
+        grandchild.prev_block_hash = child_hash;
+        grandchild.timestamp += 1;
+        grandchild.nonce = 2;
+        grandchild.state_root = changed_root;
+        let grandchild_hash = block_id(&grandchild);
+        let grandchild_block = crate::Block {
+            header: grandchild,
+            transactions: block.transactions.clone(),
+        };
+        let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
+            2,
+            crate::block_header::semantic_header_id(&grandchild),
+            0,
+        )
+        .unwrap()
+        .encode_prefix()
+        .to_vec();
+        terminal.push(1);
+        let bundle =
+            crate::AcceptedBlockBundle::try_from_parts(grandchild_block.to_bytes(), terminal)
+                .unwrap();
+        let grandchild_meta = ConsensusMeta {
+            tip_height: 2,
+            tip_hash: grandchild_hash,
+            cumulative_chainwork: crate::add_work(
+                &child_meta.cumulative_chainwork,
+                &crate::block_work(&grandchild.difficulty_target),
+            ),
+            finalized: child_meta.finalized,
+        };
+        let mut undo = crate::consensus::da_prune::BlockUndoLog::empty(2, 8);
+        undo.active_slot_count_before = 1;
+        undo.alloc_counter_before = 1;
+        undo.slot_changes.push((7, slot));
+        undo.tx_hashes =
+            crate::block::try_compute_logical_txids(&grandchild_block.transactions).unwrap();
+        let tx_hashes = undo.tx_hashes.clone();
+        let changed_columns = changed_state.state.try_get_segment_columns(0).unwrap();
+        store
+            .commit_block(
+                &grandchild,
+                &grandchild_hash,
+                &undo,
+                &[(0, 8, Some(changed_columns))],
+                &[(0, 1, changed_state.cached_exact_segment_root(0).unwrap())],
+                &tx_hashes,
+                &[],
+                Some(&bundle),
+                &grandchild_meta,
+                false,
+            )
+            .unwrap();
+        let third = export_snapshot_generation(&store, exports.path(), 2, Some(&second)).unwrap();
+        assert_ne!(
+            fs::metadata(segment_path(second.directory(), 0))
+                .unwrap()
+                .ino(),
+            fs::metadata(segment_path(third.directory(), 0))
+                .unwrap()
+                .ino()
+        );
+        assert_ne!(
+            second.manifest().segments[0].segment_root,
+            third.manifest().segments[0].segment_root
+        );
+        assert_eq!(third.manifest().state_root, changed_root);
+        assert_eq!(
+            third.read_encoded_segment(0).unwrap().len(),
+            3 * (1 << 8) * 16 + 5
+        );
+
+        let mut bad_exact_metadata = third.manifest().clone();
+        bad_exact_metadata.exact_segment_roots[0][0] ^= 1;
+        assert!(matches!(
+            validate_manifest(&bad_exact_metadata),
+            Err(SnapshotGenerationError::ExactStateRootMismatch)
+        ));
+        let mut bad_live_metadata = third.manifest().clone();
+        bad_live_metadata.segment_live_counts[0] += 1;
+        assert!(matches!(
+            validate_manifest(&bad_live_metadata),
+            Err(SnapshotGenerationError::ActiveSlotCountMismatch { .. })
         ));
     }
 }

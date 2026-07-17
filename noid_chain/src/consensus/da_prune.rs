@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! DA retention and undo-log management .
+//! DA retention and undo-log management.
 //!
 //! Compact per-block undo logs record the pre-image of every UTXO slot
-//! mutated by a block. This allows short-range reorgs (up to
-//! `UNDO_RETENTION_DEPTH` blocks deep) to be resolved without any network
-//! access — the node simply replays the undo entries in reverse to
-//! restore the prior UTXO state.
+//! mutated by a block. Reorgs inside consensus finality can therefore be
+//! resolved without network access. The operational retention is deliberately
+//! longer so finalized snapshot generations can advance incrementally.
 //!
 //! After `UNDO_RETENTION_DEPTH` confirmations, the undo log for a block is
-//! pruned (`prune_undo_logs`). MDBX retains the matching recent accepted-block
-//! bundle suffix and one additional HistoryStep boundary terminal.
+//! pruned (`prune_undo_logs`). Accepted block bodies use the shorter peer
+//! serving window, plus one additional HistoryStep boundary terminal.
 
 use std::collections::{HashMap, HashSet};
 
