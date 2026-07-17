@@ -33,10 +33,11 @@ use crate::state::{exact_segment_root_from_columns, ChainState, StreamingSparseR
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
     decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header,
-    decode_header_chain_anchor, decode_segment, decode_state_meta, decode_tx_index_value,
-    decode_undo_log, encode_chain_tip, encode_chain_work, encode_consensus_meta, encode_header,
-    encode_header_chain_anchor, encode_segment, encode_state_meta, encode_tx_index_value,
-    encode_undo_log, u64_from_key, u64_key,
+    decode_header_chain_anchor, decode_segment, decode_segment_summary, decode_state_meta,
+    decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
+    encode_consensus_meta, encode_header, encode_header_chain_anchor, encode_segment,
+    encode_segment_summary, encode_state_meta, encode_tx_index_value, encode_undo_log,
+    u64_from_key, u64_key,
 };
 use crate::storage::snapshot_staging::{FinalizedSnapshotStaging, SnapshotStagingError};
 
@@ -51,6 +52,11 @@ const T_CONSENSUS_META: &str = "consensus_meta";
 const T_CHAIN_WORK: &str = "chain_work";
 const T_UNDO_LOGS: &str = "undo";
 const T_SEGMENTS: &str = "segments";
+/// Compact restart accelerator. Key: segment_id(u16 LE). Value:
+/// live_count(u32 LE) + exact segment root([u8; 32]). The complete exact-root
+/// set is authenticated against the canonical tip header during restart;
+/// dense columns are checked lazily when first touched.
+const T_SEGMENT_SUMMARIES: &str = "segment_summaries";
 const T_STATE_META: &str = "state_meta";
 const T_RECENT_BLOCKS: &str = "recent";
 /// Transaction index for receipt lookup. Key: canonical logical txid (32B).
@@ -70,7 +76,7 @@ const T_HISTORY_STEP_TERMINALS: &str = "history_step_terminals";
 /// `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
 const T_RETENTION_META: &str = "retention_meta";
-const N_TABLES: u64 = 14;
+const N_TABLES: u64 = 15;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -841,6 +847,7 @@ impl MdbxStore {
             T_CHAIN_WORK,
             T_UNDO_LOGS,
             T_SEGMENTS,
+            T_SEGMENT_SUMMARIES,
             T_STATE_META,
             T_RECENT_BLOCKS,
             T_TX_INDEX,
@@ -1560,6 +1567,7 @@ impl MdbxStore {
 
         for name in [
             T_SEGMENTS,
+            T_SEGMENT_SUMMARIES,
             T_UNDO_LOGS,
             T_RECENT_BLOCKS,
             T_TX_INDEX,
@@ -1584,6 +1592,7 @@ impl MdbxStore {
             WriteFlags::empty(),
         )?;
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
+        let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
         for staged_file in staging.encoded_files() {
             let descriptor = *staged_file.descriptor();
@@ -1688,6 +1697,12 @@ impl MdbxStore {
                 .install_evicted_segment_summary(descriptor.segment_id, segment_live, fri_root)
                 .map_err(StoreError::Decode)?;
             let exact_root = exact_segment_root_from_columns(effective_log as usize, &columns);
+            txn.put(
+                &summary_tbl,
+                descriptor.segment_id.to_le_bytes(),
+                encode_segment_summary(segment_live, &exact_root),
+                WriteFlags::empty(),
+            )?;
             exact_segment_roots.push((descriptor.segment_id, exact_root));
             // `columns` and `encoded` drop here before the iterator opens the
             // next file. Only compact roots/counts survive the pass.
@@ -1779,6 +1794,92 @@ impl MdbxStore {
         sort_unique_segment_ids(segment_ids)
     }
 
+    /// Read the complete compact restart index without touching dense segment
+    /// values. Records are returned in numeric segment order.
+    pub(crate) fn segment_summaries(&self) -> Result<Vec<(u16, u32, [u8; 32])>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let table = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
+        let mut cursor = txn.cursor(&table)?;
+        let mut summaries = Vec::new();
+        let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
+        while let Some((key, raw)) = item {
+            if key.len() != 2 {
+                return Err(StoreError::Decode("invalid stored segment-summary key"));
+            }
+            let segment_id = u16::from_le_bytes([key[0], key[1]]);
+            let (live_count, exact_root) = decode_segment_summary(&raw)
+                .ok_or(StoreError::Decode("invalid stored segment summary"))?;
+            if live_count == 0 {
+                return Err(StoreError::Decode("empty stored segment summary"));
+            }
+            summaries.push((segment_id, live_count, exact_root));
+            item = cursor.next()?;
+        }
+        summaries.sort_unstable_by_key(|(segment_id, _, _)| *segment_id);
+        if summaries
+            .windows(2)
+            .any(|window| window[0].0 == window[1].0)
+        {
+            return Err(StoreError::Decode("duplicate stored segment summary"));
+        }
+        Ok(summaries)
+    }
+
+    /// Replace a missing/legacy compact restart index after the dense state has
+    /// passed the old full verification path. The canonical tip, header and
+    /// counters are rechecked inside the same transaction, so a future caller
+    /// can never observe summaries for another state epoch.
+    pub(crate) fn replace_segment_summaries(
+        &self,
+        expected_height: u64,
+        expected_hash: [u8; 32],
+        state: &ChainState,
+    ) -> Result<(), StoreError> {
+        let txn = self.db.begin_rw_txn()?;
+        let tip_table = txn.open_table(Some(T_CHAIN_TIP))?;
+        let tip_raw: Option<Vec<u8>> = txn.get(&tip_table, KEY_TIP)?;
+        if tip_raw.as_deref().and_then(decode_chain_tip) != Some((expected_height, expected_hash)) {
+            return Err(StoreError::Decode(
+                "canonical tip changed while rebuilding segment summaries",
+            ));
+        }
+        let header_table = txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = txn.get(&header_table, &u64_key(expected_height))?;
+        let header = header_raw
+            .as_deref()
+            .and_then(decode_header)
+            .ok_or(StoreError::Decode(
+                "canonical header missing while rebuilding segment summaries",
+            ))?;
+        if crate::hash_block_header(&header) != expected_hash
+            || header.state_root != state.cached_state_root()
+            || header.log_slots as usize != state.state.log_slots()
+            || header.active_slot_count != state.active_slot_count
+            || header.alloc_counter != state.alloc_counter
+        {
+            return Err(StoreError::Decode(
+                "canonical state changed while rebuilding segment summaries",
+            ));
+        }
+
+        let table = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
+        txn.clear_table(&table)?;
+        for segment_id in state.state.active_segment_ids() {
+            let live_count = state.state.segment_live_count(segment_id);
+            let exact_root = state
+                .cached_exact_segment_root(segment_id)
+                .ok_or(StoreError::Decode("missing compact exact segment root"))?;
+            txn.put(
+                &table,
+                segment_id.to_le_bytes(),
+                encode_segment_summary(live_count, &exact_root),
+                WriteFlags::empty(),
+            )?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Stream stored segments through a one-segment ownership boundary.
     ///
     /// Startup and reorg recovery use this path so the node never materializes
@@ -1825,12 +1926,26 @@ impl MdbxStore {
         hash: &[u8; 32],
         undo_log: &BlockUndoLog,
         dirty_segments: &[(u16, u8, Option<&SegmentColumns>)],
+        dirty_segment_summaries: &[(u16, u32, [u8; 32])],
         tx_hashes: &[TxBodyHash],
         tx_index_deletes: &[TxBodyHash],
         accepted_bundle: Option<&crate::AcceptedBlockBundle>,
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
     ) -> Result<(), StoreError> {
+        if dirty_segments.len() != dirty_segment_summaries.len()
+            || dirty_segments.iter().zip(dirty_segment_summaries).any(
+                |((segment_id, _, columns), (summary_id, live_count, _))| {
+                    segment_id != summary_id
+                        || (columns.is_none() && *live_count != 0)
+                        || (columns.is_some() && *live_count == 0)
+                },
+            )
+        {
+            return Err(StoreError::Decode(
+                "dirty segment summaries do not match dirty columns",
+            ));
+        }
         // A canonical non-genesis block is one atomic block + HistoryStep
         // unit. Keep the low-level storage API fail-closed too: no caller can
         // accidentally materialize a PoW-only tip even if it bypasses
@@ -1904,13 +2019,17 @@ impl MdbxStore {
 
         // --- 1. Dirty segments ---
         let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
-        for (seg_id, eff_log, cols) in dirty_segments {
+        let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
+        for ((seg_id, eff_log, cols), (_, live_count, exact_root)) in
+            dirty_segments.iter().zip(dirty_segment_summaries)
+        {
             let key = seg_id.to_le_bytes();
             match cols {
                 None => {
                     // Do not persist fully-empty segments. This keeps disk and
                     // snapshot size proportional to live UTXOs.
                     let _ = txn.del(&seg_tbl, key, None);
+                    let _ = txn.del(&summary_tbl, key, None);
                 }
                 Some(cols) => {
                     if segment_columns_empty(cols) {
@@ -1918,6 +2037,12 @@ impl MdbxStore {
                     }
                     let val = encode_segment(cols, *eff_log);
                     txn.put(&seg_tbl, key, val, WriteFlags::empty())?;
+                    txn.put(
+                        &summary_tbl,
+                        key,
+                        encode_segment_summary(*live_count, exact_root),
+                        WriteFlags::empty(),
+                    )?;
                 }
             }
         }
@@ -1952,6 +2077,7 @@ impl MdbxStore {
         };
         for key in out_of_domain_keys {
             txn.del(&seg_tbl, &key, None)?;
+            txn.del(&summary_tbl, &key, None)?;
         }
 
         // --- 2. BlockHeader ---
@@ -2241,11 +2367,26 @@ impl MdbxStore {
         final_header: &BlockHeader,
         final_hash: &[u8; 32],
         final_dirty_segments: &[(u16, u8, Option<&SegmentColumns>)],
+        final_dirty_segment_summaries: &[(u16, u32, [u8; 32])],
         reverted_tx_hashes: &[TxBodyHash],
         replacement_bundles: &[crate::AcceptedBlockBundle],
         replacement: &[StagedAcceptedBlockCommit],
         consensus_meta: &ConsensusMeta,
     ) -> Result<(), StoreError> {
+        if final_dirty_segments.len() != final_dirty_segment_summaries.len()
+            || final_dirty_segments
+                .iter()
+                .zip(final_dirty_segment_summaries)
+                .any(|((segment_id, _, columns), (summary_id, live_count, _))| {
+                    segment_id != summary_id
+                        || (columns.is_none() && *live_count != 0)
+                        || (columns.is_some() && *live_count == 0)
+                })
+        {
+            return Err(StoreError::Decode(
+                "final reorg segment summaries do not match dirty columns",
+            ));
+        }
         if final_header.height < ancestor_height
             || consensus_meta.tip_height != final_header.height
             || consensus_meta.tip_hash != *final_hash
@@ -2318,11 +2459,16 @@ impl MdbxStore {
         // deliberately retained across every staged block, so this is the
         // union of rollback and replacement writes.
         let seg_tbl = txn.open_table(Some(T_SEGMENTS))?;
-        for (seg_id, eff_log, cols) in final_dirty_segments {
+        let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
+        for ((seg_id, eff_log, cols), (_, live_count, exact_root)) in final_dirty_segments
+            .iter()
+            .zip(final_dirty_segment_summaries)
+        {
             let key = seg_id.to_le_bytes();
             match cols {
                 None => {
                     let _ = txn.del(&seg_tbl, key, None);
+                    let _ = txn.del(&summary_tbl, key, None);
                 }
                 Some(cols) => {
                     if segment_columns_empty(cols) {
@@ -2332,6 +2478,12 @@ impl MdbxStore {
                         &seg_tbl,
                         key,
                         encode_segment(cols, *eff_log),
+                        WriteFlags::empty(),
+                    )?;
+                    txn.put(
+                        &summary_tbl,
+                        key,
+                        encode_segment_summary(*live_count, exact_root),
                         WriteFlags::empty(),
                     )?;
                 }
@@ -2364,6 +2516,7 @@ impl MdbxStore {
         };
         for key in out_of_domain_keys {
             txn.del(&seg_tbl, &key, None)?;
+            txn.del(&summary_tbl, &key, None)?;
         }
 
         // Remove every old canonical height record above the ancestor before
@@ -2636,6 +2789,7 @@ impl MdbxStore {
             T_CHAIN_WORK,
             T_UNDO_LOGS,
             T_SEGMENTS,
+            T_SEGMENT_SUMMARIES,
             T_STATE_META,
             T_RECENT_BLOCKS,
             T_TX_INDEX,
@@ -2692,7 +2846,10 @@ impl crate::storage::BlockStore for MdbxStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fri_state::SlotValue;
+    use crate::state::ChainState;
     use crate::storage::FinalizedCheckpoint;
+    use noid_core::Block128;
     use noid_poseidon2b::primitives::Address;
     use noid_tx::{
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
@@ -2804,12 +2961,112 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
                 None,
                 &meta,
                 false,
             )
             .unwrap();
         (genesis, meta)
+    }
+
+    fn commit_stateful_test_genesis(store: &MdbxStore) -> (ChainState, BlockHeader, [u8; 32]) {
+        let slot = SlotValue::from_parts(11, 1, Block128::from(0x22u128), Block128::from(0x33u128));
+        let state = ChainState::from_sparse_utxos(8, &[(7, slot)], 1).unwrap();
+        let mut header = crate::consensus::genesis::genesis_header();
+        header.state_root = state.cached_state_root();
+        header.log_slots = 8;
+        header.active_slot_count = 1;
+        header.alloc_counter = 1;
+        let hash = crate::hash_block_header(&header);
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: hash,
+            cumulative_chainwork: crate::block_work(&header.difficulty_target),
+            finalized: FinalizedCheckpoint { height: 0, hash },
+        };
+        let columns = state.state.try_get_segment_columns(0).unwrap();
+        let exact_root = state.cached_exact_segment_root(0).unwrap();
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &BlockUndoLog::empty(0, header.log_slots),
+                &[(0, 8, Some(columns))],
+                &[(0, 1, exact_root)],
+                &[],
+                &[],
+                None,
+                &meta,
+                false,
+            )
+            .unwrap();
+        (state, header, hash)
+    }
+
+    #[test]
+    fn missing_restart_summaries_are_rebuilt_once_from_dense_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (state, header, _) = commit_stateful_test_genesis(&store);
+        assert_eq!(store.segment_summaries().unwrap().len(), 1);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_SEGMENT_SUMMARIES)).unwrap();
+        txn.clear_table(&table).unwrap();
+        txn.commit().unwrap();
+        assert!(store.segment_summaries().unwrap().is_empty());
+
+        let restored = crate::storage::mdbx_context::MdbxChainContext::load_streamed_chain_state(
+            &store,
+            header.log_slots,
+            header.active_slot_count,
+            header.alloc_counter,
+            header.height,
+            header.state_root,
+        )
+        .unwrap();
+        assert_eq!(restored.cached_state_root(), state.cached_state_root());
+        assert_eq!(store.segment_summaries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn compact_restart_defers_raw_segment_check_until_hydration() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (_, header, _) = commit_stateful_test_genesis(&store);
+
+        let (_, mut tampered) = store.get_segment(0).unwrap().unwrap();
+        tampered.values[7] = noid_tx::pack_amount_creation_id(12, 1);
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_SEGMENTS)).unwrap();
+        txn.put(
+            &table,
+            0u16.to_le_bytes(),
+            encode_segment(&tampered, 8),
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+
+        // Startup consumes only the header-authenticated compact roots, so a
+        // cold segment does not impose dense work on every restart.
+        let mut restored =
+            crate::storage::mdbx_context::MdbxChainContext::load_streamed_chain_state(
+                &store,
+                header.log_slots,
+                header.active_slot_count,
+                header.alloc_counter,
+                header.height,
+                header.state_root,
+            )
+            .unwrap();
+        assert!(restored.state.is_evicted(0));
+
+        // The first actual access verifies the raw payload against that exact
+        // root and rejects the modified value before it can enter hot state.
+        let (_, raw) = store.get_segment(0).unwrap().unwrap();
+        assert!(restored.restore_evicted_segment(0, raw).is_err());
     }
 
     fn put_test_header_row(store: &MdbxStore, header: &BlockHeader) {
@@ -2974,6 +3231,7 @@ mod tests {
                 &hash,
                 &undo,
                 &[],
+                &[],
                 &tx_hashes,
                 &[],
                 Some(&bundle),
@@ -3018,6 +3276,7 @@ mod tests {
                 &block.header,
                 &hash,
                 &identity_only_undo(&block),
+                &[],
                 &[],
                 &tx_hashes,
                 &[],
@@ -3075,6 +3334,7 @@ mod tests {
                 &block.header,
                 &hash,
                 &BlockUndoLog::empty(1, block.header.log_slots),
+                &[],
                 &[],
                 &tx_hashes,
                 &[],

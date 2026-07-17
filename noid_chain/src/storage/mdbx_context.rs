@@ -12,14 +12,14 @@
 //! Every `apply_next_block` call writes all block data in ONE atomic MDBX
 //! transaction. Either the full block is committed or nothing is. On restart,
 //! `open_or_create` reads `chain_tip` from MDBX and rebuilds hot RAM state
-//! from the `segments` table. No replay from genesis needed.
+//! from compact per-segment exact summaries. No replay from genesis needed.
 //!
 //! # Restart strategy
 //!
-//! On startup, the node attempts to resume from persisted state. If the
-//! state_root integrity check passes (segment columns produce the expected
-//! root), the node resumes at its stored tip height and forward-syncs from
-//! peers (block-by-block for small gaps, snapshot-sync for large gaps).
+//! On startup, the node authenticates the compact exact segment-root set
+//! against the canonical tip's `state_root`, then faults raw columns in and
+//! checks them only when first touched. A legacy database without summaries
+//! performs one dense verification and writes the accelerator for later runs.
 //!
 //! If persisted state cannot be restored, every chain table is cleared before
 //! the canonical genesis is installed. Mixed-epoch recovery is never attempted.
@@ -33,6 +33,7 @@
 //! |------|-------|-----|
 //! | Headers | MDBX (forever) | Random access by height/hash |
 //! | Segment columns | MDBX (forever) | Persist across restarts |
+//! | Exact segment summaries | MDBX (forever) | Header-authenticated fast restart |
 //! | Undo logs | MDBX retained window | Reorg recovery |
 //! | Accepted block bundles | MDBX retained suffix | Bounded peer sync and reorg input |
 //! | ChainState (active/alloc) | MDBX (state_meta) | Fast restart |
@@ -211,7 +212,7 @@ impl MdbxChainContext {
     // Initialisation
     // -----------------------------------------------------------------------
 
-    pub(crate) fn load_streamed_chain_state(
+    fn load_dense_chain_state(
         store: &MdbxStore,
         log_slots: u32,
         active_slot_count: u64,
@@ -304,6 +305,126 @@ impl MdbxChainContext {
             &exact_segment_roots,
         )
         .map_err(|_| MdbxContextError::Corrupt("durable exact segment summary mismatch"))
+    }
+
+    /// Rebuild the hot exact state from the compact per-segment restart index.
+    /// `Ok(None)` means the accelerator is absent, incomplete or invalid and
+    /// the caller must fall back to the dense one-time verifier above.
+    fn try_load_compact_chain_state(
+        store: &MdbxStore,
+        log_slots: u32,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        expected_root: [u8; 32],
+    ) -> Result<Option<ChainState>, MdbxContextError> {
+        let segment_ids = store.segment_ids()?;
+        let summaries = match store.segment_summaries() {
+            Ok(summaries) => summaries,
+            Err(error) => {
+                tracing::warn!(%error, "compact segment summaries are unreadable; rebuilding");
+                return Ok(None);
+            }
+        };
+        if segment_ids.len() != summaries.len()
+            || segment_ids
+                .iter()
+                .zip(&summaries)
+                .any(|(segment_id, (summary_id, _, _))| segment_id != summary_id)
+        {
+            return Ok(None);
+        }
+
+        let mut segmented = SegmentedFriState::new_empty(log_slots as usize);
+        let segment_capacity = 1u32
+            .checked_shl(segmented.effective_log_segment_size() as u32)
+            .ok_or(MdbxContextError::Corrupt(
+                "invalid compact segment geometry",
+            ))?;
+        let mut exact_segment_roots = Vec::with_capacity(summaries.len());
+        let mut counted_live = 0u64;
+        for (segment_id, live_count, exact_root) in summaries {
+            if live_count == 0 || live_count > segment_capacity {
+                return Ok(None);
+            }
+            counted_live = match counted_live.checked_add(u64::from(live_count)) {
+                Some(counted) => counted,
+                None => return Ok(None),
+            };
+            if segmented
+                .install_evicted_exact_summary(segment_id, live_count)
+                .is_err()
+            {
+                return Ok(None);
+            }
+            exact_segment_roots.push((segment_id, exact_root));
+        }
+        if counted_live != active_slot_count {
+            return Ok(None);
+        }
+        segmented.finish_evicted_exact_summaries();
+        match ChainState::from_evicted_parts(
+            segmented,
+            active_slot_count,
+            alloc_counter,
+            expected_root,
+            &exact_segment_roots,
+        ) {
+            Ok(state) => Ok(Some(state)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn load_streamed_chain_state(
+        store: &MdbxStore,
+        log_slots: u32,
+        active_slot_count: u64,
+        alloc_counter: u64,
+        tip_height: u64,
+        expected_root: [u8; 32],
+    ) -> Result<ChainState, MdbxContextError> {
+        if let Some(state) = Self::try_load_compact_chain_state(
+            store,
+            log_slots,
+            active_slot_count,
+            alloc_counter,
+            expected_root,
+        )? {
+            tracing::info!(
+                active_segments = state.state.active_segment_ids().count(),
+                active_slot_count,
+                "resumed exact state from compact segment summaries"
+            );
+            return Ok(state);
+        }
+
+        tracing::info!(
+            "compact segment summaries are absent or incomplete; performing one-time dense verification"
+        );
+        let state = Self::load_dense_chain_state(
+            store,
+            log_slots,
+            active_slot_count,
+            alloc_counter,
+            tip_height,
+            expected_root,
+        )?;
+        if let Some((stored_height, stored_hash)) = store.get_chain_tip()? {
+            if stored_height == tip_height {
+                if let Err(error) =
+                    store.replace_segment_summaries(stored_height, stored_hash, &state)
+                {
+                    // The verified state remains usable. A later canonical
+                    // commit or restart can retry this optional accelerator.
+                    tracing::warn!(%error, "failed to persist rebuilt segment summaries");
+                } else {
+                    tracing::info!(
+                        active_segments = state.state.active_segment_ids().count(),
+                        "persisted compact segment summaries"
+                    );
+                }
+            }
+        }
+        Ok(state)
     }
 
     /// Open an existing MDBX database, or initialise a fresh one from genesis.
@@ -409,6 +530,7 @@ impl MdbxChainContext {
             &[], // no dirty segments (all virtual zero)
             &[],
             &[],
+            &[],
             None, // genesis is built in and has no accepted bundle
             &meta,
             false,
@@ -448,7 +570,7 @@ impl MdbxChainContext {
         let (log_slots, active_slot_count, alloc_counter) = store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
-        // 3. Validate the canonical metadata before streaming state columns.
+        // 3. Validate canonical metadata before restoring compact state.
         let tip_hdr = store
             .get_header(tip_height)?
             .ok_or(MdbxContextError::Corrupt("tip header missing from store"))?;
@@ -477,9 +599,9 @@ impl MdbxChainContext {
                 "finalized hash mismatch with persisted finalized header",
             ));
         }
-        // 4. Verify the exact root and per-segment FRI roots while decoding
-        //    one durable segment at a time.  The returned hot state retains
-        //    only summaries; columns are faulted in lazily on first access.
+        // 4. Authenticate the compact exact-root set against the tip header.
+        //    Legacy stores run the dense verifier once and persist summaries.
+        //    Raw columns are faulted in and checked lazily on first access.
         let state = Self::load_streamed_chain_state(
             &store,
             log_slots,
@@ -788,9 +910,15 @@ impl MdbxChainContext {
                 let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
                 let eff_log = self.state.state.effective_log_segment_size() as u8;
                 let mut dirty_refs = Vec::with_capacity(dirty_ids.len());
+                let mut dirty_summaries = Vec::with_capacity(dirty_ids.len());
                 for segment_id in dirty_ids {
+                    let live_count = self.state.state.segment_live_count(segment_id);
+                    let exact_root = self
+                        .state
+                        .cached_exact_segment_root(segment_id)
+                        .ok_or(StoreError::Decode("dirty exact segment root is missing"))?;
                     let columns =
-                        if self.state.state.segment_live_count(segment_id) == 0 {
+                        if live_count == 0 {
                             None
                         } else {
                             Some(self.state.state.try_get_segment_columns(segment_id).ok_or(
@@ -798,12 +926,14 @@ impl MdbxChainContext {
                             )?)
                         };
                     dirty_refs.push((segment_id, eff_log, columns));
+                    dirty_summaries.push((segment_id, live_count, exact_root));
                 }
                 self.store.commit_block(
                     &block.header,
                     &block_hash,
                     undo,
                     &dirty_refs,
+                    &dirty_summaries,
                     &tx_hashes,
                     &[],
                     Some(accepted_bundle),
@@ -1380,8 +1510,13 @@ impl MdbxChainContext {
             let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
             let eff_log = self.state.state.effective_log_segment_size() as u8;
             let mut dirty_refs = Vec::with_capacity(dirty_ids.len());
+            let mut dirty_summaries = Vec::with_capacity(dirty_ids.len());
             for segment_id in dirty_ids {
-                let columns = if self.state.state.segment_live_count(segment_id) == 0 {
+                let live_count = self.state.state.segment_live_count(segment_id);
+                let exact_root = self.state.cached_exact_segment_root(segment_id).ok_or(
+                    MdbxContextError::Corrupt("dirty reorg exact segment root is missing"),
+                )?;
+                let columns = if live_count == 0 {
                     None
                 } else {
                     Some(self.state.state.try_get_segment_columns(segment_id).ok_or(
@@ -1389,12 +1524,14 @@ impl MdbxChainContext {
                     )?)
                 };
                 dirty_refs.push((segment_id, eff_log, columns));
+                dirty_summaries.push((segment_id, live_count, exact_root));
             }
             self.store.commit_reorg(
                 ancestor_height,
                 &final_header,
                 &final_hash,
                 &dirty_refs,
+                &dirty_summaries,
                 &reclaimed_tx_hashes,
                 replacement,
                 &staged,
@@ -1852,6 +1989,7 @@ mod tests {
                 &header,
                 &hash,
                 &BlockUndoLog::empty(0, header.log_slots),
+                &[],
                 &[],
                 &[],
                 &[],

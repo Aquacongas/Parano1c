@@ -413,6 +413,33 @@ pub fn decode_state_meta(bytes: &[u8]) -> Option<(u32, u64, u64)> {
     Some((log_slots, active, alloc))
 }
 
+// Compact restart accelerator for one non-empty durable segment:
+// live_count(u32) + exact sparse-Merkle segment root([u8; 32]) = 36 bytes.
+//
+// The exact roots are collectively authenticated by the canonical tip's
+// state_root. Raw columns remain authoritative and are checked against this
+// summary when the segment is first faulted into RAM.
+pub const ENCODED_SEGMENT_SUMMARY_BYTES: usize = 36;
+
+pub fn encode_segment_summary(
+    live_count: u32,
+    exact_root: &[u8; 32],
+) -> [u8; ENCODED_SEGMENT_SUMMARY_BYTES] {
+    let mut out = [0u8; ENCODED_SEGMENT_SUMMARY_BYTES];
+    out[0..4].copy_from_slice(&live_count.to_le_bytes());
+    out[4..36].copy_from_slice(exact_root);
+    out
+}
+
+pub fn decode_segment_summary(bytes: &[u8]) -> Option<(u32, [u8; 32])> {
+    if bytes.len() != ENCODED_SEGMENT_SUMMARY_BYTES {
+        return None;
+    }
+    let live_count = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let exact_root = bytes[4..36].try_into().ok()?;
+    Some((live_count, exact_root))
+}
+
 // consensus_meta value:
 //   tip_height(u64) + tip_hash([u8;32]) + cumulative_chainwork([u8;32])
 //   + finalized_height(u64) + finalized_hash([u8;32]) = 112 bytes
@@ -597,6 +624,18 @@ mod tests {
         assert_eq!(ls, 25);
         assert_eq!(active, 1234567);
         assert_eq!(alloc, 999999);
+    }
+
+    #[test]
+    fn segment_summary_roundtrip_is_exact_length() {
+        let root = [0xA5; 32];
+        let bytes = encode_segment_summary(65_535, &root);
+        assert_eq!(bytes.len(), ENCODED_SEGMENT_SUMMARY_BYTES);
+        assert_eq!(decode_segment_summary(&bytes), Some((65_535, root)));
+        assert_eq!(decode_segment_summary(&bytes[..35]), None);
+        let mut extended = bytes.to_vec();
+        extended.push(0);
+        assert_eq!(decode_segment_summary(&extended), None);
     }
 
     #[test]

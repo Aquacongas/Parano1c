@@ -1049,6 +1049,37 @@ impl SegmentedFriState {
         Ok(())
     }
 
+    /// Install only the durable residency/count metadata needed by the exact
+    /// production path. The FRI root is deliberately left unavailable: unlike
+    /// the exact segment root cached by `ChainState`, it is not authenticated
+    /// by the block header. If a legacy FRI API is requested later, the raw
+    /// segment must first be hydrated and its FRI commitment recomputed.
+    pub(crate) fn install_evicted_exact_summary(
+        &mut self,
+        seg_id: u16,
+        live_count: u32,
+    ) -> Result<(), &'static str> {
+        let id = seg_id as usize;
+        if id >= self.num_segments || live_count == 0 {
+            return Err("invalid durable exact segment summary");
+        }
+        self.segments[id] = None;
+        self.live_counts[id] = live_count;
+        self.seg_roots[id] = None;
+        self.evicted.insert(seg_id);
+        self.dirty.insert(seg_id);
+        self.tree_dirty = true;
+        Ok(())
+    }
+
+    /// Seal a compact exact-only startup image. FRI-dirty markers intentionally
+    /// survive so no caller can consume an invented FRI tree; persistence and
+    /// exact-root tracking are already clean at the durable boundary.
+    pub(crate) fn finish_evicted_exact_summaries(&mut self) {
+        self.mdbx_dirty.clear();
+        self.exact_dirty.clear();
+    }
+
     /// Finish a batch of summary installs and leave no false persistence dirt.
     pub(crate) fn finish_evicted_segment_summaries(&mut self) {
         self.flush_tree();

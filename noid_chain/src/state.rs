@@ -417,8 +417,8 @@ impl ChainState {
     }
 
     /// Build a hot state from durable per-segment summaries without retaining
-    /// any segment columns.  Startup computes and validates each summary while
-    /// streaming one MDBX record at a time.
+    /// any segment columns. The compact exact-root set is accepted only when
+    /// its reconstructed upper root equals the canonical header commitment.
     pub(crate) fn from_evicted_parts(
         state: SegmentedFriState,
         active_slot_count: u64,
@@ -583,6 +583,17 @@ impl ChainState {
         self.utxo_root
     }
 
+    /// Return one compact exact segment root from the already-sealed cache.
+    ///
+    /// MDBX persists this alongside changed raw columns so restart can rebuild
+    /// the authenticated upper tree without rereading every dense segment.
+    pub(crate) fn cached_exact_segment_root(&self, segment_id: u16) -> Option<StateHash> {
+        self.exact_roots
+            .segment_roots
+            .get(segment_id as usize)
+            .copied()
+    }
+
     pub fn rebuild_exact_utxo_root_loaded(&mut self) -> Result<StateHash, ExactStateReadError> {
         self.try_state_root()
     }
@@ -594,6 +605,26 @@ impl ChainState {
         segment_id: u16,
         columns: SegmentColumns,
     ) -> Result<(), ExactStateReadError> {
+        let expected_len = 1usize << self.state.effective_log_segment_size();
+        if columns.values.len() != expected_len
+            || columns.owners_hi.len() != expected_len
+            || columns.owners_lo.len() != expected_len
+        {
+            return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
+        }
+        let actual_live = (0..expected_len)
+            .filter(|&local| {
+                !SlotValue {
+                    value: columns.values[local],
+                    owner_hi: columns.owners_hi[local],
+                    owner_lo: columns.owners_lo[local],
+                }
+                .is_empty()
+            })
+            .count();
+        if usize::try_from(self.state.segment_live_count(segment_id)).ok() != Some(actual_live) {
+            return Err(ExactStateReadError::SegmentRootMismatch { seg_id: segment_id });
+        }
         let actual = exact_segment_root_with_updates(
             self.state.effective_log_segment_size(),
             Some(&columns),
