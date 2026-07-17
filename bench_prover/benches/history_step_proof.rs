@@ -13,7 +13,9 @@
 //!
 //! Set `NOID_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
 //! B64 parent. Use `B255-B255` for the B255-parent case. With no filter, both
-//! launch classes run.
+//! launch classes run. `NOID_HISTORY_STEP_BENCH_SAMPLES=N` reuses the proved
+//! parent and authenticated matrix pack for N production samples, then reports
+//! nearest-rank p50/p95 values; the default is one sample.
 //!
 //! Honest native-valid fixtures and matrix assembly are setup.  Each reported
 //! `prove_ms` covers only production HistoryStep proof + terminal creation —
@@ -54,6 +56,7 @@ use noid_recursive::{
 const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
 const PACK_DIRECTORY_ENV: &str = "NOID_HISTORY_STEP_PACK_DIR";
 const BENCH_FILTER_ENV: &str = "NOID_HISTORY_STEP_BENCH_FILTER";
+const BENCH_SAMPLES_ENV: &str = "NOID_HISTORY_STEP_BENCH_SAMPLES";
 const METADATA_DIGEST_ENV: &str = "NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
 const LEAF_DIGESTS_ENV: &str = "NOID_HISTORY_STEP_PACK_LEAF_DIGESTS";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -230,6 +233,24 @@ fn class_is_selected(
     filter.map_or(true, |(selected, _)| selected == class)
 }
 
+fn benchmark_sample_count() -> Result<usize, String> {
+    let value = match std::env::var(BENCH_SAMPLES_ENV) {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(1),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!("{BENCH_SAMPLES_ENV} must be valid UTF-8"));
+        }
+    };
+    let samples = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{BENCH_SAMPLES_ENV} must be an integer in 1..=100"))?;
+    if !(1..=100).contains(&samples) {
+        return Err(format!("{BENCH_SAMPLES_ENV} must be an integer in 1..=100"));
+    }
+    Ok(samples)
+}
+
 fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), String> {
     let root = PathBuf::from(
         std::env::var_os(PACK_DIRECTORY_ENV)
@@ -312,11 +333,27 @@ fn build_parent(
     }
 }
 
+#[derive(Clone, Copy)]
+struct TierMeasurement {
+    class_index: usize,
+    wires: usize,
+    assemble_ms: u128,
+    prove_ms: u128,
+    verify_ms: u128,
+    terminal_bytes: usize,
+}
+
+impl TierMeasurement {
+    fn prepare_ms(self) -> u128 {
+        self.assemble_ms + self.prove_ms
+    }
+}
+
 fn benchmark_tier<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: &HistoryStepTerminal,
     fixture: PreparedHistoryStepTierFixture<TIER>,
-) -> Result<(), String> {
+) -> Result<TierMeasurement, String> {
     let (block, input) = finish_fixture(fixture)?;
     let assemble_started = Instant::now();
     let parent = HistoryStepParent::new(runtime, parent)
@@ -345,16 +382,84 @@ fn benchmark_tier<const TIER: usize>(
         return Err(format!("B{TIER} accepted terminal boundary drift"));
     }
 
+    Ok(TierMeasurement {
+        class_index: class.index(),
+        wires,
+        assemble_ms,
+        prove_ms,
+        verify_ms,
+        terminal_bytes,
+    })
+}
+
+fn nearest_rank(mut values: Vec<u128>, percentile: usize) -> u128 {
+    assert!(!values.is_empty());
+    assert!((1..=100).contains(&percentile));
+    values.sort_unstable();
+    let rank = (percentile * values.len()).div_ceil(100);
+    values[rank.saturating_sub(1)]
+}
+
+fn report_samples<const TIER: usize>(measurements: &[TierMeasurement]) {
+    if measurements.len() == 1 {
+        return;
+    }
+
+    let metric = |select: fn(TierMeasurement) -> u128| {
+        let values: Vec<_> = measurements.iter().copied().map(select).collect();
+        (nearest_rank(values.clone(), 50), nearest_rank(values, 95))
+    };
+    let (assemble_p50, assemble_p95) = metric(|sample| sample.assemble_ms);
+    let (prove_p50, prove_p95) = metric(|sample| sample.prove_ms);
+    let (prepare_p50, prepare_p95) = metric(TierMeasurement::prepare_ms);
+    let (verify_p50, verify_p95) = metric(|sample| sample.verify_ms);
     println!(
-        "B{TIER} class=c{:02} wires={wires} assemble_ms={assemble_ms} prove_ms={prove_ms} verify_ms={verify_ms} terminal_bytes={terminal_bytes}",
-        class.index(),
+        "B{TIER} summary samples={} wires={} assemble_p50_ms={assemble_p50} assemble_p95_ms={assemble_p95} prove_p50_ms={prove_p50} prove_p95_ms={prove_p95} prepare_p50_ms={prepare_p50} prepare_p95_ms={prepare_p95} verify_p50_ms={verify_p50} verify_p95_ms={verify_p95} terminal_bytes={}",
+        measurements.len(),
+        measurements[0].wires,
+        measurements[0].terminal_bytes,
     );
+}
+
+fn benchmark_tier_samples<const TIER: usize>(
+    runtime: &HistoryStepRuntime,
+    parent: &HistoryStepTerminal,
+    sample_count: usize,
+    mut fixture: impl FnMut() -> Result<PreparedHistoryStepTierFixture<TIER>, String>,
+) -> Result<(), String> {
+    let mut measurements = Vec::with_capacity(sample_count);
+    for sample in 0..sample_count {
+        let measurement = benchmark_tier(runtime, parent, fixture()?)?;
+        println!(
+            "B{TIER} class=c{:02} sample={}/{} wires={} assemble_ms={} prove_ms={} prepare_ms={} verify_ms={} terminal_bytes={}",
+            measurement.class_index,
+            sample + 1,
+            sample_count,
+            measurement.wires,
+            measurement.assemble_ms,
+            measurement.prove_ms,
+            measurement.prepare_ms(),
+            measurement.verify_ms,
+            measurement.terminal_bytes,
+        );
+        measurements.push(measurement);
+    }
+    let expected = measurements[0];
+    if measurements.iter().any(|measurement| {
+        measurement.class_index != expected.class_index
+            || measurement.wires != expected.wires
+            || measurement.terminal_bytes != expected.terminal_bytes
+    }) {
+        return Err(format!("B{TIER} repeated benchmark shape drift"));
+    }
+    report_samples::<TIER>(&measurements);
     Ok(())
 }
 
 fn run() -> Result<(), String> {
     noid_ivc_prover::init_perf_thread_pool();
     let filter = benchmark_filter()?;
+    let sample_count = benchmark_sample_count()?;
     let (runtime, source) = load_runtime()?;
     let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)?;
     let c00 = CanonicalHistoryStepClassId::new(0).expect("B64 class");
@@ -395,13 +500,17 @@ fn run() -> Result<(), String> {
     if class_is_selected(filter, c00) {
         source.load_checked(c00)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b64(c00, parent_accumulator)?)?;
+        benchmark_tier_samples(&runtime, &parent, sample_count, || {
+            provider.b64(c00, parent_accumulator)
+        })?;
     }
     let c01 = CanonicalHistoryStepClassId::new(1).expect("B255 class");
     if class_is_selected(filter, c01) {
         source.load_checked(c01)?;
         source.load_checked(parent_class)?;
-        benchmark_tier(&runtime, &parent, provider.b255(c01, parent_accumulator)?)?;
+        benchmark_tier_samples(&runtime, &parent, sample_count, || {
+            provider.b255(c01, parent_accumulator)
+        })?;
     }
     Ok(())
 }
