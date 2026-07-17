@@ -62,3 +62,9 @@ Compared with the default-codegen 20-sample run:
 The preceding phase trace placed almost all proof time in PCS commit and the
 post-commit recursive phase. Thin LTO improves those cross-crate hot paths
 without changing consensus, the capsule, HistoryStep matrices or wire format.
+
+The complete pack was subsequently regenerated from a fresh root at commit
+`05be8eeec61525bd51cc0744450fab39301dc57d`; runtime metadata and both matrix
+leaves were byte-identical. The freezer command, SHA-256 identities and
+release pins are recorded in
+`2026-07-17-history-step-pack-reproduction.md`.
