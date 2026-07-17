@@ -33,6 +33,36 @@ pub struct ReceiptVerifyResult {
     pub canonical: bool,
     pub confirmed: bool,
     pub error: Option<String>,
+    /// Payment data reconstructed from the receipt and authenticated by its
+    /// Merkle path. Present only when `merkle_valid` is true; `canonical`
+    /// separately says whether the claimed root is on this node's chain.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated_summary: Option<ReceiptSummaryInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptSummaryInfo {
+    pub txid: String,
+    pub claimed_height: u64,
+    pub confirmed_unix: u64,
+    pub tx_index: u16,
+    pub tx_count: u16,
+    pub fee_micronoid: u64,
+    pub inputs: Vec<ReceiptInputInfo>,
+    pub outputs: Vec<ReceiptOutputInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptInputInfo {
+    pub slot_index: u32,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptOutputInfo {
+    pub slot_index: u32,
+    pub amount_micronoid: u64,
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1934,6 +1934,7 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
     let canonical = result["canonical"].as_bool().unwrap_or(false);
     let confirmed = result["confirmed"].as_bool().unwrap_or(false);
     let error = result["error"].as_str();
+    let authenticated_summary = result["authenticated_summary"].as_object();
 
     section("Receipt verification");
 
@@ -1971,6 +1972,56 @@ async fn cmd_verify(ctx: &Ctx<'_>, receipt: &str) -> anyhow::Result<()> {
             },
         );
         bail!("Receipt verification failed");
+    }
+
+    if let Some(summary) = authenticated_summary {
+        let txid = summary
+            .get("txid")
+            .and_then(|value| value.as_str())
+            .unwrap_or("?");
+        let height = summary
+            .get("claimed_height")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let confirmed_unix = summary
+            .get("confirmed_unix")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let fee = summary
+            .get("fee_micronoid")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        let inputs = summary
+            .get("inputs")
+            .and_then(|value| value.as_array())
+            .map_or(0, Vec::len);
+        let outputs = summary
+            .get("outputs")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        println!();
+        section("Authenticated payment");
+        kv("Transaction", txid);
+        kv2(
+            "Block",
+            &format!("#{height}"),
+            &format!("unix {confirmed_unix}"),
+        );
+        kv("Fee", &format!("{} ({} μNOID)", noid_str(fee), fee));
+        kv("Inputs", &inputs.to_string());
+        kv("Outputs", &outputs.len().to_string());
+        for (index, output) in outputs.iter().enumerate() {
+            let owner = output["owner"].as_str().unwrap_or("?");
+            let amount = output["amount_micronoid"].as_u64().unwrap_or(0);
+            let slot = output["slot_index"].as_u64().unwrap_or(0);
+            kv2(
+                &format!("  Output {}", index + 1),
+                &format!("{} ({} μNOID)", noid_str(amount), amount),
+                &format!("to {owner}, slot {slot}"),
+            );
+        }
     }
 
     Ok(())

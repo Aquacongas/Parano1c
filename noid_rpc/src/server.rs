@@ -30,10 +30,11 @@ use noid_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
-    MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo,
-    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletInputLimitExceeded,
-    WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
-    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptInputInfo, ReceiptOutputInfo,
+    ReceiptSummaryInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo,
+    WalletBalance, WalletHistoryEntry, WalletInputLimitExceeded, WalletScanResult, WalletSendPlan,
+    WalletSendResult, WalletStatus, WalletUtxoInfo, WALLET_INPUT_LIMIT_EXCEEDED_CODE,
+    WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -1438,6 +1439,33 @@ impl ParanoidApiServer for RpcHandler {
         };
 
         let confirmed = merkle_valid && canonical == Some(true);
+        let authenticated_summary = merkle_valid.then(|| ReceiptSummaryInfo {
+            txid: hex::encode(receipt.summary.logical_txid),
+            claimed_height: receipt.claimed_height,
+            confirmed_unix: receipt.summary.confirmed_unix,
+            tx_index: receipt.tx_index,
+            tx_count: receipt.tx_count,
+            fee_micronoid: receipt.summary.fee_micronoid,
+            inputs: receipt
+                .summary
+                .inputs
+                .iter()
+                .map(|(slot_index, owner)| ReceiptInputInfo {
+                    slot_index: *slot_index,
+                    owner: owner.to_bech32(),
+                })
+                .collect(),
+            outputs: receipt
+                .summary
+                .outputs
+                .iter()
+                .map(|(slot_index, amount_micronoid, owner)| ReceiptOutputInfo {
+                    slot_index: *slot_index,
+                    amount_micronoid: *amount_micronoid,
+                    owner: owner.to_bech32(),
+                })
+                .collect(),
+        });
 
         Ok(ReceiptVerifyResult {
             merkle_valid,
@@ -1451,6 +1479,7 @@ impl ParanoidApiServer for RpcHandler {
             } else {
                 None
             },
+            authenticated_summary,
         })
     }
 
