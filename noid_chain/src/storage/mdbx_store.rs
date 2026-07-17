@@ -817,15 +817,18 @@ impl MdbxStore {
         // size. For a node with 160 active UTXOs this wastes disk and inflates VmSize.
         //
         // Sizing rationale:
-        //   min_size  = 4 MB  — enough for genesis + a few hundred blocks
-        //   max_size  = 16 GB — full state at log_slots=32: ~768 MB segments
-        //                        + headers + undo logs + margin
-        //   growth_step = 64 MB — incremental growth to avoid excessive resize churn
+        //   min_size  = 4 MB — enough for genesis + a few hundred blocks
+        //   max_size  = 1 TiB — a fully materialised log_slots=32 raw state is
+        //                        ~192 GiB (65,536 × 3 MiB), before the live-owner
+        //                        index, permanent headers/tx index and B+tree
+        //                        overhead. This is an address-space ceiling, not
+        //                        eager RAM or disk allocation; MDBX grows below.
+        //   growth_step = 64 MB — incremental growth to avoid resize churn
         let rw = ReadWriteOptions {
             sync_mode: SyncMode::Durable,
-            min_size: Some(4 * 1024 * 1024),         //  4 MB
-            max_size: Some(16 * 1024 * 1024 * 1024), // 16 GB
-            growth_step: Some(64 * 1024 * 1024),     // 64 MB steps
+            min_size: Some(4 * 1024 * 1024),                // 4 MiB
+            max_size: Some(1024isize * 1024 * 1024 * 1024), // 1 TiB virtual ceiling
+            growth_step: Some(64 * 1024 * 1024),            // 64 MiB steps
             ..Default::default()
         };
         let db = Database::<NoWriteMap>::open_with_options(

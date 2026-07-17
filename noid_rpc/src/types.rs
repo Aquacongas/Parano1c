@@ -309,8 +309,8 @@ pub struct StateInfo {
     pub expand_trigger_pct: u8,
     /// Maximum allowed log_slots (slot space cannot grow beyond 2^log_slots_max).
     pub log_slots_max: u32,
-    /// Total on-disk segment size for the current state in bytes.
-    /// Formula: capacity × 48 bytes/slot (value 16B + owner_hi 16B + owner_lo 16B).
+    /// Raw on-disk bytes for currently non-empty dense segments. Virtual-zero
+    /// segments, including a newly added expansion half, consume no bytes.
     pub state_bytes: u64,
     /// Human-readable state size (e.g. "768.0 MB").
     pub state_size_human: String,
