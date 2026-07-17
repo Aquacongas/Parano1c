@@ -1034,6 +1034,10 @@ async fn main() -> anyhow::Result<()> {
             1
         };
         let mat_segs = ctx.state.state.active_segment_ids().count();
+        let encoded_state_bytes = ctx
+            .store
+            .encoded_state_bytes()
+            .context("read encoded state size for startup banner")?;
         let reward = block_reward(log_slots) as f64 / 1_000_000.0;
 
         drop(ctx);
@@ -1055,6 +1059,7 @@ async fn main() -> anyhow::Result<()> {
             log_slots,
             mat_segs,
             num_segs,
+            encoded_state_bytes,
             reward,
             wallet_bech32.as_deref(),
             cfg.mining.enabled,
@@ -5445,6 +5450,7 @@ fn print_startup_banner(
     log_slots: u32,
     materialized_segs: usize,
     total_segs: usize,
+    encoded_state_bytes: u64,
     block_reward_noid: f64,
     wallet_addr: Option<&str>,
     mining: bool,
@@ -5501,16 +5507,19 @@ fn print_startup_banner(
             }
         })
         .collect();
-    let seg_size_bytes = 3u64 * 65536 * 16;
-    let disk_bytes = materialized_segs as u64 * seg_size_bytes;
-    let max_bytes = total_segs as u64 * seg_size_bytes;
+    let effective_log = log_slots.min(noid_chain::fri_state::LOG_SEGMENT_SIZE as u32) as u8;
+    let max_segment_bytes = noid_chain::storage::max_encoded_segment_len_for_eff_log(effective_log)
+        .unwrap_or(usize::MAX) as u64;
+    let max_bytes = (total_segs as u64).saturating_mul(max_segment_bytes);
     let hb = |n: u64| -> String {
         if n >= 1 << 30 {
             format!("{:.1}GB", n as f64 / (1 << 30) as f64)
         } else if n >= 1 << 20 {
-            format!("{:.0}MB", n as f64 / (1 << 20) as f64)
+            format!("{:.1}MB", n as f64 / (1 << 20) as f64)
+        } else if n >= 1 << 10 {
+            format!("{:.1}KB", n as f64 / (1 << 10) as f64)
         } else {
-            format!("{:.0}KB", n as f64 / 1024.0)
+            format!("{n}B")
         }
     };
 
@@ -5548,13 +5557,13 @@ fn print_startup_banner(
     row(
         "state",
         &format!(
-            "{}/{} slots  {:.2}%  [{}]  {} seg  {} disk  {} max",
+            "{}/{} slots  {:.2}%  [{}]  {} seg  {} encoded  {} domain max",
             active_slots,
             capacity,
             fill_pct,
             bar,
             dim(&format!("{}/{}", materialized_segs, total_segs)),
-            dim(&hb(disk_bytes)),
+            dim(&hb(encoded_state_bytes)),
             dim(&hb(max_bytes))
         ),
     );

@@ -89,6 +89,19 @@ def compact_metrics(label):
     return result
 
 
+def assert_banner_encoded_size(label, expected_bytes):
+    state_lines = [
+        line
+        for line in log_text(label).splitlines()
+        if " slots  " in line and " encoded" in line and "domain max" in line
+    ]
+    require(state_lines, f"{label} has no sparse state banner line")
+    require(
+        f"{expected_bytes}B encoded" in state_lines[-1],
+        f"{label} banner does not report {expected_bytes} encoded bytes: {state_lines[-1]}",
+    )
+
+
 def state_info(node):
     return rpc(node.rpc_port, "getStateInfo")
 
@@ -203,6 +216,7 @@ def main():
         restart_metrics = compact_metrics(restart_label)
         require(restart_metrics["active_segments"] == 1, f"bad restart metrics: {restart_metrics}")
         require(int(restart_info["height"]) >= INITIAL_HEIGHT, f"restart lost state: {restart_info}")
+        assert_banner_encoded_size(restart_label, int(initial_state["state_bytes"]))
         rpc(node.rpc_port, "walletScan", timeout=180)
 
         before_utxos = rpc(node.rpc_port, "walletListUtxos")
@@ -255,6 +269,7 @@ def main():
         labels.append(final_label)
         final_metrics = compact_metrics(final_label)
         require(final_metrics["active_segments"] == 1, f"bad final metrics: {final_metrics}")
+        assert_banner_encoded_size(final_label, int(post_payment_state["state_bytes"]))
         require(
             int(final_info["height"]) >= int(confirmed["height"]),
             f"final restart lost payment: {final_info}",
