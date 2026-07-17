@@ -655,9 +655,10 @@ async fn main() -> anyhow::Result<()> {
     // A Notify permit can be consumed by one of many mempool/miner waiters;
     // watch preserves the state for every current and future subscriber.
     let (initial_sync_ready_tx, initial_sync_ready_rx) = tokio::sync::watch::channel(false);
-    // Tip-change notifier cancels active proof/PoW work so it can rebuild on
-    // the new canonical parent.
-    let sync_ready = Arc::new(tokio::sync::Notify::new());
+    // Edge-triggered tip changes cancel active proof/PoW work. Broadcast keeps
+    // no stale permit from advances that happened before the miner subscribed;
+    // its initial chain snapshot already includes those advances.
+    let (tip_change_tx, _) = tokio::sync::broadcast::channel::<()>(16);
     // Extminer mode owns one prepared/proving attempt. P2P canonical advances
     // use this same handle to invalidate stale ready capabilities immediately.
     let external_mining_attempts = ExternalMiningAttemptInvalidator::new();
@@ -671,7 +672,6 @@ async fn main() -> anyhow::Result<()> {
             .as_secs();
         if h > 0 && ts > 0 && now.saturating_sub(ts) < 60 * 3 {
             mark_initial_sync_ready(&initial_sync_ready_tx);
-            sync_ready.notify_one();
             tracing::info!(height = h, "chain state is current");
         }
     }
@@ -796,12 +796,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // --genesis flag: bootstrap mode for the very first node on a new network.
-    // Fires sync_ready immediately so the miner starts without waiting for peers.
+    // Marks durable initial readiness so the miner starts without waiting for peers.
     // All other nodes sync automatically when they connect to a genesis node.
     if cli.genesis {
-        tracing::debug!("genesis mode: firing sync_ready immediately");
+        tracing::debug!("genesis mode: marking initial sync ready immediately");
         mark_initial_sync_ready(&initial_sync_ready_tx);
-        sync_ready.notify_one();
     }
 
     // Background P2P event handler.
@@ -810,7 +809,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_wallet = shared_wallet.clone();
     let p2p_events = p2p.subscribe();
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
-    let p2p_sync_ready = Arc::clone(&sync_ready);
+    let p2p_tip_changes = tip_change_tx.clone();
     let p2p_initial_sync_ready = initial_sync_ready_tx.clone();
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
     let p2p_snapshot_staging_root = snapshot_staging_root.clone();
@@ -824,7 +823,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_wallet,
             p2p_cmd_for_events,
             p2p_initial_sync_ready,
-            p2p_sync_ready,
+            p2p_tip_changes,
             p2p_wallet_operation_gate,
             p2p_snapshot_staging_root,
             p2p_history_step_runtime,
@@ -920,7 +919,7 @@ async fn main() -> anyhow::Result<()> {
             mempool.clone(),
             chain.clone(),
             initial_sync_ready_rx,
-            Arc::clone(&sync_ready),
+            tip_change_tx.clone(),
             Arc::clone(
                 history_step_runtime
                     .as_ref()
@@ -1865,7 +1864,7 @@ async fn handle_p2p_events(
     wallet: SharedWallet,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     initial_sync_ready: tokio::sync::watch::Sender<bool>,
-    sync_ready: Arc<tokio::sync::Notify>,
+    tip_changes: tokio::sync::broadcast::Sender<()>,
     wallet_operation_gate: WalletOperationGate,
     snapshot_staging_root: PathBuf,
     history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
@@ -2631,7 +2630,7 @@ async fn handle_p2p_events(
                                             .await;
                                         last_tip_advance = Instant::now();
                                         mark_initial_sync_ready(&initial_sync_ready);
-                                        sync_ready.notify_one();
+                                        let _ = tip_changes.send(());
                                         tracing::info!(
                                             new_tip = new_tip_height,
                                             reverted,
@@ -2778,7 +2777,7 @@ async fn handle_p2p_events(
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 mark_initial_sync_ready(&initial_sync_ready);
-                                sync_ready.notify_one(); // cancel/rebuild any active stale template
+                                let _ = tip_changes.send(()); // cancel/rebuild any active stale template
 
                                 // Continue only to the authenticated/announced target. Pulling
                                 // one height beyond a caught-up tip used to turn an ordinary
@@ -2990,7 +2989,7 @@ async fn handle_p2p_events(
 
                                                     last_tip_advance = Instant::now();
                                                     mark_initial_sync_ready(&initial_sync_ready);
-                                                    sync_ready.notify_one();
+                                                    let _ = tip_changes.send(());
                                                     let new_tip = new_tip_height;
                                                     tracing::info!(
                                                         new_tip,
@@ -4725,7 +4724,7 @@ async fn handle_p2p_events(
                     }
                     last_tip_advance = Instant::now();
                     mark_initial_sync_ready(&initial_sync_ready);
-                    sync_ready.notify_one();
+                    let _ = tip_changes.send(());
                     if highest_announced > height {
                         let peer = last_announcement_peer.unwrap_or(completed.key.from);
                         let count = (highest_announced - height)

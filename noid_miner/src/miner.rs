@@ -62,7 +62,7 @@ pub struct MinerConfig {
     /// Safety-net heartbeat interval (seconds).
     ///
     /// Fires only if the miner has been stuck without a block for this long.
-    /// Normal template refreshes happen immediately via `sync_ready` (P2P
+    /// Normal template refreshes happen immediately via tip-change events (P2P
     /// block received) and `TxAdmitted` for coinbase-only sealed templates.
     /// This timer exists only for edge cases where both are silent.
     ///
@@ -75,7 +75,7 @@ impl Default for MinerConfig {
     fn default() -> Self {
         Self {
             miner_address: Address([0u8; 32]),
-            refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are sync_ready + TxAdmitted
+            refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are tip changes + TxAdmitted
         }
     }
 }
@@ -182,9 +182,13 @@ pub struct BlockMiner {
     /// Durable initial-sync state. Unlike `Notify`, a watch value cannot be
     /// consumed by another waiter or lost before the miner task starts.
     initial_sync_ready: watch::Receiver<bool>,
-    /// Notified whenever the canonical tip changes after startup so active
-    /// proof/PoW work is cancelled and rebuilt on the new parent.
-    sync_ready: Arc<tokio::sync::Notify>,
+    /// Edge-triggered canonical-tip changes observed after this miner was
+    /// created. Broadcast deliberately retains no pre-subscription permit:
+    /// the initial chain snapshot already includes every earlier advance.
+    tip_changes: broadcast::Receiver<()>,
+    /// Keep the channel open for library-only miners even when their caller
+    /// does not retain a sender after construction.
+    _tip_change_sender: broadcast::Sender<()>,
     history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
     ghost_authorization:
         Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
@@ -208,7 +212,7 @@ impl BlockMiner {
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
         initial_sync_ready: watch::Receiver<bool>,
-        sync_ready: Arc<tokio::sync::Notify>,
+        tip_change_sender: broadcast::Sender<()>,
         history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
         ghost_authorization: Arc<
             noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization,
@@ -234,7 +238,8 @@ impl BlockMiner {
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             initial_sync_ready,
-            sync_ready,
+            tip_changes: tip_change_sender.subscribe(),
+            _tip_change_sender: tip_change_sender,
             history_step_runtime,
             ghost_authorization,
             on_block_applied: None,
@@ -299,7 +304,7 @@ impl BlockMiner {
 
     /// Main mining loop. Run in a dedicated `tokio::spawn` task.
     /// Never returns under normal operation.
-    pub async fn run(self) {
+    pub async fn run(mut self) {
         // Sync guard: do not mine until chain is current.
         {
             use noid_chain::consensus::params::BLOCK_TIME;
@@ -680,12 +685,20 @@ impl BlockMiner {
                     }
                 }
 
-                _ = self.sync_ready.notified() => {
+                tip_change = self.tip_changes.recv() => {
                     // A new chain tip is available (P2P block applied or snapshot synced).
                     // Cancel current PoW so the next iteration mines on the correct tip.
                     cancel.store(true, Ordering::Relaxed);
                     let _ = pow_handle.await;
-                    tracing::debug!("sync_ready: new chain tip, cancelling PoW to rebuild");
+                    match tip_change {
+                        Ok(()) => tracing::debug!("new chain tip: cancelling PoW to rebuild"),
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::debug!(skipped, "chain-tip receiver lagged: cancelling PoW to rebuild");
+                        }
+                        // The miner owns a sender, so closure is unreachable
+                        // until the miner itself is dropped.
+                        Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                    }
                 }
             }
         }

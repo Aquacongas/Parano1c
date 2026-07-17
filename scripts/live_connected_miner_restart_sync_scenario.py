@@ -113,7 +113,7 @@ def require_miner_caught_up(label, text, minimum_applied):
     require(applied >= minimum_applied, f"{label} applied only {applied}/{minimum_applied} blocks")
     stale_work_cancelled = (
         "prepared template parent changed before PoW" in text
-        or "sync_ready: new chain tip, cancelling PoW to rebuild" in text
+        or "new chain tip: cancelling PoW to rebuild" in text
         or "miner: sync ready, starting" in text
         or "miner: ready, starting" in text
     )
