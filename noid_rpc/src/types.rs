@@ -346,7 +346,7 @@ pub fn micronoid_to_noid(micronoid: u64) -> f64 {
 /// Information about a single pending transaction in the mempool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MempoolTxInfo {
-    /// Transaction body hash (hex).
+    /// Canonical logical transaction id (hex).
     pub tx_hash: String,
     /// Fee in μNOID.
     pub fee_micronoid: u64,
@@ -356,6 +356,12 @@ pub struct MempoolTxInfo {
     pub n_inputs: usize,
     /// Number of live outputs.
     pub n_outputs: usize,
+    /// Number of physical Tx8x2 pages in this indivisible logical transaction.
+    pub page_count: usize,
+    /// Smallest block proof class capable of including the complete intent.
+    pub minimum_proof_class: String,
+    /// True while this pending intent requires a B255-qualified producer.
+    pub requires_b255_miner: bool,
     /// Chain height at admission.
     pub admitted_height: u64,
     /// Whether a wallet authorization bundle is cached.

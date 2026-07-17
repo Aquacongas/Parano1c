@@ -256,6 +256,27 @@ fn fee_breakdown_info(
     }
 }
 
+fn mempool_tx_info(entry: noid_mempool::MempoolEntryMetadata) -> MempoolTxInfo {
+    use noid_chain::consensus::paged_spend::BlockProofClass;
+
+    let page_count = usize::from(entry.page_count);
+    let proof_class = BlockProofClass::for_page_count(page_count)
+        .expect("admitted PagedSpend always fits a consensus proof class");
+    let requires_b255_miner = matches!(proof_class, BlockProofClass::B255);
+    MempoolTxInfo {
+        tx_hash: hex::encode(entry.tx_hash.0),
+        fee_micronoid: entry.fee_micronoid,
+        fee_rate: entry.fee_rate,
+        n_inputs: usize::from(entry.n_inputs),
+        n_outputs: usize::from(entry.n_outputs),
+        page_count,
+        minimum_proof_class: if requires_b255_miner { "B255" } else { "B64" }.to_owned(),
+        requires_b255_miner,
+        admitted_height: entry.admitted_height,
+        has_authorization: entry.has_authorization,
+    }
+}
+
 fn validate_tx_counts(n_inputs: usize, n_outputs: usize) -> Result<(), ErrorObject<'static>> {
     if (1..=noid_tx::MAX_PAGED_SPEND_INPUTS).contains(&n_inputs)
         && (1..=noid_tx::MAX_PAGED_SPEND_OUTPUTS).contains(&n_outputs)
@@ -1381,15 +1402,7 @@ impl ParanoidApiServer for RpcHandler {
         let hash_bytes = decode_32_byte_hex("txhash", &txhash)?;
         let hash = noid_poseidon2b::primitives::TxBodyHash(hash_bytes);
         let found = self.mempool.get_entry_metadata(&hash).await;
-        Ok(found.map(|e| MempoolTxInfo {
-            tx_hash: txhash,
-            fee_micronoid: e.fee_micronoid,
-            fee_rate: e.fee_rate,
-            n_inputs: usize::from(e.n_inputs),
-            n_outputs: usize::from(e.n_outputs),
-            admitted_height: e.admitted_height,
-            has_authorization: e.has_authorization,
-        }))
+        Ok(found.map(mempool_tx_info))
     }
 
     // -----------------------------------------------------------------------
@@ -1804,15 +1817,8 @@ impl ParanoidApiServer for RpcHandler {
         let txs: Vec<MempoolTxInfo> = snapshot
             .entries
             .iter()
-            .map(|e| MempoolTxInfo {
-                tx_hash: hex::encode(e.tx_hash.0),
-                fee_micronoid: e.fee_micronoid,
-                fee_rate: e.fee_rate,
-                n_inputs: usize::from(e.n_inputs),
-                n_outputs: usize::from(e.n_outputs),
-                admitted_height: e.admitted_height,
-                has_authorization: e.has_authorization,
-            })
+            .copied()
+            .map(mempool_tx_info)
             .collect();
 
         Ok(MempoolInfo {
@@ -1977,6 +1983,30 @@ mod tests {
         assert!(validate_tx_counts(0, 1).is_err());
         assert!(validate_tx_counts(noid_tx::MAX_PAGED_SPEND_INPUTS + 1, 1).is_err());
         assert!(validate_tx_counts(1, noid_tx::MAX_PAGED_SPEND_OUTPUTS + 1).is_err());
+    }
+
+    #[test]
+    fn mempool_status_exposes_the_exact_b64_b255_boundary() {
+        let metadata = |page_count| noid_mempool::MempoolEntryMetadata {
+            tx_hash: noid_poseidon2b::primitives::TxBodyHash([page_count as u8; 32]),
+            fee_micronoid: 7,
+            fee_rate: 3,
+            n_inputs: 1,
+            n_outputs: 1,
+            page_count,
+            admitted_height: 11,
+            has_authorization: true,
+        };
+
+        let b64 = mempool_tx_info(metadata(64));
+        assert_eq!(b64.page_count, 64);
+        assert_eq!(b64.minimum_proof_class, "B64");
+        assert!(!b64.requires_b255_miner);
+
+        let b255 = mempool_tx_info(metadata(65));
+        assert_eq!(b255.page_count, 65);
+        assert_eq!(b255.minimum_proof_class, "B255");
+        assert!(b255.requires_b255_miner);
     }
 
     #[test]

@@ -1091,6 +1091,14 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
         &result["n_outputs"].as_u64().unwrap_or(0).to_string(),
     );
     kv(
+        "Physical pages",
+        &result["page_count"].as_u64().unwrap_or(0).to_string(),
+    );
+    kv(
+        "Minimum proof class",
+        result["minimum_proof_class"].as_str().unwrap_or("?"),
+    );
+    kv(
         "Admitted at height",
         &result["admitted_height"].as_u64().unwrap_or(0).to_string(),
     );
@@ -1103,6 +1111,10 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
             "not attached"
         },
     );
+    if result["requires_b255_miner"].as_bool().unwrap_or(false) {
+        println!();
+        warn_msg("Waiting for inclusion: this atomic PagedSpend requires a B255-qualified miner.");
+    }
     Ok(())
 }
 
@@ -1155,43 +1167,54 @@ async fn cmd_mempool(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     }
 
     println!();
-    separator(88);
+    separator(100);
     if is_tty() {
         println!(
-            "  {}{:<20}  {:>12}  {:>3}→{:<3}  {}{}",
-            BOLD, "tx hash", "fee (μNOID)", "in", "out", "proof", RST
+            "  {}{:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}{}",
+            BOLD, "tx hash", "fee (μNOID)", "pages", "in", "out", "class", "proof", RST
         );
     } else {
         println!(
-            "  {:<20}  {:>12}  {:>3}→{:<3}  {}",
-            "tx hash", "fee (μNOID)", "in", "out", "proof"
+            "  {:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}",
+            "tx hash", "fee (μNOID)", "pages", "in", "out", "class", "proof"
         );
     }
-    separator(88);
+    separator(100);
 
     let show = txs.len().min(20);
     for tx in txs.iter().take(show) {
         let hash = tx["tx_hash"].as_str().unwrap_or("?");
         let fee = tx["fee_micronoid"].as_u64().unwrap_or(0);
+        let pages = tx["page_count"].as_u64().unwrap_or(0);
         let nin = tx["n_inputs"].as_u64().unwrap_or(0);
         let nout = tx["n_outputs"].as_u64().unwrap_or(0);
+        let class = tx["minimum_proof_class"].as_str().unwrap_or("?");
         let authorization = if tx["has_authorization"].as_bool().unwrap_or(false) {
             c!(GRN, "✓")
         } else {
             c!(DIM, "·")
         };
         println!(
-            "  {:<20}  {:>12}  {:>3}→{:<3}  {}",
+            "  {:<20}  {:>12}  {:>5}  {:>3}→{:<3}  {:>5}  {}",
             ctx.h(hash),
             fee,
+            pages,
             nin,
             nout,
+            class,
             authorization
         );
     }
 
     if txs.len() > show {
         println!("  {} {} more…", c!(DIM, "...and"), txs.len() - show);
+    }
+    if txs
+        .iter()
+        .any(|tx| tx["requires_b255_miner"].as_bool().unwrap_or(false))
+    {
+        println!();
+        warn_msg("B255 entries are atomic and wait for a B255-qualified miner.");
     }
 
     Ok(())
