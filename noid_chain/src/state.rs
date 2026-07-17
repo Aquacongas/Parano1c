@@ -521,10 +521,22 @@ impl ChainState {
     /// columns are evicted and a full exact-root rebuild is unavailable.
     pub fn expand_one(&mut self) {
         let old_log_slots = self.state.log_slots();
+        let exact_cache_was_current = self.state.exact_dirty_segment_ids().next().is_none()
+            && self.exact_roots.log_slots == old_log_slots
+            && self.exact_roots.root() == self.utxo_root;
         let empty_right = zero_slot_roots(old_log_slots)[old_log_slots];
         self.state.expand();
         self.exact_roots.expand_one();
         self.utxo_root = state_node_hash(self.utxo_root, empty_right);
+        // Below LOG_SEGMENT_SIZE the raw FRI carrier grows its sole resident
+        // segment and conservatively marks the exact segment root stale.  At
+        // the ChainState layer the same transition is already authenticated by
+        // the O(1) old-root-as-left-child rule, so preserve the sealed status.
+        // If the parent was dirty or inconsistent, leave the marker intact and
+        // let the next exact read recompute (or reject) it normally.
+        if exact_cache_was_current {
+            self.state.clear_exact_dirty();
+        }
         debug_assert_eq!(self.exact_roots.root(), self.utxo_root);
     }
 
@@ -1295,6 +1307,26 @@ mod tests {
         assert_eq!(state.cached_state_root(), expected);
         assert_eq!(state.exact_roots.root(), expected);
         assert_eq!(state.state.materialized_segment_ids().count(), 0);
+    }
+
+    #[test]
+    fn sealed_small_expansion_keeps_the_exact_frontier_readable() {
+        let owner = Address([0x5E; 32]);
+        let mut state = ChainState::from_sparse_utxos(
+            8,
+            &[(3, SlotValue::with_owner_fields(9, 1, owner.as_fields()))],
+            1,
+        )
+        .unwrap();
+        let parent_root = state.cached_state_root();
+
+        state.expand_one();
+
+        assert_eq!(
+            state.cached_state_root(),
+            state_node_hash(parent_root, zero_slot_roots(8)[8])
+        );
+        assert!(state.exact_frontier_siblings(&[3], 9).is_ok());
     }
 
     #[test]
