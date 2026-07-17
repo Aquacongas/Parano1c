@@ -947,7 +947,7 @@ async fn cmd_state(ctx: &Ctx<'_>) -> anyhow::Result<()> {
             &c!(YLW, "EXPANSION PENDING (trigger has fired)"),
         );
     }
-    kv("State size", size_human);
+    kv("State storage", size_human);
     Ok(())
 }
 

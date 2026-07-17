@@ -312,7 +312,9 @@ pub struct StateInfo {
     /// Raw on-disk bytes for currently non-empty dense segments. Virtual-zero
     /// segments, including a newly added expansion half, consume no bytes.
     pub state_bytes: u64,
-    /// Human-readable state size (e.g. "768.0 MB").
+    /// Human-readable resident/raw/current-domain/protocol-limit breakdown.
+    /// Raw segment bytes intentionally exclude MDBX page and owner-index
+    /// overhead, which depend on the storage engine and workload.
     pub state_size_human: String,
 }
 

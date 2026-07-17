@@ -1146,8 +1146,16 @@ impl ParanoidApiServer for RpcHandler {
         // Virtual-zero segments cost nothing until their first UTXO lands.
         let state_bytes_ram = (materialized_in_ram as u64).saturating_mul(seg_size_bytes);
         let state_bytes_disk = (nonempty_segments as u64).saturating_mul(seg_size_bytes);
-        // Theoretical maximum if all slots were filled:
-        let state_bytes_max = (num_segments as u64).saturating_mul(seg_size_bytes);
+        // Theoretical maxima are deliberately reported separately.  The
+        // current slot domain grows at the consensus expansion boundary, so
+        // its fully-materialised size is not the lifetime protocol ceiling.
+        let state_bytes_current_domain_max = (num_segments as u64).saturating_mul(seg_size_bytes);
+        let protocol_num_segments = if LOG_SLOTS_MAX as usize > LOG_SEGMENT_SIZE {
+            1u64 << (LOG_SLOTS_MAX as usize - LOG_SEGMENT_SIZE)
+        } else {
+            1
+        };
+        let state_bytes_protocol_max = protocol_num_segments.saturating_mul(seg_size_bytes);
 
         let fill_pct = if capacity > 0 {
             (active as f64 / capacity as f64 * 10000.0).round() / 100.0
@@ -1172,10 +1180,12 @@ impl ParanoidApiServer for RpcHandler {
             // Real current size (non-zero segments only)
             state_bytes: state_bytes_disk,
             state_size_human: format!(
-                "{} RAM  /  {} disk  /  {} max",
+                "{} RAM  /  {} raw disk  /  {} at 2^{}  /  {} protocol max",
                 human_bytes(state_bytes_ram),
                 human_bytes(state_bytes_disk),
-                human_bytes(state_bytes_max),
+                human_bytes(state_bytes_current_domain_max),
+                log_slots,
+                human_bytes(state_bytes_protocol_max),
             ),
         })
     }
