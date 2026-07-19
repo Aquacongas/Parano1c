@@ -663,6 +663,17 @@ fn butterfly_interleaved_block_par_rows(
     }
     let half_offset = block_size_half * num_ntts;
     let (top, bot) = block.split_at_mut(half_offset);
+    #[cfg(target_arch = "x86_64")]
+    if num_ntts.is_multiple_of(4) && noid_core::cpu::avx512_vpclmul_available() {
+        top.par_chunks_mut(num_ntts)
+            .zip(bot.par_chunks_mut(num_ntts))
+            .for_each(|(top_row, bot_row)| {
+                // SAFETY: process-wide AVX-512 runtime gate above; row sizes
+                // are positive multiples of four field elements.
+                unsafe { butterfly_row_avx512(top_row, bot_row, twiddle) };
+            });
+        return;
+    }
     top.par_chunks_mut(num_ntts)
         .zip(bot.par_chunks_mut(num_ntts))
         .for_each(|(top_row, bot_row)| {
@@ -776,6 +787,14 @@ fn butterfly_interleaved_block(
     block_size_half: usize,
     num_ntts: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if num_ntts.is_multiple_of(4) && noid_core::cpu::avx512_vpclmul_available() {
+        // SAFETY: runtime-gated AVX-512 kernel; every row contains a multiple
+        // of four contiguous F128 values.
+        return unsafe {
+            butterfly_interleaved_block_avx512(block, twiddle, block_size_half, num_ntts)
+        };
+    }
     let off_bot = block_size_half * num_ntts;
     for r in 0..block_size_half {
         let off_top = r * num_ntts;
@@ -785,6 +804,46 @@ fn butterfly_interleaved_block(
             let new_u = block[off_top + lane] + v * twiddle;
             block[off_top + lane] = new_u;
             block[off_bot_r + lane] = v + new_u;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn butterfly_row_avx512(top: &mut [F128], bot: &mut [F128], twiddle: F128) {
+    use core::arch::x86_64::*;
+    use noid_core::packed::clmul_avx512::{broadcast_u128, mul_gcm_x4};
+
+    debug_assert_eq!(top.len(), bot.len());
+    debug_assert!(top.len().is_multiple_of(4));
+    let twiddle_bits = (twiddle.lo as u128) | ((twiddle.hi as u128) << 64);
+    unsafe {
+        let t = broadcast_u128(twiddle_bits);
+        for lane in (0..top.len()).step_by(4) {
+            let top_ptr = top.as_mut_ptr().add(lane).cast::<__m512i>();
+            let bot_ptr = bot.as_mut_ptr().add(lane).cast::<__m512i>();
+            let v = _mm512_loadu_si512(bot_ptr);
+            let new_top = _mm512_xor_si512(_mm512_loadu_si512(top_ptr), mul_gcm_x4(v, t));
+            _mm512_storeu_si512(top_ptr, new_top);
+            _mm512_storeu_si512(bot_ptr, _mm512_xor_si512(v, new_top));
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+unsafe fn butterfly_interleaved_block_avx512(
+    block: &mut [F128],
+    twiddle: F128,
+    block_size_half: usize,
+    num_ntts: usize,
+) {
+    let half_offset = block_size_half * num_ntts;
+    let (top, bot) = block.split_at_mut(half_offset);
+    unsafe {
+        for (top_row, bot_row) in top.chunks_mut(num_ntts).zip(bot.chunks_mut(num_ntts)) {
+            butterfly_row_avx512(top_row, bot_row, twiddle);
         }
     }
 }

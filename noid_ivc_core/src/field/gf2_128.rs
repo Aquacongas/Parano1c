@@ -606,6 +606,7 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
 pub mod x86_64_clmul {
     use super::{F128, F256Unreduced};
     use core::arch::x86_64::*;
+    use noid_core::packed::clmul_avx512::mul_gcm_x4;
 
     #[inline]
     unsafe fn to_vec(a: F128) -> __m128i {
@@ -678,6 +679,21 @@ pub mod x86_64_clmul {
             }
         }
     }
+
+    /// Four independent reduced products in one ZMM register.
+    ///
+    /// # Safety
+    /// Requires AVX-512F, AVX-512BW and VPCLMULQDQ.
+    #[target_feature(enable = "avx512f,avx512bw,vpclmulqdq")]
+    pub unsafe fn ghash_mul_vec4_avx512(a: [F128; 4], b: [F128; 4]) -> [F128; 4] {
+        unsafe {
+            let va = _mm512_loadu_si512(a.as_ptr().cast());
+            let vb = _mm512_loadu_si512(b.as_ptr().cast());
+            let mut out = [F128::ZERO; 4];
+            _mm512_storeu_si512(out.as_mut_ptr().cast(), mul_gcm_x4(va, vb));
+            out
+        }
+    }
 }
 
 #[cfg(test)]
@@ -740,6 +756,23 @@ mod tests {
             let fast_u = unsafe { x86_64_clmul::ghash_mul_unreduced_clmul(a, b) };
             let slow_u = software::ghash_mul_unreduced(a, b);
             assert_eq!(fast_u, slow_u, "unreduced mismatch a={a:?} b={b:?}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_avx512_vec4_matches_software() {
+        if !noid_core::cpu::avx512_vpclmul_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x5120_F128);
+        for _ in 0..4096 {
+            let a = std::array::from_fn(|_| rng.next_f128());
+            let b = std::array::from_fn(|_| rng.next_f128());
+            let got = unsafe { x86_64_clmul::ghash_mul_vec4_avx512(a, b) };
+            for lane in 0..4 {
+                assert_eq!(got[lane], software::ghash_mul(a[lane], b[lane]));
+            }
         }
     }
 
