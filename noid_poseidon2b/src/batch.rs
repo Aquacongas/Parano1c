@@ -548,7 +548,7 @@ fn flat_tables() -> &'static FlatTables {
 
 /// Runtime gate for the register-domain AVX2+VPCLMULQDQ kernels. In a build
 /// where both features are statically enabled this folds to `true` at
-/// compile time; a portable release binary probes the CPU once at first use
+/// compile time; a runtime-dispatched source build probes once at first use
 /// (Alder/Raptor-Lake class cores and every AVX-512 part pass). New ISA
 /// tiers (AVX-512, aarch64 PMULL) plug their kernels into the same dispatch
 /// points.

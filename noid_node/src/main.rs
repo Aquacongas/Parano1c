@@ -26,6 +26,7 @@
 // within dirty_decay_ms (default 10 000 ms) via a background reclaim thread.
 // This keeps the node's RSS proportional to actual working set size.
 // ---------------------------------------------------------------------------
+#[cfg(unix)]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -5729,11 +5730,33 @@ fn load_or_create_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<(
 
 fn expand_tilde(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        PathBuf::from(format!("{home}/{rest}"))
+    let rest = if s == "~" {
+        Some("")
     } else {
-        p.to_path_buf()
+        s.strip_prefix("~/").or_else(|| s.strip_prefix("~\\"))
+    };
+    let Some(rest) = rest else {
+        return p.to_path_buf();
+    };
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Some(home)
+        });
+    match home {
+        Some(mut home) => {
+            if !rest.is_empty() {
+                home.push(rest);
+            }
+            home
+        }
+        None => p.to_path_buf(),
     }
 }
 

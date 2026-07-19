@@ -1,4 +1,4 @@
-# Official and developer-default builds target the portable architecture
-# baseline. Hot proof kernels opt into AVX2/AVX-512/PMULL locally and are
-# selected at runtime. Benchmarks may still set `RUSTFLAGS=-Ctarget-cpu=native`
-# explicitly when measuring one reference machine.
+# Developer builds keep rustc's baseline so forced-backend differential tests
+# can exercise the scalar oracle. Official artifacts set one modern profile
+# per architecture in CI: x86-64-v3 + VPCLMULQDQ, or AArch64 + PMULL. Wider
+# AVX-512 kernels remain runtime-selected inside the single x86-64 binary.

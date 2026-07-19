@@ -635,12 +635,16 @@ fn persist_atomically(
         .map_err(|error| format!("sync {label}: {error}"))?;
     drop(file);
     std::fs::rename(&temporary, path).map_err(|error| format!("replace {label}: {error}"))?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{label} path has no parent directory"))?;
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| format!("sync {label} directory: {error}"))
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| format!("{label} path has no parent directory"))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {label} directory: {error}"))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

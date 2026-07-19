@@ -1099,7 +1099,10 @@ fn write_synced_file(path: &Path, bytes: &[u8]) -> Result<(), SnapshotGeneration
 }
 
 fn sync_directory(path: &Path) -> Result<(), SnapshotGenerationError> {
+    #[cfg(unix)]
     File::open(path)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 

@@ -3,11 +3,12 @@
 
 //! Runtime CPU capability detection shared by the proof stack.
 //!
-//! Official binaries are built for the portable architecture baseline and
-//! carry multiple `#[target_feature]` kernels.  A process selects one safe
-//! implementation at runtime.  `NOID_CPU_BACKEND` is a diagnostic/test hook
-//! which may restrict that selection to `scalar`, `pclmul`, `avx2`,
-//! `avx512`, `neon`, or `neon-pmull`.
+//! A process selects the widest safe implementation embedded in its
+//! architecture's binary. `NOID_CPU_BACKEND` is a diagnostic/test hook which
+//! may restrict that selection to `scalar`, `pclmul`, `avx2`, `avx512`,
+//! `neon`, or `neon-pmull`. Official x86-64 artifacts have a modern
+//! AVX2+VPCLMUL baseline; the scalar implementation remains a test oracle and
+//! a source-build fallback, not a separately distributed binary.
 
 use std::fmt;
 use std::sync::OnceLock;

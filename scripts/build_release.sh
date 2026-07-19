@@ -114,9 +114,26 @@ unset GZIP
 unset GZIP_OPT
 export CARGO_TARGET_DIR="$ROOT_DIR/target"
 
-printf 'Paranoid portable self-contained release build\n'
+HOST_TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+case "$HOST_TRIPLE" in
+  x86_64-*)
+    export RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq'
+    ISA_PROFILE='x86-64-v3 + PCLMULQDQ + VPCLMULQDQ (runtime AVX-512)'
+    ;;
+  aarch64-*)
+    export RUSTFLAGS='-C target-feature=+aes'
+    ISA_PROFILE='AArch64 NEON + PMULL'
+    ;;
+  *)
+    die "unsupported release host: $HOST_TRIPLE"
+    ;;
+esac
+
+printf 'Paranoid self-contained release build\n'
 printf '  source:       %s\n' "$ROOT_DIR"
 printf '  release dir:  %s\n' "$RELEASE_DIR"
+printf '  target:       %s\n' "$HOST_TRIPLE"
+printf '  ISA profile:  %s\n' "$ISA_PROFILE"
 printf '  rustc:        %s\n' "$(rustc --version)"
 printf '  cargo:        %s\n' "$(cargo --version)"
 

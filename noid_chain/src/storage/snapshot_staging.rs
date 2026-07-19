@@ -888,13 +888,16 @@ fn atomic_publish_segment(
             .map_err(|error| SnapshotStagingError::io("write temporary segment", error))?;
         file.sync_all()
             .map_err(|error| SnapshotStagingError::io("sync temporary segment", error))?;
-        let mut permissions = file
-            .metadata()
-            .map_err(|error| SnapshotStagingError::io("read segment permissions", error))?
-            .permissions();
-        permissions.set_readonly(true);
-        file.set_permissions(permissions)
-            .map_err(|error| SnapshotStagingError::io("seal segment read-only", error))?;
+        #[cfg(unix)]
+        {
+            let mut permissions = file
+                .metadata()
+                .map_err(|error| SnapshotStagingError::io("read segment permissions", error))?
+                .permissions();
+            permissions.set_readonly(true);
+            file.set_permissions(permissions)
+                .map_err(|error| SnapshotStagingError::io("seal segment read-only", error))?;
+        }
         drop(file);
 
         // `hard_link` publishes a fully synced inode atomically and, unlike
@@ -914,11 +917,17 @@ fn atomic_publish_segment(
 }
 
 fn sync_directory(directory: &Path) -> Result<(), SnapshotStagingError> {
-    let directory_file = File::open(directory)
-        .map_err(|error| SnapshotStagingError::io("open staging directory", error))?;
-    directory_file
-        .sync_all()
-        .map_err(|error| SnapshotStagingError::io("sync staging directory", error))
+    #[cfg(unix)]
+    {
+        let directory_file = File::open(directory)
+            .map_err(|error| SnapshotStagingError::io("open staging directory", error))?;
+        directory_file
+            .sync_all()
+            .map_err(|error| SnapshotStagingError::io("sync staging directory", error))?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 fn read_staged_file(
