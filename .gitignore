@@ -1,6 +1,5 @@
 /target/
 **/target/
-!/README.md
 .idea/
 .vscode/
 *.swp
@@ -9,5 +8,3 @@
 .DS_Store
 __pycache__/
 *.py[cod]
-/docs/
-/history_step.md
