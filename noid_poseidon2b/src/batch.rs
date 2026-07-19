@@ -507,6 +507,14 @@ struct FlatTables {
     mds_partial_is_one: [[bool; STATE_SIZE]; STATE_SIZE],
 }
 
+/// Flat-basis constants shared by register-domain ISA kernels.
+pub(crate) struct KernelTables {
+    pub rc: [[u128; N_ROUNDS]; STATE_SIZE],
+    pub mds_full_two: u128,
+    pub mds_full_four: u128,
+    pub mds_partial_diag: [u128; STATE_SIZE],
+}
+
 fn flat_tables() -> &'static FlatTables {
     static TABLES: OnceLock<FlatTables> = OnceLock::new();
     TABLES.get_or_init(|| {
@@ -553,9 +561,18 @@ pub(crate) fn avx2_vpclmul_runtime() -> bool {
     noid_core::cpu::avx2_vpclmul_available()
 }
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
-    static TABLES: OnceLock<crate::batch_avx2::VecTables> = OnceLock::new();
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn pmull_runtime() -> bool {
+    #[cfg(target_feature = "aes")]
+    return true;
+    #[cfg(not(target_feature = "aes"))]
+    noid_core::cpu::pmull_available()
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn kernel_tables() -> &'static KernelTables {
+    static TABLES: OnceLock<KernelTables> = OnceLock::new();
     TABLES.get_or_init(|| {
         assert_eq!(
             MDS_FULL,
@@ -575,7 +592,7 @@ pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
                 );
             }
         }
-        crate::batch_avx2::VecTables {
+        KernelTables {
             rc: t.rc,
             mds_full_two: tower_to_flat_u128(2),
             mds_full_four: tower_to_flat_u128(4),
@@ -618,7 +635,12 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
     #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
-        return unsafe { crate::batch_avx2::permute_flat_groups(states, vec_tables()) };
+        return unsafe { crate::batch_avx2::permute_flat_groups(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if pmull_runtime() {
+        // SAFETY: gated on runtime/static PMULL detection.
+        return unsafe { crate::batch_aarch64::permute_flat_groups(states, kernel_tables()) };
     }
     #[allow(unreachable_code)]
     {
@@ -662,7 +684,12 @@ pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE])
     #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
-        return unsafe { crate::batch_avx2::permute_flat_one(states, vec_tables()) };
+        return unsafe { crate::batch_avx2::permute_flat_one(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if pmull_runtime() {
+        // SAFETY: gated on runtime/static PMULL detection.
+        return unsafe { crate::batch_aarch64::permute_flat_one(states, kernel_tables()) };
     }
     #[allow(unreachable_code)]
     let tables = flat_tables();
@@ -861,6 +888,21 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     };
 
     let n = out.len();
+    #[cfg(target_arch = "aarch64")]
+    if !pad && n.is_multiple_of(PERM_INTERLEAVE) && pmull_runtime() {
+        // SAFETY: runtime/static PMULL gate and the public shape checks above
+        // satisfy the specialized kernel contract.
+        unsafe {
+            crate::batch_aarch64::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
+        }
+        return;
+    }
     if PACKED_LANES == 1 || n < PACKED_LANES {
         for i in 0..n {
             scalar(i, out);
@@ -882,7 +924,13 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
         // SAFETY: the runtime ISA gate and public preconditions above prove
         // the specialized kernel's alignment-independent slice contract.
         unsafe {
-            crate::batch_avx2::leaf_sponge_flat_no_pad_into(iv, data, leaf_size, out, vec_tables());
+            crate::batch_avx2::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
         }
         return;
     }

@@ -470,7 +470,29 @@ pub fn clmul_gcm(a: u128, b: u128) -> u128 {
             return unsafe { x86_64_clmul::clmul_block128(a, b) };
         }
     }
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: PMULL is part of the static build target.
+        return unsafe { aarch64_clmul::clmul_block128(a, b) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+    {
+        if crate::cpu::pmull_available() {
+            // SAFETY: PMULL was detected before selecting this backend.
+            return unsafe { aarch64_clmul::clmul_block128(a, b) };
+        }
+    }
     soft_clmul::clmul_block128(a, b)
+}
+
+/// Direct PMULL entry point for AArch64 batch kernels which already crossed
+/// a runtime/static `aes` feature boundary.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+pub unsafe fn clmul_gcm_pmull(a: u128, b: u128) -> u128 {
+    // SAFETY: inherited `aes`/PMULL target feature.
+    unsafe { aarch64_clmul::clmul_block128(a, b) }
 }
 
 /// Convert a raw tower-basis u128 to flat-basis.
@@ -518,6 +540,53 @@ mod x86_64_clmul {
         let x_hi = v1_u128 ^ (v_mid_u128 >> 64);
 
         reduce_gcm_256(x_hi, x_lo)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod aarch64_clmul {
+    use core::arch::aarch64::*;
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
+        // SAFETY: inherited `aes`/PMULL target feature. `poly128_t` and
+        // `uint64x2_t` are the same 128 raw bits.
+        unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub unsafe fn clmul_block128(a: u128, b: u128) -> u128 {
+        // Three-product Karatsuba followed by the same two-stage GCM
+        // reduction as `reduce_gcm_256`, kept entirely in NEON registers.
+        unsafe {
+            let a_lo = a as u64;
+            let a_hi = (a >> 64) as u64;
+            let b_lo = b as u64;
+            let b_hi = (b >> 64) as u64;
+            let zero = vdupq_n_u64(0);
+
+            let ll = pmull(a_lo, b_lo);
+            let hh = pmull(a_hi, b_hi);
+            let mut cross = pmull(a_lo ^ a_hi, b_lo ^ b_hi);
+            cross = veorq_u64(veorq_u64(cross, ll), hh);
+
+            // 256-bit product `(hi, lo)`.
+            let lo = veorq_u64(ll, vextq_u64::<1>(zero, cross));
+            let hi = veorq_u64(hh, vextq_u64::<1>(cross, zero));
+
+            // x^128 = x^7 + x^2 + x + 1, encoded by 0x87. Reducing the
+            // upper half can overflow by at most six bits, hence one final
+            // PMULL is sufficient.
+            let reduce_lo = pmull(vgetq_lane_u64::<0>(hi), 0x87);
+            let reduce_hi = pmull(vgetq_lane_u64::<1>(hi), 0x87);
+            let mut result = veorq_u64(lo, reduce_lo);
+            result = veorq_u64(result, vextq_u64::<1>(zero, reduce_hi));
+            result = veorq_u64(result, pmull(vgetq_lane_u64::<1>(reduce_hi), 0x87));
+
+            (vgetq_lane_u64::<0>(result) as u128) | ((vgetq_lane_u64::<1>(result) as u128) << 64)
+        }
     }
 }
 
