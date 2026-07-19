@@ -16,7 +16,7 @@
 //!
 //! Bit-identical to `native::permutation::permute_flat_u128` per lane.
 
-#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#![cfg(target_arch = "x86_64")]
 
 use core::arch::x86_64::*;
 

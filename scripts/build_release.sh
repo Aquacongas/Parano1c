@@ -113,9 +113,8 @@ unset TAR_OPTIONS
 unset GZIP
 unset GZIP_OPT
 export CARGO_TARGET_DIR="$ROOT_DIR/target"
-export RUSTFLAGS='-C target-cpu=native'
 
-printf 'Paranoid self-contained release build\n'
+printf 'Paranoid portable self-contained release build\n'
 printf '  source:       %s\n' "$ROOT_DIR"
 printf '  release dir:  %s\n' "$RELEASE_DIR"
 printf '  rustc:        %s\n' "$(rustc --version)"

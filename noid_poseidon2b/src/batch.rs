@@ -544,17 +544,16 @@ fn flat_tables() -> &'static FlatTables {
 /// (Alder/Raptor-Lake class cores and every AVX-512 part pass). New ISA
 /// tiers (AVX-512, aarch64 PMULL) plug their kernels into the same dispatch
 /// points.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn avx2_vpclmul_runtime() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("vpclmulqdq")
-    })
+    #[cfg(all(target_feature = "avx2", target_feature = "vpclmulqdq"))]
+    return true;
+    #[cfg(not(all(target_feature = "avx2", target_feature = "vpclmulqdq")))]
+    noid_core::cpu::avx2_vpclmul_available()
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
     static TABLES: OnceLock<crate::batch_avx2::VecTables> = OnceLock::new();
     TABLES.get_or_init(|| {
@@ -616,7 +615,7 @@ const PERM_INTERLEAVE: usize = 4;
 /// multiply chains. Bit-identical per group to
 /// [`packed_poseidon2b_permute_flat`].
 pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_SIZE]]) {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
         return unsafe { crate::batch_avx2::permute_flat_groups(states, vec_tables()) };
@@ -660,7 +659,7 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
 /// (GCM) basis** bit patterns — the batched twin of
 /// `native::permutation::permute_flat_u128`, with no boundary conversion.
 pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE]) {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
         return unsafe { crate::batch_avx2::permute_flat_one(states, vec_tables()) };
@@ -874,7 +873,7 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     // of crossing the packed-permutation load/store boundary after every
     // block. Eight leaves are exactly four two-lane state groups, the same
     // interleave width as the register-domain permutation kernel.
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
     if !pad
         && leaf_size.is_multiple_of(32)
         && n.is_multiple_of(PERM_INTERLEAVE * PACKED_LANES)

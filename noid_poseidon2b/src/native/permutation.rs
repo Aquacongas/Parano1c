@@ -47,7 +47,7 @@ impl Poseidon2bPermutation {
 /// the flat basis (lane-oriented transcripts, the proof-core PCS Merkle
 /// primitives) use this entry point and skip both conversions.
 pub fn permute_flat_u128(flat: &mut [u128; STATE_SIZE]) {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
     if crate::batch::avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
         return unsafe {

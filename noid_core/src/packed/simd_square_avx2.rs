@@ -11,7 +11,7 @@
 //! The module is only compiled when AVX2 is available and AVX-512 is not —
 //! i.e. exactly the configuration where `PACKED_LANES == 2`.
 
-#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#![cfg(target_arch = "x86_64")]
 
 use super::PackedBlock128;
 use core::arch::x86_64::*;

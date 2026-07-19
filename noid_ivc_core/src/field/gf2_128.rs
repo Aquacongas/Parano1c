@@ -90,11 +90,19 @@ impl AddAssign for F128 {
 impl Mul for F128 {
     type Output = Self;
     #[inline]
+    #[allow(unreachable_code)]
     fn mul(self, rhs: Self) -> Self {
         #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
         {
-            // SAFETY: aes target feature is enabled at compile time.
-            unsafe { aarch64::ghash_mul_binius(self, rhs) }
+            // SAFETY: PMULL is part of the static build target.
+            return unsafe { aarch64::ghash_mul_binius(self, rhs) };
+        }
+        #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+        {
+            if noid_core::cpu::pmull_available() {
+                // SAFETY: PMULL was detected before selecting this backend.
+                return unsafe { aarch64::ghash_mul_binius(self, rhs) };
+            }
         }
         #[cfg(all(
             target_arch = "x86_64",
@@ -102,20 +110,21 @@ impl Mul for F128 {
             target_feature = "sse4.1"
         ))]
         {
-            // SAFETY: pclmulqdq + sse4.1 are enabled at compile time.
-            unsafe { x86_64_clmul::ghash_mul_clmul(self, rhs) }
+            // SAFETY: both instructions are part of the static build target.
+            return unsafe { x86_64_clmul::ghash_mul_clmul(self, rhs) };
         }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_feature = "aes"),
-            all(
-                target_arch = "x86_64",
-                target_feature = "pclmulqdq",
-                target_feature = "sse4.1"
-            )
-        )))]
+        #[cfg(all(
+            target_arch = "x86_64",
+            not(all(target_feature = "pclmulqdq", target_feature = "sse4.1"))
+        ))]
         {
-            software::ghash_mul(self, rhs)
+            if noid_core::cpu::pclmul_available() {
+                // SAFETY: PCLMULQDQ and SSE4.1 were detected before selecting
+                // this backend.
+                return unsafe { x86_64_clmul::ghash_mul_clmul(self, rhs) };
+            }
         }
+        software::ghash_mul(self, rhs)
     }
 }
 
@@ -219,7 +228,7 @@ pub fn ghash_reduce(r0: u64, r1: u64, r2: u64, r3: u64) -> F128 {
 // aarch64 + AES: PMULL-based multiplication variants.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+#[cfg(target_arch = "aarch64")]
 pub mod aarch64 {
     use super::{F128, F256Unreduced, ghash_reduce};
     use core::arch::aarch64::*;
@@ -550,11 +559,19 @@ pub mod software {
 }
 
 #[inline]
+#[allow(unreachable_code)]
 fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
     #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
     {
-        // SAFETY: aes target feature is enabled at compile time.
-        unsafe { aarch64::ghash_mul_unreduced_neon(a, b) }
+        // SAFETY: PMULL is part of the static build target.
+        return unsafe { aarch64::ghash_mul_unreduced_neon(a, b) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+    {
+        if noid_core::cpu::pmull_available() {
+            // SAFETY: PMULL was detected before selecting this backend.
+            return unsafe { aarch64::ghash_mul_unreduced_neon(a, b) };
+        }
     }
     #[cfg(all(
         target_arch = "x86_64",
@@ -562,33 +579,30 @@ fn ghash_mul_unreduced(a: F128, b: F128) -> F256Unreduced {
         target_feature = "sse4.1"
     ))]
     {
-        // SAFETY: pclmulqdq + sse4.1 are enabled at compile time.
-        unsafe { x86_64_clmul::ghash_mul_unreduced_clmul(a, b) }
+        // SAFETY: both instructions are part of the static build target.
+        return unsafe { x86_64_clmul::ghash_mul_unreduced_clmul(a, b) };
     }
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_feature = "aes"),
-        all(
-            target_arch = "x86_64",
-            target_feature = "pclmulqdq",
-            target_feature = "sse4.1"
-        )
-    )))]
+    #[cfg(all(
+        target_arch = "x86_64",
+        not(all(target_feature = "pclmulqdq", target_feature = "sse4.1"))
+    ))]
     {
-        software::ghash_mul_unreduced(a, b)
+        if noid_core::cpu::pclmul_available() {
+            // SAFETY: PCLMULQDQ and SSE4.1 were detected before selecting
+            // this backend.
+            return unsafe { x86_64_clmul::ghash_mul_unreduced_clmul(a, b) };
+        }
     }
+    software::ghash_mul_unreduced(a, b)
 }
 
 // ---------------------------------------------------------------------------
 // x86_64 + PCLMULQDQ: carry-less multiplication variants. Mirrors the
-// aarch64 module; enabled when the workspace `target-cpu=native` build (or an
-// explicit `-C target-feature=+pclmulqdq,+sse4.1`) makes the features static.
+// aarch64 module; compiled into every x86_64 binary and entered through the
+// process-wide runtime dispatch.
 // ---------------------------------------------------------------------------
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "pclmulqdq",
-    target_feature = "sse4.1"
-))]
+#[cfg(target_arch = "x86_64")]
 pub mod x86_64_clmul {
     use super::{F128, F256Unreduced};
     use core::arch::x86_64::*;
@@ -692,13 +706,12 @@ mod tests {
 
     /// The x86_64 CLMUL kernels are bit-exact with the portable software
     /// path (which itself is pinned by the algebraic identity tests below).
-    #[cfg(all(
-        target_arch = "x86_64",
-        target_feature = "pclmulqdq",
-        target_feature = "sse4.1"
-    ))]
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn x86_clmul_matches_software() {
+        if !noid_core::cpu::pclmul_available() {
+            return;
+        }
         let mut rng = Rng::new(0xC1_4A11);
         let mut cases: Vec<(F128, F128)> = vec![
             (F128::ZERO, F128::ZERO),
@@ -874,9 +887,12 @@ mod tests {
         assert_eq!(just_top * just_top.inv(), F128::ONE);
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn neon_mul_vec2_matches_scalar() {
+        if !noid_core::cpu::pmull_available() {
+            return;
+        }
         let mut rng = Rng::new(11);
         for _ in 0..128 {
             let a0 = rng.next_f128();
@@ -890,9 +906,12 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    #[cfg(target_arch = "aarch64")]
     #[test]
     fn all_neon_variants_agree() {
+        if !noid_core::cpu::pmull_available() {
+            return;
+        }
         let mut rng = Rng::new(8);
         for _ in 0..128 {
             let a = rng.next_f128();

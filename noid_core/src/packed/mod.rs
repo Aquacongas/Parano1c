@@ -4,7 +4,9 @@
 //! SIMD-packed field elements for binary tower fields.
 //!
 //! PackedBlock128 holds P independent Block128 values in a single
-//! struct. P = 4 on x86-64 (AVX-512), P = 2 (AVX2), P = 1 (scalar fallback).
+//! struct. P = 2 on x86-64 and P = 1 elsewhere. Wider physical kernels may
+//! consume several logical packs, so runtime ISA selection never changes the
+//! in-memory layout.
 //! All XOR operations are lane-wise. Multiplications and squarings operate
 //! per-lane but batch the lane setup/teardown amortisation.
 
@@ -20,28 +22,16 @@ use crate::{Block128, TowerField};
 
 /// Number of Block128 lanes per packed value.
 ///
-/// The two-lane layout is fixed for every x86_64 build without a static
-/// AVX-512 layout: whether the AVX2+VPCLMULQDQ kernels actually run is a
-/// RUNTIME dispatch decision, so a portable baseline binary shares the
-/// layout and picks the fast kernels on capable CPUs.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-pub const PACKED_LANES: usize = 4;
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+/// The logical layout is fixed independently of AVX2/AVX-512 availability.
+/// Runtime-selected AVX-512 kernels operate on two adjacent logical packs.
+#[cfg(target_arch = "x86_64")]
 pub const PACKED_LANES: usize = 2;
 
 #[cfg(not(target_arch = "x86_64"))]
 pub const PACKED_LANES: usize = 1;
 
 /// SIMD-packed block of Block128 values.
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PackedBlock128 {
-    lanes: [u128; 4],
-}
-
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PackedBlock128 {

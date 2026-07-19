@@ -1,5 +1,4 @@
-# Stable Cargo profiles cannot carry rustflags. Keep the workspace default
-# here; noid_core independently rejects release targets that lose the required
-# proof ISA through an environment override or an out-of-tree Cargo invocation.
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Official and developer-default builds target the portable architecture
+# baseline. Hot proof kernels opt into AVX2/AVX-512/PMULL locally and are
+# selected at runtime. Benchmarks may still set `RUSTFLAGS=-Ctarget-cpu=native`
+# explicitly when measuring one reference machine.
