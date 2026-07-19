@@ -145,16 +145,18 @@ The protocol is built over the binary tower field `GF(2^128)`. Poseidon2b is
 the common permutation for addresses, transactions, Merkle trees, state roots,
 transcripts, block identifiers and PoW.
 
-For ParanO(1)d, we developed Kill-Shot GKR. It packs entire Poseidon2b batches
-and Merkle paths into direct degree-seven relations over shared Boolean
-hypercubes instead of running a low-degree sumcheck chain for every
-permutation. In a like-for-like 59-permutation benchmark, this reduces median
-prover time by 10.50× and raw algebraic proof bytes by 51.67×. Batched
-sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS relation
-without a trusted setup. The two authenticated launch matrices — B64 at
-`m=23` and B255 at `m=24` — are embedded in the official binary and can be
-regenerated from source. The [benchmark artifact](research/frost_gkr/README.md)
-pins the exact comparison revision and environment.
+For ParanO(1)d, we developed FROST-GKR (Frobenius Reduction Over Shifted
+Tables). It packs entire Poseidon2b batches and Merkle paths into direct
+degree-seven relations over shared Boolean hypercubes instead of running a
+low-degree sumcheck chain for every permutation. In a like-for-like
+59-permutation benchmark, this reduces median prover time by 10.69×, median
+protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
+Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
+relation without a trusted setup. The two authenticated launch matrices — B64
+at `m=23` and B255 at `m=24` — are embedded in the official binary and can be
+regenerated from source. The public [FROST-GKR research
+artifact](https://github.com/ignotusnemo/frost-gkr) contains the paper's
+reference implementation, comparison harness and complete measurement report.
 
 This common arithmetic is what lets wallet authorization, exact state and
 recursive chain verification compose as one protocol instead of independent
@@ -275,10 +277,12 @@ cd paranoid
 The build regenerates and authenticates both HistoryStep matrices, runs the
 release tests and produces `paranoid`, `noid-cli` and `noid-extminer`.
 
-The frozen protocol construction is recorded in [DESIGN.md](DESIGN.md).
-
 ## Status
 
 ParanO(1)d is version `0.1.0` and pre-genesis. No public network has launched.
 
-Designed and developed by **Ignotus Nemo**. Licensed under Apache-2.0.
+Designed and developed by **Ignotus Nemo**. Licensed under the
+[Apache License 2.0](LICENSE). Please report security issues according to the
+[security policy](.github/SECURITY.md).
+
+Contact: [ignotus.nemo@proton.me](mailto:ignotus.nemo@proton.me)
