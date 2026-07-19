@@ -16,27 +16,14 @@
 //!
 //! Bit-identical to `native::permutation::permute_flat_u128` per lane.
 
-#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#![cfg(target_arch = "x86_64")]
 
 use core::arch::x86_64::*;
 
+use crate::batch::KernelTables;
 use crate::native::permutation::{F_ROUNDS, N_ROUNDS, P_ROUNDS, STATE_SIZE};
 use noid_core::packed::clmul_avx2::{mul_gcm_x2, square_gcm_clmul_x2};
 use noid_core::packed::PackedBlock128;
-
-/// Flat-basis round constants / MDS entries, as produced by the batch
-/// module's `FlatTables` (already tower→flat converted).
-pub(crate) struct VecTables {
-    pub rc: [[u128; N_ROUNDS]; STATE_SIZE],
-    /// Flat-basis images of the tower constants 2 and 4. The production
-    /// full MDS contains only coefficients 1..=7, so linearity lets the
-    /// kernel synthesize 3/5/6/7 from these two products and XORs.
-    pub mds_full_two: u128,
-    pub mds_full_four: u128,
-    /// Diagonal of the partial-round matrix (its off-diagonal entries are
-    /// all 1, checked at table build time).
-    pub mds_partial_diag: [u128; STATE_SIZE],
-}
 
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
@@ -56,7 +43,7 @@ unsafe fn sbox_x7(x: __m256i) -> __m256i {
 /// Full-round MDS: generic 4×4 with the is-one entries as bare XORs.
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
-unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
+unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &KernelTables) {
     // M = [5 7 1 3; 4 6 1 1; 1 3 5 7; 1 1 4 6]. In characteristic two,
     // 3x=2x+x, 5x=4x+x, 6x=4x+2x, 7x=4x+2x+x. Six products by 2/4 therefore
     // replace the generic ten non-identity products without changing the
@@ -97,7 +84,7 @@ unsafe fn mds_full(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
 /// 4 multiplies and one shared sum instead of a dense row pass.
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
-unsafe fn mds_partial(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
+unsafe fn mds_partial(s: &mut [__m256i; STATE_SIZE], t: &KernelTables) {
     let sum = _mm256_xor_si256(_mm256_xor_si256(s[0], s[1]), _mm256_xor_si256(s[2], s[3]));
     for i in 0..STATE_SIZE {
         let diag = mul_gcm_x2(s[i], bcast(t.mds_partial_diag[i]));
@@ -109,7 +96,7 @@ unsafe fn mds_partial(s: &mut [__m256i; STATE_SIZE], t: &VecTables) {
 /// `__m256i` registers (each group = PACKED_LANES independent permutations).
 #[inline]
 #[target_feature(enable = "avx2,vpclmulqdq")]
-unsafe fn permute_groups<const G: usize>(st: &mut [[__m256i; STATE_SIZE]; G], t: &VecTables) {
+unsafe fn permute_groups<const G: usize>(st: &mut [[__m256i; STATE_SIZE]; G], t: &KernelTables) {
     for g in 0..G {
         mds_full(&mut st[g], t);
     }
@@ -160,7 +147,7 @@ unsafe fn store_group(v: &[__m256i; STATE_SIZE], s: &mut [PackedBlock128; STATE_
 #[target_feature(enable = "avx2,vpclmulqdq")]
 pub(crate) unsafe fn permute_flat_groups(
     states: &mut [[PackedBlock128; STATE_SIZE]],
-    t: &VecTables,
+    t: &KernelTables,
 ) {
     /// Groups per register-domain chunk. 4 groups × 4 state words = 16 ymm
     /// values plus multiply temporaries: the working set spills a little,
@@ -191,7 +178,7 @@ pub(crate) unsafe fn permute_flat_groups(
 /// # Safety
 /// See [`permute_flat_groups`].
 #[target_feature(enable = "avx2,vpclmulqdq")]
-pub(crate) unsafe fn permute_flat_one(states: &mut [PackedBlock128; STATE_SIZE], t: &VecTables) {
+pub(crate) unsafe fn permute_flat_one(states: &mut [PackedBlock128; STATE_SIZE], t: &KernelTables) {
     unsafe {
         let mut regs = [load_group(states)];
         permute_groups(&mut regs, t);
@@ -222,7 +209,7 @@ pub(crate) unsafe fn leaf_sponge_flat_no_pad_into(
     data: &[u8],
     leaf_size: usize,
     out: &mut [[u8; 32]],
-    t: &VecTables,
+    t: &KernelTables,
 ) {
     const G: usize = 4;
     const LEAVES_PER_CHUNK: usize = G * 2;
@@ -280,7 +267,7 @@ pub(crate) unsafe fn leaf_sponge_flat_no_pad_into(
 /// # Safety
 /// See [`permute_flat_groups`].
 #[target_feature(enable = "avx2,vpclmulqdq")]
-pub(crate) unsafe fn permute_flat_single_u128(flat: &mut [u128; STATE_SIZE], t: &VecTables) {
+pub(crate) unsafe fn permute_flat_single_u128(flat: &mut [u128; STATE_SIZE], t: &KernelTables) {
     unsafe {
         let mut regs: [[__m256i; STATE_SIZE]; 1] = [std::array::from_fn(|i| {
             _mm256_zextsi128_si256(_mm_loadu_si128(&flat[i] as *const u128 as *const __m128i))

@@ -50,7 +50,7 @@ hex     = "0.4"
 # Networking
 libp2p  = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Wallet security: key derivation, zeroization, and owner-only file handling
 rand             = "0.8"
@@ -61,6 +61,8 @@ libc             = "0.2"
 # glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)
 # indefinitely, causing 3-4 GB RSS on full nodes. jemalloc returns memory to
 # the OS aggressively via background threads (dirty_decay_ms=1000).
+
+[target.'cfg(unix)'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 
 [dev-dependencies]

@@ -484,6 +484,7 @@ fn layer_terms(q: usize, u: &[F128; STATE_SIZE]) -> [F128; STATE_SIZE] {
 /// target VPCLMULQDQ executes both 128-bit lanes per instruction; the scalar
 /// fallback preserves portability and the exact unreduced bit layout.
 #[inline]
+#[allow(unreachable_code)]
 fn mul_unreduced_pair(a0: F128, b0: F128, a1: F128, b1: F128) -> [F256Unreduced; 2] {
     #[cfg(all(
         target_arch = "x86_64",
@@ -491,17 +492,20 @@ fn mul_unreduced_pair(a0: F128, b0: F128, a1: F128, b1: F128) -> [F256Unreduced;
         target_feature = "vpclmulqdq"
     ))]
     {
-        // SAFETY: both required target features are enabled statically.
-        unsafe { mul_unreduced_pair_vpclmul(a0, b0, a1, b1) }
+        // SAFETY: both instructions are part of the static build target.
+        return unsafe { mul_unreduced_pair_vpclmul(a0, b0, a1, b1) };
     }
-    #[cfg(not(all(
+    #[cfg(all(
         target_arch = "x86_64",
-        target_feature = "avx2",
-        target_feature = "vpclmulqdq"
-    )))]
+        not(all(target_feature = "avx2", target_feature = "vpclmulqdq"))
+    ))]
     {
-        [a0.mul_unreduced(b0), a1.mul_unreduced(b1)]
+        if noid_core::cpu::avx2_vpclmul_available() {
+            // SAFETY: AVX2 and VPCLMULQDQ were detected before selection.
+            return unsafe { mul_unreduced_pair_vpclmul(a0, b0, a1, b1) };
+        }
     }
+    [a0.mul_unreduced(b0), a1.mul_unreduced(b1)]
 }
 
 #[inline]
@@ -509,11 +513,7 @@ fn mul_pair(a0: F128, b0: F128, a1: F128, b1: F128) -> [F128; 2] {
     mul_unreduced_pair(a0, b0, a1, b1).map(F256Unreduced::reduce)
 }
 
-#[cfg(all(
-    target_arch = "x86_64",
-    target_feature = "avx2",
-    target_feature = "vpclmulqdq"
-))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "vpclmulqdq")]
 unsafe fn mul_unreduced_pair_vpclmul(a0: F128, b0: F128, a1: F128, b1: F128) -> [F256Unreduced; 2] {
     use core::arch::x86_64::*;

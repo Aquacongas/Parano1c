@@ -507,6 +507,14 @@ struct FlatTables {
     mds_partial_is_one: [[bool; STATE_SIZE]; STATE_SIZE],
 }
 
+/// Flat-basis constants shared by register-domain ISA kernels.
+pub(crate) struct KernelTables {
+    pub rc: [[u128; N_ROUNDS]; STATE_SIZE],
+    pub mds_full_two: u128,
+    pub mds_full_four: u128,
+    pub mds_partial_diag: [u128; STATE_SIZE],
+}
+
 fn flat_tables() -> &'static FlatTables {
     static TABLES: OnceLock<FlatTables> = OnceLock::new();
     TABLES.get_or_init(|| {
@@ -540,23 +548,48 @@ fn flat_tables() -> &'static FlatTables {
 
 /// Runtime gate for the register-domain AVX2+VPCLMULQDQ kernels. In a build
 /// where both features are statically enabled this folds to `true` at
-/// compile time; a portable release binary probes the CPU once at first use
+/// compile time; a runtime-dispatched source build probes once at first use
 /// (Alder/Raptor-Lake class cores and every AVX-512 part pass). New ISA
 /// tiers (AVX-512, aarch64 PMULL) plug their kernels into the same dispatch
 /// points.
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 pub(crate) fn avx2_vpclmul_runtime() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("vpclmulqdq")
-    })
+    #[cfg(all(target_feature = "avx2", target_feature = "vpclmulqdq"))]
+    return true;
+    #[cfg(not(all(target_feature = "avx2", target_feature = "vpclmulqdq")))]
+    noid_core::cpu::avx2_vpclmul_available()
 }
 
-#[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
-pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
-    static TABLES: OnceLock<crate::batch_avx2::VecTables> = OnceLock::new();
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn avx512_vpclmul_runtime() -> bool {
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    return true;
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    )))]
+    noid_core::cpu::avx512_vpclmul_available()
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+pub(crate) fn pmull_runtime() -> bool {
+    #[cfg(target_feature = "aes")]
+    return true;
+    #[cfg(not(target_feature = "aes"))]
+    noid_core::cpu::pmull_available()
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn kernel_tables() -> &'static KernelTables {
+    static TABLES: OnceLock<KernelTables> = OnceLock::new();
     TABLES.get_or_init(|| {
         assert_eq!(
             MDS_FULL,
@@ -576,7 +609,7 @@ pub(crate) fn vec_tables() -> &'static crate::batch_avx2::VecTables {
                 );
             }
         }
-        crate::batch_avx2::VecTables {
+        KernelTables {
             rc: t.rc,
             mds_full_two: tower_to_flat_u128(2),
             mds_full_four: tower_to_flat_u128(4),
@@ -616,10 +649,20 @@ const PERM_INTERLEAVE: usize = 4;
 /// multiply chains. Bit-identical per group to
 /// [`packed_poseidon2b_permute_flat`].
 pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_SIZE]]) {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
+    if states.len() >= 2 && avx512_vpclmul_runtime() {
+        // SAFETY: gated on runtime AVX-512BW+VPCLMULQDQ detection.
+        return unsafe { crate::batch_avx512::permute_flat_groups(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
-        return unsafe { crate::batch_avx2::permute_flat_groups(states, vec_tables()) };
+        return unsafe { crate::batch_avx2::permute_flat_groups(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if pmull_runtime() {
+        // SAFETY: gated on runtime/static PMULL detection.
+        return unsafe { crate::batch_aarch64::permute_flat_groups(states, kernel_tables()) };
     }
     #[allow(unreachable_code)]
     {
@@ -660,10 +703,15 @@ pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_
 /// (GCM) basis** bit patterns — the batched twin of
 /// `native::permutation::permute_flat_u128`, with no boundary conversion.
 pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE]) {
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
-        return unsafe { crate::batch_avx2::permute_flat_one(states, vec_tables()) };
+        return unsafe { crate::batch_avx2::permute_flat_one(states, kernel_tables()) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if pmull_runtime() {
+        // SAFETY: gated on runtime/static PMULL detection.
+        return unsafe { crate::batch_aarch64::permute_flat_one(states, kernel_tables()) };
     }
     #[allow(unreachable_code)]
     let tables = flat_tables();
@@ -862,6 +910,40 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     };
 
     let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    if !pad
+        && leaf_size.is_multiple_of(32)
+        && n.is_multiple_of(PERM_INTERLEAVE * 4)
+        && avx512_vpclmul_runtime()
+    {
+        // SAFETY: runtime ISA gate and the public shape checks above satisfy
+        // the sixteen-leaf AVX-512 kernel contract.
+        unsafe {
+            crate::batch_avx512::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
+        }
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if !pad && n.is_multiple_of(PERM_INTERLEAVE) && pmull_runtime() {
+        // SAFETY: runtime/static PMULL gate and the public shape checks above
+        // satisfy the specialized kernel contract.
+        unsafe {
+            crate::batch_aarch64::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
+        }
+        return;
+    }
     if PACKED_LANES == 1 || n < PACKED_LANES {
         for i in 0..n {
             scalar(i, out);
@@ -874,7 +956,7 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     // of crossing the packed-permutation load/store boundary after every
     // block. Eight leaves are exactly four two-lane state groups, the same
     // interleave width as the register-domain permutation kernel.
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+    #[cfg(target_arch = "x86_64")]
     if !pad
         && leaf_size.is_multiple_of(32)
         && n.is_multiple_of(PERM_INTERLEAVE * PACKED_LANES)
@@ -883,7 +965,13 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
         // SAFETY: the runtime ISA gate and public preconditions above prove
         // the specialized kernel's alignment-independent slice contract.
         unsafe {
-            crate::batch_avx2::leaf_sponge_flat_no_pad_into(iv, data, leaf_size, out, vec_tables());
+            crate::batch_avx2::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
         }
         return;
     }

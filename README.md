@@ -263,10 +263,16 @@ interface.
 
 ## Building from Source
 
-The canonical release build supports Linux on x86-64 and AArch64. It requires
-Rust with `rustfmt`, a native C/C++ toolchain, `pkg-config`, libclang and OpenSSL
-development headers. Release proving requires AVX2, PCLMULQDQ and VPCLMULQDQ
-on x86-64, or AES/PMULL on AArch64.
+The node and proof stack are continuously built on Linux x86-64, Linux ARM64,
+macOS Apple Silicon and Windows x86-64. A build requires the pinned Rust
+toolchain, a native C/C++ toolchain, CMake, libclang and `pkg-config` where the
+platform provides it.
+
+Official x86-64 builds use an x86-64-v3, PCLMULQDQ and VPCLMULQDQ baseline;
+the same binary selects AVX-512 at runtime when available. ARM64 builds use
+NEON and PMULL. There is no separate legacy x86-64 release.
+
+The canonical self-contained release command currently runs on Linux:
 
 ```sh
 git clone https://github.com/ignotusnemo/paranoid.git

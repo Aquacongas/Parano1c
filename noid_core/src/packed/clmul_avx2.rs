@@ -17,7 +17,7 @@
 //! AVX-512 is not — i.e. the PACKED_LANES == 2 configuration with the wide
 //! carry-less multiply extension (Alder/Raptor Lake class cores).
 
-#![cfg(all(target_arch = "x86_64", not(target_feature = "avx512f")))]
+#![cfg(target_arch = "x86_64")]
 
 use super::PackedBlock128;
 use core::arch::x86_64::*;

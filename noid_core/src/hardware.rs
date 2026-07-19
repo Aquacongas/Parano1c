@@ -24,7 +24,6 @@ pub trait HardwareField: TowerField {
 // Basis Conversion Matrices
 // ---------------------------------------------------------------------------
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 mod conversion_matrix {
     /// Tower basis -> Standard GCM polynomial basis.
     pub const TOWER_TO_FLAT: [u128; 128] = [
@@ -319,21 +318,18 @@ fn apply_matrix(matrix: &[u128; 128], v: u128) -> u128 {
 fn matrix_nibble_table(matrix: &[u128; 128]) -> &'static [u128; 32 * 16] {
     use std::sync::OnceLock;
 
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    // The two static conversion matrices have unique first entries.
+    if matrix[0] == conversion_matrix::TOWER_TO_FLAT[0]
+        && matrix[1] == conversion_matrix::TOWER_TO_FLAT[1]
     {
-        // The two static conversion matrices have unique first entries.
-        if matrix[0] == conversion_matrix::TOWER_TO_FLAT[0]
-            && matrix[1] == conversion_matrix::TOWER_TO_FLAT[1]
-        {
-            static T2F: OnceLock<[u128; 32 * 16]> = OnceLock::new();
-            return T2F.get_or_init(|| build_nibble_table(&conversion_matrix::TOWER_TO_FLAT));
-        }
-        if matrix[0] == conversion_matrix::FLAT_TO_TOWER[0]
-            && matrix[1] == conversion_matrix::FLAT_TO_TOWER[1]
-        {
-            static F2T: OnceLock<[u128; 32 * 16]> = OnceLock::new();
-            return F2T.get_or_init(|| build_nibble_table(&conversion_matrix::FLAT_TO_TOWER));
-        }
+        static T2F: OnceLock<[u128; 32 * 16]> = OnceLock::new();
+        return T2F.get_or_init(|| build_nibble_table(&conversion_matrix::TOWER_TO_FLAT));
+    }
+    if matrix[0] == conversion_matrix::FLAT_TO_TOWER[0]
+        && matrix[1] == conversion_matrix::FLAT_TO_TOWER[1]
+    {
+        static F2T: OnceLock<[u128; 32 * 16]> = OnceLock::new();
+        return F2T.get_or_init(|| build_nibble_table(&conversion_matrix::FLAT_TO_TOWER));
     }
 
     static FALLBACK: OnceLock<[u128; 32 * 16]> = OnceLock::new();
@@ -458,41 +454,57 @@ const fn expand_bits_u64_to_u128(v: u64) -> u128 {
 /// Inputs and output are interpreted as 128-bit polynomials in the flat
 /// basis. Used by `PackedBlock128` flat-basis helpers.
 #[inline(always)]
+#[allow(unreachable_code)]
 pub fn clmul_gcm(a: u128, b: u128) -> u128 {
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        x86_64_clmul::clmul_block128(a, b)
-    }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
     {
-        soft_clmul::clmul_block128(a, b)
+        // SAFETY: PCLMULQDQ is part of the static build target, so LLVM may
+        // inline this path into ISA-specific release kernels.
+        return unsafe { x86_64_clmul::clmul_block128(a, b) };
     }
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "pclmulqdq")))]
+    {
+        if crate::cpu::pclmul_available() {
+            // SAFETY: the process-wide runtime backend is selected only after
+            // PCLMULQDQ was detected on this CPU.
+            return unsafe { x86_64_clmul::clmul_block128(a, b) };
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // SAFETY: PMULL is part of the static build target.
+        return unsafe { aarch64_clmul::clmul_block128(a, b) };
+    }
+    #[cfg(all(target_arch = "aarch64", not(target_feature = "aes")))]
+    {
+        if crate::cpu::pmull_available() {
+            // SAFETY: PMULL was detected before selecting this backend.
+            return unsafe { aarch64_clmul::clmul_block128(a, b) };
+        }
+    }
+    soft_clmul::clmul_block128(a, b)
+}
+
+/// Direct PMULL entry point for AArch64 batch kernels which already crossed
+/// a runtime/static `aes` feature boundary.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "aes")]
+pub unsafe fn clmul_gcm_pmull(a: u128, b: u128) -> u128 {
+    // SAFETY: inherited `aes`/PMULL target feature.
+    unsafe { aarch64_clmul::clmul_block128(a, b) }
 }
 
 /// Convert a raw tower-basis u128 to flat-basis.
 #[inline(always)]
 pub fn tower_to_flat_u128(v: u128) -> u128 {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        apply_matrix(&conversion_matrix::TOWER_TO_FLAT, v)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        v
-    }
+    apply_matrix(&conversion_matrix::TOWER_TO_FLAT, v)
 }
 
 /// Convert a raw flat-basis u128 to tower-basis.
 #[inline(always)]
 pub fn flat_to_tower_u128(v: u128) -> u128 {
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    {
-        apply_matrix(&conversion_matrix::FLAT_TO_TOWER, v)
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        v
-    }
+    apply_matrix(&conversion_matrix::FLAT_TO_TOWER, v)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -500,7 +512,8 @@ mod x86_64_clmul {
     use super::*;
     use core::arch::x86_64::*;
 
-    #[inline(always)]
+    #[inline]
+    #[target_feature(enable = "pclmulqdq")]
     pub unsafe fn clmul_block128(a: u128, b: u128) -> u128 {
         let a_reg = _mm_set_epi64x((a >> 64) as i64, a as i64);
         let b_reg = _mm_set_epi64x((b >> 64) as i64, b as i64);
@@ -530,7 +543,52 @@ mod x86_64_clmul {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+mod aarch64_clmul {
+    use core::arch::aarch64::*;
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    unsafe fn pmull(a: u64, b: u64) -> uint64x2_t {
+        // SAFETY: inherited `aes`/PMULL target feature. `poly128_t` and
+        // `uint64x2_t` are the same 128 raw bits.
+        unsafe { core::mem::transmute::<u128, uint64x2_t>(vmull_p64(a, b)) }
+    }
+
+    #[inline]
+    #[target_feature(enable = "aes")]
+    pub unsafe fn clmul_block128(a: u128, b: u128) -> u128 {
+        // Binius-style Horner fold. Four independent schoolbook PMULLs
+        // produce the product, then two PMULLs by 0x87 reduce it in two
+        // x^64 stages. This is the fastest measured M-series variant.
+        unsafe {
+            let a_lo = a as u64;
+            let a_hi = (a >> 64) as u64;
+            let b_lo = b as u64;
+            let b_hi = (b >> 64) as u64;
+            let zero = vdupq_n_u64(0);
+
+            let t0 = pmull(a_lo, b_lo);
+            let t1a = pmull(a_lo, b_hi);
+            let t1b = pmull(a_hi, b_lo);
+            let t2 = pmull(a_hi, b_hi);
+            let mut t1 = veorq_u64(t1a, t1b);
+
+            // Horner form t0 + x^64(t1 + x^64 t2), reducing after each
+            // shift by x^64. The only overflow in each stage is its high
+            // word multiplied by the modulus tail 0x87.
+            t1 = veorq_u64(t1, vextq_u64::<1>(zero, t2));
+            t1 = veorq_u64(t1, pmull(vgetq_lane_u64::<1>(t2), 0x87));
+
+            let mut t0 = t0;
+            t0 = veorq_u64(t0, vextq_u64::<1>(zero, t1));
+            t0 = veorq_u64(t0, pmull(vgetq_lane_u64::<1>(t1), 0x87));
+
+            (vgetq_lane_u64::<0>(t0) as u128) | ((vgetq_lane_u64::<1>(t0) as u128) << 64)
+        }
+    }
+}
+
 mod soft_clmul {
     use super::*;
 
@@ -538,7 +596,7 @@ mod soft_clmul {
     pub fn clmul_64x64(a: u64, b: u64) -> u128 {
         let mut res = 0u128;
         let mut b = b as u128;
-        let mut a = a as u128;
+        let a = a as u128;
         while b != 0 {
             let lsb = b & (!b + 1);
             res ^= a * lsb;
@@ -593,13 +651,7 @@ impl Mul for Flat<Block128> {
         let a = self.0 .0;
         let b = r.0 .0;
 
-        #[cfg(target_arch = "x86_64")]
-        let res = unsafe { x86_64_clmul::clmul_block128(a, b) };
-
-        #[cfg(not(target_arch = "x86_64"))]
-        let res = soft_clmul::clmul_block128(a, b);
-
-        Self(Block128(res))
+        Self(Block128(clmul_gcm(a, b)))
     }
 }
 

@@ -1,5 +1,4 @@
-# Stable Cargo profiles cannot carry rustflags. Keep the workspace default
-# here; noid_core independently rejects release targets that lose the required
-# proof ISA through an environment override or an out-of-tree Cargo invocation.
-[build]
-rustflags = ["-C", "target-cpu=native"]
+# Developer builds keep rustc's baseline so forced-backend differential tests
+# can exercise the scalar oracle. Official artifacts set one modern profile
+# per architecture in CI: x86-64-v3 + VPCLMULQDQ, or AArch64 + PMULL. Wider
+# AVX-512 kernels remain runtime-selected inside the single x86-64 binary.
