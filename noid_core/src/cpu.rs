@@ -20,6 +20,7 @@ pub struct CpuCapabilities {
     pub vpclmulqdq: bool,
     pub gfni: bool,
     pub avx512f: bool,
+    pub avx512bw: bool,
     pub neon: bool,
     pub pmull: bool,
 }
@@ -40,7 +41,7 @@ impl fmt::Display for CpuBackend {
             Self::Scalar => "scalar",
             Self::Pclmul => "pclmul",
             Self::Avx2 => "avx2+vpclmul",
-            Self::Avx512 => "avx512+vpclmul",
+            Self::Avx512 => "avx512bw+vpclmul",
             Self::Neon => "neon",
             Self::NeonPmull => "neon+pmull",
         })
@@ -137,7 +138,7 @@ fn parse_backend_request(value: &str) -> Option<BackendRequest> {
 fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend {
     #[cfg(target_arch = "x86_64")]
     {
-        let available = if caps.avx512f && caps.vpclmulqdq {
+        let available = if caps.avx512f && caps.avx512bw && caps.vpclmulqdq {
             CpuBackend::Avx512
         } else if caps.avx2 && caps.vpclmulqdq {
             CpuBackend::Avx2
@@ -151,7 +152,9 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
             BackendRequest::Scalar => CpuBackend::Scalar,
             BackendRequest::Pclmul if caps.sse4_1 && caps.pclmulqdq => CpuBackend::Pclmul,
             BackendRequest::Avx2 if caps.avx2 && caps.vpclmulqdq => CpuBackend::Avx2,
-            BackendRequest::Avx512 if caps.avx512f && caps.vpclmulqdq => CpuBackend::Avx512,
+            BackendRequest::Avx512 if caps.avx512f && caps.avx512bw && caps.vpclmulqdq => {
+                CpuBackend::Avx512
+            }
             BackendRequest::Neon | BackendRequest::NeonPmull => {
                 panic!("NOID_CPU_BACKEND requests an AArch64 backend on x86_64")
             }
@@ -209,6 +212,7 @@ fn detect_capabilities() -> CpuCapabilities {
         caps.vpclmulqdq = std::arch::is_x86_feature_detected!("vpclmulqdq");
         caps.gfni = std::arch::is_x86_feature_detected!("gfni");
         caps.avx512f = std::arch::is_x86_feature_detected!("avx512f");
+        caps.avx512bw = std::arch::is_x86_feature_detected!("avx512bw");
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -243,7 +247,9 @@ mod tests {
             CpuBackend::Scalar => {}
             CpuBackend::Pclmul => assert!(caps.sse4_1 && caps.pclmulqdq),
             CpuBackend::Avx2 => assert!(caps.avx2 && caps.vpclmulqdq),
-            CpuBackend::Avx512 => assert!(caps.avx512f && caps.vpclmulqdq),
+            CpuBackend::Avx512 => {
+                assert!(caps.avx512f && caps.avx512bw && caps.vpclmulqdq)
+            }
             CpuBackend::Neon => assert!(caps.neon),
             CpuBackend::NeonPmull => assert!(caps.neon && caps.pmull),
         }

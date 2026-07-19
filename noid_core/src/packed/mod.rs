@@ -12,6 +12,8 @@
 
 pub mod arith;
 pub mod clmul_avx2;
+#[cfg(target_arch = "x86_64")]
+pub mod clmul_avx512;
 pub mod karatsuba;
 pub mod mul_table;
 pub mod pow7;

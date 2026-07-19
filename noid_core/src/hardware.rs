@@ -558,8 +558,9 @@ mod aarch64_clmul {
     #[inline]
     #[target_feature(enable = "aes")]
     pub unsafe fn clmul_block128(a: u128, b: u128) -> u128 {
-        // Three-product Karatsuba followed by the same two-stage GCM
-        // reduction as `reduce_gcm_256`, kept entirely in NEON registers.
+        // Binius-style Horner fold. Four independent schoolbook PMULLs
+        // produce the product, then two PMULLs by 0x87 reduce it in two
+        // x^64 stages. This is the fastest measured M-series variant.
         unsafe {
             let a_lo = a as u64;
             let a_hi = (a >> 64) as u64;
@@ -567,25 +568,23 @@ mod aarch64_clmul {
             let b_hi = (b >> 64) as u64;
             let zero = vdupq_n_u64(0);
 
-            let ll = pmull(a_lo, b_lo);
-            let hh = pmull(a_hi, b_hi);
-            let mut cross = pmull(a_lo ^ a_hi, b_lo ^ b_hi);
-            cross = veorq_u64(veorq_u64(cross, ll), hh);
+            let t0 = pmull(a_lo, b_lo);
+            let t1a = pmull(a_lo, b_hi);
+            let t1b = pmull(a_hi, b_lo);
+            let t2 = pmull(a_hi, b_hi);
+            let mut t1 = veorq_u64(t1a, t1b);
 
-            // 256-bit product `(hi, lo)`.
-            let lo = veorq_u64(ll, vextq_u64::<1>(zero, cross));
-            let hi = veorq_u64(hh, vextq_u64::<1>(cross, zero));
+            // Horner form t0 + x^64(t1 + x^64 t2), reducing after each
+            // shift by x^64. The only overflow in each stage is its high
+            // word multiplied by the modulus tail 0x87.
+            t1 = veorq_u64(t1, vextq_u64::<1>(zero, t2));
+            t1 = veorq_u64(t1, pmull(vgetq_lane_u64::<1>(t2), 0x87));
 
-            // x^128 = x^7 + x^2 + x + 1, encoded by 0x87. Reducing the
-            // upper half can overflow by at most six bits, hence one final
-            // PMULL is sufficient.
-            let reduce_lo = pmull(vgetq_lane_u64::<0>(hi), 0x87);
-            let reduce_hi = pmull(vgetq_lane_u64::<1>(hi), 0x87);
-            let mut result = veorq_u64(lo, reduce_lo);
-            result = veorq_u64(result, vextq_u64::<1>(zero, reduce_hi));
-            result = veorq_u64(result, pmull(vgetq_lane_u64::<1>(reduce_hi), 0x87));
+            let mut t0 = t0;
+            t0 = veorq_u64(t0, vextq_u64::<1>(zero, t1));
+            t0 = veorq_u64(t0, pmull(vgetq_lane_u64::<1>(t1), 0x87));
 
-            (vgetq_lane_u64::<0>(result) as u128) | ((vgetq_lane_u64::<1>(result) as u128) << 64)
+            (vgetq_lane_u64::<0>(t0) as u128) | ((vgetq_lane_u64::<1>(t0) as u128) << 64)
         }
     }
 }

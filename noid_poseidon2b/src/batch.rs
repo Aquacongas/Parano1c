@@ -561,6 +561,23 @@ pub(crate) fn avx2_vpclmul_runtime() -> bool {
     noid_core::cpu::avx2_vpclmul_available()
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub(crate) fn avx512_vpclmul_runtime() -> bool {
+    #[cfg(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    ))]
+    return true;
+    #[cfg(not(all(
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "vpclmulqdq"
+    )))]
+    noid_core::cpu::avx512_vpclmul_available()
+}
+
 #[cfg(target_arch = "aarch64")]
 #[inline]
 pub(crate) fn pmull_runtime() -> bool {
@@ -632,6 +649,11 @@ const PERM_INTERLEAVE: usize = 4;
 /// multiply chains. Bit-identical per group to
 /// [`packed_poseidon2b_permute_flat`].
 pub fn packed_poseidon2b_permute_flat_many(states: &mut [[PackedBlock128; STATE_SIZE]]) {
+    #[cfg(target_arch = "x86_64")]
+    if states.len() >= 2 && avx512_vpclmul_runtime() {
+        // SAFETY: gated on runtime AVX-512BW+VPCLMULQDQ detection.
+        return unsafe { crate::batch_avx512::permute_flat_groups(states, kernel_tables()) };
+    }
     #[cfg(target_arch = "x86_64")]
     if avx2_vpclmul_runtime() {
         // SAFETY: gated on runtime AVX2+VPCLMULQDQ detection.
@@ -888,6 +910,25 @@ pub fn leaf_sponge_flat_batch_with_iv_into(
     };
 
     let n = out.len();
+    #[cfg(target_arch = "x86_64")]
+    if !pad
+        && leaf_size.is_multiple_of(32)
+        && n.is_multiple_of(PERM_INTERLEAVE * 4)
+        && avx512_vpclmul_runtime()
+    {
+        // SAFETY: runtime ISA gate and the public shape checks above satisfy
+        // the sixteen-leaf AVX-512 kernel contract.
+        unsafe {
+            crate::batch_avx512::leaf_sponge_flat_no_pad_into(
+                iv,
+                data,
+                leaf_size,
+                out,
+                kernel_tables(),
+            );
+        }
+        return;
+    }
     #[cfg(target_arch = "aarch64")]
     if !pad && n.is_multiple_of(PERM_INTERLEAVE) && pmull_runtime() {
         // SAFETY: runtime/static PMULL gate and the public shape checks above
