@@ -14,7 +14,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: platform-ci-${{ github.workflow }}-${{ github.ref }}
+  # A branch push followed by its pull_request synchronization is one logical
+  # validation. Keep only the PR run instead of compiling Linux x86-64 twice.
+  group: platform-ci-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
