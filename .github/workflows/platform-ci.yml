@@ -1,0 +1,205 @@
+name: Platform CI
+
+on:
+  push:
+    branches:
+      - main
+      - v2
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  linux-x86-64:
+    name: Linux x86-64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Show compiler and CPU
+        run: |
+          rustc -vV
+          cargo -vV
+          lscpu
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check the complete x86-64 release profile
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
+            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq
+        run: >-
+          cargo check --locked --workspace --all-targets
+          --target x86_64-unknown-linux-gnu
+
+      - name: Link the official node tools
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
+            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq
+        run: >-
+          cargo build --locked --target x86_64-unknown-linux-gnu
+          -p noid_node -p noid-extminer --bins
+
+      - name: Test proof kernels with runtime dispatch
+        run: >-
+          cargo test --locked --release
+          -p noid_core -p noid_poseidon2b -p noid-ivc-core
+
+      - name: Cross-check the scalar oracle
+        env:
+          NOID_CPU_BACKEND: scalar
+        run: >-
+          cargo test --locked --release
+          -p noid_core -p noid_poseidon2b -p noid-ivc-core
+
+  native-platforms:
+    name: ${{ matrix.name }}
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            release_flags: -C target-feature=+aes
+            test_flags: -C target-feature=+aes
+            backend: neon-pmull
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+            release_flags: -C target-feature=+aes
+            test_flags: -C target-feature=+aes
+            backend: neon-pmull
+          - name: Windows x86-64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            release_flags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq
+            test_flags: ""
+            backend: auto
+
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config
+
+      - name: Locate libclang on macOS
+        if: runner.os == 'macOS'
+        run: |
+          libclang_path="$(xcode-select -p)/Toolchains/XcodeDefault.xctoolchain/usr/lib"
+          test -f "$libclang_path/libclang.dylib"
+          echo "LIBCLANG_PATH=$libclang_path" >> "$GITHUB_ENV"
+          clang --version
+
+      - name: Locate libclang on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $libclangPath = Join-Path $env:ProgramFiles "LLVM\bin"
+          if (-not (Test-Path (Join-Path $libclangPath "libclang.dll"))) {
+            throw "libclang.dll was not found in $libclangPath"
+          }
+          "LIBCLANG_PATH=$libclangPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          clang --version
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+
+      - name: Cache Cargo downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Show compiler and CPU
+        shell: bash
+        run: |
+          rustc -vV
+          cargo -vV
+          uname -a || true
+          if command -v lscpu >/dev/null 2>&1; then lscpu; fi
+
+      - name: Check the complete platform release profile
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && matrix.release_flags || '' }}
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && matrix.release_flags || '' }}
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && matrix.release_flags || '' }}
+        run: >-
+          cargo check --locked --workspace --all-targets
+          --target ${{ matrix.target }}
+
+      - name: Link the official node tools
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && matrix.release_flags || '' }}
+          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && matrix.release_flags || '' }}
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && matrix.release_flags || '' }}
+        run: >-
+          cargo build --locked --target ${{ matrix.target }}
+          -p noid_node -p noid-extminer --bins
+
+      - name: Smoke-test ARM64 executables
+        if: runner.arch == 'ARM64'
+        shell: bash
+        run: |
+          target/${{ matrix.target }}/debug/paranoid --help
+          target/${{ matrix.target }}/debug/noid-cli --help
+          target/${{ matrix.target }}/debug/noid-extminer --help
+
+      - name: Test native proof kernels
+        env:
+          NOID_CPU_BACKEND: ${{ matrix.backend }}
+          RUSTFLAGS: ${{ matrix.test_flags }}
+        run: >-
+          cargo test --locked --release
+          -p noid_core -p noid_poseidon2b -p noid-ivc-core
+
