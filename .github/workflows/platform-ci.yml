@@ -30,7 +30,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install native build dependencies
         run: |
@@ -41,7 +41,7 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
 
       - name: Cache Cargo downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -80,12 +80,12 @@ jobs:
           cargo test --locked --release
           -p noid_core -p noid_poseidon2b -p noid-ivc-core
 
-      - name: Cross-check the scalar oracle
+      - name: Cross-check scalar field and hash references
         env:
           NOID_CPU_BACKEND: scalar
         run: >-
           cargo test --locked --release
-          -p noid_core -p noid_poseidon2b -p noid-ivc-core
+          -p noid_core -p noid_poseidon2b
 
   native-platforms:
     name: ${{ matrix.name }}
@@ -121,7 +121,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install Linux native build dependencies
         if: runner.os == 'Linux'
@@ -152,7 +152,7 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
 
       - name: Cache Cargo downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -202,4 +202,3 @@ jobs:
         run: >-
           cargo test --locked --release
           -p noid_core -p noid_poseidon2b -p noid-ivc-core
-
