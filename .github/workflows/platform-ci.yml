@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - v2
   pull_request:
     branches:
       - main
@@ -14,8 +13,7 @@ permissions:
   contents: read
 
 concurrency:
-  # A branch push followed by its pull_request synchronization is one logical
-  # validation. Keep only the PR run instead of compiling Linux x86-64 twice.
+  # A newer commit supersedes an older validation of the same branch or PR.
   group: platform-ci-${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
