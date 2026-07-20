@@ -274,20 +274,49 @@ AVX2-era Macs remain supported. Each x86-64 binary selects wider
 AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available. ARM64 builds use
 NEON and PMULL. There is no separate legacy x86-64 release.
 
-The canonical self-contained release command currently runs on Linux:
+Check out the version you want to build and generate the HistoryStep matrices
+locally. This is the trustless path: the machine derives and authenticates the
+pack instead of accepting matrix bytes supplied by the project. Keep the pack
+outside the repository's disposable `target/` tree:
 
 ```sh
 git clone https://github.com/ignotusnemo/paranoid.git
 cd paranoid
-./scripts/build_release.sh
+git checkout v0.0.1
+
+mkdir -p ../paranoid-artifacts
+./scripts/generate_history_step_pack.sh \
+  ../paranoid-artifacts/history-step-v1
 ```
 
-The build regenerates and authenticates both HistoryStep matrices, runs the
-release tests and produces `paranoid`, `noid-cli` and `noid-extminer`.
+Generation is expensive but only needs to be performed once.
+
+Build for the current machine. The script authenticates the pack, embeds it
+into the node and produces a self-contained archive containing `paranoid`,
+`noid-cli` and `noid-extminer`:
+
+```sh
+./scripts/build_release.sh \
+  --pack ../paranoid-artifacts/history-step-pack-v1
+
+cat target/release-builds/LAST_RELEASE
+```
+
+For a faster build, the corresponding GitHub release also carries the
+authenticated `history-step-pack-v1.tar.gz`. Extract it and pass the contained
+directory to the same build command:
+
+```sh
+mkdir -p ../release-pack
+tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
+
+./scripts/build_release.sh \
+  --pack ../release-pack/history-step-pack-v1
+```
 
 ## Status
 
-ParanO(1)d is version `0.1.0` and pre-genesis. No public network has launched.
+ParanO(1)d is version `0.0.1` and pre-genesis. No public network has launched.
 
 Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the
