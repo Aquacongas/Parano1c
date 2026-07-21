@@ -33,6 +33,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
   GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
   RELEASE_TAG: ${{ inputs.tag }}
   PACK_SHA256: ${{ inputs.pack_sha256 }}
   RELEASE_CHANNEL: ${{ inputs.release_channel }}
