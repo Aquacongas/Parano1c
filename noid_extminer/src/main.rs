@@ -39,10 +39,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
-use noid_core::packed::{PackedBlock128, PACKED_LANES};
 use noid_core::{Block128, TowerField};
-use noid_poseidon2b::batch::packed_poseidon2b_permute;
-use noid_poseidon2b::native::domain::{capacity_iv, TAG_POWHDR};
+use noid_poseidon2b::batch::FixedFieldNonceBatch;
+use noid_poseidon2b::native::domain::TAG_POWHDR;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -72,7 +71,7 @@ struct Cli {
     #[arg(long, value_name = "TOKEN")]
     key: Option<String>,
 
-    /// Number of PoW threads. 0 = all physical cores.
+    /// Number of PoW threads. 0 = every logical CPU visible to the process.
     #[arg(long, default_value_t = 0, value_name = "N")]
     threads: usize,
 
@@ -205,7 +204,7 @@ fn search_nonce(
     cancel: &AtomicBool,
 ) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
-    let per_thread = CHUNK_SIZE / num_threads as u128;
+    let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
 
     // Random start so multiple miners on the same template don't collide.
     let start_nonce: u128 = {
@@ -223,11 +222,16 @@ fn search_nonce(
             return None;
         }
 
+        let chunk_end = chunk_start + CHUNK_SIZE;
         let solution = (0..num_threads).into_par_iter().find_map_any(|tid| {
             let ts = chunk_start + tid as u128 * per_thread;
-            let te = ts + per_thread;
+            let te = (ts + per_thread).min(chunk_end);
+            if ts >= te {
+                return None;
+            }
 
             let fields = *pow_fields;
+            let mut hasher = FixedFieldNonceBatch::new(TAG_POWHDR, &fields, POW_NONCE_FIELD_INDEX);
             let mut digests = [[0u8; 32]; DIGEST_BATCH];
             let mut nonce = ts;
             while nonce < te {
@@ -235,7 +239,7 @@ fn search_nonce(
                     return None;
                 }
                 let n = ((te - nonce).min(DIGEST_BATCH as u128)) as usize;
-                poseidon_pow_digest_nonce_batch(&fields, nonce, &mut digests[..n]);
+                hasher.hash_into(nonce, &mut digests[..n]);
                 for (i, hash) in digests[..n].iter().enumerate() {
                     if le256_lt(hash, target) {
                         return Some(nonce + i as u128);
@@ -269,56 +273,6 @@ fn decode_pow_fields_hex(hex_str: &str) -> Result<[Block128; POW_HEADER_FIELD_CO
     Ok(fields)
 }
 
-fn poseidon_pow_digest_nonce_batch(
-    fields: &[Block128; POW_HEADER_FIELD_COUNT],
-    start_nonce: u128,
-    out: &mut [[u8; 32]],
-) {
-    if out.is_empty() {
-        return;
-    }
-
-    let [iv_hi, iv_lo] = capacity_iv(TAG_POWHDR);
-    let mut offset = 0usize;
-    while offset < out.len() {
-        let lanes = (out.len() - offset).min(PACKED_LANES);
-        let mut states = [PackedBlock128::ZERO; 4];
-        states[2] = PackedBlock128::broadcast(iv_hi);
-        states[3] = PackedBlock128::broadcast(iv_lo);
-
-        for pair in 0..(POW_HEADER_FIELD_COUNT / 2) {
-            let left_idx = pair * 2;
-            let right_idx = left_idx + 1;
-            let mut left = PackedBlock128::broadcast(fields[left_idx]);
-            let mut right = PackedBlock128::broadcast(fields[right_idx]);
-            if left_idx == POW_NONCE_FIELD_INDEX {
-                left = PackedBlock128::ZERO;
-                for lane in 0..lanes {
-                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
-                    left = left.set_lane(lane, Block128::from(nonce));
-                }
-            } else if right_idx == POW_NONCE_FIELD_INDEX {
-                right = PackedBlock128::ZERO;
-                for lane in 0..lanes {
-                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
-                    right = right.set_lane(lane, Block128::from(nonce));
-                }
-            }
-            states[0] = states[0].xor(left);
-            states[1] = states[1].xor(right);
-            packed_poseidon2b_permute(&mut states);
-        }
-
-        for lane in 0..lanes {
-            let s0 = states[0].get_lane(lane);
-            let s1 = states[1].get_lane(lane);
-            out[offset + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
-            out[offset + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
-        }
-        offset += lanes;
-    }
-}
-
 /// Compare two 32-byte values as 256-bit LE integers: `a < b`.
 #[inline]
 fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
@@ -345,13 +299,16 @@ fn mine(cli: &Cli) -> Result<()> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(cli.threads)
             .build_global()
-            .ok();
+            .context("configure PoW thread pool")?;
     }
     let threads = rayon::current_num_threads();
 
     eprintln!(
-        "noid-extminer  rpc={}  threads={}  poll={}ms",
-        cli.rpc, threads, cli.poll_ms,
+        "noid-extminer  rpc={}  threads={}  backend={}  poll={}ms",
+        cli.rpc,
+        threads,
+        noid_core::cpu::selected_backend(),
+        cli.poll_ms,
     );
     if cli.key.is_some() {
         eprintln!("auth: bearer token configured");

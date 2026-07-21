@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use noid_chain::consensus::genesis::genesis_header;
-use noid_chain::consensus::pow::{poseidon_pow_digest_nonce_batch, pow_header_fields};
+use noid_chain::consensus::pow::{pow_header_fields, PowNonceBatchHasher};
 use noid_core::packed::PACKED_LANES;
 use rayon::prelude::*;
 
@@ -64,10 +64,11 @@ fn main() {
     let start = Instant::now();
     let mut sink = [0u8; 32];
     let mut seq_digests = [[0u8; 32]; DIGEST_BATCH];
+    let mut seq_hasher = PowNonceBatchHasher::new(&seq_fields);
     let mut nonce = 0u64;
     while nonce < seq_attempts {
         let n = (seq_attempts - nonce).min(DIGEST_BATCH as u64) as usize;
-        poseidon_pow_digest_nonce_batch(&seq_fields, nonce as u128, &mut seq_digests[..n]);
+        seq_hasher.hash_into(nonce as u128, &mut seq_digests[..n]);
         for digest in &seq_digests[..n] {
             xor_digest(&mut sink, *digest);
         }
@@ -84,6 +85,7 @@ fn main() {
         .into_par_iter()
         .map(|thread| {
             let local = fields;
+            let mut hasher = PowNonceBatchHasher::new(&local);
             let mut local_sink = [0u8; 32];
             let start_nonce = thread as u64 * per_thread;
             let end_nonce = (start_nonce + per_thread).min(par_attempts);
@@ -91,7 +93,7 @@ fn main() {
             let mut digests = [[0u8; 32]; DIGEST_BATCH];
             while nonce < end_nonce {
                 let n = (end_nonce - nonce).min(DIGEST_BATCH as u64) as usize;
-                poseidon_pow_digest_nonce_batch(&local, nonce as u128, &mut digests[..n]);
+                hasher.hash_into(nonce as u128, &mut digests[..n]);
                 for digest in &digests[..n] {
                     xor_digest(&mut local_sink, *digest);
                 }
@@ -136,7 +138,11 @@ fn main() {
         "  threads:                  {}",
         rayon::current_num_threads()
     );
-    println!("  packed lanes:             {PACKED_LANES}");
+    println!(
+        "  CPU backend:              {}",
+        noid_core::cpu::selected_backend()
+    );
+    println!("  logical packed lanes:     {PACKED_LANES}");
     println!(
         "  checksum:                 {}{}",
         hex::encode(sink),

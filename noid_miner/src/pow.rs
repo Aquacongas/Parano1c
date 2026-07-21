@@ -11,7 +11,7 @@
 
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::difficulty::le256_lt;
-use noid_chain::consensus::pow::{poseidon_pow_digest_nonce_batch, pow_header_fields};
+use noid_chain::consensus::pow::{pow_header_fields, PowNonceBatchHasher};
 
 /// Result of a successful PoW search.
 #[derive(Debug, Clone)]
@@ -58,7 +58,7 @@ pub fn search_pow_parallel(
 
     // Hoist thread count — it never changes during a chunk.
     let num_threads = rayon::current_num_threads();
-    let per_thread = CHUNK_SIZE / num_threads as u128;
+    let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
     let fields = pow_header_fields(header_template);
 
     loop {
@@ -68,11 +68,16 @@ pub fn search_pow_parallel(
 
         // Search this chunk in parallel. Each thread reuses one canonical field
         // schedule and computes nonce digests in packed Poseidon2b batches.
+        let chunk_end = start_nonce + CHUNK_SIZE;
         let solution: Option<PowSolution> =
             (0..num_threads).into_par_iter().find_map_any(|thread_id| {
                 let thread_start = start_nonce + (thread_id as u128) * per_thread;
-                let thread_end = thread_start + per_thread;
+                let thread_end = (thread_start + per_thread).min(chunk_end);
+                if thread_start >= thread_end {
+                    return None;
+                }
                 let fields = fields;
+                let mut hasher = PowNonceBatchHasher::new(&fields);
                 let mut digests = [[0u8; 32]; DIGEST_BATCH];
                 let mut nonce = thread_start;
 
@@ -81,7 +86,7 @@ pub fn search_pow_parallel(
                         return None;
                     }
                     let n = ((thread_end - nonce).min(DIGEST_BATCH as u128)) as usize;
-                    poseidon_pow_digest_nonce_batch(&fields, nonce, &mut digests[..n]);
+                    hasher.hash_into(nonce, &mut digests[..n]);
                     for (i, hash) in digests[..n].iter().enumerate() {
                         if le256_lt(hash, &target) {
                             return Some(PowSolution {

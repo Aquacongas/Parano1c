@@ -28,9 +28,8 @@
 
 use crate::block_header::BlockHeader;
 use crate::consensus::{difficulty::le256_lt, ConsensusError};
-use noid_core::packed::{PackedBlock128, PACKED_LANES};
 use noid_core::{Block128, TowerField};
-use noid_poseidon2b::batch::packed_poseidon2b_permute;
+use noid_poseidon2b::batch::FixedFieldNonceBatch;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_POWHDR};
 
@@ -44,6 +43,26 @@ pub const POW_HEADER_FIELD_COUNT: usize = 16;
 pub const POW_NONCE_FIELD_INDEX: usize = 10;
 
 pub type PowHeaderFields = [Block128; POW_HEADER_FIELD_COUNT];
+
+/// Prepared production PoW hasher. One value should be retained by each mining
+/// worker so the fixed flat-basis header and scratch allocation are reused
+/// across nonce batches.
+pub struct PowNonceBatchHasher {
+    inner: FixedFieldNonceBatch,
+}
+
+impl PowNonceBatchHasher {
+    pub fn new(fields: &PowHeaderFields) -> Self {
+        Self {
+            inner: FixedFieldNonceBatch::new(TAG_POWHDR, fields, POW_NONCE_FIELD_INDEX),
+        }
+    }
+
+    #[inline]
+    pub fn hash_into(&mut self, start_nonce: u128, out: &mut [[u8; 32]]) {
+        self.inner.hash_into(start_nonce, out);
+    }
+}
 
 /// Compute the semantic block id (used as `prev_block_hash` in the next block).
 #[inline]
@@ -107,49 +126,7 @@ pub fn poseidon_pow_digest_nonce_batch(
     start_nonce: u128,
     out: &mut [[u8; 32]],
 ) {
-    if out.is_empty() {
-        return;
-    }
-
-    let [iv_hi, iv_lo] = capacity_iv(TAG_POWHDR);
-    let mut offset = 0usize;
-    while offset < out.len() {
-        let lanes = (out.len() - offset).min(PACKED_LANES);
-        let mut states = [PackedBlock128::ZERO; 4];
-        states[2] = PackedBlock128::broadcast(iv_hi);
-        states[3] = PackedBlock128::broadcast(iv_lo);
-
-        for pair in 0..(POW_HEADER_FIELD_COUNT / 2) {
-            let left_idx = pair * 2;
-            let right_idx = left_idx + 1;
-            let mut left = PackedBlock128::broadcast(fields[left_idx]);
-            let mut right = PackedBlock128::broadcast(fields[right_idx]);
-            if left_idx == POW_NONCE_FIELD_INDEX {
-                left = PackedBlock128::ZERO;
-                for lane in 0..lanes {
-                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
-                    left = left.set_lane(lane, Block128::from(nonce));
-                }
-            } else if right_idx == POW_NONCE_FIELD_INDEX {
-                right = PackedBlock128::ZERO;
-                for lane in 0..lanes {
-                    let nonce = start_nonce.saturating_add((offset + lane) as u128);
-                    right = right.set_lane(lane, Block128::from(nonce));
-                }
-            }
-            states[0] = states[0].xor(left);
-            states[1] = states[1].xor(right);
-            packed_poseidon2b_permute(&mut states);
-        }
-
-        for lane in 0..lanes {
-            let s0 = states[0].get_lane(lane);
-            let s1 = states[1].get_lane(lane);
-            out[offset + lane][..16].copy_from_slice(&s0.to_u128().to_le_bytes());
-            out[offset + lane][16..].copy_from_slice(&s1.to_u128().to_le_bytes());
-        }
-        offset += lanes;
-    }
+    PowNonceBatchHasher::new(fields).hash_into(start_nonce, out);
 }
 
 /// Validate that the block satisfies the declared PoW target.
@@ -169,13 +146,14 @@ pub fn validate_pow(header: &BlockHeader) -> Result<BlockHash, ConsensusError> {
 /// Search for a valid PoW nonce in `[start, start + range)`.
 pub fn search_pow(header_template: &BlockHeader, start_nonce: u128, range: u128) -> Option<u128> {
     let fields = pow_header_fields(header_template);
+    let mut hasher = PowNonceBatchHasher::new(&fields);
     let target = &header_template.difficulty_target;
     let mut digests = [[0u8; 32]; 64];
     let mut done = 0u128;
     while done < range {
         let batch_len = ((range - done).min(digests.len() as u128)) as usize;
         let nonce_base = start_nonce.saturating_add(done);
-        poseidon_pow_digest_nonce_batch(&fields, nonce_base, &mut digests[..batch_len]);
+        hasher.hash_into(nonce_base, &mut digests[..batch_len]);
         for (i, digest) in digests[..batch_len].iter().enumerate() {
             if le256_lt(digest, target) {
                 return Some(nonce_base.saturating_add(i as u128));
@@ -198,6 +176,7 @@ fn put_digest(out: &mut PowHeaderFields, index: &mut usize, digest: &[u8; 32]) {
 mod tests {
     use super::*;
     use crate::block_header::BlockHeader;
+    use noid_core::packed::PACKED_LANES;
     use noid_poseidon2b::native::domain::{capacity_iv, TAG_BLOCKHDR};
     use noid_poseidon2b::primitives::Address;
 

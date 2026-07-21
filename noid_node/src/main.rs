@@ -581,8 +581,13 @@ async fn main() -> anyhow::Result<()> {
     } else {
         noid_miner::ProcessCpuBudgetMode::ProofOnly
     };
-    noid_miner::configure_process_cpu_budget(cpu_budget_mode)
+    let cpu_plan = noid_miner::configure_process_cpu_budget(cpu_budget_mode)
         .context("configure process CPU budget")?;
+    tracing::info!(
+        backend = %noid_core::cpu::selected_backend(),
+        threads = cpu_plan.shared_pool_threads,
+        "CPU proof and mining backend selected"
+    );
     // --seed accepts HOST:PORT; convert to multiaddr strings for internal use
     for raw_seed in cli.seed {
         let ma = ip_port_to_multiaddr(&raw_seed).with_context(|| format!("--seed {raw_seed}"))?;

@@ -15,11 +15,11 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::native::compression::Poseidon2bSponge;
-use crate::native::domain::{capacity_iv, DomainTag, TAG_COMPRESS};
+use crate::native::domain::{capacity_iv, capacity_iv_flat, DomainTag, TAG_COMPRESS};
 use crate::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, N_ROUNDS, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
-use noid_core::hardware::tower_to_flat_u128;
+use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
 use noid_core::packed::{PackedBlock128, PACKED_LANES};
 use noid_core::Block128;
 use std::sync::OnceLock;
@@ -748,6 +748,86 @@ pub fn packed_poseidon2b_permute_flat(states: &mut [PackedBlock128; STATE_SIZE])
     }
 }
 
+/// Prepared fixed-length field-element sponge whose only varying field is a
+/// consecutive `u128` nonce.
+///
+/// Fixed fields are converted to the flat basis once at construction and are
+/// copied into scratch only when the batch reaches a new maximum size. Later
+/// calls patch only the nonce words. The existing no-pad leaf kernels then
+/// keep several independent sponge chains in registers: eight nonces per AVX2
+/// chunk, sixteen per AVX-512 chunk, and four per AArch64 PMULL chunk. Results
+/// are mapped back to the canonical tower basis, so this is byte-identical to
+/// `Poseidon2bSponge::with_iv` followed by `absorb_pair` for every field pair
+/// and `finalize_no_pad`.
+pub struct FixedFieldNonceBatch {
+    iv: [u128; 2],
+    flat_template: Box<[u8]>,
+    nonce_offset: usize,
+    flat_leaves: Vec<u8>,
+}
+
+impl FixedFieldNonceBatch {
+    pub fn new(tag: DomainTag, fields: &[Block128], nonce_field_index: usize) -> Self {
+        assert!(
+            !fields.is_empty() && fields.len().is_multiple_of(2),
+            "fixed-field sponge requires a nonempty even field count"
+        );
+        assert!(
+            nonce_field_index < fields.len(),
+            "nonce field index is outside the fixed-field sponge"
+        );
+
+        let leaf_size = fields
+            .len()
+            .checked_mul(16)
+            .expect("fixed-field sponge byte length must fit usize");
+        let mut flat_template = Vec::with_capacity(leaf_size);
+        for field in fields {
+            flat_template.extend_from_slice(&tower_to_flat_u128(field.to_u128()).to_le_bytes());
+        }
+        Self {
+            iv: capacity_iv_flat(tag),
+            flat_template: flat_template.into_boxed_slice(),
+            nonce_offset: nonce_field_index * 16,
+            flat_leaves: Vec::new(),
+        }
+    }
+
+    pub fn hash_into(&mut self, start_nonce: u128, out: &mut [[u8; 32]]) {
+        if out.is_empty() {
+            return;
+        }
+
+        let leaf_size = self.flat_template.len();
+        let data_len = leaf_size
+            .checked_mul(out.len())
+            .expect("fixed-field sponge batch length must fit usize");
+        let previous_len = self.flat_leaves.len();
+        if previous_len < data_len {
+            self.flat_leaves.resize(data_len, 0);
+            for leaf in self.flat_leaves[previous_len..data_len].chunks_exact_mut(leaf_size) {
+                leaf.copy_from_slice(&self.flat_template);
+            }
+        }
+
+        let active_leaves = &mut self.flat_leaves[..data_len];
+        for (index, leaf) in active_leaves.chunks_exact_mut(leaf_size).enumerate() {
+            let nonce = start_nonce.saturating_add(index as u128);
+            let nonce_flat = tower_to_flat_u128(nonce).to_le_bytes();
+            leaf[self.nonce_offset..self.nonce_offset + 16].copy_from_slice(&nonce_flat);
+        }
+
+        leaf_sponge_flat_batch_with_iv_into(self.iv, false, active_leaves, leaf_size, out);
+
+        for digest in out {
+            let flat_hi = u128::from_le_bytes(digest[..16].try_into().unwrap());
+            let flat_lo = u128::from_le_bytes(digest[16..].try_into().unwrap());
+            digest[..16].copy_from_slice(&flat_to_tower_u128(flat_hi).to_le_bytes());
+            digest[16..].copy_from_slice(&flat_to_tower_u128(flat_lo).to_le_bytes());
+        }
+    }
+}
+
 /// Batched flat-basis 1-permutation feed-forward compression of interleaved
 /// 32-byte digest pairs. Matches
 /// `native::compress_flat_feed_forward_with_tag(tag, left, right)` exactly.
@@ -1356,6 +1436,37 @@ mod tests {
                 })
                 .collect();
             assert_eq!(got, expected, "n={n} leaf_size={leaf_size}");
+        }
+    }
+
+    #[test]
+    fn fixed_field_nonce_batch_matches_tower_sponge() {
+        use crate::native::domain::DomainTag;
+
+        let tag = DomainTag::new(b"NONCETST");
+        let nonce_index = 10usize;
+        let start_nonce = 0x0123_4567_89ab_cdefu128;
+        let fields: [Block128; 16] =
+            std::array::from_fn(|index| Block128::from((index as u128 + 1) * 0x0101_0101));
+
+        let mut prepared = FixedFieldNonceBatch::new(tag, &fields, nonce_index);
+        for count in [257usize, 1, 16, 3, 8] {
+            let mut got = vec![[0u8; 32]; count];
+            prepared.hash_into(start_nonce, &mut got);
+
+            let expected: Vec<[u8; 32]> = (0..count)
+                .map(|index| {
+                    let mut scalar_fields = fields;
+                    scalar_fields[nonce_index] =
+                        Block128::from(start_nonce.saturating_add(index as u128));
+                    let mut sponge = Poseidon2bSponge::with_iv(capacity_iv(tag));
+                    for pair in scalar_fields.chunks_exact(2) {
+                        sponge.absorb_pair(pair[0], pair[1]);
+                    }
+                    sponge.finalize_no_pad()
+                })
+                .collect();
+            assert_eq!(got, expected, "count={count}");
         }
     }
 
