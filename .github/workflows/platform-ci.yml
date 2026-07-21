@@ -56,7 +56,7 @@ jobs:
       - name: Check the complete x86-64 release profile
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq
+            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
         run: >-
           cargo check --locked --workspace --all-targets
           --target x86_64-unknown-linux-gnu
@@ -64,12 +64,20 @@ jobs:
       - name: Link the official node tools
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq
+            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
         run: >-
           cargo build --locked --target x86_64-unknown-linux-gnu
           -p noid_node -p noid-extminer --bins
 
       - name: Test proof kernels with runtime dispatch
+        run: >-
+          cargo test --locked --release
+          -p noid_core -p noid_poseidon2b -p noid-ivc-core
+
+      - name: Test the x86-64-v3 PCLMUL baseline
+        env:
+          NOID_CPU_BACKEND: pclmul
+          RUSTFLAGS: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
         run: >-
           cargo test --locked --release
           -p noid_core -p noid_poseidon2b -p noid-ivc-core
@@ -108,7 +116,7 @@ jobs:
           - name: Windows x86-64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            release_flags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq
+            release_flags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
             test_flags: ""
             backend: auto
 

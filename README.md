@@ -268,11 +268,9 @@ macOS Apple Silicon, macOS Intel and Windows x86-64. A build requires the
 pinned Rust toolchain, a native C/C++ toolchain, CMake, libclang and
 `pkg-config` where the platform provides it.
 
-Official Linux and Windows x86-64 builds use an x86-64-v3, PCLMULQDQ and
-VPCLMULQDQ baseline. Intel macOS uses an x86-64-v3 and PCLMULQDQ baseline so
-AVX2-era Macs remain supported. Each x86-64 binary selects wider
-AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available. ARM64 builds use
-NEON and PMULL. There is no separate legacy x86-64 release.
+Official x86-64 builds use an x86-64-v3 and PCLMULQDQ baseline. Each binary
+selects wider AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available.
+ARM64 builds use NEON and PMULL. There is no separate legacy x86-64 release.
 
 To reproduce a published release, check out the tag shown on its GitHub release
 page. Then generate the HistoryStep matrices locally. This is the trustless

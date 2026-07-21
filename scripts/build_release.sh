@@ -91,8 +91,8 @@ HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')
 case "$HOST_TRIPLE" in
   x86_64-unknown-linux-gnu)
     PLATFORM=linux-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq'
-    ISA_PROFILE='x86-64-v3 + PCLMULQDQ + VPCLMULQDQ (runtime AVX-512)'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
+    ISA_PROFILE='x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ / AVX-512)'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     ;;
@@ -105,8 +105,8 @@ case "$HOST_TRIPLE" in
     ;;
   x86_64-pc-windows-msvc)
     PLATFORM=windows-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq,+vpclmulqdq'
-    ISA_PROFILE='x86-64-v3 + PCLMULQDQ + VPCLMULQDQ (runtime AVX-512)'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
+    ISA_PROFILE='x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ / AVX-512)'
     BINARY_SUFFIX=.exe
     ARCHIVE_KIND=zip
     ;;
@@ -120,7 +120,7 @@ case "$HOST_TRIPLE" in
   x86_64-apple-darwin)
     PLATFORM=macos-x86_64
     RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
-    ISA_PROFILE='Intel macOS x86-64-v3 + PCLMULQDQ (runtime AVX2)'
+    ISA_PROFILE='Intel macOS x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ)'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     ;;
