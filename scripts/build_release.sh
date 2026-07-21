@@ -144,9 +144,13 @@ RELEASE_DIR=$(release_canonical_directory "$RELEASE_DIR")
 BIN_DIR="$RELEASE_DIR/bin"
 ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
 LOG_FILE="$RELEASE_DIR/build.log"
+USER_GUIDE_SOURCE="$RELEASE_ROOT_DIR/scripts/release/README.txt"
 LOCK_DIR="$RELEASE_ROOT_DIR/target/.build_release.lock"
 LOCK_HELD=0
 CURRENT_STAGE=initialization
+
+[[ -f $USER_GUIDE_SOURCE && -s $USER_GUIDE_SOURCE && ! -L $USER_GUIDE_SOURCE ]] || \
+  release_die "release user guide is missing, empty, or a symlink: $USER_GUIDE_SOURCE"
 
 on_exit() {
   local status=$?
@@ -247,14 +251,20 @@ for binary in paranoid noid-cli noid-extminer; do
   cp -- "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX" "$BIN_DIR/$binary$BINARY_SUFFIX"
   chmod 0755 "$BIN_DIR/$binary$BINARY_SUFFIX" 2>/dev/null || true
 done
+cp -- "$USER_GUIDE_SOURCE" "$BIN_DIR/README.txt"
+chmod 0644 "$BIN_DIR/README.txt" 2>/dev/null || true
+
+archive_entries=(
+  README.txt
+  "paranoid$BINARY_SUFFIX"
+  "noid-cli$BINARY_SUFFIX"
+  "noid-extminer$BINARY_SUFFIX"
+)
 
 if [[ $ARCHIVE_KIND == zip ]]; then
   (
     cd "$BIN_DIR"
-    7z a -bd -tzip -mx=9 "$ARCHIVE" \
-      "paranoid$BINARY_SUFFIX" \
-      "noid-cli$BINARY_SUFFIX" \
-      "noid-extminer$BINARY_SUFFIX" >/dev/null
+    7z a -bd -tzip -mx=9 "$ARCHIVE" "${archive_entries[@]}" >/dev/null
   )
 else
   SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-0}
@@ -267,12 +277,10 @@ else
       --group=0 \
       --numeric-owner \
       --mtime="@$SOURCE_DATE_EPOCH" \
-      -cf - \
-      paranoid noid-cli noid-extminer |
+      -cf - "${archive_entries[@]}" |
       gzip -n -9 > "$ARCHIVE"
   else
-    COPYFILE_DISABLE=1 tar -C "$BIN_DIR" -cf - \
-      paranoid noid-cli noid-extminer |
+    COPYFILE_DISABLE=1 tar -C "$BIN_DIR" -cf - "${archive_entries[@]}" |
       gzip -n -9 > "$ARCHIVE"
   fi
 fi
@@ -289,17 +297,16 @@ else
     archive_members+=("$member")
   done < <(tar -tzf "$ARCHIVE")
 fi
-(( ${#archive_members[@]} == 3 )) || \
-  release_die "binary archive must contain exactly three entries"
-for binary in paranoid noid-cli noid-extminer; do
+(( ${#archive_members[@]} == ${#archive_entries[@]} )) || \
+  release_die "release archive contains an unexpected number of entries"
+for expected in "${archive_entries[@]}"; do
   member_count=0
   for member in "${archive_members[@]}"; do
-    if [[ $member == "$binary$BINARY_SUFFIX" ]]; then
+    if [[ $member == "$expected" ]]; then
       (( member_count += 1 ))
     fi
   done
-  (( member_count == 1 )) || \
-    release_die "binary archive must contain exactly one $binary$BINARY_SUFFIX"
+  (( member_count == 1 )) || release_die "release archive must contain exactly one $expected"
 done
 
 ARCHIVE_DIGEST=$(release_sha256_file "$ARCHIVE")
