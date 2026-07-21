@@ -24,7 +24,7 @@
 //! images — do not mix the two conventions.)
 
 use noid_ivc_core::field::PHI_8_TABLE;
-use noid_ivc_core::field_circuit::{f128_from_u128, f128_to_u128, FsChannelOps};
+use noid_ivc_core::field_circuit::{f128_from_u128, FsChannelOps};
 use noid_ivc_core::field_r1cs::FieldR1cs;
 use noid_ivc_core::merkle::{self, Hash};
 use noid_ivc_core::ntt::AdditiveNttF128;
@@ -952,8 +952,8 @@ pub fn lincheck_verify_trace_deferred(
 /// tail slot are all driven by the transcript-bound position bits (witness
 /// booleans pinned to the squeezed lanes in [`basefold_verify_trace`]);
 /// the hashing schedule is query count × fixed tree depths. `position` is
-/// kept only as builder-input data — bool witness values and the
-/// build-time desync assert; it shapes nothing. (The wallet-capsule
+/// kept only as builder-input data for the native walk-column preparation;
+/// it shapes no recursive constraint. (The wallet-capsule
 /// `gen_compact_queries_trace` still carries the old interim caveat.)
 pub struct QueryOpeningTrace {
     pub position: usize,
@@ -1490,15 +1490,11 @@ pub fn basefold_verify_trace(
         let used = per_lane.min(n_queries - query_bits.len());
         let (bound, range) = bind_query_positions_lane_trace(b, lane, k_code, used);
         bit_ranges.push(range);
-        for (position, bits) in bound {
-            // Build-time sanity: the proof's query must carry the
-            // transcript-derived position (native `q.position !=
-            // positions[qi]` reject); soundness is the lane pin.
-            assert_eq!(
-                proof.queries[query_bits.len()].position,
-                position,
-                "query position desynced from transcript"
-            );
+        for (_position, bits) in bound {
+            // The recursive relation is bound directly to the sampled lane:
+            // these bits drive every Merkle direction, coset selection and
+            // affine twiddle below. `QueryOpening::position` is redundant
+            // native-verifier metadata and is deliberately not a trace input.
             query_bits.push(bits);
         }
     }
@@ -2508,12 +2504,11 @@ pub(crate) fn shape_only_field_r1cs_proof(
     (proof, initial_root)
 }
 
-/// Overwrite a shape-only proof's query positions with the transcript-derived
-/// values harvested from a first recording pass (see the layout-derivation
-/// drivers in `r_pcs_region`).  The final `div_ceil(n_queries, 128/k_code)`
-/// squeezed challenges of an [R]-replay recording are exactly the
-/// query-position lanes: the batched PCS opening is the replay's last channel
-/// consumer and nothing squeezes after the query draw.
+/// Install the positions derived by the recursive transcript into the
+/// redundant native query metadata consumed later by walk-column assembly.
+/// The final `div_ceil(n_queries, 128/k_code)` squeezed challenges are the
+/// query-position lanes because the PCS opening is the replay's last channel
+/// consumer.
 pub(crate) fn patch_shape_only_query_positions(
     proof: &mut noid_ivc_core::proof::FieldR1csProof,
     pcs_params: &PcsParams,
@@ -2532,9 +2527,9 @@ pub(crate) fn patch_shape_only_query_positions(
     let mask = (1u128 << k_code) - 1;
     let mut query = 0usize;
     for lane in query_lane_values {
-        let raw = f128_to_u128(*lane);
-        for w in 0..per_lane.min(n_queries - query) {
-            proof.pcs_open.queries[query].position = ((raw >> (w * k_code)) & mask) as usize;
+        let raw = noid_ivc_core::field_circuit::f128_to_u128(*lane);
+        for window in 0..per_lane.min(n_queries - query) {
+            proof.pcs_open.queries[query].position = ((raw >> (window * k_code)) & mask) as usize;
             query += 1;
         }
     }
@@ -2550,7 +2545,7 @@ mod tests {
     use super::*;
     use noid_ivc_core::challenger::{fs_pack_bytes_lanes, Challenger, FsLaneChallenger};
     use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout};
-    use noid_ivc_core::field_circuit::FsChannelUnionRecorder;
+    use noid_ivc_core::field_circuit::{f128_to_u128, FsChannelUnionRecorder};
 
     fn lanes_bytes(lanes: &[F128]) -> Vec<u8> {
         lanes

@@ -313,6 +313,14 @@ impl HistoryStepParentGeometry {
         self.child_layouts.len()
     }
 
+    pub(crate) fn child_layout(&self, slot: usize) -> Option<&DuplexLayout> {
+        self.child_layouts.get(slot)
+    }
+
+    pub(crate) fn r_prev_layout(&self, slot: usize) -> Option<&DuplexLayout> {
+        self.r_prev_layouts.get(slot)
+    }
+
     #[cfg(test)]
     pub(crate) fn child_block_index(&self, slot: usize) -> usize {
         debug_assert!(slot < self.tier_count());

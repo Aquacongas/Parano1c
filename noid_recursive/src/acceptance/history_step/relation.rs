@@ -239,9 +239,24 @@ pub struct HistoryStepRuntimeParts {
     parent_recursion_vk: LinkRegionSidecarVk,
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
     parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+    parent_geometry: HistoryStepParentGeometry,
 }
 
 impl HistoryStepRuntimeParts {
+    pub(super) fn from_canonical_geometry(
+        parent_recursion_vk: LinkRegionSidecarVk,
+        direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
+        parent_transcripts: [HistoryStepParentTranscriptLayout; HISTORY_STEP_TIER_SLOT_COUNT],
+        parent_geometry: HistoryStepParentGeometry,
+    ) -> Self {
+        Self {
+            parent_recursion_vk,
+            direct_block_vks,
+            parent_transcripts,
+            parent_geometry,
+        }
+    }
+
     pub fn new(
         parent_recursion_vk: LinkRegionSidecarVk,
         direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
@@ -286,6 +301,7 @@ impl HistoryStepRuntimeParts {
             parent_recursion_vk,
             direct_block_vks,
             parent_transcripts,
+            parent_geometry: geometry,
         })
     }
 
@@ -476,7 +492,7 @@ pub fn derive_history_step_runtime_parts(
             let entry = runtime.bank().entry(class_id);
             let (field_proof, commitment_root) =
                 shape_only_field_r1cs_proof(&entry.shape(), entry.pcs_params());
-            let mut envelope = HistoryStepProof {
+            let envelope = HistoryStepProof {
                 field_proof,
                 commitment: Commitment {
                     root: commitment_root,
@@ -496,14 +512,12 @@ pub fn derive_history_step_runtime_parts(
                     )?,
                 },
             };
-            patch_shape_only_parent_arm(&runtime, class_id, &mut envelope)?;
             let complete = run_scratch_parent_recording_pass(
                 &runtime,
                 class_id,
                 &envelope,
                 &entry.matrix_digest(),
                 &entry.post_commit_digest(),
-                false,
             )?;
             if complete
                 .child
@@ -555,7 +569,8 @@ impl HistoryStepRuntime {
         let HistoryStepRuntimeParts {
             parent_recursion_vk,
             direct_block_vks,
-            parent_transcripts,
+            parent_transcripts: _,
+            parent_geometry,
         } = parts;
         if parent_recursion_vk.transcript_digest()
             != bank
@@ -570,30 +585,6 @@ impl HistoryStepRuntime {
             if vk.transcript_digest() != bank.entry(class).direct_block_vk_digest() {
                 return Err(HistoryStepError::RuntimeBlockVk(slot));
             }
-        }
-        let parent_params = (0..HISTORY_STEP_TIER_SLOT_COUNT)
-            .map(|slot| {
-                let class = CanonicalHistoryStepClassId::new(slot)
-                    .expect("runtime parent tier is canonical");
-                bank.entry(class).pcs_params().clone()
-            })
-            .collect::<Vec<_>>();
-        let child_layouts = parent_transcripts
-            .iter()
-            .map(|transcript| transcript.child.clone())
-            .collect::<Vec<_>>();
-        let r_prev_layouts = parent_transcripts
-            .iter()
-            .map(|transcript| transcript.r_prev.clone())
-            .collect::<Vec<_>>();
-        let parent_geometry =
-            HistoryStepParentGeometry::new(&parent_params, child_layouts, r_prev_layouts)?;
-        if parent_geometry
-            .canonical_vk(bank.spec())?
-            .transcript_digest()
-            != parent_recursion_vk.transcript_digest()
-        {
-            return Err(HistoryStepError::RuntimeParentVk);
         }
         Ok(Self {
             bank,
@@ -1041,7 +1032,7 @@ impl ParentClassSelectorTrace {
 struct ScratchParentRecordingPass {
     child: Option<LayoutRecordedChannel>,
     r_prev: LayoutRecordedChannel,
-    challenge_values: Vec<F128>,
+    query_lane_values: Vec<F128>,
 }
 
 fn run_scratch_parent_recording_pass(
@@ -1050,7 +1041,6 @@ fn run_scratch_parent_recording_pass(
     envelope: &HistoryStepProof,
     matrix_digest: &[u8; 32],
     post_commit_digest: &[u8; 32],
-    allow_query_position_desync: bool,
 ) -> Result<ScratchParentRecordingPass, HistoryStepError> {
     let entry = runtime.bank().entry(class_id);
     let mut builder = FieldR1csBuilder::new_witness_only();
@@ -1074,75 +1064,61 @@ fn run_scratch_parent_recording_pass(
     let mut channel = FsChannelUnionRecorder::new(HISTORY_STEP_PROOF_DOMAIN);
     let mut child_recording = None;
     let mut sidecar_result = Ok(());
-    let mut drive = || {
-        verify_field_trace_deferred_region_with_post_commit_context_expr(
-            &mut builder,
-            &mut channel,
-            &entry.shape(),
-            entry.pcs_params(),
-            &statement_digest,
-            &root,
-            &proof,
-            runtime.bank().spec(),
-            &io,
-            &post_commit_digest,
-            Some(&mut obligations),
-            |builder, context| {
-                if let Err(error) = verify_link_region_sidecar_trace_post_commit(
-                    builder,
-                    context,
-                    runtime.parent_recursion_vk(),
-                    &envelope.sidecar.parent_recursion,
-                ) {
-                    sidecar_result = Err(HistoryStepError::sidecar(
-                        HistoryStepSidecarOperation::ScratchParentRecursionReplay,
-                        error,
-                    ));
-                    return;
-                }
-                match verify_block_region_sidecar_recorded_trace_post_commit(
-                    builder,
-                    context,
-                    runtime
-                        .direct_block_vk(class_id.current_slot())
-                        .expect("canonical parent arm has a direct-Block VK"),
-                    &envelope.sidecar.direct_block,
-                ) {
-                    Ok(recording) => child_recording = Some(recording),
-                    Err(error) => {
-                        sidecar_result = Err(HistoryStepError::sidecar(
-                            HistoryStepSidecarOperation::ScratchDirectBlockReplay,
-                            error,
-                        ))
-                    }
-                }
-            },
-        );
-    };
-    if allow_query_position_desync {
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(drive));
-        std::panic::set_hook(hook);
-        if let Err(payload) = outcome {
-            let expected = payload
-                .downcast_ref::<String>()
-                .is_some_and(|message| message.contains("query position desynced"))
-                || payload
-                    .downcast_ref::<&str>()
-                    .is_some_and(|message| message.contains("query position desynced"));
-            if !expected {
-                std::panic::resume_unwind(payload);
+    verify_field_trace_deferred_region_with_post_commit_context_expr(
+        &mut builder,
+        &mut channel,
+        &entry.shape(),
+        entry.pcs_params(),
+        &statement_digest,
+        &root,
+        &proof,
+        runtime.bank().spec(),
+        &io,
+        &post_commit_digest,
+        Some(&mut obligations),
+        |builder, context| {
+            if let Err(error) = verify_link_region_sidecar_trace_post_commit(
+                builder,
+                context,
+                runtime.parent_recursion_vk(),
+                &envelope.sidecar.parent_recursion,
+            ) {
+                sidecar_result = Err(HistoryStepError::sidecar(
+                    HistoryStepSidecarOperation::ScratchParentRecursionReplay,
+                    error,
+                ));
+                return;
             }
-        }
-    } else {
-        drive();
-    }
+            match verify_block_region_sidecar_recorded_trace_post_commit(
+                builder,
+                context,
+                runtime
+                    .direct_block_vk(class_id.current_slot())
+                    .expect("canonical parent arm has a direct-Block VK"),
+                &envelope.sidecar.direct_block,
+            ) {
+                Ok(recording) => child_recording = Some(recording),
+                Err(error) => {
+                    sidecar_result = Err(HistoryStepError::sidecar(
+                        HistoryStepSidecarOperation::ScratchDirectBlockReplay,
+                        error,
+                    ))
+                }
+            }
+        },
+    );
     sidecar_result?;
     let r_prev = channel.finish();
-    let challenge_values = r_prev
+    let query_lanes = history_step_query_lane_count(entry.pcs_params());
+    let query_lane_start = r_prev
+        .challenge_wires
+        .len()
+        .checked_sub(query_lanes)
+        .ok_or(HistoryStepError::ParentRecording)?;
+    let query_lane_values = r_prev
         .challenge_wires
         .iter()
+        .skip(query_lane_start)
         .map(|wire| wire.eval(builder.values()))
         .collect();
     Ok(ScratchParentRecordingPass {
@@ -1150,34 +1126,8 @@ fn run_scratch_parent_recording_pass(
             .as_ref()
             .map(|recording| capture_scratch_recording(recording, &builder)),
         r_prev: capture_scratch_recording(&r_prev, &builder),
-        challenge_values,
+        query_lane_values,
     })
-}
-
-fn patch_shape_only_parent_arm(
-    runtime: &HistoryStepRuntime,
-    class_id: CanonicalHistoryStepClassId,
-    envelope: &mut HistoryStepProof,
-) -> Result<(), HistoryStepError> {
-    let entry = runtime.bank().entry(class_id);
-    let first = run_scratch_parent_recording_pass(
-        runtime,
-        class_id,
-        envelope,
-        &entry.matrix_digest(),
-        &entry.post_commit_digest(),
-        true,
-    )?;
-    let lanes = history_step_query_lane_count(entry.pcs_params());
-    if first.challenge_values.len() < lanes {
-        return Err(HistoryStepError::ParentRecording);
-    }
-    super::super::trace::self_verify::patch_shape_only_query_positions(
-        &mut envelope.field_proof,
-        entry.pcs_params(),
-        &first.challenge_values[first.challenge_values.len() - lanes..],
-    );
-    Ok(())
 }
 
 fn shape_only_parent_arm(
@@ -1220,15 +1170,18 @@ fn shape_only_parent_arm(
             })?,
         },
     };
-    patch_shape_only_parent_arm(runtime, class_id, &mut envelope)?;
     let scratch = run_scratch_parent_recording_pass(
         runtime,
         class_id,
         &envelope,
         &entry.matrix_digest(),
         &entry.post_commit_digest(),
-        false,
     )?;
+    super::super::trace::self_verify::patch_shape_only_query_positions(
+        &mut envelope.field_proof,
+        entry.pcs_params(),
+        &scratch.query_lane_values,
+    );
     if scratch.child.is_none() {
         return Err(HistoryStepError::ParentRecording);
     }
@@ -1252,14 +1205,6 @@ fn prepare_parent_replay<'a>(
     let entry = bank.entry(class_id);
     let matrix_digest = entry.matrix_digest();
     let post_commit_digest = entry.post_commit_digest();
-    let actual_scratch = run_scratch_parent_recording_pass(
-        runtime,
-        class_id,
-        envelope,
-        &matrix_digest,
-        &post_commit_digest,
-        false,
-    )?;
     let live_slot = class_id.current_slot();
     let ghost_slot = 1usize
         .checked_sub(live_slot)
@@ -1268,13 +1213,16 @@ fn prepare_parent_replay<'a>(
         CanonicalHistoryStepClassId::new(ghost_slot).ok_or(HistoryStepError::InvalidClass)?;
     let (ghost_envelope, ghost_scratch) =
         shape_only_parent_arm(runtime, ghost_class, envelope.io.clone())?;
-    let child_layout = actual_scratch
-        .child
-        .as_ref()
+    let child_layout = runtime
+        .parent_geometry()
+        .child_layout(live_slot)
         .ok_or(HistoryStepError::ParentRecording)?
-        .layout
         .clone();
-    let r_prev_layout = actual_scratch.r_prev.layout.clone();
+    let r_prev_layout = runtime
+        .parent_geometry()
+        .r_prev_layout(live_slot)
+        .ok_or(HistoryStepError::ParentRecording)?
+        .clone();
 
     let mut challenger =
         LayoutRecordingChallenger::new(HISTORY_STEP_PROOF_DOMAIN, r_prev_layout.clone());

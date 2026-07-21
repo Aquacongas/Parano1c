@@ -394,7 +394,12 @@ impl HistoryStepRuntimeParts {
         )?;
         let parent_recursion_vk = geometry
             .canonical_vk(&crate::acceptance::history_step_bank::history_step_bank_io_spec())?;
-        HistoryStepRuntimeParts::new(parent_recursion_vk, direct_block_vks, parent_transcripts)
+        Ok(HistoryStepRuntimeParts::from_canonical_geometry(
+            parent_recursion_vk,
+            direct_block_vks,
+            parent_transcripts,
+            geometry,
+        ))
     }
 }
 
