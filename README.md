@@ -274,15 +274,15 @@ AVX2-era Macs remain supported. Each x86-64 binary selects wider
 AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available. ARM64 builds use
 NEON and PMULL. There is no separate legacy x86-64 release.
 
-Check out the version you want to build and generate the HistoryStep matrices
-locally. This is the trustless path: the machine derives and authenticates the
-pack instead of accepting matrix bytes supplied by the project. Keep the pack
-outside the repository's disposable `target/` tree:
+To reproduce a published release, check out the tag shown on its GitHub release
+page. Then generate the HistoryStep matrices locally. This is the trustless
+path: the machine derives and authenticates the pack instead of accepting
+matrix bytes supplied by the project. Keep the pack outside the repository's
+disposable `target/` tree:
 
 ```sh
 git clone https://github.com/ignotusnemo/paranoid.git
 cd paranoid
-git checkout v0.0.1
 
 mkdir -p ../paranoid-artifacts
 ./scripts/generate_history_step_pack.sh \
@@ -316,7 +316,7 @@ tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
 
 ## Status
 
-ParanO(1)d is version `0.0.1` and pre-genesis. No public network has launched.
+ParanO(1)d is pre-genesis. No public network has launched.
 
 Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the

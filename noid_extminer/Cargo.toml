@@ -1,6 +1,6 @@
 [package]
 name        = "noid-extminer"
-version     = "0.0.1"
+version.workspace = true
 edition     = "2021"
 license     = "Apache-2.0"
 description = "External Poseidon2b PoW miner for the Paranoid blockchain"
