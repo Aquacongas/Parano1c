@@ -65,6 +65,10 @@ pub enum ProcessCpuBudgetError {
     NotConfigured,
     #[error("process CPU budget requires at least one available logical CPU")]
     NoAvailableThreads,
+    #[error(
+        "requested CPU thread count {requested} is outside the host-visible range 1..={available}"
+    )]
+    InvalidThreadCount { requested: usize, available: usize },
     #[error("internal PoW phase is disabled for a proof-only process")]
     PowPhaseDisabled,
     #[error("failed to build {role} Rayon pool: {detail}")]
@@ -84,22 +88,41 @@ pub fn plan_process_cpu_budget(
     available_threads: usize,
     mode: ProcessCpuBudgetMode,
 ) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
+    plan_process_cpu_budget_with_threads(available_threads, available_threads, mode)
+}
+
+/// Calculate a fixed phase plan with an explicit worker limit.
+///
+/// The host-visible count remains part of the plan for truthful UI and logs;
+/// every CPU-heavy phase reuses exactly `worker_threads` workers. The default
+/// planner above continues to select every available thread.
+pub fn plan_process_cpu_budget_with_threads(
+    available_threads: usize,
+    worker_threads: usize,
+    mode: ProcessCpuBudgetMode,
+) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
     if available_threads == 0 {
         return Err(ProcessCpuBudgetError::NoAvailableThreads);
+    }
+    if worker_threads == 0 || worker_threads > available_threads {
+        return Err(ProcessCpuBudgetError::InvalidThreadCount {
+            requested: worker_threads,
+            available: available_threads,
+        });
     }
 
     let pow_phase_threads = match mode {
         ProcessCpuBudgetMode::ProofOnly => 0,
-        ProcessCpuBudgetMode::InternalMiner => available_threads,
+        ProcessCpuBudgetMode::InternalMiner => worker_threads,
     };
     let plan = ProcessCpuBudgetPlan {
         available_threads,
-        shared_pool_threads: available_threads,
+        shared_pool_threads: worker_threads,
         pow_phase_threads,
-        history_step_phase_threads: available_threads,
-        inbound_verifier_threads: available_threads,
+        history_step_phase_threads: worker_threads,
+        inbound_verifier_threads: worker_threads,
     };
-    debug_assert_eq!(plan.admitted_rayon_threads(), available_threads);
+    debug_assert_eq!(plan.admitted_rayon_threads(), worker_threads);
     Ok(plan)
 }
 
@@ -229,7 +252,21 @@ fn host_available_threads() -> usize {
 pub fn configure_process_cpu_budget(
     mode: ProcessCpuBudgetMode,
 ) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
-    let requested = plan_process_cpu_budget(host_available_threads(), mode)?;
+    configure_process_cpu_budget_with_threads(mode, None)
+}
+
+/// Configure the process pool with an optional startup worker limit.
+/// `None` preserves the default all-visible-CPU behavior.
+pub fn configure_process_cpu_budget_with_threads(
+    mode: ProcessCpuBudgetMode,
+    requested_threads: Option<usize>,
+) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
+    let available = host_available_threads();
+    let requested = plan_process_cpu_budget_with_threads(
+        available,
+        requested_threads.unwrap_or(available),
+        mode,
+    )?;
     if let Some(active) = PROCESS_CPU_BUDGET.get() {
         return if active.plan == requested {
             Ok(active.plan)
@@ -353,6 +390,29 @@ mod tests {
         );
         assert_eq!(default_plan.admitted_rayon_threads(), 12);
         assert_ne!(default_plan.pow_phase_threads, 1);
+    }
+
+    #[test]
+    fn explicit_worker_limit_is_shared_by_every_enabled_phase() {
+        assert_eq!(
+            plan_process_cpu_budget_with_threads(12, 8, ProcessCpuBudgetMode::InternalMiner)
+                .unwrap(),
+            ProcessCpuBudgetPlan {
+                available_threads: 12,
+                shared_pool_threads: 8,
+                pow_phase_threads: 8,
+                history_step_phase_threads: 8,
+                inbound_verifier_threads: 8,
+            }
+        );
+        assert!(matches!(
+            plan_process_cpu_budget_with_threads(12, 0, ProcessCpuBudgetMode::InternalMiner),
+            Err(ProcessCpuBudgetError::InvalidThreadCount { .. })
+        ));
+        assert!(matches!(
+            plan_process_cpu_budget_with_threads(12, 13, ProcessCpuBudgetMode::InternalMiner),
+            Err(ProcessCpuBudgetError::InvalidThreadCount { .. })
+        ));
     }
 
     #[test]

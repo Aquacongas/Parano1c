@@ -513,6 +513,7 @@ impl WalletOps for WalletHandle {
                     address: u.address.to_bech32(),
                     key_index: u.key_index,
                     confirmed_height: u.confirmed_height,
+                    reserved: w.pending_input_slots.contains(&u.slot_index),
                 })
                 .collect(),
         }

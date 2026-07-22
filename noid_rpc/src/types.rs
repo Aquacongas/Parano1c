@@ -160,6 +160,9 @@ pub struct WalletUtxoInfo {
     pub address: String,
     pub key_index: u32,
     pub confirmed_height: u64,
+    /// True while a pending mempool transaction reserves this input.
+    #[serde(default)]
+    pub reserved: bool,
 }
 
 /// A historical transaction entry.
@@ -321,6 +324,21 @@ pub struct MiningInfo {
     pub active_slot_count: u64,
 }
 
+/// Runtime status of the daemon which serves this RPC endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    /// Durable initial-sync readiness used by the production miner.
+    pub synced: bool,
+    /// Whether this process owns the built-in miner.
+    pub mining: bool,
+    /// Runtime-selected CPU implementation.
+    pub backend: String,
+    /// Logical CPUs visible to the process.
+    pub available_threads: usize,
+    /// Workers in the single shared proof/mining pool.
+    pub worker_threads: usize,
+}
+
 /// Current UTXO state dimensions and fill metrics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateInfo {
@@ -347,6 +365,18 @@ pub struct StateInfo {
     /// Encoded bytes exclude MDBX page and owner-index overhead, which depend
     /// on the storage engine and workload.
     pub state_size_human: String,
+}
+
+/// Bounded occupancy map of the live state for operator and wallet UIs.
+///
+/// The map has at most 256 buckets. At the launch `m24` state each bucket is
+/// one physical segment; after state expansion adjacent segments are folded
+/// into the same stable 16×16 atlas cell.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateMapInfo {
+    pub log_slots: u32,
+    pub bucket_capacity: u64,
+    pub live_counts: Vec<u64>,
 }
 
 /// Result of `validateAddress`.
@@ -410,4 +440,14 @@ pub struct MempoolInfo {
     pub fee_floor: u64,
     /// All pending transactions.
     pub txs: Vec<MempoolTxInfo>,
+}
+
+/// Constant-size mempool pressure summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MempoolStats {
+    pub size: usize,
+    pub capacity: usize,
+    pub intent_bytes: u64,
+    pub max_intent_bytes: u64,
+    pub fee_floor: u64,
 }

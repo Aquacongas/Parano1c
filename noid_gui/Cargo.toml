@@ -1,0 +1,30 @@
+[package]
+name = "noid_gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Temporary local-network bootstrap surface. Build explicitly with
+# `--features dev-genesis`; remove this feature before the public GUI merge.
+dev-genesis = []
+
+[[bin]]
+name = "paranoid-gui"
+path = "src/main.rs"
+
+[dependencies]
+iced = { version = "0.14", features = [
+    "advanced-shaping",
+    "canvas",
+    "fira-sans",
+    "qr_code",
+    "tokio",
+] }
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = "0.33"
+tokio = { workspace = true }

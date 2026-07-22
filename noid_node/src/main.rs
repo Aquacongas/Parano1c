@@ -320,6 +320,11 @@ struct Cli {
     #[arg(long, value_name = "HEX")]
     miner_address: Option<String>,
 
+    /// Logical CPU threads used by the built-in miner and its proof phases.
+    /// Defaults to every CPU visible to the process.
+    #[arg(long, value_name = "N")]
+    cpu_threads: Option<usize>,
+
     /// Data directory for the MDBX database and wallet key.
     /// Default: ~/.paranoid/data
     #[arg(long, value_name = "PATH")]
@@ -523,6 +528,9 @@ async fn main() -> anyhow::Result<()> {
             "--mining-key is ignored in --mode miner (internal miner needs no bearer token)"
         );
     }
+    if cli.cpu_threads.is_some() && cli.mode != NodeMode::Miner {
+        anyhow::bail!("--cpu-threads requires --mode miner");
+    }
     // allow_custom_coinbase only makes sense with extminer mode
     if cli.allow_custom_coinbase && cli.mode != NodeMode::Extminer {
         anyhow::bail!("--allow-custom-coinbase requires --mode extminer");
@@ -581,8 +589,15 @@ async fn main() -> anyhow::Result<()> {
     } else {
         noid_miner::ProcessCpuBudgetMode::ProofOnly
     };
-    let cpu_plan = noid_miner::configure_process_cpu_budget(cpu_budget_mode)
-        .context("configure process CPU budget")?;
+    let cpu_plan = noid_miner::configure_process_cpu_budget_with_threads(
+        cpu_budget_mode,
+        if cli.mode == NodeMode::Miner {
+            cli.cpu_threads
+        } else {
+            None
+        },
+    )
+    .context("configure process CPU budget")?;
     tracing::info!(
         backend = %noid_core::cpu::selected_backend(),
         threads = cpu_plan.shared_pool_threads,
@@ -898,6 +913,11 @@ async fn main() -> anyhow::Result<()> {
         wallet,
         Arc::clone(&wallet_operation_gate),
         p2p.cmd_tx.clone(),
+        initial_sync_ready_rx.clone(),
+        cfg.mining.enabled,
+        noid_core::cpu::selected_backend().to_string(),
+        cpu_plan.available_threads,
+        cpu_plan.shared_pool_threads,
         history_step_runtime.clone(),
         history_step_ghost.clone(),
         external_mining_attempts,

@@ -30,11 +30,11 @@ use noid_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
-    MempoolInfo, MempoolTxInfo, MiningInfo, ReceiptInputInfo, ReceiptOutputInfo,
-    ReceiptSummaryInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo,
-    WalletBalance, WalletHistoryEntry, WalletInputLimitExceeded, WalletScanResult, WalletSendPlan,
-    WalletSendResult, WalletStatus, WalletUtxoInfo, WALLET_INPUT_LIMIT_EXCEEDED_CODE,
-    WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus, ReceiptInputInfo,
+    ReceiptOutputInfo, ReceiptSummaryInfo, ReceiptVerifyResult, SlotInfo, StateInfo, StateMapInfo,
+    TxInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletInputLimitExceeded,
+    WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -654,6 +654,13 @@ pub struct RpcHandler {
     pub wallet_operation_gate: Arc<tokio::sync::Mutex<()>>,
     /// Channel to the P2P layer for queries (peer count, etc.).
     pub p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    /// The same durable readiness watch consumed by the internal miner.
+    pub initial_sync_ready: tokio::sync::watch::Receiver<bool>,
+    /// Immutable process role and CPU plan selected at startup.
+    pub internal_mining_enabled: bool,
+    pub cpu_backend: String,
+    pub available_threads: usize,
+    pub worker_threads: usize,
     /// One-shot sender: firing this triggers graceful daemon shutdown
     /// (same effect as Ctrl-C). Wrapped in Mutex so the RPC handler can
     /// take ownership on first call.
@@ -1197,6 +1204,34 @@ impl ParanoidApiServer for RpcHandler {
         })
     }
 
+    async fn get_state_map(&self) -> RpcResult<StateMapInfo> {
+        use noid_chain::fri_state::LOG_SEGMENT_SIZE;
+
+        const MAX_BUCKETS: usize = 256;
+        let chain = self.chain.read().await;
+        let log_slots = chain.tip_header().log_slots;
+        let num_segments = if log_slots as usize > LOG_SEGMENT_SIZE {
+            1usize << (log_slots as usize - LOG_SEGMENT_SIZE)
+        } else {
+            1
+        };
+        let bucket_count = num_segments.min(MAX_BUCKETS).max(1);
+        let capacity = 1u64.checked_shl(log_slots).unwrap_or(u64::MAX);
+        let bucket_capacity = capacity / bucket_count as u64;
+        let mut live_counts = vec![0u64; bucket_count];
+        for segment_id in 0..num_segments {
+            let bucket = segment_id.saturating_mul(bucket_count) / num_segments;
+            live_counts[bucket] = live_counts[bucket].saturating_add(u64::from(
+                chain.state.state.segment_live_count(segment_id as u16),
+            ));
+        }
+        Ok(StateMapInfo {
+            log_slots,
+            bucket_capacity,
+            live_counts,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // New chain methods
     // -----------------------------------------------------------------------
@@ -1323,6 +1358,16 @@ impl ParanoidApiServer for RpcHandler {
     async fn get_peer_count(&self) -> RpcResult<usize> {
         let count = noid_p2p::P2PNetwork::peer_count_via(&self.p2p_cmd).await;
         Ok(count)
+    }
+
+    async fn get_node_status(&self) -> RpcResult<NodeStatus> {
+        Ok(NodeStatus {
+            synced: *self.initial_sync_ready.borrow(),
+            mining: self.internal_mining_enabled,
+            backend: self.cpu_backend.clone(),
+            available_threads: self.available_threads,
+            worker_threads: self.worker_threads,
+        })
     }
 
     async fn estimate_fee(&self, n_outputs: u32) -> RpcResult<u64> {
@@ -1870,6 +1915,17 @@ impl ParanoidApiServer for RpcHandler {
             txs,
         })
     }
+
+    async fn get_mempool_stats(&self) -> RpcResult<MempoolStats> {
+        let usage = self.mempool.usage_snapshot().await;
+        Ok(MempoolStats {
+            size: usage.size,
+            capacity: usage.capacity,
+            intent_bytes: usage.intent_bytes as u64,
+            max_intent_bytes: usage.max_intent_bytes as u64,
+            fee_floor: usage.fee_floor,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2128,6 +2184,11 @@ pub async fn start_rpc_server(
     wallet: Arc<dyn WalletOps + Send + Sync>,
     wallet_operation_gate: WalletOperationGate,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    initial_sync_ready: tokio::sync::watch::Receiver<bool>,
+    internal_mining_enabled: bool,
+    cpu_backend: String,
+    available_threads: usize,
+    worker_threads: usize,
     history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
     history_step_ghost: Option<
         Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
@@ -2149,6 +2210,11 @@ pub async fn start_rpc_server(
         wallet,
         wallet_operation_gate,
         p2p_cmd,
+        initial_sync_ready,
+        internal_mining_enabled,
+        cpu_backend,
+        available_threads,
+        worker_threads,
         stop_tx,
         mining_api_enabled,
         mining_payout_address,

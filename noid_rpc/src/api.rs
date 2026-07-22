@@ -7,9 +7,9 @@ use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
     AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate, MempoolInfo,
-    MiningInfo, ReceiptVerifyResult, SlotInfo, StateInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
-    WalletUtxoInfo,
+    MempoolStats, MiningInfo, NodeStatus, ReceiptVerifyResult, SlotInfo, StateInfo, StateMapInfo,
+    TxInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
+    WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -65,6 +65,10 @@ pub trait ParanoidApi {
     #[method(name = "getStateInfo")]
     async fn get_state_info(&self) -> RpcResult<StateInfo>;
 
+    /// Bounded 16×16 occupancy atlas of the current live state.
+    #[method(name = "getStateMap")]
+    async fn get_state_map(&self) -> RpcResult<StateMapInfo>;
+
     /// Confirmed transaction info by derived txid. Uses the permanent tx index.
     /// Returns null if hash is unknown (not yet confirmed or never submitted).
     #[method(name = "getTx")]
@@ -86,6 +90,10 @@ pub trait ParanoidApi {
     /// Number of currently connected P2P peers.
     #[method(name = "getPeerCount")]
     async fn get_peer_count(&self) -> RpcResult<usize>;
+
+    /// Daemon sync, mining, CPU backend and worker-pool status.
+    #[method(name = "getNodeStatus")]
+    async fn get_node_status(&self) -> RpcResult<NodeStatus>;
 
     /// Estimated minimum fee in μNOID for a transaction with `n_outputs` outputs.
     /// Simple u64 method: assumes one live input.
@@ -139,6 +147,10 @@ pub trait ParanoidApi {
     /// Pending transaction count (lighter than getMempoolInfo).
     #[method(name = "getMempoolSize")]
     async fn get_mempool_size(&self) -> RpcResult<usize>;
+
+    /// Constant-size transaction-count and retained-byte pressure summary.
+    #[method(name = "getMempoolStats")]
+    async fn get_mempool_stats(&self) -> RpcResult<MempoolStats>;
 
     /// Single pending transaction by hash. Returns null if not in mempool.
     #[method(name = "getMempoolEntry")]

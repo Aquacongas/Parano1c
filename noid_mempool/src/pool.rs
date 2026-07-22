@@ -107,6 +107,16 @@ pub struct MempoolMetadataSnapshot {
     pub entries: Vec<MempoolEntryMetadata>,
 }
 
+/// Constant-size lock-consistent mempool pressure snapshot for status UIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MempoolUsageSnapshot {
+    pub size: usize,
+    pub capacity: usize,
+    pub intent_bytes: usize,
+    pub max_intent_bytes: usize,
+    pub fee_floor: u64,
+}
+
 /// Minimal owned block-template selection.
 ///
 /// Raw `PagedSpendIntent` bytes are a networking cache and are never cloned into the
@@ -670,6 +680,19 @@ impl AsyncMempool {
         }
     }
 
+    /// Read count and retained-byte pressure without cloning entry metadata or
+    /// any transaction/proof payload.
+    pub async fn usage_snapshot(&self) -> MempoolUsageSnapshot {
+        let state = self.state.lock().await;
+        MempoolUsageSnapshot {
+            size: state.pool.len(),
+            capacity: self.config.capacity,
+            intent_bytes: state.pool.total_intent_bytes(),
+            max_intent_bytes: self.config.max_total_intent_bytes,
+            fee_floor: state.floor.current(),
+        }
+    }
+
     /// O(1) compact lookup without cloning the entry's retained byte payloads.
     pub async fn get_entry_metadata(&self, hash: &TxBodyHash) -> Option<MempoolEntryMetadata> {
         let st = self.state.lock().await;
@@ -1072,6 +1095,14 @@ mod tests {
 
         let single = pool.get_entry_metadata(&txid).await.unwrap();
         assert_eq!(single, snapshot.entries[0]);
+        let usage = pool.usage_snapshot().await;
+        assert_eq!(usage.size, 1);
+        assert_eq!(usage.capacity, 8);
+        assert_eq!(usage.intent_bytes, 2 * 1024 * 1024);
+        assert_eq!(
+            usage.max_intent_bytes,
+            noid_chain::consensus::wire_limits::MAX_MEMPOOL_BYTES
+        );
         assert_eq!(
             pool.state.lock().await.pool.total_intent_bytes(),
             2 * 1024 * 1024

@@ -44,8 +44,8 @@ use noid_poseidon2b::primitives::Address;
 
 use crate::block_production::{PreparedBlockAttempt, ProvedBlock};
 use crate::cpu_budget::{
-    configure_process_cpu_budget, install_history_step_phase_cpu, install_pow_phase_cpu,
-    ProcessCpuBudgetMode,
+    configure_process_cpu_budget, configured_process_cpu_budget, install_history_step_phase_cpu,
+    install_pow_phase_cpu, ProcessCpuBudgetMode,
 };
 use crate::proof_capacity::AdaptiveProofCapacity;
 use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
@@ -219,10 +219,16 @@ impl BlockMiner {
         >,
     ) -> (Self, broadcast::Receiver<MinerEvent>) {
         let (events, rx) = broadcast::channel(32);
-        let cpu_plan = configure_process_cpu_budget(ProcessCpuBudgetMode::InternalMiner)
+        let cpu_plan = configured_process_cpu_budget()
+            .map(Ok)
+            .unwrap_or_else(|| configure_process_cpu_budget(ProcessCpuBudgetMode::InternalMiner))
             .unwrap_or_else(|error| {
                 panic!("invalid process CPU budget for internal miner: {error}")
             });
+        assert!(
+            cpu_plan.pow_phase_threads > 0,
+            "internal miner requires a process CPU budget with PoW enabled"
+        );
         let pow_threads = cpu_plan.pow_phase_threads;
         let history_step_threads = cpu_plan.history_step_phase_threads;
         tracing::debug!(
