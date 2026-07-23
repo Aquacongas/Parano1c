@@ -801,6 +801,10 @@ impl Drop for ExternalMiningProvingLease {
 pub struct RpcHandler {
     pub chain: Arc<RwLock<MdbxChainContext>>,
     pub mempool: AsyncMempool,
+    /// Shared mempool state with a local-only CPU executor for wallet
+    /// authorization verification. P2P and public submitTx keep the ordinary
+    /// inbound executor and cannot acquire wallet priority over PoW.
+    wallet_submission_mempool: AsyncMempool,
     pub wallet: Arc<dyn WalletOps + Send + Sync>,
     /// Serializes stateful wallet RPC operations from snapshot/reload through
     /// proving and mempool admission. The wallet's short synchronous mutex is
@@ -2370,14 +2374,18 @@ impl ParanoidApiServer for RpcHandler {
 
             let wallet = Arc::clone(&self.wallet);
             let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
-                wallet.build_send(
-                    to_address,
-                    amount_micronoid,
-                    plan.fee_micronoid,
-                    epoch_anchor,
-                    slot_hints,
-                    log_slots,
-                )
+                noid_miner::install_wallet_proof_cpu(|| {
+                    wallet.build_send(
+                        to_address,
+                        amount_micronoid,
+                        plan.fee_micronoid,
+                        epoch_anchor,
+                        slot_hints,
+                        log_slots,
+                    )
+                })
+                .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+                .and_then(|result| result)
             })
             .await
             {
@@ -2436,7 +2444,11 @@ impl ParanoidApiServer for RpcHandler {
                     break;
                 }
             };
-            match self.mempool.submit(intent, intent_bytes).await {
+            match self
+                .wallet_submission_mempool
+                .submit(intent, intent_bytes)
+                .await
+            {
                 Ok(txid) => {
                     reservation.commit();
                     if attempt > 0 {
@@ -2868,9 +2880,20 @@ pub async fn start_rpc_server(
 )> {
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let stop_tx = Arc::new(tokio::sync::Mutex::new(Some(stop_tx)));
+    let wallet_submission_mempool =
+        mempool
+            .clone()
+            .with_authorization_verification_executor(Arc::new(
+                |task: noid_mempool::AuthorizationVerificationTask| {
+                    noid_miner::install_wallet_verifier_cpu(task).map_err(|error| {
+                        format!("wallet verification CPU admission failed: {error}")
+                    })?
+                },
+            ));
     let handler = RpcHandler {
         chain,
         mempool,
+        wallet_submission_mempool,
         wallet,
         wallet_operation_gate,
         p2p_cmd,

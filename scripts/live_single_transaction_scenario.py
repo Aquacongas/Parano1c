@@ -5,6 +5,11 @@ The scenario deliberately uses one node so P2P/mempool propagation cannot
 hide the local wallet -> mempool -> miner -> canonical block path.  Network
 propagation is covered by a separate live scenario. Environment parameters
 select the input/page shape, but every invocation remains one fresh scenario.
+
+The miner uses its default all-visible-CPU budget. The wallet submission must
+enter the same fixed pool through the local-only WalletProof and WalletVerify
+phases and finish inside the GUI's 120-second RPC boundary; a second Rayon
+worker set would violate this scenario.
 """
 
 import datetime
@@ -282,6 +287,11 @@ def main():
         reached = wait_height_at_least(
             MINE_TO_HEIGHT, timeout=max(300, MINE_TO_HEIGHT * 45)
         )
+        node_status = rpc("getNodeStatus")
+        require(
+            node_status["worker_threads"] == node_status["available_threads"],
+            f"scenario did not saturate the visible CPU budget: {node_status}",
+        )
         scan = rpc("walletScan", timeout=120)
         before = rpc("walletGetBalance")
         require(before["spendable_micronoid"] > PAYMENT_MICRONOID, f"sender not funded: {before}")
@@ -308,6 +318,10 @@ def main():
         proof_started = time.monotonic()
         sent = rpc("walletSend", [recipient["address"], PAYMENT_MICRONOID, 0], timeout=300)
         proof_elapsed = time.monotonic() - proof_started
+        require(
+            proof_elapsed < 120,
+            f"walletSend exceeded the GUI timeout boundary: {proof_elapsed:.3f}s",
+        )
         txid = sent["txid"]
         require(
             sent["input_count"] == EXPECTED_INPUTS
@@ -383,6 +397,37 @@ def main():
             f"{accepted}, expected physical txs={expected_physical_txs}",
         )
         require("wallet_send deterministic plan ready" in miner_text, "wallet plan missing from log")
+        wallet_phase = re.search(
+            r'CPU phase entered shared all-core Rayon pool '
+            r'phase="WalletProof" phase_threads=(\d+) shared_pool_threads=(\d+)',
+            miner_text,
+        )
+        require(wallet_phase is not None, "wallet proof bypassed the shared process CPU pool")
+        require(
+            int(wallet_phase.group(1)) == int(node_status["worker_threads"])
+            and int(wallet_phase.group(2)) == int(node_status["worker_threads"]),
+            f"wallet proof used the wrong CPU budget: {wallet_phase.group(0)}",
+        )
+        verification_phase = re.search(
+            r'CPU phase entered shared all-core Rayon pool '
+            r'phase="WalletVerify" phase_threads=(\d+) shared_pool_threads=(\d+) '
+            r"pool_queue_ms=(\d+)",
+            miner_text[wallet_phase.end() :],
+        )
+        require(
+            verification_phase is not None,
+            "wallet submission did not enter shared-pool admission verification",
+        )
+        require(
+            int(verification_phase.group(1)) == int(node_status["worker_threads"])
+            and int(verification_phase.group(2)) == int(node_status["worker_threads"]),
+            f"wallet admission verification used the wrong CPU budget: {verification_phase.group(0)}",
+        )
+        require(
+            int(verification_phase.group(3)) < 5_000,
+            "wallet admission verification starved behind background PoW: "
+            f"{verification_phase.group(0)}",
+        )
         require(
             "mining template ready" in miner_text
             and f"n_txs={expected_physical_txs}" in miner_text,

@@ -6,7 +6,9 @@
 //! PoW is computed over the fixed semantic header field schedule. Detached
 //! nonce-independent witness data is prepared before this phase. The search
 //! then owns the miner's shared all-core pool until it finds a nonce or is
-//! cancelled; HistoryStep proving starts only after the search has drained.
+//! cancelled. Latency-sensitive wallet proof and admission verification also
+//! ask the search to drain at its next batch boundary; HistoryStep proving
+//! starts only after the search has drained.
 //!
 
 use noid_chain::block_header::BlockHeader;
@@ -62,7 +64,7 @@ pub fn search_pow_parallel(
     let fields = pow_header_fields(header_template);
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || crate::cpu_budget::pow_preemption_requested() {
             return None;
         }
 
@@ -82,7 +84,9 @@ pub fn search_pow_parallel(
                 let mut nonce = thread_start;
 
                 while nonce < thread_end {
-                    if cancel.load(Ordering::Relaxed) {
+                    if cancel.load(Ordering::Relaxed)
+                        || crate::cpu_budget::pow_preemption_requested()
+                    {
                         return None;
                     }
                     let n = ((thread_end - nonce).min(DIGEST_BATCH as u128)) as usize;
@@ -105,7 +109,7 @@ pub fn search_pow_parallel(
         }
 
         // Check cancellation before next chunk.
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Relaxed) || crate::cpu_budget::pow_preemption_requested() {
             return None;
         }
 

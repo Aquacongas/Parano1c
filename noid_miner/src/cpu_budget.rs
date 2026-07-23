@@ -1,17 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Process-wide CPU admission for internal PoW and HistoryStep work.
+//! Process-wide CPU admission for internal PoW, HistoryStep, verification, and
+//! wallet-proof work.
 //!
 //! Block production is a sequence of CPU-heavy phases, not a permanent CPU
 //! split: all workers search PoW, then the same workers prove HistoryStep. The
 //! process therefore owns exactly one fixed Rayon pool sized to the complete
 //! host-visible CPU budget. Inbound verification also enters that pool, so no
 //! caller can activate a second full worker set.
+//!
+//! A local wallet proof and its admission verification are latency-sensitive
+//! and have priority over the interruptible PoW phase. Registering either
+//! makes PoW stop at its next cancellation checkpoint. Existing P2P/snapshot
+//! verification remains work-conserving beside mining and gains no authority
+//! to cancel PoW. An already-running HistoryStep drains before local wallet
+//! work starts; network verification keeps its existing concurrent policy.
 
 use std::sync::{
-    atomic::{AtomicU8, Ordering},
-    Arc, OnceLock,
+    atomic::{AtomicU8, AtomicUsize, Ordering},
+    Arc, Condvar, Mutex, OnceLock,
 };
 use std::time::Instant;
 
@@ -130,6 +138,9 @@ struct ProcessCpuBudget {
     plan: ProcessCpuBudgetPlan,
     phase_pool: Arc<rayon::ThreadPool>,
     observed_phases: AtomicU8,
+    phase_admission: Mutex<PhaseAdmissionState>,
+    phase_ready: Condvar,
+    wallet_priority_requests: AtomicUsize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +148,8 @@ enum ProcessCpuPhase {
     Pow,
     HistoryStep,
     InboundVerify,
+    WalletProof,
+    WalletVerify,
 }
 
 impl ProcessCpuPhase {
@@ -145,6 +158,8 @@ impl ProcessCpuPhase {
             Self::Pow => "PoW",
             Self::HistoryStep => "HistoryStep",
             Self::InboundVerify => "InboundVerify",
+            Self::WalletProof => "WalletProof",
+            Self::WalletVerify => "WalletVerify",
         }
     }
 
@@ -153,7 +168,45 @@ impl ProcessCpuPhase {
             Self::Pow => 1 << 0,
             Self::HistoryStep => 1 << 1,
             Self::InboundVerify => 1 << 2,
+            Self::WalletProof => 1 << 3,
+            Self::WalletVerify => 1 << 4,
         }
+    }
+
+    const fn is_wallet_priority(self) -> bool {
+        matches!(self, Self::WalletProof | Self::WalletVerify)
+    }
+}
+
+#[derive(Default)]
+struct PhaseAdmissionState {
+    active_exclusive: Option<ProcessCpuPhase>,
+}
+
+struct PhaseAdmissionGuard<'a> {
+    budget: &'a ProcessCpuBudget,
+    phase: ProcessCpuPhase,
+}
+
+impl Drop for PhaseAdmissionGuard<'_> {
+    fn drop(&mut self) {
+        let mut admission = self
+            .budget
+            .phase_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        debug_assert_ne!(self.phase, ProcessCpuPhase::InboundVerify);
+        debug_assert_eq!(admission.active_exclusive, Some(self.phase));
+        admission.active_exclusive = None;
+        if self.phase.is_wallet_priority() {
+            let previous = self
+                .budget
+                .wallet_priority_requests
+                .fetch_sub(1, Ordering::SeqCst);
+            debug_assert!(previous > 0);
+        }
+        drop(admission);
+        self.budget.phase_ready.notify_all();
     }
 }
 
@@ -187,7 +240,48 @@ impl ProcessCpuBudget {
             plan,
             phase_pool,
             observed_phases: AtomicU8::new(0),
+            phase_admission: Mutex::new(PhaseAdmissionState::default()),
+            phase_ready: Condvar::new(),
+            wallet_priority_requests: AtomicUsize::new(0),
         })
+    }
+
+    fn admit_phase(&self, phase: ProcessCpuPhase) -> PhaseAdmissionGuard<'_> {
+        debug_assert_ne!(phase, ProcessCpuPhase::InboundVerify);
+        if phase.is_wallet_priority() {
+            // Publish before taking the admission lock so active PoW workers
+            // and newly queued block-production phases yield to the local user.
+            self.wallet_priority_requests.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut admission = self
+            .phase_admission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if phase.is_wallet_priority() {
+            while admission.active_exclusive.is_some() {
+                admission = self
+                    .phase_ready
+                    .wait(admission)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            admission.active_exclusive = Some(phase);
+        } else {
+            // PoW and HistoryStep remain mutually exclusive. Neither may jump
+            // ahead of a published local-wallet request.
+            while admission.active_exclusive.is_some() || self.wallet_priority_requested() {
+                admission = self
+                    .phase_ready
+                    .wait(admission)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            admission.active_exclusive = Some(phase);
+        }
+        drop(admission);
+        PhaseAdmissionGuard {
+            budget: self,
+            phase,
+        }
     }
 
     fn install_phase<R: Send>(
@@ -199,10 +293,28 @@ impl ProcessCpuBudget {
             return self.run_phase_operation(phase, 0, true, operation);
         }
         let queued_at = Instant::now();
+        if phase == ProcessCpuPhase::InboundVerify {
+            // Preserve the original network behavior exactly: verification is
+            // work-conserving beside every other phase and never enters the
+            // local-wallet priority gate.
+            return self.phase_pool.install(|| {
+                let pool_queue_ms = queued_at.elapsed().as_millis() as u64;
+                self.run_phase_operation(phase, pool_queue_ms, false, operation)
+            });
+        }
+        let _admission = self.admit_phase(phase);
         self.phase_pool.install(|| {
             let pool_queue_ms = queued_at.elapsed().as_millis() as u64;
             self.run_phase_operation(phase, pool_queue_ms, false, operation)
         })
+    }
+
+    fn wallet_priority_requested(&self) -> bool {
+        self.wallet_priority_requests.load(Ordering::Acquire) > 0
+    }
+
+    fn pow_preemption_requested(&self) -> bool {
+        self.wallet_priority_requested()
     }
 
     fn run_phase_operation<R>(
@@ -344,11 +456,46 @@ pub fn install_history_step_phase_cpu<R: Send>(
 }
 
 /// Run inbound terminal verification on the same fixed process pool as PoW
-/// and HistoryStep. This admits no independent verifier worker set.
+/// and HistoryStep. This admits no independent verifier worker set and
+/// preserves the existing work-conserving network policy beside mining.
 pub fn install_inbound_verifier_cpu<R: Send>(
     operation: impl FnOnce() -> R + Send,
 ) -> Result<R, ProcessCpuBudgetError> {
     Ok(process_cpu_budget()?.install_phase(ProcessCpuPhase::InboundVerify, operation))
+}
+
+/// Run a latency-sensitive local wallet authorization proof on the same fixed
+/// process pool as block production.
+///
+/// The request preempts only interruptible PoW. An already-running
+/// HistoryStep remains atomic and drains first; network verification keeps its
+/// existing work-conserving behavior.
+pub fn install_wallet_proof_cpu<R: Send>(
+    operation: impl FnOnce() -> R + Send,
+) -> Result<R, ProcessCpuBudgetError> {
+    Ok(process_cpu_budget()?.install_phase(ProcessCpuPhase::WalletProof, operation))
+}
+
+/// Run the authorization verification for a locally built wallet transaction.
+///
+/// Unlike ordinary inbound network verification, this remains part of the
+/// latency-sensitive GUI submission and preempts interruptible PoW.
+pub fn install_wallet_verifier_cpu<R: Send>(
+    operation: impl FnOnce() -> R + Send,
+) -> Result<R, ProcessCpuBudgetError> {
+    Ok(process_cpu_budget()?.install_phase(ProcessCpuPhase::WalletVerify, operation))
+}
+
+/// Whether latency-sensitive local wallet work is waiting for or currently
+/// owns the shared pool.
+///
+/// PoW polls this alongside its ordinary cancellation flag. Keeping the signal
+/// inside the CPU budget prevents the RPC and miner layers from sharing a
+/// second lifecycle channel. Network verification does not set this signal.
+pub(crate) fn pow_preemption_requested() -> bool {
+    PROCESS_CPU_BUDGET
+        .get()
+        .is_some_and(|budget| budget.pow_preemption_requested())
 }
 
 #[cfg(test)]
@@ -416,15 +563,19 @@ mod tests {
     }
 
     #[test]
-    fn pow_history_and_inbound_verifier_use_one_twelve_worker_pool() {
+    fn every_cpu_phase_uses_one_twelve_worker_pool() {
         let plan = plan_process_cpu_budget(12, ProcessCpuBudgetMode::InternalMiner).unwrap();
         let budget = ProcessCpuBudget::build(plan).unwrap();
 
         let pow_handle = budget.phase_pool();
         let history_handle = budget.phase_pool();
         let inbound_handle = budget.phase_pool();
+        let wallet_handle = budget.phase_pool();
+        let wallet_verify_handle = budget.phase_pool();
         assert!(Arc::ptr_eq(&pow_handle, &history_handle));
         assert!(Arc::ptr_eq(&pow_handle, &inbound_handle));
+        assert!(Arc::ptr_eq(&pow_handle, &wallet_handle));
+        assert!(Arc::ptr_eq(&pow_handle, &wallet_verify_handle));
 
         assert_eq!(
             budget.install_phase(ProcessCpuPhase::Pow, rayon::current_num_threads),
@@ -438,6 +589,122 @@ mod tests {
             budget.install_phase(ProcessCpuPhase::InboundVerify, rayon::current_num_threads),
             12
         );
+        assert_eq!(
+            budget.install_phase(ProcessCpuPhase::WalletProof, rayon::current_num_threads),
+            12
+        );
+        assert_eq!(
+            budget.install_phase(ProcessCpuPhase::WalletVerify, rayon::current_num_threads),
+            12
+        );
+    }
+
+    #[test]
+    fn wallet_proof_preempts_pow_and_beats_an_already_queued_phase() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let plan = plan_process_cpu_budget_with_threads(2, 2, ProcessCpuBudgetMode::InternalMiner)
+            .unwrap();
+        let budget = Arc::new(ProcessCpuBudget::build(plan).unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (pow_started_tx, pow_started_rx) = mpsc::sync_channel(1);
+
+        let pow_budget = Arc::clone(&budget);
+        let pow_priority = Arc::clone(&budget);
+        let pow_events = Arc::clone(&events);
+        let pow = std::thread::spawn(move || {
+            pow_budget.install_phase(ProcessCpuPhase::Pow, move || {
+                pow_events.lock().unwrap().push("pow-start");
+                pow_started_tx.send(()).unwrap();
+                while !pow_priority.pow_preemption_requested() {
+                    std::thread::yield_now();
+                }
+                pow_events.lock().unwrap().push("pow-stop");
+            });
+        });
+        pow_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("PoW phase did not start");
+
+        // Queue ordinary work first. The later wallet request must still win
+        // admission after it asks the active PoW phase to drain.
+        let history_budget = Arc::clone(&budget);
+        let history_events = Arc::clone(&events);
+        let history = std::thread::spawn(move || {
+            history_budget.install_phase(ProcessCpuPhase::HistoryStep, move || {
+                history_events.lock().unwrap().push("history");
+            });
+        });
+
+        let wallet_budget = Arc::clone(&budget);
+        let wallet_events = Arc::clone(&events);
+        let wallet = std::thread::spawn(move || {
+            wallet_budget.install_phase(ProcessCpuPhase::WalletProof, move || {
+                wallet_events.lock().unwrap().push("wallet");
+            });
+        });
+
+        pow.join().unwrap();
+        wallet.join().unwrap();
+        history.join().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["pow-start", "pow-stop", "wallet", "history"]
+        );
+    }
+
+    #[test]
+    fn inbound_verification_remains_work_conserving_during_pow() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let plan = plan_process_cpu_budget_with_threads(2, 2, ProcessCpuBudgetMode::InternalMiner)
+            .unwrap();
+        let budget = Arc::new(ProcessCpuBudget::build(plan).unwrap());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (pow_started_tx, pow_started_rx) = mpsc::sync_channel(1);
+        let (verify_finished_tx, verify_finished_rx) = mpsc::sync_channel(1);
+        let release_pow = Arc::new(AtomicBool::new(false));
+
+        let pow_budget = Arc::clone(&budget);
+        let pow_release = Arc::clone(&release_pow);
+        let pow_events = Arc::clone(&events);
+        let pow = std::thread::spawn(move || {
+            pow_budget.install_phase(ProcessCpuPhase::Pow, move || {
+                pow_events.lock().unwrap().push("pow-start");
+                pow_started_tx.send(()).unwrap();
+                while !pow_release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                pow_events.lock().unwrap().push("pow-stop");
+            });
+        });
+        pow_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("PoW phase did not start");
+
+        let verify_budget = Arc::clone(&budget);
+        let verify_events = Arc::clone(&events);
+        let verify = std::thread::spawn(move || {
+            verify_budget.install_phase(ProcessCpuPhase::InboundVerify, move || {
+                verify_events.lock().unwrap().push("verify");
+                verify_finished_tx.send(()).unwrap();
+            });
+        });
+
+        verify_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("inbound verifier waited for background PoW to stop");
+        assert!(
+            !pow.is_finished(),
+            "network verification must not cancel background PoW"
+        );
+        release_pow.store(true, Ordering::Release);
+        verify.join().unwrap();
+        pow.join().unwrap();
+        assert_eq!(*events.lock().unwrap(), ["pow-start", "verify", "pow-stop"]);
     }
 
     #[test]
