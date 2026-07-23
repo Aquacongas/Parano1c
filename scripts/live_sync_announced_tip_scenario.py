@@ -136,7 +136,12 @@ def main():
 
         source.stop()
         live_miner_label = "04-source-live-h3-miner"
-        source.start(live_miner_label, mode="miner", seeds=[sink.seed])
+        source.start(
+            live_miner_label,
+            mode="miner",
+            genesis=True,
+            seeds=[sink.seed],
+        )
         labels.append(live_miner_label)
         gossip_started = time.monotonic()
         mined = live.wait_mined(source, GOSSIP_TIP, timeout=600)

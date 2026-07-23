@@ -11,12 +11,14 @@
 //! - The cache is replaced from an exact, verified owner-index snapshot
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use noid_chain::storage::VerifiedOwnerSnapshot;
 use noid_poseidon2b::primitives::{Address, SpendSecret};
+use zeroize::Zeroizing;
 
 use super::keystore::{Keystore, KeystoreError, MasterSecret};
 
@@ -44,6 +46,9 @@ pub struct TxHistoryEntry {
     pub height: u64,
     /// Whether we sent or received in this tx.
     pub direction: TxDirection,
+    /// True only for the canonical coinbase at logical transaction zero.
+    #[serde(default)]
+    pub is_coinbase: bool,
     /// Net amount in μNOID (sent: net sent, received: total received).
     pub amount_micronoid: u64,
     /// Counterparty address (None if unknown).
@@ -210,6 +215,31 @@ impl WalletState {
         !self.pending_input_slots.is_empty() || !self.pending_output_slots.is_empty()
     }
 
+    /// Persist a contiguous prefix of funded addresses discovered from the
+    /// live owner index without activating or loading any inactive address.
+    pub fn commit_discovered_next_index(
+        &mut self,
+        expected_active_index: u32,
+        expected_next_index: u32,
+        discovered_next_index: u32,
+    ) -> Result<(), String> {
+        if self.active_index != expected_active_index || self.next_index != expected_next_index {
+            return Err("wallet address selection changed during address discovery".into());
+        }
+        if self.has_pending_activity() {
+            return Err("cannot discover addresses while a wallet transaction is pending".into());
+        }
+        if discovered_next_index < self.next_index || discovered_next_index > MAX_WALLET_ADDRESSES {
+            return Err("discovered address range is invalid".into());
+        }
+        if discovered_next_index == self.next_index {
+            return Ok(());
+        }
+        self.persist_metadata(discovered_next_index, self.active_index)?;
+        self.next_index = discovered_next_index;
+        Ok(())
+    }
+
     /// Confirmed balance of the ACTIVE address in μNOID.
     pub fn balance(&self) -> u64 {
         self.utxos
@@ -323,6 +353,7 @@ impl WalletState {
             tx_hash,
             height: 0, // updated to real height when block is confirmed
             direction: TxDirection::Sent,
+            is_coinbase: false,
             amount_micronoid,
             peer_address: Some(to_address),
             timestamp: now,
@@ -464,6 +495,259 @@ struct WalletMetadata {
     /// The ACTIVE address key index (one-owner-per-tx model: sends spend
     /// from this address only; change returns to it).
     active_index: u32,
+}
+
+const MASTER_SECRET_HEX_LEN: usize = 64;
+
+/// Return the one 32-byte master secret that deterministically derives every
+/// wallet address. The GUI displays this explicit export and never invents a
+/// second backup-file format.
+pub fn export_generated_master_secret(wallet_key_path: &Path) -> Result<Zeroizing<String>, String> {
+    Keystore::new(wallet_key_path)
+        .export_master_secret_hex()
+        .map_err(|error| format!("export generated master secret: {error}"))
+}
+
+/// Replace the generated master secret and reset the local address cursor to
+/// address zero. Old wallet records are transactionally moved aside only for
+/// rollback during this call and are deleted before success is returned.
+pub fn import_generated_master_secret(
+    wallet_key_path: &Path,
+    master_secret: &str,
+) -> Result<(), String> {
+    let normalized = Zeroizing::new(
+        master_secret
+            .chars()
+            .filter(|character| !character.is_ascii_whitespace())
+            .collect::<String>(),
+    );
+    if normalized.len() != MASTER_SECRET_HEX_LEN {
+        return Err("Master secret must contain exactly 64 hexadecimal characters.".into());
+    }
+    let mut decoded = Zeroizing::new([0u8; 32]);
+    hex::decode_to_slice(normalized.as_bytes(), &mut *decoded)
+        .map_err(|_| "Master secret contains a non-hexadecimal character.".to_string())?;
+    let key_bytes = Keystore::encode_plain_file(&decoded);
+    let metadata_bytes = serde_json::to_vec(&WalletMetadata {
+        next_index: 1,
+        active_index: 0,
+    })
+    .map_err(|error| format!("encode imported wallet metadata: {error}"))?;
+
+    let parent = wallet_key_path
+        .parent()
+        .ok_or_else(|| "Wallet key path has no parent directory.".to_string())?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create wallet directory {}: {error}", parent.display()))?;
+
+    let staged_key = parent.join(format!(
+        ".wallet-import-{:032x}.key",
+        rand::random::<u128>()
+    ));
+    let staged_metadata = parent.join(format!(
+        ".wallet-import-{:032x}.meta",
+        rand::random::<u128>()
+    ));
+    if let Err(error) =
+        persist_owner_only_atomically(&staged_key, &key_bytes, "staged master secret")
+    {
+        let _ = std::fs::remove_file(&staged_key);
+        return Err(error);
+    }
+    if let Err(error) =
+        persist_owner_only_atomically(&staged_metadata, &metadata_bytes, "staged wallet metadata")
+    {
+        let _ = std::fs::remove_file(&staged_key);
+        let _ = std::fs::remove_file(&staged_metadata);
+        return Err(error);
+    }
+    if let Err(error) = Keystore::new(&staged_key).load_plain() {
+        let _ = std::fs::remove_file(&staged_key);
+        let _ = std::fs::remove_file(&staged_metadata);
+        return Err(format!("validate imported master secret: {error}"));
+    }
+
+    let rollback = parent.join(format!(
+        ".wallet-import-rollback-{:032x}",
+        rand::random::<u128>()
+    ));
+    if let Err(error) = std::fs::create_dir(&rollback) {
+        let _ = std::fs::remove_file(&staged_key);
+        let _ = std::fs::remove_file(&staged_metadata);
+        return Err(format!(
+            "create temporary wallet rollback directory {}: {error}",
+            rollback.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(error) =
+            std::fs::set_permissions(&rollback, std::fs::Permissions::from_mode(0o700))
+        {
+            let _ = std::fs::remove_file(&staged_key);
+            let _ = std::fs::remove_file(&staged_metadata);
+            let _ = std::fs::remove_dir(&rollback);
+            return Err(format!(
+                "protect temporary wallet rollback directory {}: {error}",
+                rollback.display()
+            ));
+        }
+    }
+
+    let artifacts = [
+        wallet_key_path.to_path_buf(),
+        metadata_path(wallet_key_path),
+        history_path(wallet_key_path),
+        receipts_path(wallet_key_path),
+    ];
+    let artifact_existed: [bool; 4] = std::array::from_fn(|index| artifacts[index].exists());
+    let stage_old = (|| {
+        for source in &artifacts {
+            if !source.exists() {
+                continue;
+            }
+            let name = source
+                .file_name()
+                .ok_or_else(|| format!("wallet artifact {} has no file name", source.display()))?;
+            std::fs::rename(source, rollback.join(name)).map_err(|error| {
+                format!(
+                    "stage previous wallet artifact {} for replacement: {error}",
+                    source.display()
+                )
+            })?;
+        }
+        Ok::<(), String>(())
+    })();
+    if let Err(error) = stage_old {
+        let restore = restore_import_rollback(&artifacts, &artifact_existed, &rollback);
+        let _ = std::fs::remove_file(&staged_key);
+        let _ = std::fs::remove_file(&staged_metadata);
+        let _ = std::fs::remove_dir_all(&rollback);
+        return match restore {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!("{error}; rollback failed: {restore_error}")),
+        };
+    }
+
+    let install = (|| {
+        std::fs::rename(&staged_key, wallet_key_path)
+            .map_err(|error| format!("install imported master secret: {error}"))?;
+        std::fs::rename(&staged_metadata, metadata_path(wallet_key_path))
+            .map_err(|error| format!("install reset wallet metadata: {error}"))?;
+        sync_directory(parent, "wallet directory")
+    })();
+    if let Err(error) = install {
+        let restore = restore_import_rollback(&artifacts, &artifact_existed, &rollback);
+        let _ = std::fs::remove_file(&staged_key);
+        let _ = std::fs::remove_file(&staged_metadata);
+        let _ = std::fs::remove_dir_all(&rollback);
+        return match restore {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(format!("{error}; rollback failed: {restore_error}")),
+        };
+    }
+
+    std::fs::remove_dir_all(&rollback).map_err(|error| {
+        format!(
+            "discard previous master secret after import {}: {error}",
+            rollback.display()
+        )
+    })?;
+    sync_directory(parent, "wallet directory")
+}
+
+fn restore_import_rollback(
+    artifacts: &[PathBuf],
+    artifact_existed: &[bool],
+    rollback: &Path,
+) -> Result<(), String> {
+    for (target, existed) in artifacts.iter().zip(artifact_existed) {
+        let name = target
+            .file_name()
+            .ok_or_else(|| format!("wallet artifact {} has no file name", target.display()))?;
+        let staged = rollback.join(name);
+        if *existed && staged.exists() {
+            match std::fs::remove_file(target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "remove partially imported wallet artifact {}: {error}",
+                        target.display()
+                    ));
+                }
+            }
+            std::fs::rename(&staged, target).map_err(|error| {
+                format!(
+                    "restore previous wallet artifact {}: {error}",
+                    target.display()
+                )
+            })?;
+        } else if *existed && !target.exists() {
+            return Err(format!(
+                "previous wallet artifact {} is missing from rollback",
+                target.display()
+            ));
+        } else if !*existed {
+            match std::fs::remove_file(target) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "remove partially imported wallet artifact {}: {error}",
+                        target.display()
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn persist_owner_only_atomically(path: &Path, bytes: &[u8], label: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{label} path has no parent directory"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("create {label} directory {}: {error}", parent.display()))?;
+    let temporary = path.with_extension(format!("tmp.{:032x}", rand::random::<u128>()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create temporary {label}: {error}"))?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("write {label}: {error}"));
+    }
+    drop(file);
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|error| format!("replace {label}: {error}"))?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("install {label}: {error}"));
+    }
+    sync_directory(parent, label)
+}
+
+fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("sync {label}: {error}"))?;
+    }
+    Ok(())
 }
 
 fn normalize_metadata_indices(
@@ -656,6 +940,22 @@ pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn legacy_history_without_coinbase_marker_remains_readable() {
+        let json = r#"{
+            "tx_hash":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
+            "height":7,
+            "direction":"Received",
+            "amount_micronoid":50000000,
+            "peer_address":null,
+            "timestamp":9,
+            "own_address":null,
+            "own_key_index":0
+        }"#;
+        let entry: TxHistoryEntry = serde_json::from_str(json).unwrap();
+        assert!(!entry.is_coinbase);
+    }
 
     #[test]
     fn corrupt_durable_wallet_artifacts_fail_startup() {
@@ -1017,6 +1317,118 @@ mod tests {
     }
 
     #[test]
+    fn generated_master_secret_round_trip_resets_local_wallet_records() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_key = source_dir.path().join("wallet.key");
+        let source = WalletState::create_or_load(source_key.clone()).unwrap();
+        let expected_addresses = [
+            source.address_at(0),
+            source.address_at(4),
+            source.address_at(8),
+        ];
+        let master_secret = export_generated_master_secret(&source_key).unwrap();
+        assert_eq!(master_secret.len(), 64);
+        assert!(master_secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!master_secret.bytes().any(|byte| byte.is_ascii_uppercase()));
+        drop(source);
+
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_key = target_dir.path().join("wallet.key");
+        let mut target = WalletState::create_or_load(target_key.clone()).unwrap();
+        let previous_address = target.address_at(0);
+        target.next_index = 9;
+        target.active_index = 4;
+        target.history.push(TxHistoryEntry {
+            tx_hash: [0x21; 32],
+            height: 3,
+            direction: TxDirection::Sent,
+            is_coinbase: false,
+            amount_micronoid: 9,
+            peer_address: None,
+            timestamp: 7,
+            own_address: Some(previous_address.to_bech32()),
+            own_key_index: Some(0),
+        });
+        target.receipts.insert([0x31; 32], vec![0x41; 16]);
+        target.save_metadata();
+        target.save_history().unwrap();
+        target.save_receipts().unwrap();
+        drop(target);
+
+        let pasted = Zeroizing::new(format!(
+            "{}\n{}",
+            &master_secret[..32],
+            &master_secret[32..]
+        ));
+        import_generated_master_secret(&target_key, &pasted).unwrap();
+
+        let imported = WalletState::create_or_load(target_key).unwrap();
+        assert_ne!(imported.address_at(0), previous_address);
+        assert_eq!(imported.address_at(0), expected_addresses[0]);
+        assert_eq!(imported.address_at(4), expected_addresses[1]);
+        assert_eq!(imported.address_at(8), expected_addresses[2]);
+        assert_eq!(imported.next_index, 1);
+        assert_eq!(imported.active_index, 0);
+        assert!(imported.history.is_empty());
+        assert!(imported.receipts.is_empty());
+        assert_eq!(
+            std::fs::read_dir(target_dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wallet-import"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn rejected_generated_master_secret_does_not_mutate_wallet() {
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_key = target_dir.path().join("wallet.key");
+        let target = WalletState::create_or_load(target_key.clone()).unwrap();
+        target.save_metadata();
+        let key_before = std::fs::read(&target_key).unwrap();
+        let metadata_before = std::fs::read(metadata_path(&target_key)).unwrap();
+        drop(target);
+
+        assert!(import_generated_master_secret(&target_key, &"g".repeat(64)).is_err());
+        assert_eq!(std::fs::read(&target_key).unwrap(), key_before);
+        assert_eq!(
+            std::fs::read(metadata_path(&target_key)).unwrap(),
+            metadata_before
+        );
+        assert_eq!(
+            std::fs::read_dir(target_dir.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".wallet-import"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn discovered_address_prefix_does_not_change_active_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut wallet = WalletState::create_or_load(directory.path().join("wallet.key")).unwrap();
+        let active = wallet.active_address();
+
+        wallet.commit_discovered_next_index(0, 1, 4).unwrap();
+
+        assert_eq!(wallet.active_index, 0);
+        assert_eq!(wallet.active_address(), active);
+        assert_eq!(wallet.next_index, 4);
+        assert!(wallet.preview_generated_index(3).is_ok());
+        assert!(wallet.preview_generated_index(4).is_err());
+    }
+
+    #[test]
     fn wallet_sidecars_never_persist_master_or_derived_spend_secret() {
         use zeroize::Zeroize;
 
@@ -1040,6 +1452,7 @@ mod tests {
             tx_hash: [0x11; 32],
             height: 9,
             direction: TxDirection::Sent,
+            is_coinbase: false,
             amount_micronoid: 77,
             peer_address: Some([0x22; 32]),
             timestamp: 123,

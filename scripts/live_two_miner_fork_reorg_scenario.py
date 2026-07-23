@@ -356,8 +356,8 @@ def main():
         left.stop()
 
         # Mine one competing child on each disconnected miner.
-        left.start("04-a-isolated-fork-miner", mode="miner")
-        right.start("05-b-isolated-fork-miner", mode="miner")
+        left.start("04-a-isolated-fork-miner", mode="miner", genesis=True)
+        right.start("05-b-isolated-fork-miner", mode="miner", genesis=True)
         fork_infos = mine_both_one_block(left, right, FORK_HEIGHT)
         left_fork_hash = fork_infos[left.name]["best_hash"]
         right_fork_hash = fork_infos[right.name]["best_hash"]
@@ -368,7 +368,7 @@ def main():
         )
 
         # Give A strictly more cumulative work while B remains stopped.
-        left.start("06-a-extends-winning-branch", mode="miner")
+        left.start("06-a-extends-winning-branch", mode="miner", genesis=True)
         winner_info = wait_mined(left, WINNER_HEIGHT)
         left.stop()
 

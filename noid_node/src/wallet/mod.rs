@@ -81,7 +81,10 @@ use noid_rpc::types::{
     micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
     WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
 };
-use noid_rpc::wallet_ops::{WalletActivationPreview, WalletSendPlanError};
+use noid_rpc::wallet_ops::{
+    WalletActivationPreview, WalletAddressDiscoveryPreview, WalletMinedBlockRecord,
+    WalletMinedBlockSlice, WalletReceiptRecord, WalletReceiptSlice, WalletSendPlanError,
+};
 use noid_rpc::WalletOps;
 use noid_tx::MAX_PAGED_SPEND_INPUTS;
 
@@ -473,6 +476,7 @@ impl WalletOps for WalletHandle {
                 balance_noid: 0.0,
                 utxo_count: 0,
                 pending_outbound_micronoid: 0,
+                pending_incoming_micronoid: 0,
                 spendable_micronoid: 0,
                 spendable_noid: 0.0,
             },
@@ -491,6 +495,7 @@ impl WalletOps for WalletHandle {
                     balance_noid: micronoid_to_noid(total),
                     utxo_count: w.utxos.len(),
                     pending_outbound_micronoid: pending_out,
+                    pending_incoming_micronoid: 0,
                     spendable_micronoid: spendable,
                     spendable_noid: micronoid_to_noid(spendable),
                 }
@@ -534,6 +539,7 @@ impl WalletOps for WalletHandle {
                         state::TxDirection::Sent => "sent".into(),
                         state::TxDirection::Received => "received".into(),
                     },
+                    is_coinbase: h.is_coinbase,
                     amount_micronoid: h.amount_micronoid,
                     amount_noid: micronoid_to_noid(h.amount_micronoid),
                     peer_address: h
@@ -545,6 +551,107 @@ impl WalletOps for WalletHandle {
                 })
                 .collect(),
         }
+    }
+
+    fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String> {
+        use noid_chain::consensus::receipt::ParanoidReceipt;
+
+        let guard = self.inner.lock().unwrap();
+        let wallet = guard
+            .as_ref()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+        let mut receipts = Vec::with_capacity(wallet.receipts.len());
+        for (txid, bytes) in &wallet.receipts {
+            let receipt = ParanoidReceipt::from_bytes(bytes).map_err(|error| {
+                format!("decode durable receipt {}: {error}", hex::encode(txid))
+            })?;
+            if receipt.summary.logical_txid != *txid {
+                return Err(format!(
+                    "durable receipt key does not match authenticated txid {}",
+                    hex::encode(txid)
+                ));
+            }
+            let sent = wallet.history.iter().find(|entry| {
+                entry.tx_hash == *txid && entry.direction == state::TxDirection::Sent
+            });
+            let input_owner = receipt.summary.inputs.first().map(|(_, owner)| *owner);
+            let external_outputs = receipt
+                .summary
+                .outputs
+                .iter()
+                .filter(|(_, _, owner)| Some(*owner) != input_owner)
+                .collect::<Vec<_>>();
+            let derived_amount = external_outputs
+                .iter()
+                .map(|(_, amount, _)| *amount)
+                .fold(0u64, u64::saturating_add);
+            let derived_peer =
+                (external_outputs.len() == 1).then(|| external_outputs[0].2.to_bech32());
+
+            receipts.push(WalletReceiptRecord {
+                txid: *txid,
+                height: receipt.claimed_height,
+                timestamp: receipt.summary.confirmed_unix,
+                amount_micronoid: sent.map_or(derived_amount, |entry| entry.amount_micronoid),
+                fee_micronoid: receipt.summary.fee_micronoid,
+                peer_address: sent
+                    .and_then(|entry| entry.peer_address)
+                    .map(|owner| noid_poseidon2b::primitives::Address(owner).to_bech32())
+                    .or(derived_peer),
+                own_address: sent
+                    .and_then(|entry| entry.own_address.clone())
+                    .or_else(|| input_owner.map(|owner| owner.to_bech32())),
+                own_key_index: sent.and_then(|entry| entry.own_key_index),
+                input_count: receipt.summary.inputs.len(),
+                output_count: receipt.summary.outputs.len(),
+                receipt_bytes: bytes.len(),
+            });
+        }
+        receipts.sort_unstable_by(|left, right| {
+            right
+                .height
+                .cmp(&left.height)
+                .then_with(|| right.timestamp.cmp(&left.timestamp))
+                .then_with(|| right.txid.cmp(&left.txid))
+        });
+        let total = receipts.len();
+        let receipts = receipts.into_iter().skip(offset).take(limit).collect();
+        Ok(WalletReceiptSlice { total, receipts })
+    }
+
+    fn mined_blocks(&self, offset: usize, limit: usize) -> WalletMinedBlockSlice {
+        let guard = self.inner.lock().unwrap();
+        let Some(wallet) = &*guard else {
+            return WalletMinedBlockSlice {
+                total: 0,
+                blocks: Vec::new(),
+            };
+        };
+
+        let total = wallet
+            .history
+            .iter()
+            .filter(|entry| entry.is_coinbase && entry.height != 0)
+            .count();
+        let blocks = wallet
+            .history
+            .iter()
+            .rev()
+            .filter(|entry| entry.is_coinbase && entry.height != 0)
+            .skip(offset)
+            .take(limit)
+            .filter_map(|entry| {
+                Some(WalletMinedBlockRecord {
+                    coinbase_txid: entry.tx_hash,
+                    height: entry.height,
+                    timestamp: entry.timestamp,
+                    reward_micronoid: entry.amount_micronoid,
+                    payout_address: entry.own_address.clone()?,
+                    payout_key_index: entry.own_key_index?,
+                })
+            })
+            .collect();
+        WalletMinedBlockSlice { total, blocks }
     }
 
     fn preview_active_reload(&self) -> Result<WalletActivationPreview, String> {
@@ -590,6 +697,55 @@ impl WalletOps for WalletHandle {
             owner: owner.0,
             advance_next_index: true,
         })
+    }
+
+    fn preview_address_discovery(
+        &self,
+        max_additional: u32,
+    ) -> Result<WalletAddressDiscoveryPreview, String> {
+        let guard = self.inner.lock().unwrap();
+        let w = guard
+            .as_ref()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+        if w.has_pending_activity() {
+            return Err("cannot discover addresses while a wallet transaction is pending".into());
+        }
+        let end = w
+            .next_index
+            .saturating_add(max_additional)
+            .min(state::MAX_WALLET_ADDRESSES);
+        let candidates = (w.next_index..end)
+            .map(|index| (index, w.address_at(index).0))
+            .collect();
+        Ok(WalletAddressDiscoveryPreview {
+            expected_active_index: w.active_index,
+            expected_next_index: w.next_index,
+            candidates,
+        })
+    }
+
+    fn commit_address_discovery(
+        &self,
+        expected_active_index: u32,
+        expected_next_index: u32,
+        discovered_next_index: u32,
+    ) -> Result<Vec<WalletAddressInfo>, String> {
+        let mut guard = self.inner.lock().unwrap();
+        let w = guard
+            .as_mut()
+            .ok_or_else(|| "wallet not initialized".to_string())?;
+        w.commit_discovered_next_index(
+            expected_active_index,
+            expected_next_index,
+            discovered_next_index,
+        )?;
+        Ok((0..w.next_index)
+            .map(|index| WalletAddressInfo {
+                address: w.address_at(index).to_bech32(),
+                key_index: index,
+                is_active: index == w.active_index,
+            })
+            .collect())
     }
 
     fn commit_activation_snapshot(
@@ -1280,6 +1436,7 @@ mod tests {
                 tx_hash: [3; 32],
                 height: 7,
                 direction: state::TxDirection::Received,
+                is_coinbase: false,
                 amount_micronoid: 20,
                 peer_address: None,
                 timestamp: 8,
@@ -1291,6 +1448,39 @@ mod tests {
         let history = handle.history();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].own_key_index, Some(0));
+    }
+
+    #[test]
+    fn mined_block_slice_spans_addresses_and_is_newest_first() {
+        let (_dir, handle) = handle_with_utxos(&[1_000]);
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_mut().unwrap();
+            for (height, key_index, is_coinbase) in [(3, 0, true), (5, 1, false), (7, 2, true)] {
+                wallet.history.push(state::TxHistoryEntry {
+                    tx_hash: [height as u8; 32],
+                    height,
+                    direction: state::TxDirection::Received,
+                    is_coinbase,
+                    amount_micronoid: height * 1_000,
+                    peer_address: None,
+                    timestamp: height + 100,
+                    own_address: Some(wallet.address_at(key_index).to_bech32()),
+                    own_key_index: Some(key_index),
+                });
+            }
+        }
+
+        let newest = handle.mined_blocks(0, 1);
+        assert_eq!(newest.total, 2);
+        assert_eq!(newest.blocks.len(), 1);
+        assert_eq!(newest.blocks[0].height, 7);
+        assert_eq!(newest.blocks[0].payout_key_index, 2);
+
+        let older = handle.mined_blocks(1, 1);
+        assert_eq!(older.total, 2);
+        assert_eq!(older.blocks[0].height, 3);
+        assert_eq!(older.blocks[0].payout_key_index, 0);
     }
 
     #[test]
@@ -1314,6 +1504,50 @@ mod tests {
 
         assert!(handle.preview_next_address().is_err());
         assert!(handle.get_address(MAX_WALLET_ADDRESSES).is_none());
+    }
+
+    #[test]
+    fn discovery_derives_twenty_addresses_without_loading_inactive_balances() {
+        let (_dir, handle) = handle_with_utxos(&[1_000, 2_000]);
+        let balance_before = handle.get_balance();
+        let slots_before = handle
+            .list_utxos()
+            .into_iter()
+            .map(|utxo| utxo.slot_index)
+            .collect::<Vec<_>>();
+
+        let preview = handle.preview_address_discovery(20).unwrap();
+        assert_eq!(preview.candidates.len(), 20);
+        assert_eq!(preview.candidates.first().unwrap().0, 1);
+        assert_eq!(preview.candidates.last().unwrap().0, 20);
+        let addresses = handle
+            .commit_address_discovery(
+                preview.expected_active_index,
+                preview.expected_next_index,
+                21,
+            )
+            .unwrap();
+
+        assert_eq!(addresses.len(), 21);
+        assert_eq!(
+            addresses.iter().filter(|address| address.is_active).count(),
+            1
+        );
+        assert!(addresses[0].is_active);
+        let balance_after = handle.get_balance();
+        assert_eq!(
+            balance_after.balance_micronoid,
+            balance_before.balance_micronoid
+        );
+        assert_eq!(balance_after.utxo_count, balance_before.utxo_count);
+        assert_eq!(
+            handle
+                .list_utxos()
+                .into_iter()
+                .map(|utxo| utxo.slot_index)
+                .collect::<Vec<_>>(),
+            slots_before
+        );
     }
 
     #[test]
@@ -1401,6 +1635,7 @@ mod tests {
                 tx_hash: orphan_hash,
                 height: 9,
                 direction: state::TxDirection::Sent,
+                is_coinbase: false,
                 amount_micronoid: 7,
                 peer_address: None,
                 timestamp: 8,

@@ -246,7 +246,12 @@ def main():
             funder.stop()
 
             miner_label = f"04-split-{round_index:02d}-funder-miner"
-            funder.start(miner_label, mode="miner", seeds=[relay.seed])
+            funder.start(
+                miner_label,
+                mode="miner",
+                genesis=True,
+                seeds=[relay.seed],
+            )
             phase_logs.append(miner_label)
             drained = wait_round_drain(funder, relay, parent_height)
             confirmed = fetch_confirmed(relay, txids)
@@ -310,7 +315,12 @@ def main():
         relay.stop()
 
         final_miner_label = "06-single-miner-drains-128"
-        relay.start(final_miner_label, mode="miner", seeds=[funder.seed])
+        relay.start(
+            final_miner_label,
+            mode="miner",
+            genesis=True,
+            seeds=[funder.seed],
+        )
         phase_logs.append(final_miner_label)
         max_miner_pool = 0
         max_funder_pool = SPAM_COUNT

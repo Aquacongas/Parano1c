@@ -211,7 +211,11 @@ def main():
         node.stop()
 
         restart_label = "03-compact-restart-payment"
-        restart_info, restart_seconds = node.start(restart_label, mode="miner")
+        restart_info, restart_seconds = node.start(
+            restart_label,
+            mode="miner",
+            genesis=True,
+        )
         labels.append(restart_label)
         restart_metrics = compact_metrics(restart_label)
         require(restart_metrics["active_segments"] == 1, f"bad restart metrics: {restart_metrics}")

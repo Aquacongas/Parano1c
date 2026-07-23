@@ -1174,6 +1174,23 @@ impl MdbxStore {
         &self,
         owner: &[u8; 32],
     ) -> Result<VerifiedOwnerSnapshot, StoreError> {
+        self.get_verified_utxos_by_owner_bounded(owner, None)
+    }
+
+    /// Check whether an owner has at least one live UTXO without loading its
+    /// complete balance. Imported-wallet discovery uses this bounded query
+    /// while full active-address activation continues to use the complete
+    /// snapshot above.
+    pub fn has_verified_utxo_by_owner(&self, owner: &[u8; 32]) -> Result<bool, StoreError> {
+        self.get_verified_utxos_by_owner_bounded(owner, Some(1))
+            .map(|snapshot| !snapshot.utxos.is_empty())
+    }
+
+    fn get_verified_utxos_by_owner_bounded(
+        &self,
+        owner: &[u8; 32],
+        max_utxos: Option<usize>,
+    ) -> Result<VerifiedOwnerSnapshot, StoreError> {
         let txn = self.db.begin_ro_txn()?;
 
         // Bind the returned owner view to the exact chain/state identity from
@@ -1334,6 +1351,9 @@ impl MdbxStore {
                 amount,
                 creation_id,
             });
+            if max_utxos.is_some_and(|limit| verified.len() >= limit) {
+                break;
+            }
             item = owner_cursor.next()?;
         }
         Ok(VerifiedOwnerSnapshot {
@@ -3062,10 +3082,29 @@ mod tests {
                 &[],
                 None,
                 &meta,
-                false,
+                true,
             )
             .unwrap();
         (state, header, hash)
+    }
+
+    #[test]
+    fn bounded_owner_presence_query_distinguishes_funded_and_empty_addresses() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        commit_stateful_test_genesis(&store);
+        let funded = owner_key_from_fields(Block128::from(0x22u128), Block128::from(0x33u128));
+
+        assert!(store.has_verified_utxo_by_owner(&funded).unwrap());
+        assert!(!store.has_verified_utxo_by_owner(&[0xA5; 32]).unwrap());
+        assert_eq!(
+            store
+                .get_verified_utxos_by_owner(&funded)
+                .unwrap()
+                .utxos
+                .len(),
+            1
+        );
     }
 
     #[test]

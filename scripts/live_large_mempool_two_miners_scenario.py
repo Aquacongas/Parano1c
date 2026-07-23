@@ -106,7 +106,12 @@ def prepare_independent_utxos(funder, relay, phase_logs):
         funder.stop()
 
         miner_label = f"04-setup-split-{round_index:02d}-miner"
-        funder.start(miner_label, mode="miner", seeds=[relay.seed])
+        funder.start(
+            miner_label,
+            mode="miner",
+            genesis=True,
+            seeds=[relay.seed],
+        )
         phase_logs.append(miner_label)
         drained = shared.wait_round_drain(funder, relay, parent)
         confirmed = shared.fetch_confirmed(relay, txids)
@@ -258,8 +263,18 @@ def main():
 
         miner_a_label = "07-miner-a-races-128"
         miner_b_label = "08-miner-b-races-128"
-        start_a = miner_a.spawn(miner_a_label, mode="miner", seeds=[funder.seed])
-        start_b = miner_b.spawn(miner_b_label, mode="miner", seeds=[funder.seed])
+        start_a = miner_a.spawn(
+            miner_a_label,
+            mode="miner",
+            genesis=True,
+            seeds=[funder.seed],
+        )
+        start_b = miner_b.spawn(
+            miner_b_label,
+            mode="miner",
+            genesis=True,
+            seeds=[funder.seed],
+        )
         phase_logs.extend((miner_a_label, miner_b_label))
         _, startup_a = miner_a.wait_ready(miner_a_label, start_a, timeout=600)
         _, startup_b = miner_b.wait_ready(miner_b_label, start_b, timeout=600)

@@ -5,6 +5,7 @@ mod app;
 mod app_icon;
 mod backend;
 mod model;
+mod secret;
 mod theme;
 mod view;
 mod widgets;

@@ -41,11 +41,12 @@ pub use cpu_budget::{
 };
 pub use history_step_artifacts::{
     decode_history_step_runtime_metadata_pinned, encode_history_step_runtime_metadata,
-    history_step_matrix_file_name, EmbeddedHistoryStepMatrixError, EmbeddedHistoryStepMatrixLeaf,
-    EmbeddedHistoryStepMatrixSource, HistoryStepRuntimeMetadata, HistoryStepRuntimeMetadataError,
-    HISTORY_STEP_PACK_LEAF_COUNT, HISTORY_STEP_PACK_VERSION_DIRECTORY,
-    HISTORY_STEP_RUNTIME_METADATA_DIGEST_DOMAIN, HISTORY_STEP_RUNTIME_METADATA_FILE,
-    HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES, HISTORY_STEP_RUNTIME_METADATA_VERSION,
+    history_step_matrix_file_name, history_step_runtime_image_file_name,
+    EmbeddedHistoryStepMatrixError, EmbeddedHistoryStepMatrixLeaf, EmbeddedHistoryStepMatrixSource,
+    HistoryStepRuntimeMetadata, HistoryStepRuntimeMetadataError, HISTORY_STEP_PACK_LEAF_COUNT,
+    HISTORY_STEP_PACK_VERSION_DIRECTORY, HISTORY_STEP_RUNTIME_METADATA_DIGEST_DOMAIN,
+    HISTORY_STEP_RUNTIME_METADATA_FILE, HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
+    HISTORY_STEP_RUNTIME_METADATA_VERSION,
 };
 pub use miner::{BlockAppliedHook, BlockMiner, MinerConfig, MinerEvent};
 pub use pow::{search_pow_parallel, PowSolution};

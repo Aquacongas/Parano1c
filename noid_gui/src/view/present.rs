@@ -8,15 +8,18 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::app::{Action, App, Message};
+use crate::backend::PaymentSubmission;
 use crate::model::{
-    format_micronoid, grouped, AddressSnapshot, UtxoSnapshot, WALLET_CONSOLIDATION_INPUT_LIMIT,
+    format_creation_origin, format_micronoid, grouped, AddressSnapshot, UtxoSnapshot,
+    WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::StateField;
 
+use super::copy_value_button;
+
 const DESKTOP_METER_CELLS: usize = 34;
 const COMPACT_METER_CELLS: usize = 16;
-const PROGRESS_METER_CELLS: usize = 24;
 const PREVIEW_FEE_BASE_MICRONOID: u64 = 5_000;
 const PREVIEW_FEE_PER_INPUT_MICRONOID: u64 = 100;
 const PREVIEW_FEE_PER_OUTPUT_MICRONOID: u64 = 700;
@@ -122,7 +125,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
         column![
             state_scale(network.log_slots, compact),
             terminal_meter(
-                "State use".into(),
+                "STATE USE".into(),
                 state_ratio,
                 state_color,
                 format!("{:.1}%", state_ratio.clamp(0.0, 1.0) * 100.0),
@@ -131,7 +134,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
                 false,
             ),
             terminal_meter(
-                "Mempool".into(),
+                "MEMPOOL".into(),
                 mempool_ratio,
                 mempool_color,
                 format!("{:.1}%", mempool_ratio.clamp(0.0, 1.0) * 100.0),
@@ -153,7 +156,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
                 false,
             ),
             terminal_meter(
-                "Memory".into(),
+                "MEMORY".into(),
                 memory_ratio,
                 theme::WARNING,
                 format!("{:.1}%", memory_ratio.clamp(0.0, 1.0) * 100.0),
@@ -162,9 +165,9 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
                 false,
             ),
             terminal_meter(
-                "Mining TH".into(),
+                "MINING TH".into(),
                 miner_ratio,
-                if app.snapshot.mining.enabled {
+                if app.snapshot.mining.enabled && app.snapshot.mining.ready {
                     theme::ACCENT
                 } else {
                     theme::DIM
@@ -175,7 +178,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
                 ),
                 meter_cells,
                 meter_label_width,
-                !app.snapshot.mining.enabled,
+                !(app.snapshot.mining.enabled && app.snapshot.mining.ready),
             ),
         ]
         .spacing(3)
@@ -187,7 +190,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
 
     let network_status: Element<'_, Message> = column![
         telemetry_value(
-            "Last block",
+            "LAST BLOCK",
             if network.height == 0 {
                 "genesis".into()
             } else {
@@ -196,12 +199,12 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
             theme::ACCENT,
         ),
         telemetry_value(
-            "Avg time",
+            "AVG TIME",
             format!("{:.1}s", network.average_block_time_ms as f64 / 1_000.0),
             theme::ACCENT,
         ),
         telemetry_value(
-            "Difficulty",
+            "DIFFICULTY",
             format!("{:.2}×", network.difficulty),
             theme::WARNING,
         ),
@@ -262,7 +265,7 @@ fn terminal_meter(
 
     row![
         text(label)
-            .size(15)
+            .size(12)
             .color(label_color)
             .wrapping(text::Wrapping::None)
             .width(label_width),
@@ -311,8 +314,8 @@ fn state_scale(current: u32, compact: bool) -> Element<'static, Message> {
     }
 
     row![
-        text("State lvl")
-            .size(15)
+        text("STATE LVL")
+            .size(12)
             .color(theme::CYAN)
             .wrapping(text::Wrapping::None)
             .width(label_width),
@@ -332,7 +335,7 @@ fn telemetry_value(
     container(
         row![
             text(label)
-                .size(14)
+                .size(12)
                 .color(theme::CYAN)
                 .wrapping(text::Wrapping::None),
             text(format!("[{value}]"))
@@ -344,36 +347,6 @@ fn telemetry_value(
         .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .into()
-}
-
-fn progress_meter(
-    label: &'static str,
-    ratio: f32,
-    color: iced::Color,
-    value: String,
-) -> Element<'static, Message> {
-    let active = (ratio.clamp(0.0, 1.0) * PROGRESS_METER_CELLS as f32).ceil() as usize;
-    let mut cells = row![].spacing(2).width(Length::Fill);
-    for index in 0..PROGRESS_METER_CELLS {
-        cells = cells.push(
-            container(iced::widget::Space::new())
-                .width(Length::FillPortion(1))
-                .height(13)
-                .style(theme::meter_cell(color, index < active)),
-        );
-    }
-
-    row![
-        text(label).size(14).color(color).width(86),
-        cells,
-        text(value)
-            .size(13)
-            .color(theme::TEXT)
-            .width(Length::Fixed(330.0)),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center)
     .into()
 }
 
@@ -689,7 +662,7 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
     ]
     .align_y(Alignment::Center);
 
-    let header = table_columns("SLOT", "VALUE / NOID", "CREATION ID", "SEGMENT", "STATE");
+    let header = table_columns("SLOT", "VALUE / NOID", "ORIGIN", "SEGMENT", "STATE");
     let mut rows = column![].spacing(0);
     for (index, utxo) in app.snapshot.utxos.iter().enumerate() {
         rows = rows.push(utxo_row(
@@ -767,7 +740,7 @@ fn utxo_row(utxo: &UtxoSnapshot, alternate: bool, selected: bool) -> Element<'_,
         row![
             table_cell(grouped(utxo.slot_index as u64), 3, theme::CYAN),
             table_cell(utxo.value(), 5, theme::TEXT),
-            table_cell(grouped(utxo.creation_id), 5, theme::MUTED),
+            table_cell(format_creation_origin(utxo.creation_id), 5, theme::MUTED),
             table_cell(format!("{:03}", utxo.segment), 3, theme::PROOF),
             table_cell(
                 if utxo.reserved {
@@ -841,7 +814,11 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
                     .font(theme::SYMBOL_FONT)
                     .color(theme::ACCENT),
                 iced::widget::Space::new().width(Length::Fill),
-                state_detail("CREATED", grouped(utxo.creation_id), theme::MUTED),
+                state_detail(
+                    "ORIGIN",
+                    format_creation_origin(utxo.creation_id),
+                    theme::MUTED,
+                ),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -1216,19 +1193,8 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
 
     let (label, content): (String, Element<'_, Message>) = match action {
         Action::Send => (
-            "PROVE & SEND".into(),
-            column![
-                form_line("RECIPIENT", "o1…", compact),
-                form_line("AMOUNT", "0.000000 NOID", compact),
-                form_line("FEE", "AUTO", compact),
-                progress_meter("WITNESS", 1.0, theme::ACCENT, "READY".into()),
-                progress_meter("ZK PROOF", 0.0, theme::PROOF, "WAITING".into()),
-                text("The spending witness remains inside this node.")
-                    .size(12)
-                    .color(theme::DIM),
-            ]
-            .spacing(if compact { 7 } else { 12 })
-            .into(),
+            format!("SEND · [{}] {}", address.key_index, address.label),
+            send_form(app, compact),
         ),
         Action::Consolidate => (
             format!("CONSOLIDATE · [{}] {}", address.key_index, address.label),
@@ -1322,16 +1288,20 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         ),
     };
 
+    let mut close = button(text("ESC CLOSE").size(12))
+        .padding([6, 9])
+        .style(|_, status| theme::button(ButtonKind::Ghost, status));
+    if !app.send_in_flight {
+        close = close.on_press(Message::CloseAction);
+    }
+
     let card = container(
         column![
             container(
                 row![
                     text(label).size(13),
                     iced::widget::Space::new().width(Length::Fill),
-                    button(text("ESC CLOSE").size(12))
-                        .on_press(Message::CloseAction)
-                        .padding([6, 9])
-                        .style(|_, status| theme::button(ButtonKind::Ghost, status)),
+                    close,
                 ]
                 .align_y(Alignment::Center)
             )
@@ -1341,7 +1311,8 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         ]
         .spacing(0),
     )
-    .width(Length::Fixed(680.0))
+    .width(Length::Fill)
+    .max_width(680)
     .style(theme::surface_alt);
 
     container(card)
@@ -1352,6 +1323,316 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         .padding(Padding::from(if compact { [8, 12] } else { [24, 18] }))
         .style(theme::overlay)
         .into()
+}
+
+fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
+    if let Some(result) = app.send_result.as_ref() {
+        return send_success(app, result, compact);
+    }
+    let address = app.snapshot.active_address();
+    let spendable = address
+        .balance_micronoid
+        .saturating_sub(address.pending_outbound_micronoid);
+    let recipient = send_input_line(
+        "RECIPIENT",
+        "Paste an o1 address",
+        &app.send_recipient,
+        Message::SendRecipientChanged,
+        compact,
+        app.send_in_flight,
+    );
+    let amount = send_input_line(
+        "AMOUNT / NOID",
+        "0.000000",
+        &app.send_amount,
+        Message::SendAmountChanged,
+        compact,
+        app.send_in_flight,
+    );
+
+    let proof_label = if app.send_in_flight {
+        "BUILDING"
+    } else {
+        "READY"
+    };
+    let proof_color = if app.send_in_flight {
+        theme::WARNING
+    } else {
+        theme::PROOF
+    };
+    let status: Element<'_, Message> = row![
+        send_status("SPENDING SECRET", "LOCAL", theme::ACCENT),
+        send_status("PROOF", proof_label, proof_color),
+    ]
+    .spacing(8)
+    .into();
+
+    let feedback: Element<'_, Message> = if let Some(error) = app.send_error.as_ref() {
+        container(
+            column![
+                text("TRANSACTION NOT SUBMITTED")
+                    .size(11)
+                    .color(theme::DANGER),
+                text(error).size(11).color(theme::TEXT),
+            ]
+            .spacing(5),
+        )
+        .padding(if compact { 10 } else { 12 })
+        .width(Length::Fill)
+        .style(theme::surface)
+        .into()
+    } else {
+        container(
+            text("The secret remains local. Only the proved transaction is submitted.")
+                .size(11)
+                .color(theme::DIM),
+        )
+        .padding([5, 2])
+        .width(Length::Fill)
+        .into()
+    };
+
+    let mut cancel = button(text("CANCEL").size(12))
+        .padding(if compact { [9, 13] } else { [10, 15] })
+        .width(if compact {
+            Length::Fill
+        } else {
+            Length::Shrink
+        })
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if !app.send_in_flight {
+        cancel = cancel.on_press(Message::CloseAction);
+    }
+    let mut submit = button(
+        text(if app.send_in_flight {
+            "BUILDING PROOF…"
+        } else {
+            "PROVE & SEND"
+        })
+        .size(12),
+    )
+    .padding(if compact { [9, 13] } else { [10, 17] })
+    .width(if compact {
+        Length::Fill
+    } else {
+        Length::Shrink
+    })
+    .style(|_, status| theme::button(ButtonKind::Primary, status));
+    if !app.send_in_flight
+        && matches!(
+            app.backend_state,
+            crate::app::BackendState::Online | crate::app::BackendState::Mock
+        )
+    {
+        submit = submit.on_press(Message::SubmitSend);
+    }
+    let controls = row![
+        if compact {
+            iced::widget::Space::new().width(Length::Shrink)
+        } else {
+            iced::widget::Space::new().width(Length::Fill)
+        },
+        cancel,
+        submit,
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    column![
+        form_line(
+            "FROM",
+            format!(
+                "[{}] {} · {} ① spendable",
+                address.key_index,
+                address.label,
+                format_micronoid(spendable)
+            ),
+            compact,
+        ),
+        recipient,
+        amount,
+        form_line("NETWORK FEE", "AUTOMATIC · quoted by the node", compact),
+        status,
+        feedback,
+        controls,
+    ]
+    .spacing(if compact { 7 } else { 10 })
+    .into()
+}
+
+fn send_success<'a>(
+    app: &'a App,
+    result: &'a PaymentSubmission,
+    compact: bool,
+) -> Element<'a, Message> {
+    let recipient = row![
+        text("TO")
+            .size(10)
+            .color(theme::CYAN)
+            .width(if compact { 54 } else { 70 }),
+        text_input("", &result.recipient)
+            .on_input(|_| Message::Noop)
+            .size(12)
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(theme::text_input),
+        copy_value_button(
+            &result.recipient,
+            app.copied_value.as_deref() == Some(result.recipient.as_str()),
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let txid = row![
+        text("TXID")
+            .size(10)
+            .color(theme::CYAN)
+            .width(if compact { 54 } else { 70 }),
+        text_input("", &result.txid)
+            .on_input(|_| Message::Noop)
+            .size(12)
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(theme::text_input),
+        copy_value_button(
+            &result.txid,
+            app.copied_value.as_deref() == Some(result.txid.as_str()),
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let metrics = row![
+        send_result_metric(
+            "AMOUNT",
+            format!("{} ①", format_micronoid(result.amount_micronoid)),
+        ),
+        send_result_metric(
+            "FEE",
+            format!("{} ①", format_micronoid(result.fee_micronoid)),
+        ),
+        send_result_metric("INPUTS", result.input_count.to_string()),
+        send_result_metric("OUTPUTS", result.output_count.to_string()),
+    ]
+    .spacing(7);
+
+    let close = button(text("CLOSE").size(12))
+        .on_press(Message::CloseAction)
+        .padding(if compact { [9, 13] } else { [10, 15] })
+        .width(if compact {
+            Length::Fill
+        } else {
+            Length::Shrink
+        })
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    let another = button(text("SEND ANOTHER").size(12))
+        .on_press(Message::ResetSend)
+        .padding(if compact { [9, 13] } else { [10, 17] })
+        .width(if compact {
+            Length::Fill
+        } else {
+            Length::Shrink
+        })
+        .style(|_, status| theme::button(ButtonKind::Primary, status));
+
+    column![
+        row![
+            text("TRANSACTION SUBMITTED").size(12).color(theme::ACCENT),
+            iced::widget::Space::new().width(Length::Fill),
+            text("PENDING CONFIRMATION").size(10).color(theme::WARNING),
+        ]
+        .align_y(Alignment::Center),
+        container(recipient)
+            .padding([7, 9])
+            .width(Length::Fill)
+            .style(theme::surface),
+        container(txid)
+            .padding([7, 9])
+            .width(Length::Fill)
+            .style(theme::surface),
+        metrics,
+        text("The proof was admitted to the local mempool.")
+            .size(11)
+            .color(theme::DIM),
+        row![
+            if compact {
+                iced::widget::Space::new().width(Length::Shrink)
+            } else {
+                iced::widget::Space::new().width(Length::Fill)
+            },
+            close,
+            another,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(if compact { 7 } else { 10 })
+    .into()
+}
+
+fn send_result_metric(label: &'static str, value: String) -> Element<'static, Message> {
+    container(
+        column![
+            text(label).size(9).color(theme::DIM),
+            text(value).size(11).color(theme::TEXT),
+        ]
+        .spacing(3),
+    )
+    .padding([8, 10])
+    .width(Length::Fill)
+    .style(theme::surface)
+    .into()
+}
+
+fn send_input_line<'a>(
+    label: &'static str,
+    placeholder: &'static str,
+    value: &'a str,
+    on_input: fn(String) -> Message,
+    compact: bool,
+    disabled: bool,
+) -> Element<'a, Message> {
+    let mut input = text_input(placeholder, value)
+        .size(13)
+        .padding([9, 10])
+        .width(Length::Fill)
+        .style(theme::text_input);
+    if !disabled {
+        input = input.on_input(on_input).on_submit(Message::SubmitSend);
+    }
+    let content: Element<'a, Message> = row![
+        text(label)
+            .size(if compact { 10 } else { 11 })
+            .color(theme::CYAN)
+            .width(if compact { 110 } else { 120 }),
+        input
+    ]
+    .spacing(if compact { 8 } else { 10 })
+    .align_y(Alignment::Center)
+    .into();
+    container(content)
+        .padding(if compact { [8, 10] } else { [9, 12] })
+        .width(Length::Fill)
+        .style(theme::surface)
+        .into()
+}
+
+fn send_status(
+    label: &'static str,
+    value: &'static str,
+    color: iced::Color,
+) -> Element<'static, Message> {
+    container(
+        row![
+            text(label).size(10).color(theme::DIM),
+            iced::widget::Space::new().width(Length::Fill),
+            text(value).size(11).color(color),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 10])
+    .width(Length::Fill)
+    .style(theme::surface)
+    .into()
 }
 
 fn form_line(

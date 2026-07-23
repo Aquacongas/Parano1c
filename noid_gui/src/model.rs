@@ -2,26 +2,138 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 pub const WALLET_CONSOLIDATION_INPUT_LIMIT: usize = 64;
+pub const MINED_BLOCK_PAGE_SIZE: u32 = 8;
+pub const EXPLORER_PAGE_SIZE: u32 = 8;
+pub const EXPLORER_SLOT_PAGE_SIZE: usize = 8;
+pub const RECEIPT_PAGE_SIZE: u32 = 7;
+
+#[derive(Clone, Default)]
+pub struct SensitiveString(zeroize::Zeroizing<String>);
+
+impl SensitiveString {
+    pub fn new(value: String) -> Self {
+        Self(zeroize::Zeroizing::new(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn clear(&mut self) {
+        zeroize::Zeroize::zeroize(&mut *self.0);
+    }
+}
+
+impl std::fmt::Debug for SensitiveString {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SensitiveString(<redacted>)")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+}
+
+impl LogLevel {
+    pub const ALL: [Self; 4] = [Self::Error, Self::Warn, Self::Info, Self::Debug];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeSettingsSnapshot {
+    pub data_dir: String,
+    pub p2p_listen: String,
+    pub custom_seeds: Vec<String>,
+    pub log_level: LogLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixClass {
+    B64,
+    B255,
+}
+
+impl MatrixClass {
+    pub const fn cli_value(self) -> &'static str {
+        match self {
+            Self::B64 => "b64",
+            Self::B255 => "b255",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MatrixCacheState {
+    Pending,
+    Preparing,
+    Ready,
+    Failed(String),
+}
+
+impl MatrixCacheState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Preparing => "PREPARING",
+            Self::Ready => "READY",
+            Self::Failed(_) => "FAILED",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProofsTab {
+    Mine,
+    Verify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Secret,
+    Node,
+    Network,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretImportMode {
+    Raw,
+    Photo,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
     Present,
     Proofs,
     Mine,
-    Node,
+    Explorer,
     Settings,
-}
-
-impl Section {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Present => "Main",
-            Self::Proofs => "Proofs",
-            Self::Mine => "Mining",
-            Self::Node => "Node",
-            Self::Settings => "Settings",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +144,7 @@ pub struct AppSnapshot {
     pub segments: Vec<SegmentSnapshot>,
     pub utxos: Vec<UtxoSnapshot>,
     pub mining: MiningSnapshot,
+    pub mined_blocks: MinedBlocksSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -128,8 +241,295 @@ impl UtxoSnapshot {
 #[derive(Debug, Clone)]
 pub struct MiningSnapshot {
     pub enabled: bool,
+    pub ready: bool,
+    pub isolated: bool,
+    pub confirmed_peers: usize,
+    pub required_peers: usize,
     pub selected_threads: usize,
     pub available_threads: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MinedBlocksSnapshot {
+    pub page: u32,
+    pub total: usize,
+    pub total_pages: u32,
+    pub blocks: Vec<MinedBlockSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptsSnapshot {
+    pub page: u32,
+    pub total: usize,
+    pub total_pages: u32,
+    pub receipts: Vec<ReceiptSnapshot>,
+}
+
+impl ReceiptsSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            page: 1,
+            total: 0,
+            total_pages: 0,
+            receipts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptSnapshot {
+    pub txid: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub amount_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub peer_address: Option<String>,
+    pub own_address: Option<String>,
+    pub own_key_index: Option<u32>,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub receipt_bytes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptDetailSnapshot {
+    pub receipt_hex: String,
+    pub verification: ReceiptVerificationSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptVerificationSnapshot {
+    pub merkle_valid: bool,
+    pub canonical: bool,
+    pub confirmed: bool,
+    pub error: Option<String>,
+    pub authenticated_summary: Option<ReceiptSummarySnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptSummarySnapshot {
+    pub txid: String,
+    pub claimed_height: u64,
+    pub confirmed_unix: u64,
+    pub tx_index: u16,
+    pub tx_count: u16,
+    pub fee_micronoid: u64,
+    pub inputs: Vec<ReceiptInputSnapshot>,
+    pub outputs: Vec<ReceiptOutputSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptInputSnapshot {
+    pub slot_index: u32,
+    pub owner: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceiptOutputSnapshot {
+    pub slot_index: u32,
+    pub amount_micronoid: u64,
+    pub owner: String,
+}
+
+impl MinedBlocksSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            page: 1,
+            total: 0,
+            total_pages: 0,
+            blocks: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MinedBlockSnapshot {
+    pub height: u64,
+    pub block_hash: String,
+    pub timestamp: u64,
+    pub reward_micronoid: u64,
+    pub payout_key_index: u32,
+    pub confirmations: u64,
+    pub full_block_available: bool,
+}
+
+impl MinedBlockSnapshot {
+    pub fn reward(&self) -> String {
+        format_micronoid(self.reward_micronoid)
+    }
+
+    pub fn short_hash(&self) -> String {
+        if self.block_hash.len() <= 20 {
+            return self.block_hash.clone();
+        }
+        format!(
+            "{}…{}",
+            &self.block_hash[..11],
+            &self.block_hash[self.block_hash.len() - 7..]
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockDetailsSnapshot {
+    pub header: BlockHeaderSnapshot,
+    pub retained: Option<RetainedBlockSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockHeaderSnapshot {
+    pub height: u64,
+    pub hash: String,
+    pub prev_hash: String,
+    pub state_root: String,
+    pub tx_root: String,
+    pub timestamp: u64,
+    pub miner: String,
+    pub nonce_hex: String,
+    pub difficulty_target: String,
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RetainedBlockSnapshot {
+    pub proof_class: String,
+    pub logical_transactions: u16,
+    pub user_pages: u16,
+    pub live_inputs: u16,
+    pub live_outputs: u16,
+    pub reward_micronoid: u64,
+    pub total_fees_micronoid: String,
+    pub block_bytes: u64,
+    pub history_step_bytes: u64,
+    pub bundle_bytes: u64,
+    pub transactions: Vec<BlockTransactionSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockTransactionSnapshot {
+    pub position: u16,
+    pub txid: String,
+    pub page_count: u16,
+    pub live_inputs: u16,
+    pub live_outputs: u16,
+    pub fee_micronoid: u64,
+    pub coinbase: bool,
+    pub epoch_anchor: String,
+    pub input_owner: Option<String>,
+    pub input_sum_micronoid: String,
+    pub output_sum_micronoid: String,
+    pub page_hashes: Vec<String>,
+    pub inputs: Vec<BlockTransactionInputSnapshot>,
+    pub outputs: Vec<BlockTransactionOutputSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockTransactionInputSnapshot {
+    pub page: u16,
+    pub lane: u8,
+    pub slot_index: u32,
+    pub amount_micronoid: u64,
+    pub creation_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlockTransactionOutputSnapshot {
+    pub page: u16,
+    pub lane: u8,
+    pub slot_index: u32,
+    pub amount_micronoid: u64,
+    pub owner: String,
+    pub creation_id: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplorerSnapshot {
+    pub tip_height: u64,
+    pub block_page: u32,
+    pub block_total_pages: u32,
+    pub blocks: Vec<ExplorerBlockSnapshot>,
+    pub recent_transactions: RecentTransactionsSnapshot,
+}
+
+impl ExplorerSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            tip_height: 0,
+            block_page: 1,
+            block_total_pages: 0,
+            blocks: Vec::new(),
+            recent_transactions: RecentTransactionsSnapshot::empty(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplorerBlockSnapshot {
+    pub header: BlockHeaderSnapshot,
+    pub confirmations: u64,
+    pub full_block_available: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecentTransactionsSnapshot {
+    pub page: u32,
+    pub total: usize,
+    pub total_pages: u32,
+    pub tip_height: u64,
+    pub retained_from_height: u64,
+    pub transactions: Vec<RecentTransactionSnapshot>,
+}
+
+impl RecentTransactionsSnapshot {
+    pub fn empty() -> Self {
+        Self {
+            page: 1,
+            total: 0,
+            total_pages: 0,
+            tip_height: 0,
+            retained_from_height: 0,
+            transactions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RecentTransactionSnapshot {
+    pub height: u64,
+    pub timestamp: u64,
+    pub position: u16,
+    pub txid: String,
+    pub live_inputs: u16,
+    pub live_outputs: u16,
+    pub fee_micronoid: u64,
+    pub coinbase: bool,
+    pub address_spent_micronoid: Option<String>,
+    pub address_received_micronoid: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplorerSlotSnapshot {
+    pub slot_index: u32,
+    pub value_micronoid: u64,
+    pub creation_id: u64,
+    pub owner: String,
+    pub empty: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ExplorerAddressSnapshot {
+    pub address: String,
+    pub balance_micronoid: u128,
+    pub slots: Vec<ExplorerSlotSnapshot>,
+    pub recent_transactions: RecentTransactionsSnapshot,
+}
+
+#[derive(Debug, Clone)]
+pub enum ExplorerSearchResultSnapshot {
+    Address(ExplorerAddressSnapshot),
+    Slot(ExplorerSlotSnapshot),
 }
 
 impl AppSnapshot {
@@ -193,6 +593,10 @@ impl AppSnapshot {
         }
     }
 
+    pub fn set_preview_mining_page(&mut self, page: u32) {
+        self.mined_blocks = preview_mined_blocks(page);
+    }
+
     pub fn offline(available_threads: usize) -> Self {
         Self {
             network: NetworkSnapshot {
@@ -236,9 +640,14 @@ impl AppSnapshot {
             utxos: Vec::new(),
             mining: MiningSnapshot {
                 enabled: false,
+                ready: false,
+                isolated: false,
+                confirmed_peers: 0,
+                required_peers: 2,
                 selected_threads: available_threads,
                 available_threads,
             },
+            mined_blocks: MinedBlocksSnapshot::empty(),
         }
     }
 
@@ -353,10 +762,45 @@ impl AppSnapshot {
             utxos,
             mining: MiningSnapshot {
                 enabled: false,
+                ready: false,
+                isolated: false,
+                confirmed_peers: 12,
+                required_peers: 2,
                 selected_threads: 12,
                 available_threads: 12,
             },
+            mined_blocks: preview_mined_blocks(1),
         }
+    }
+}
+
+fn preview_mined_blocks(page: u32) -> MinedBlocksSnapshot {
+    const TOTAL: usize = 23;
+    let total_pages = (TOTAL as u32).div_ceil(MINED_BLOCK_PAGE_SIZE);
+    let page = page.clamp(1, total_pages);
+    let offset = (page - 1) * MINED_BLOCK_PAGE_SIZE;
+    let count = MINED_BLOCK_PAGE_SIZE.min(TOTAL as u32 - offset);
+    let blocks = (0..count)
+        .map(|row| {
+            let index = offset + row;
+            let height = 18_420 - u64::from(index);
+            let confirmations = u64::from(index) + 1;
+            MinedBlockSnapshot {
+                height,
+                block_hash: format!("{:064x}", 0xa94f_2c77_18d9_5063u64.wrapping_add(height)),
+                timestamp: 1_784_732_200u64.saturating_sub(u64::from(index) * 15),
+                reward_micronoid: 50_000_000,
+                payout_key_index: 0,
+                confirmations,
+                full_block_available: confirmations <= 18,
+            }
+        })
+        .collect();
+    MinedBlocksSnapshot {
+        page,
+        total: TOTAL,
+        total_pages,
+        blocks,
     }
 }
 
@@ -375,8 +819,46 @@ pub fn grouped(value: u64) -> String {
     output
 }
 
+/// Human-readable form of the consensus creation-id namespaces.
+///
+/// The high bit tags a coinbase output and the remaining bits encode its
+/// block height. Ordinary outputs use the monotone output-id namespace.
+pub fn format_creation_origin(creation_id: u64) -> String {
+    const COINBASE_TAG: u64 = 1 << 63;
+
+    if creation_id & COINBASE_TAG != 0 {
+        format!("CB #{}", creation_id & !COINBASE_TAG)
+    } else {
+        format!("OUT #{creation_id}")
+    }
+}
+
 pub fn format_micronoid(value: u64) -> String {
     let whole = value / 1_000_000;
     let fractional = value % 1_000_000;
     format!("{whole}.{fractional:06}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{format_creation_origin, SensitiveString};
+
+    #[test]
+    fn formats_creation_id_namespaces_semantically() {
+        assert_eq!(format_creation_origin(4), "OUT #4");
+        assert_eq!(format_creation_origin((1 << 63) | 1), "CB #1");
+    }
+
+    #[test]
+    fn sensitive_strings_are_redacted_and_explicitly_cleared() {
+        let secret = "11".repeat(32);
+        let mut value = SensitiveString::new(secret.clone());
+
+        let debug = format!("{value:?}");
+        assert!(!debug.contains(&secret));
+        assert_eq!(debug, "SensitiveString(<redacted>)");
+
+        value.clear();
+        assert!(value.is_empty());
+    }
 }

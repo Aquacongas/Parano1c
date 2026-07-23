@@ -3,7 +3,8 @@
 
 use iced::border::Radius;
 use iced::widget::{
-    button as button_widget, container, scrollable as scrollable_widget, text_input as input_widget,
+    button as button_widget, container, scrollable as scrollable_widget,
+    text_editor as editor_widget, text_input as input_widget,
 };
 use iced::{font, theme::Palette, Background, Border, Color, Font, Shadow, Theme, Vector};
 
@@ -134,6 +135,75 @@ pub fn status_panel(_: &Theme) -> container::Style {
     }
 }
 
+pub fn secret_visual(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(Color::from_rgb8(28, 31, 41))),
+        border: Border {
+            color: Color::from_rgba8(206, 88, 214, 0.32),
+            width: 1.0,
+            radius: Radius::from(8.0),
+        },
+        shadow: soft_shadow(),
+        snap: true,
+    }
+}
+
+pub fn secret_key_token(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(Color::from_rgb8(34, 38, 49))),
+        border: Border {
+            color: Color::from_rgba8(52, 224, 111, 0.58),
+            width: 1.0,
+            radius: Radius::from(10.0),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(3, 5, 10, 0.48),
+            offset: Vector::new(0.0, 5.0),
+            blur_radius: 13.0,
+        },
+        snap: true,
+    }
+}
+
+pub fn secret_address_token(depth: u8) -> container::Style {
+    let lift = 3.0 - f32::from(depth).min(2.0) * 0.7;
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(Color::from_rgb8(
+            48 + depth.min(2) * 2,
+            51 + depth.min(2) * 2,
+            68 + depth.min(2) * 2,
+        ))),
+        border: Border {
+            color: Color::from_rgba8(103, 215, 246, 0.28),
+            width: 1.0,
+            radius: Radius::from(5.0),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(3, 5, 10, 0.42),
+            offset: Vector::new(0.0, lift),
+            blur_radius: 6.0,
+        },
+        snap: true,
+    }
+}
+
+pub fn photo_frame(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(Color::from_rgb8(22, 25, 34))),
+        border: Border {
+            color: Color::from_rgba8(103, 215, 246, 0.42),
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn status_capsule(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
@@ -172,10 +242,6 @@ fn title_style(background: Color) -> container::Style {
     }
 }
 
-pub fn title_bar(_: &Theme) -> container::Style {
-    title_style(ACCENT)
-}
-
 pub fn title_bar_cyan(_: &Theme) -> container::Style {
     title_style(CYAN)
 }
@@ -199,6 +265,34 @@ pub fn table_row(alternate: bool) -> impl Fn(&Theme) -> container::Style {
         container::Style::default()
             .background(if alternate { SURFACE_ALT } else { SURFACE })
             .color(TEXT)
+    }
+}
+
+pub fn transaction_row(alternate: bool, status: button_widget::Status) -> button_widget::Style {
+    let hovered = matches!(
+        status,
+        button_widget::Status::Hovered | button_widget::Status::Pressed
+    );
+    button_widget::Style {
+        background: Some(Background::Color(if hovered {
+            SURFACE_HIGH
+        } else if alternate {
+            SURFACE_ALT
+        } else {
+            SURFACE
+        })),
+        text_color: TEXT,
+        border: Border {
+            color: if hovered {
+                LINE_STRONG
+            } else {
+                Color::TRANSPARENT
+            },
+            width: if hovered { 1.0 } else { 0.0 },
+            radius: Radius::from(2.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
     }
 }
 
@@ -330,16 +424,6 @@ pub fn overlay(_: &Theme) -> container::Style {
     container::Style::default().background(Color::from_rgba8(12, 13, 19, 0.78))
 }
 
-pub fn meter_cell(color: Color, active: bool) -> impl Fn(&Theme) -> container::Style {
-    move |_| {
-        container::Style::default().background(if active {
-            color
-        } else {
-            Color::from_rgb8(67, 70, 85)
-        })
-    }
-}
-
 pub fn key_cap(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         text_color: Some(INK),
@@ -372,6 +456,29 @@ pub fn text_input(_: &Theme, status: input_widget::Status) -> input_widget::Styl
             radius: Radius::from(6.0),
         },
         icon: MUTED,
+        placeholder: DIM,
+        value: TEXT,
+        selection: Color::from_rgba8(103, 215, 246, 0.28),
+    }
+}
+
+pub fn text_editor(_: &Theme, status: editor_widget::Status) -> editor_widget::Style {
+    let focused = matches!(status, editor_widget::Status::Focused { .. });
+    let hovered = matches!(status, editor_widget::Status::Hovered);
+
+    editor_widget::Style {
+        background: Background::Color(SURFACE),
+        border: Border {
+            color: if focused {
+                CYAN
+            } else if hovered {
+                LINE_STRONG
+            } else {
+                LINE
+            },
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
         placeholder: DIM,
         value: TEXT,
         selection: Color::from_rgba8(103, 215, 246, 0.28),

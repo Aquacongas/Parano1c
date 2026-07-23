@@ -33,7 +33,10 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use std::{fs::OpenOptions, io::Write};
+use std::{
+    fs::OpenOptions,
+    io::{Read, Write},
+};
 
 use anyhow::Context;
 use clap::Parser;
@@ -192,12 +195,114 @@ fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     }
 }
 
+const MINING_PEER_QUORUM: usize = 2;
+
+struct MiningPeerQuorum {
+    isolated: bool,
+    connected: std::collections::HashSet<libp2p::PeerId>,
+    confirmed: std::collections::HashSet<libp2p::PeerId>,
+    ready: tokio::sync::watch::Sender<bool>,
+    count: tokio::sync::watch::Sender<usize>,
+}
+
+impl MiningPeerQuorum {
+    fn new(
+        isolated: bool,
+        ready: tokio::sync::watch::Sender<bool>,
+        count: tokio::sync::watch::Sender<usize>,
+    ) -> Self {
+        let quorum = Self {
+            isolated,
+            connected: std::collections::HashSet::new(),
+            confirmed: std::collections::HashSet::new(),
+            ready,
+            count,
+        };
+        quorum.publish();
+        quorum
+    }
+
+    fn connect(&mut self, peer: libp2p::PeerId) {
+        self.connected.insert(peer);
+    }
+
+    fn confirm(&mut self, peer: libp2p::PeerId) {
+        self.connected.insert(peer);
+        if self.confirmed.insert(peer) {
+            self.publish();
+        }
+    }
+
+    fn disconnect(&mut self, peer: libp2p::PeerId) {
+        self.connected.remove(&peer);
+        if self.confirmed.remove(&peer) {
+            self.publish();
+        }
+    }
+
+    fn waiting_for_quorum(&self) -> bool {
+        !self.isolated && self.confirmed.len() < MINING_PEER_QUORUM
+    }
+
+    fn unconfirmed_connected(&self) -> Vec<libp2p::PeerId> {
+        self.connected
+            .difference(&self.confirmed)
+            .copied()
+            .collect()
+    }
+
+    fn publish(&self) {
+        let count = self.confirmed.len();
+        if *self.count.borrow() != count {
+            self.count.send_replace(count);
+        }
+        let ready = self.isolated || count >= MINING_PEER_QUORUM;
+        if *self.ready.borrow() != ready {
+            self.ready.send_replace(ready);
+            tracing::info!(
+                confirmed_peers = count,
+                required_peers = MINING_PEER_QUORUM,
+                isolated = self.isolated,
+                ready,
+                "mining network gate changed"
+            );
+        }
+    }
+}
+
 /// A state-manifest round with zero responses is re-requested after this
 /// deadline. A dropped response stream must not wedge sync: with few peers
 /// there may never be another PeerConnected event to retrigger the probe
 /// (live-test finding, 2026-07-12).
 const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn history_step_cache_directory(data_dir: &Path, metadata_digest: [u8; 32]) -> PathBuf {
+    let mut digest_hex = String::with_capacity(64);
+    for byte in metadata_digest {
+        use std::fmt::Write as _;
+        write!(&mut digest_hex, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    data_dir.join("history-step-cache").join(digest_hex)
+}
+
+fn embedded_history_step_cache_file(
+    data_dir: &Path,
+    class: HistoryStepCacheClass,
+) -> Option<PathBuf> {
+    let pack = embedded_history_step_pack::embedded_history_step_pack()?;
+    Some(
+        history_step_cache_directory(data_dir, pack.runtime_metadata_digest()).join(
+            noid_miner::history_step_runtime_image_file_name(class.class_id()),
+        ),
+    )
+}
+
+fn embedded_history_step_cache_ready(data_dir: &Path, class: HistoryStepCacheClass) -> bool {
+    embedded_history_step_cache_file(data_dir, class)
+        .and_then(|path| std::fs::metadata(path).ok())
+        .is_some_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
 
 fn embedded_history_step_runtime(
     data_dir: &Path,
@@ -213,12 +318,7 @@ fn embedded_history_step_runtime(
     // The packed runtime layout is derived from the embedded canonical
     // leaves once per release build (keyed by the pinned metadata digest)
     // and reused on later starts.
-    let mut digest_hex = String::with_capacity(64);
-    for byte in pack.runtime_metadata_digest() {
-        use std::fmt::Write as _;
-        write!(&mut digest_hex, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    let cache_directory = data_dir.join("history-step-cache").join(digest_hex);
+    let cache_directory = history_step_cache_directory(data_dir, pack.runtime_metadata_digest());
     let matrix_source = pack
         .matrix_source(Some(cache_directory))
         .map_err(|error| format!("embedded HistoryStep matrices rejected: {error}"))?;
@@ -282,6 +382,29 @@ pub enum NodeMode {
     Extminer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum HistoryStepCacheClass {
+    B64,
+    B255,
+}
+
+impl HistoryStepCacheClass {
+    fn class_id(self) -> noid_recursive::CanonicalHistoryStepClassId {
+        noid_recursive::CanonicalHistoryStepClassId::new(match self {
+            Self::B64 => 0,
+            Self::B255 => 1,
+        })
+        .expect("GUI cache class is canonical")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::B64 => "B64/m23",
+            Self::B255 => "B255/m24",
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "paranoid",
@@ -311,8 +434,8 @@ struct Cli {
     #[arg(long, conflicts_with = "miner")]
     extminer: bool,
 
-    /// Bootstrap a new network: start mining immediately without waiting for peers.
-    /// Use ONLY for the very first node on a fresh network.
+    /// Permit isolated block production without a peer quorum.
+    /// Used for the first network node and explicit local-chain testing.
     #[arg(long)]
     genesis: bool,
 
@@ -379,6 +502,18 @@ struct Cli {
     /// or to recover from suspected data corruption.
     #[arg(long)]
     purge_state: bool,
+
+    /// Print the generated master secret as 64 hexadecimal characters, then exit.
+    #[arg(long, hide = true, conflicts_with = "import_wallet_secret")]
+    export_wallet_secret: bool,
+
+    /// Read a 64-character master secret from stdin, replace the wallet, then exit.
+    #[arg(long, hide = true, conflicts_with = "export_wallet_secret")]
+    import_wallet_secret: bool,
+
+    /// Materialize one HistoryStep packed cache image, then exit.
+    #[arg(long, value_enum, value_name = "CLASS", hide = true)]
+    prepare_history_step_cache: Option<HistoryStepCacheClass>,
 }
 
 /// Resolve a seed string to a libp2p Multiaddr.
@@ -535,6 +670,32 @@ async fn main() -> anyhow::Result<()> {
     if cli.allow_custom_coinbase && cli.mode != NodeMode::Extminer {
         anyhow::bail!("--allow-custom-coinbase requires --mode extminer");
     }
+    let wallet_maintenance = cli.export_wallet_secret || cli.import_wallet_secret;
+    if wallet_maintenance && cli.prepare_history_step_cache.is_some() {
+        anyhow::bail!("owner secret maintenance and matrix preparation are separate operations");
+    }
+    if wallet_maintenance
+        && (cli.mode != NodeMode::Node
+            || cli.genesis
+            || cli.purge_state
+            || cli.miner_address.is_some()
+            || cli.cpu_threads.is_some()
+            || cli.mining_key.is_some()
+            || cli.allow_custom_coinbase)
+    {
+        anyhow::bail!("owner secret maintenance cannot be combined with node or mining actions");
+    }
+    if cli.prepare_history_step_cache.is_some()
+        && (cli.mode != NodeMode::Node
+            || cli.genesis
+            || cli.purge_state
+            || cli.miner_address.is_some()
+            || cli.cpu_threads.is_some()
+            || cli.mining_key.is_some()
+            || cli.allow_custom_coinbase)
+    {
+        anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
+    }
     // --- Network ---
     let net = NetworkConfig::mainnet();
     tracing::debug!(network = %net.kind, "daemon starting");
@@ -617,9 +778,55 @@ async fn main() -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
-    // Receiver snapshots are transactional scratch data.  A crash can leave
+    let wallet_path = data_dir.join("wallet.key");
+    if cli.export_wallet_secret {
+        let master_secret = wallet::state::export_generated_master_secret(&wallet_path)
+            .map_err(anyhow::Error::msg)?;
+        println!("{}", master_secret.as_str());
+        return Ok(());
+    }
+    if cli.import_wallet_secret {
+        let mut master_secret = zeroize::Zeroizing::new(String::new());
+        std::io::stdin()
+            .take(4_097)
+            .read_to_string(&mut master_secret)
+            .context("read master secret from stdin")?;
+        wallet::state::import_generated_master_secret(&wallet_path, &master_secret)
+            .map_err(anyhow::Error::msg)?;
+        println!("Master secret imported");
+        return Ok(());
+    }
+    if let Some(class) = cli.prepare_history_step_cache {
+        if embedded_history_step_cache_ready(&data_dir, class) {
+            println!("HistoryStep {} matrix cache is ready", class.label());
+            return Ok(());
+        }
+    }
+    let history_step_runtime =
+        embedded_history_step_runtime(&data_dir).map_err(anyhow::Error::msg)?;
+    match &history_step_runtime {
+        None => tracing::warn!(
+            "HistoryStep verification unavailable in this pack-free development build"
+        ),
+        Some(_) => {
+            tracing::debug!("HistoryStep verifier uses executable-embedded registry and matrices")
+        }
+    }
+    if let Some(class) = cli.prepare_history_step_cache {
+        let runtime = history_step_runtime.clone().ok_or_else(|| {
+            anyhow::anyhow!("matrix preparation requires an embedded release pack")
+        })?;
+        tokio::task::spawn_blocking(move || runtime.prepare_matrix_cache(class.class_id()))
+            .await
+            .context("HistoryStep cache preparation task panicked")?
+            .map_err(anyhow::Error::msg)?;
+        println!("HistoryStep {} matrix cache is ready", class.label());
+        return Ok(());
+    }
+    // Receiver snapshots are transactional scratch data. A crash can leave
     // sealed segment files behind, but they are never authoritative and must
-    // not survive into a new sync session.
+    // not survive into a new sync session. Maintenance helpers return above:
+    // a cache prewarm running beside a live node must never touch sync state.
     let snapshot_staging_root = data_dir.join("snapshot-staging");
     match std::fs::remove_dir_all(&snapshot_staging_root) {
         Ok(()) => {}
@@ -639,16 +846,6 @@ async fn main() -> anyhow::Result<()> {
             snapshot_staging_root.display()
         )
     })?;
-    let history_step_runtime =
-        embedded_history_step_runtime(&data_dir).map_err(anyhow::Error::msg)?;
-    match &history_step_runtime {
-        None => tracing::warn!(
-            "HistoryStep verification unavailable in this pack-free development build"
-        ),
-        Some(_) => {
-            tracing::debug!("HistoryStep verifier uses executable-embedded registry and matrices")
-        }
-    }
     let block_production_enabled = cli.mode != NodeMode::Node;
     if block_production_enabled && history_step_runtime.is_none() {
         anyhow::bail!(
@@ -685,6 +882,10 @@ async fn main() -> anyhow::Result<()> {
     // A Notify permit can be consumed by one of many mempool/miner waiters;
     // watch preserves the state for every current and future subscriber.
     let (initial_sync_ready_tx, initial_sync_ready_rx) = tokio::sync::watch::channel(false);
+    let (mining_network_ready_tx, mining_network_ready_rx) =
+        tokio::sync::watch::channel(cli.genesis);
+    let (mining_confirmed_peer_count_tx, mining_confirmed_peer_count_rx) =
+        tokio::sync::watch::channel(0usize);
     // Edge-triggered tip changes cancel active proof/PoW work. Broadcast keeps
     // no stale permit from advances that happened before the miner subscribed;
     // its initial chain snapshot already includes those advances.
@@ -719,7 +920,6 @@ async fn main() -> anyhow::Result<()> {
     tracing::debug!("mempool ready");
 
     // --- Wallet ---
-    let wallet_path = data_dir.join("wallet.key");
     let wallet_state = match WalletState::create_or_load(wallet_path) {
         Ok(w) => {
             tracing::debug!(address = %w.active_address(), "wallet ready");
@@ -825,9 +1025,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // --genesis flag: bootstrap mode for the very first node on a new network.
-    // Marks durable initial readiness so the miner starts without waiting for peers.
-    // All other nodes sync automatically when they connect to a genesis node.
+    // --genesis is an explicit isolated-mining override for network bootstrap
+    // and local-chain tests. It remains valid after restart at any local height.
+    // Normal miners require confirmed ordinary P2P nodes; peers need not mine.
     if cli.genesis {
         tracing::debug!("genesis mode: marking initial sync ready immediately");
         mark_initial_sync_ready(&initial_sync_ready_tx);
@@ -841,6 +1041,11 @@ async fn main() -> anyhow::Result<()> {
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
     let p2p_tip_changes = tip_change_tx.clone();
     let p2p_initial_sync_ready = initial_sync_ready_tx.clone();
+    let p2p_mining_peer_quorum = MiningPeerQuorum::new(
+        cli.genesis,
+        mining_network_ready_tx,
+        mining_confirmed_peer_count_tx,
+    );
     let p2p_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
     let p2p_snapshot_staging_root = snapshot_staging_root.clone();
     let p2p_history_step_runtime = history_step_runtime.clone();
@@ -853,6 +1058,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_wallet,
             p2p_cmd_for_events,
             p2p_initial_sync_ready,
+            p2p_mining_peer_quorum,
             p2p_tip_changes,
             p2p_wallet_operation_gate,
             p2p_snapshot_staging_root,
@@ -914,6 +1120,10 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&wallet_operation_gate),
         p2p.cmd_tx.clone(),
         initial_sync_ready_rx.clone(),
+        mining_network_ready_rx.clone(),
+        mining_confirmed_peer_count_rx.clone(),
+        MINING_PEER_QUORUM,
+        cli.genesis,
         cfg.mining.enabled,
         noid_core::cpu::selected_backend().to_string(),
         cpu_plan.available_threads,
@@ -953,7 +1163,7 @@ async fn main() -> anyhow::Result<()> {
             miner_cfg,
             mempool.clone(),
             chain.clone(),
-            initial_sync_ready_rx,
+            mining_network_ready_rx,
             tip_change_tx.clone(),
             Arc::clone(
                 history_step_runtime
@@ -1640,7 +1850,8 @@ mod tests {
         snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
         unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
         validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        MINING_PEER_QUORUM,
     };
 
     #[test]
@@ -1653,6 +1864,43 @@ mod tests {
         assert!(*first.borrow());
         assert!(*second.borrow());
         assert!(*late.borrow());
+    }
+
+    #[test]
+    fn mining_quorum_counts_two_confirmed_ordinary_peers() {
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, ready_tx, count_tx);
+        let first = libp2p::PeerId::random();
+        let second = libp2p::PeerId::random();
+
+        quorum.connect(first);
+        quorum.connect(second);
+        assert_eq!(quorum.unconfirmed_connected().len(), 2);
+        assert_eq!(*count_rx.borrow(), 0);
+        assert!(!*ready_rx.borrow());
+
+        quorum.confirm(first);
+        assert_eq!(*count_rx.borrow(), 1);
+        assert!(!*ready_rx.borrow());
+
+        quorum.confirm(second);
+        assert_eq!(*count_rx.borrow(), MINING_PEER_QUORUM);
+        assert!(*ready_rx.borrow());
+
+        quorum.disconnect(first);
+        assert_eq!(*count_rx.borrow(), 1);
+        assert!(!*ready_rx.borrow());
+    }
+
+    #[test]
+    fn isolated_mining_bypasses_peer_quorum_at_any_height() {
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
+        let _quorum = MiningPeerQuorum::new(true, ready_tx, count_tx);
+
+        assert_eq!(*count_rx.borrow(), 0);
+        assert!(*ready_rx.borrow());
     }
 
     #[test]
@@ -1935,6 +2183,7 @@ async fn handle_p2p_events(
     wallet: SharedWallet,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     initial_sync_ready: tokio::sync::watch::Sender<bool>,
+    mut mining_peer_quorum: MiningPeerQuorum,
     tip_changes: tokio::sync::broadcast::Sender<()>,
     wallet_operation_gate: WalletOperationGate,
     snapshot_staging_root: PathBuf,
@@ -2701,6 +2950,7 @@ async fn handle_p2p_events(
                                             .await;
                                         last_tip_advance = Instant::now();
                                         mark_initial_sync_ready(&initial_sync_ready);
+                                        mining_peer_quorum.confirm(from);
                                         let _ = tip_changes.send(());
                                         tracing::info!(
                                             new_tip = new_tip_height,
@@ -2871,6 +3121,7 @@ async fn handle_p2p_events(
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 mark_initial_sync_ready(&initial_sync_ready);
+                                mining_peer_quorum.confirm(from);
                                 let _ = tip_changes.send(()); // cancel/rebuild any active stale template
 
                                 // Continue only to the authenticated/announced target. Pulling
@@ -3083,6 +3334,7 @@ async fn handle_p2p_events(
 
                                                     last_tip_advance = Instant::now();
                                                     mark_initial_sync_ready(&initial_sync_ready);
+                                                    mining_peer_quorum.confirm(from);
                                                     let _ = tip_changes.send(());
                                                     let new_tip = new_tip_height;
                                                     tracing::info!(
@@ -3438,6 +3690,7 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::PeerConnected(peer)) => {
                 tracing::info!(peer = %peer, "peer connected");
+                mining_peer_quorum.connect(peer);
                 manifest_peers.insert(peer);
 
                 if snapshot_install_inflight.is_some() {
@@ -3634,6 +3887,7 @@ async fn handle_p2p_events(
                         // sync probe, not an absence of peers. Make readiness
                         // durable so a miner created later starts immediately.
                         mark_initial_sync_ready(&initial_sync_ready);
+                        mining_peer_quorum.confirm(from);
                         tracing::debug!(
                             peer = %from,
                             height = our_tip,
@@ -4448,9 +4702,16 @@ async fn handle_p2p_events(
                     "snapshot HistoryStep verification started off-thread"
                 );
             }
-            Ok(NetworkEvent::PeerDisconnected(peer)) => {
-                tracing::debug!(peer = %peer, "peer disconnected");
-                manifest_peers.remove(&peer);
+            Ok(event @ NetworkEvent::PeerDisconnected(peer))
+            | Ok(event @ NetworkEvent::PeerRequestFailed(peer)) => {
+                let connection_closed = matches!(event, NetworkEvent::PeerDisconnected(_));
+                if connection_closed {
+                    mining_peer_quorum.disconnect(peer);
+                    manifest_peers.remove(&peer);
+                    tracing::debug!(peer = %peer, "peer disconnected");
+                } else {
+                    tracing::debug!(peer = %peer, "peer sync request failed");
+                }
                 if pending_shallow_fork
                     .as_ref()
                     .is_some_and(|pending| pending.peer == peer)
@@ -4854,6 +5115,7 @@ async fn handle_p2p_events(
                     }
                     last_tip_advance = Instant::now();
                     mark_initial_sync_ready(&initial_sync_ready);
+                    mining_peer_quorum.confirm(completed.key.from);
                     let _ = tip_changes.send(());
                     if highest_announced > height {
                         let peer = last_announcement_peer.unwrap_or(completed.key.from);
@@ -5013,6 +5275,37 @@ async fn handle_p2p_events(
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
+
+            // Ordinary wallet nodes count toward mining readiness once they
+            // confirm our canonical tip. A wallet may connect while still
+            // catching up, so repeat the bounded tip probe only while the
+            // quorum is incomplete. Once two peers confirm, this adds no
+            // steady-state network traffic.
+            if mining_peer_quorum.waiting_for_quorum() {
+                let our_height = {
+                    let ctx = chain.read().await;
+                    ctx.tip_height()
+                };
+                const MINING_QUORUM_TIP_PROBE_HEADERS: u16 = 512;
+                for peer in mining_peer_quorum.unconfirmed_connected() {
+                    let request_key = (peer, our_height, MINING_QUORUM_TIP_PROBE_HEADERS);
+                    let recently_requested = recent_header_fetches
+                        .get(&request_key)
+                        .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                    if fetch_in_progress.contains(&peer) || recently_requested {
+                        continue;
+                    }
+                    fetch_in_progress.insert(peer);
+                    recent_header_fetches.insert(request_key, Instant::now());
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::FetchHeaders {
+                            peer,
+                            start_height: our_height,
+                            count: MINING_QUORUM_TIP_PROBE_HEADERS,
+                        })
+                        .await;
+                }
+            }
 
             if pending_shallow_fork
                 .as_ref()

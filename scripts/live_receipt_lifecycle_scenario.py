@@ -331,7 +331,10 @@ def main():
         sender_node.stop()
         restart_label = "04-durable-receipt-restart-and-prune"
         restart_info, restart_seconds = sender_node.start(
-            restart_label, mode="miner", seeds=[verifier_node.seed]
+            restart_label,
+            mode="miner",
+            genesis=True,
+            seeds=[verifier_node.seed],
         )
         labels.append(restart_label)
         require(export_receipt(sender_node, txid) == receipt_hex, "restart changed receipt bytes")

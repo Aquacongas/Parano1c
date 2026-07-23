@@ -13,6 +13,7 @@
 use std::collections::VecDeque;
 use std::io::Read as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use noid_ivc_core::field_r1cs::{
@@ -41,6 +42,7 @@ pub const HISTORY_STEP_PACK_LEAF_COUNT: usize = HISTORY_STEP_CLASS_COUNT;
 /// these caps.
 const MAX_COMPRESSED_RUNTIME_IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_RUNTIME_IMAGE_BYTES: u64 = 1024 * 1024 * 1024;
+static RUNTIME_CACHE_STAGE_ID: AtomicU64 = AtomicU64::new(0);
 pub const HISTORY_STEP_PACK_LEAF_HASH_DOMAIN: &[u8] = b"NOID/HISTORY-STEP/PACK-LEAF/V1";
 pub const HISTORY_STEP_RUNTIME_METADATA_DIGEST_DOMAIN: &[u8] =
     b"NOID/HISTORY-STEP/RUNTIME-METADATA/V1";
@@ -489,9 +491,30 @@ impl EmbeddedHistoryStepMatrixSource {
                     .map(std::fs::create_dir_all)
                     .transpose()
                     .and_then(|_| {
-                        let staged = path.with_extension("tmp");
+                        let staged = path.with_extension(format!(
+                            "tmp-{}-{}",
+                            std::process::id(),
+                            RUNTIME_CACHE_STAGE_ID.fetch_add(1, Ordering::Relaxed)
+                        ));
                         std::fs::write(&staged, &compressed)?;
-                        std::fs::rename(&staged, &path)
+                        #[cfg(target_os = "windows")]
+                        if path.exists() {
+                            if let Err(error) = std::fs::remove_file(&path) {
+                                let _ = std::fs::remove_file(&staged);
+                                return Err(error);
+                            }
+                        }
+                        match std::fs::rename(&staged, &path) {
+                            Ok(()) => Ok(()),
+                            Err(_) if path.is_file() => {
+                                let _ = std::fs::remove_file(&staged);
+                                Ok(())
+                            }
+                            Err(error) => {
+                                let _ = std::fs::remove_file(&staged);
+                                Err(error)
+                            }
+                        }
                     });
             }
         }

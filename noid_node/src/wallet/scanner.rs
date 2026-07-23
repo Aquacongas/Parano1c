@@ -174,6 +174,7 @@ pub fn update_wallet_artifacts_from_block(
                 tx_hash: coinbase_hash,
                 height: block.header.height,
                 direction: TxDirection::Received,
+                is_coinbase: true,
                 amount_micronoid: received,
                 peer_address: None,
                 timestamp: block.header.timestamp,
@@ -213,6 +214,7 @@ pub fn update_wallet_artifacts_from_block(
             tx_hash,
             height: block.header.height,
             direction: TxDirection::Received,
+            is_coinbase: false,
             amount_micronoid: received,
             peer_address: None,
             timestamp: block.header.timestamp,
@@ -300,6 +302,7 @@ pub fn update_active_wallet_from_block(
                 tx_hash: coinbase_hash,
                 height,
                 direction: TxDirection::Received,
+                is_coinbase: true,
                 amount_micronoid: output.amount,
                 peer_address: None,
                 timestamp,
@@ -380,6 +383,7 @@ pub fn update_active_wallet_from_block(
                     tx_hash,
                     height,
                     direction: TxDirection::Sent,
+                    is_coinbase: false,
                     amount_micronoid: net_sent,
                     peer_address: None,
                     timestamp,
@@ -391,6 +395,7 @@ pub fn update_active_wallet_from_block(
                     tx_hash,
                     height,
                     direction: TxDirection::Received,
+                    is_coinbase: false,
                     amount_micronoid: received_by_wallet,
                     peer_address: None,
                     timestamp,
@@ -521,6 +526,9 @@ mod tests {
             utxos[&20].creation_id, 102,
             "user output follows the allocator (coinbase still burned id 101)"
         );
+        assert_eq!(history.len(), 2);
+        assert!(history[0].is_coinbase);
+        assert!(!history[1].is_coinbase);
     }
 
     #[test]
@@ -610,6 +618,7 @@ mod tests {
             tx_hash: outgoing_hash,
             height: 0,
             direction: TxDirection::Sent,
+            is_coinbase: false,
             amount_micronoid: 123,
             peer_address: Some([0xBB; 32]),
             timestamp: 1,
@@ -647,6 +656,7 @@ mod tests {
             tx_hash: outgoing_hash,
             height: 0,
             direction: TxDirection::Sent,
+            is_coinbase: false,
             amount_micronoid: 123,
             peer_address: Some([0xBB; 32]),
             timestamp: 1,

@@ -6,10 +6,11 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
 
 use crate::types::{
-    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate, MempoolInfo,
-    MempoolStats, MiningInfo, NodeStatus, ReceiptVerifyResult, SlotInfo, StateInfo, StateMapInfo,
-    TxInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
-    WalletSendResult, WalletStatus, WalletUtxoInfo,
+    AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate,
+    MempoolInfo, MempoolStats, MiningInfo, NodeStatus, ReceiptVerifyResult, RecentTransactionsPage,
+    SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance,
+    WalletHistoryEntry, WalletMinedBlocksPage, WalletReceiptsPage, WalletScanResult,
+    WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -35,6 +36,10 @@ pub trait ParanoidApi {
     /// Stored forever.
     #[method(name = "getBlockHeader")]
     async fn get_block_header(&self, height: u64) -> RpcResult<Option<BlockHeaderInfo>>;
+
+    /// Decoded permanent block header by H_BLOCK hash.
+    #[method(name = "getBlockHeaderByHash")]
+    async fn get_block_header_by_hash(&self, hash: String) -> RpcResult<Option<BlockHeaderInfo>>;
 
     /// Raw 212-byte block header hex at `height` (for developers).
     #[method(name = "getHeaderByHeight")]
@@ -78,6 +83,21 @@ pub trait ParanoidApi {
     /// Only retained recent blocks are served; older block bodies are pruned.
     #[method(name = "getBlock")]
     async fn get_block(&self, height: u64) -> RpcResult<Option<String>>;
+
+    /// Permanent header plus full body detail when the block remains retained.
+    #[method(name = "getBlockDetails")]
+    async fn get_block_details(&self, height: u64) -> RpcResult<Option<BlockDetailsInfo>>;
+
+    /// Compact paginated logical transactions from the retained body window.
+    /// Supplying an address filters the bounded scan to transitions involving
+    /// that owner and adds exact sent/received aggregates for that address.
+    #[method(name = "getRecentTransactions")]
+    async fn get_recent_transactions(
+        &self,
+        page: u32,
+        page_size: u32,
+        address: Option<String>,
+    ) -> RpcResult<RecentTransactionsPage>;
 
     // =========================================================================
     // Network / mining
@@ -212,9 +232,29 @@ pub trait ParanoidApi {
     #[method(name = "walletHistory")]
     async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>>;
 
+    /// Newest-first durable receipts for every locally sent transaction.
+    #[method(name = "walletReceipts")]
+    async fn wallet_receipts(&self, page: u32, page_size: u32) -> RpcResult<WalletReceiptsPage>;
+
+    /// Newest-first paginated blocks whose coinbase belongs to this wallet.
+    #[method(name = "walletMinedBlocks")]
+    async fn wallet_mined_blocks(
+        &self,
+        page: u32,
+        page_size: u32,
+    ) -> RpcResult<WalletMinedBlocksPage>;
+
     /// Reload the active address from the exact verified durable owner index.
     #[method(name = "walletScan")]
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult>;
+
+    /// Discover the contiguous funded address prefix after master-secret
+    /// import. The first empty address stops discovery.
+    #[method(name = "walletDiscoverAddresses")]
+    async fn wallet_discover_addresses(
+        &self,
+        max_additional: u32,
+    ) -> RpcResult<Vec<WalletAddressInfo>>;
 
     /// Dry-run wallet send planning without proving or submitting.
     /// `fee_micronoid = 0` computes the automatic fee.

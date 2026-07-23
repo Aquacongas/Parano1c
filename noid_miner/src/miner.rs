@@ -179,9 +179,9 @@ pub struct BlockMiner {
     /// Permanent stop flag: set only by stop(), never reset. The main loop
     /// checks this at the top of each iteration and breaks cleanly.
     stopped: Arc<AtomicBool>,
-    /// Durable initial-sync state. Unlike `Notify`, a watch value cannot be
-    /// consumed by another waiter or lost before the miner task starts.
-    initial_sync_ready: watch::Receiver<bool>,
+    /// Live network gate. Normal miners require an authenticated peer quorum;
+    /// explicit isolated/genesis mode keeps this true without peers.
+    mining_network_ready: watch::Receiver<bool>,
     /// Edge-triggered canonical-tip changes observed after this miner was
     /// created. Broadcast deliberately retains no pre-subscription permit:
     /// the initial chain snapshot already includes every earlier advance.
@@ -211,7 +211,7 @@ impl BlockMiner {
         config: MinerConfig,
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
-        initial_sync_ready: watch::Receiver<bool>,
+        mining_network_ready: watch::Receiver<bool>,
         tip_change_sender: broadcast::Sender<()>,
         history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
         ghost_authorization: Arc<
@@ -243,7 +243,7 @@ impl BlockMiner {
             events,
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
-            initial_sync_ready,
+            mining_network_ready,
             tip_changes: tip_change_sender.subscribe(),
             _tip_change_sender: tip_change_sender,
             history_step_runtime,
@@ -308,68 +308,34 @@ impl BlockMiner {
         self.stopped.clone()
     }
 
+    async fn wait_for_mining_network(&mut self) -> bool {
+        if *self.mining_network_ready.borrow() {
+            return true;
+        }
+        tracing::info!("miner: waiting for authenticated peer quorum");
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return false;
+            }
+            tokio::select! {
+                result = self.mining_network_ready.changed() => {
+                    if result.is_err() {
+                        tracing::info!("miner: network readiness channel closed");
+                        return false;
+                    }
+                    if *self.mining_network_ready.borrow() {
+                        tracing::info!("miner: authenticated peer quorum ready");
+                        return true;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+        }
+    }
+
     /// Main mining loop. Run in a dedicated `tokio::spawn` task.
     /// Never returns under normal operation.
     pub async fn run(mut self) {
-        // Sync guard: do not mine until chain is current.
-        {
-            use noid_chain::consensus::params::BLOCK_TIME;
-            const INITIAL_GENESIS_SYNC_GRACE: Duration = Duration::from_secs(5);
-            let (height, tip_ts) = {
-                let ctx = self.chain.read().await;
-                (ctx.tip_height(), ctx.tip_header().timestamp)
-            };
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            // "Fresh" = tip within 3 block-times of wall clock.
-            let is_fresh = tip_ts > 0 && now.saturating_sub(tip_ts) < BLOCK_TIME * 3;
-            let mut initial_sync_ready = self.initial_sync_ready.clone();
-
-            if height > 0 && is_fresh {
-                tracing::debug!(height, "miner: chain current, starting");
-            } else if *initial_sync_ready.borrow() {
-                tracing::debug!(height, "miner: initial sync already ready, starting");
-            } else if height > 0 {
-                let age = now.saturating_sub(tip_ts);
-                tracing::info!(height, age_secs = age, "waiting for peer sync (max 30s)");
-                tokio::select! {
-                    result = initial_sync_ready.changed() => {
-                        let h = self.chain.read().await.tip_height();
-                        if result.is_ok() && *initial_sync_ready.borrow() {
-                            tracing::debug!(height = h, "miner: sync ready, starting");
-                        } else {
-                            tracing::info!(height = h, "miner: sync readiness channel closed, starting from local tip");
-                        }
-                    }
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
-                        let h = self.chain.read().await.tip_height();
-                        tracing::info!(height = h, "miner: sync timeout, starting anyway");
-                    }
-                }
-            } else {
-                // Give discovery and the first authenticated header probe one
-                // short grace period. Explicit --genesis and a same-tip peer
-                // set the durable watch value immediately. Mining offline is
-                // valid, so a missing peer must not impose a one-minute UX tax.
-                tracing::debug!("miner: height=0, waiting for initial sync readiness or 5s grace");
-                tokio::select! {
-                    result = initial_sync_ready.changed() => {
-                        let h = self.chain.read().await.tip_height();
-                        if result.is_ok() && *initial_sync_ready.borrow() {
-                            tracing::debug!(height = h, "miner: ready, starting");
-                        } else {
-                            tracing::info!(height = h, "miner: sync readiness channel closed, starting from local genesis");
-                        }
-                    }
-                    _ = tokio::time::sleep(INITIAL_GENESIS_SYNC_GRACE) => {
-                        tracing::info!("miner: initial sync grace elapsed, starting from local genesis");
-                    }
-                }
-            }
-        }
-
         let builder = TemplateBuilder::new(self.mempool.clone());
         let cancel = self.cancel_pow.clone();
         let mut heartbeat = interval(Duration::from_secs(self.config.refresh_interval_secs));
@@ -383,6 +349,9 @@ impl BlockMiner {
             // starting a new template build so the task exits promptly.
             if self.stopped.load(Ordering::Acquire) {
                 tracing::info!("miner: shutdown flag set, exiting loop");
+                break;
+            }
+            if !self.wait_for_mining_network().await {
                 break;
             }
 
@@ -503,6 +472,13 @@ impl BlockMiner {
                 );
                 break;
             }
+            if !*self.mining_network_ready.borrow() {
+                tracing::info!(
+                    height,
+                    "miner: peer quorum lost during preparation; discarding prepared block"
+                );
+                continue;
+            }
 
             // Preparation may be expensive. Refuse to spend PoW on a parent
             // that was replaced while it ran; the final commit repeats this
@@ -555,6 +531,10 @@ impl BlockMiner {
                             if self.stopped.load(Ordering::Acquire) {
                                 tracing::info!(height, "miner: shutdown requested after PoW; discarding nonce");
                                 break 'mining;
+                            }
+                            if !*self.mining_network_ready.borrow() {
+                                tracing::info!(height, "miner: peer quorum lost after PoW; discarding nonce");
+                                continue;
                             }
                             let nonce_found_at = Instant::now();
                             let sealed_header = attempt.pow_header(sol.nonce);
@@ -620,6 +600,10 @@ impl BlockMiner {
                             if self.stopped.load(Ordering::Acquire) {
                                 tracing::info!(height, "miner: shutdown requested during seal; discarding proved block");
                                 break 'mining;
+                            }
+                            if !*self.mining_network_ready.borrow() {
+                                tracing::info!(height, "miner: peer quorum lost during seal; discarding proved block");
+                                continue;
                             }
 
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
@@ -704,6 +688,20 @@ impl BlockMiner {
                         // The miner owns a sender, so closure is unreachable
                         // until the miner itself is dropped.
                         Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                    }
+                }
+
+                readiness = self.mining_network_ready.changed() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = pow_handle.await;
+                    match readiness {
+                        Ok(()) if !*self.mining_network_ready.borrow() => {
+                            tracing::info!("miner: authenticated peer quorum lost; pausing");
+                        }
+                        Ok(()) => {
+                            tracing::debug!("miner: network readiness changed; rebuilding");
+                        }
+                        Err(_) => break 'mining,
                     }
                 }
             }

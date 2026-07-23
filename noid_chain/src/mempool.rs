@@ -21,7 +21,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use noid_poseidon2b::primitives::{Digest, TxBodyHash};
+use noid_poseidon2b::primitives::{Address, Digest, TxBodyHash};
 use noid_tx::{
     paged_spend_authorization_wire_offset, validate_paged_spend, PagedSpendFacts, TxPage,
 };
@@ -170,6 +170,9 @@ pub struct Mempool {
     spent_inputs: HashMap<u32, TxBodyHash>,
     /// Output slot -> logical txid of the group that mints it.
     minted_outputs: HashMap<u32, TxBodyHash>,
+    /// Pending value sent to each external owner. Change back to the input
+    /// owner is excluded, so wallet UIs do not mislabel change as incoming.
+    incoming_value_by_owner: HashMap<Address, u64>,
     /// Maximum number of entries.
     capacity: usize,
 }
@@ -182,6 +185,7 @@ impl Mempool {
             fee_index: BTreeMap::new(),
             spent_inputs: HashMap::new(),
             minted_outputs: HashMap::new(),
+            incoming_value_by_owner: HashMap::new(),
             capacity,
         }
     }
@@ -265,6 +269,12 @@ impl Mempool {
             }
             for (_, out) in page.body.live_outputs() {
                 self.minted_outputs.insert(out.slot_index, hash);
+                if out.owner != entry.spend.input_owner {
+                    self.incoming_value_by_owner
+                        .entry(out.owner)
+                        .and_modify(|value| *value = value.saturating_add(out.amount))
+                        .or_insert(out.amount);
+                }
             }
         }
         self.fee_index.insert(fee_key, hash);
@@ -283,6 +293,18 @@ impl Mempool {
             }
             for (_, out) in page.body.live_outputs() {
                 self.minted_outputs.remove(&out.slot_index);
+                if out.owner != entry.spend.input_owner {
+                    let remove_owner = self
+                        .incoming_value_by_owner
+                        .get_mut(&out.owner)
+                        .is_some_and(|value| {
+                            *value = value.saturating_sub(out.amount);
+                            *value == 0
+                        });
+                    if remove_owner {
+                        self.incoming_value_by_owner.remove(&out.owner);
+                    }
+                }
             }
         }
         Some(entry)
@@ -443,6 +465,15 @@ impl Mempool {
             .map(|entry| entry.spend.fee)
             .fold(0u64, |a, f| a.saturating_add(f))
     }
+
+    /// Pending external value addressed to `owner`, excluding change produced
+    /// by spends from the same owner. O(1), maintained on admission/removal.
+    pub fn pending_incoming_for_owner(&self, owner: &Address) -> u64 {
+        self.incoming_value_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -459,6 +490,17 @@ mod tests {
     };
 
     fn tx(input_slot: u32, output_slot: u32, fee: u64, seed: u8, anchor: Digest) -> Vec<TxPage> {
+        tx_to(input_slot, output_slot, fee, seed, seed, anchor)
+    }
+
+    fn tx_to(
+        input_slot: u32,
+        output_slot: u32,
+        fee: u64,
+        input_seed: u8,
+        output_seed: u8,
+        anchor: Digest,
+    ) -> Vec<TxPage> {
         let mut inputs = [TxInput::dummy(); TX_INPUTS];
         inputs[0] = TxInput {
             slot_index: input_slot,
@@ -469,12 +511,12 @@ mod tests {
         outputs[0] = TxOutput {
             slot_index: output_slot,
             amount: 100,
-            owner: Address([seed; 32]),
+            owner: Address([output_seed; 32]),
         };
         vec![TxPage::new(TxBody {
             epoch_anchor: anchor,
             fee,
-            input_owner: Address([seed; 32]),
+            input_owner: Address([input_seed; 32]),
             inputs,
             outputs,
             validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
@@ -536,6 +578,22 @@ mod tests {
         assert!(pool.contains(&hash));
         assert_eq!(pool.admit(tx, 3), Err(MempoolError::AlreadyAdmitted));
         assert_eq!(pool.remove(&hash).unwrap().spend.logical_txid, hash);
+    }
+
+    #[test]
+    fn pending_incoming_index_excludes_change_and_tracks_removal() {
+        let mut pool = Mempool::new(4);
+        let recipient = Address([9; 32]);
+        let first = tx_to(1, 2, 10, 1, 9, [7; 32]);
+        let first_id = id(&first);
+        let second = tx_to(3, 4, 10, 2, 9, [7; 32]);
+        pool.admit(first, 3).unwrap();
+        pool.admit(second, 3).unwrap();
+
+        assert_eq!(pool.pending_incoming_for_owner(&recipient), 200);
+        assert_eq!(pool.pending_incoming_for_owner(&Address([1; 32])), 0);
+        pool.remove(&first_id).unwrap();
+        assert_eq!(pool.pending_incoming_for_owner(&recipient), 100);
     }
 
     #[test]

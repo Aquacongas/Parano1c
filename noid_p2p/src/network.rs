@@ -240,7 +240,7 @@ fn notify_outbound_request_failed(
     // This is the same retry-driving signal used for request-response
     // OutboundFailure. The connection may still be live; node sync state must
     // nevertheless release the logical request and choose/retry a peer.
-    let _ = event_tx.send(NetworkEvent::PeerDisconnected(peer));
+    let _ = event_tx.send(NetworkEvent::PeerRequestFailed(peer));
 }
 
 fn clear_peer_request_correlations(
@@ -525,6 +525,8 @@ pub enum NetworkEvent {
     PeerConnected(PeerId),
     /// A peer disconnected.
     PeerDisconnected(PeerId),
+    /// A peer-owned sync request failed while the connection may remain live.
+    PeerRequestFailed(PeerId),
 }
 
 /// Receive side for node-facing P2P events.
@@ -2673,7 +2675,9 @@ async fn handle_swarm_event(
             // Multiple connections to the same peer are common (simultaneous dials,
             // mDNS re-discovery, relay + direct). Emitting for each one causes
             if num_established.get() == 1 {
-                let _ = gossip_event_tx.send(NetworkEvent::PeerConnected(peer_id));
+                let _ = required_event_tx
+                    .send(NetworkEvent::PeerConnected(peer_id))
+                    .await;
                 tracing::debug!(peer = %peer_id, "peer connected");
             }
             // Clear any pending reconnect entry — connection succeeded.
@@ -2696,7 +2700,9 @@ async fn handle_swarm_event(
             }
             // Only emit PeerDisconnected when the LAST connection to a peer closes.
             if num_established == 0 {
-                let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer_id));
+                let _ = required_event_tx
+                    .send(NetworkEvent::PeerDisconnected(peer_id))
+                    .await;
                 tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
                 block_event_rate.remove(&peer_id);
                 tx_gossip_rate.remove(&peer_id);
@@ -2745,7 +2751,8 @@ async fn handle_swarm_event(
                 tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale block-sync failure");
                 return;
             }
-            // Emit a generic disconnect so the sync state machine can retry.
+            // Release the logical request so the sync state machine can retry
+            // without pretending the underlying peer connection closed.
             fail_peer!(peer);
         }
 
@@ -2753,7 +2760,7 @@ async fn handle_swarm_event(
             request_response::Event::OutboundFailure { peer, error, .. },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "manifest sync request failed");
-            let _ = gossip_event_tx.send(NetworkEvent::PeerDisconnected(peer));
+            let _ = gossip_event_tx.send(NetworkEvent::PeerRequestFailed(peer));
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
@@ -2898,7 +2905,7 @@ mod tests {
         notify_outbound_request_failed(&failure_tx, peer);
         assert!(matches!(
             failure_rx.try_recv(),
-            Ok(NetworkEvent::PeerDisconnected(failed_peer)) if failed_peer == peer
+            Ok(NetworkEvent::PeerRequestFailed(failed_peer)) if failed_peer == peer
         ));
     }
 

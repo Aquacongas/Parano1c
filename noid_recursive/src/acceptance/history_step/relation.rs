@@ -613,6 +613,18 @@ impl HistoryStepRuntime {
         Ok(matrix)
     }
 
+    /// Materialize one release-pinned matrix through the configured runtime
+    /// source. GUI launch helpers use this in a short-lived process so the
+    /// packed disk image is ready before mining while its large resident image
+    /// is released immediately when the helper exits.
+    pub fn prepare_matrix_cache(
+        &self,
+        class: CanonicalHistoryStepClassId,
+    ) -> Result<(), HistoryStepError> {
+        drop(self.load_matrix(class)?);
+        Ok(())
+    }
+
     pub fn parent_recursion_vk(&self) -> &LinkRegionSidecarVk {
         &self.parent_recursion_vk
     }

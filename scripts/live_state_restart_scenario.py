@@ -131,7 +131,11 @@ def main():
         node.stop()
 
         cold_miner_label = "03-cold-post-restart-mining"
-        _, cold_startup_seconds = node.start(cold_miner_label, mode="miner")
+        _, cold_startup_seconds = node.start(
+            cold_miner_label,
+            mode="miner",
+            genesis=True,
+        )
         labels.append(cold_miner_label)
         cold_parent_height = node.height()
         cold_started = time.monotonic()

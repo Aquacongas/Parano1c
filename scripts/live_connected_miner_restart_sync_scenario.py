@@ -160,6 +160,7 @@ def main():
         b_initial, _ = miner_b.start(
             "02-b-fresh-miner-joins-live-a",
             mode="miner",
+            genesis=True,
             seeds=[miner_a.seed],
         )
         initial_identity_hashes = {
@@ -191,6 +192,7 @@ def main():
         b_restart_initial, _ = miner_b.start(
             "03-b-miner-restarts-gap5-while-a-mines",
             mode="miner",
+            genesis=True,
             seeds=[miner_a.seed],
         )
         b_restart_exact = wait_exact_at_least(
@@ -215,6 +217,7 @@ def main():
         a_restart_initial, _ = miner_a.start(
             "04-a-miner-restarts-gap5-while-b-mines",
             mode="miner",
+            genesis=True,
             seeds=[miner_b.seed],
         )
         a_restart_exact = wait_exact_at_least(

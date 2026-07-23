@@ -44,7 +44,7 @@ use noid_chain::consensus::wire_limits::{MAX_AUTHORIZATION_BYTES, MAX_TX_INTENT_
 use noid_chain::consensus::{fee_breakdown, tx_epoch_anchor_height_for_child};
 use noid_chain::fri_state::SlotValue;
 use noid_chain::Mempool;
-use noid_poseidon2b::primitives::TxBodyHash;
+use noid_poseidon2b::primitives::{Address, TxBodyHash};
 use noid_tx::{
     validate_paged_spend, PagedSpendFacts, PagedSpendIntent, TxPage, PAGED_SPEND_INTENT_MARKER,
 };
@@ -665,6 +665,16 @@ impl AsyncMempool {
     pub async fn fee_context(&self) -> (u64, u32) {
         let st = self.state.lock().await;
         (st.view.active_slot_count, st.view.log_slots())
+    }
+
+    /// Pending value sent to an external owner, excluding change from that
+    /// same owner. The underlying index is maintained at admission/removal.
+    pub async fn pending_incoming_for_owner(&self, owner: &Address) -> u64 {
+        self.state
+            .lock()
+            .await
+            .pool
+            .pending_incoming_for_owner(owner)
     }
 
     /// Snapshot compact RPC metadata without cloning intent/proof payloads.

@@ -206,6 +206,34 @@ impl Keystore {
 
     /// Load a plaintext wallet key file.
     pub(super) fn load_plain(&self) -> Result<MasterSecret, KeystoreError> {
+        let data = self.read_plain_bytes()?;
+        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
+        secret.copy_from_slice(&data[16..]);
+        let master = MasterSecret(*secret);
+        secret.zeroize();
+        Ok(master)
+    }
+
+    /// Export only the 32-byte master secret as lowercase hexadecimal.
+    ///
+    /// The on-disk magic is an implementation detail and is deliberately not
+    /// exposed to the user-facing import/export surface.
+    pub(super) fn export_master_secret_hex(&self) -> Result<Zeroizing<String>, KeystoreError> {
+        let data = self.read_plain_bytes()?;
+        Ok(Zeroizing::new(hex::encode(&data[PLAIN_MAGIC.len()..])))
+    }
+
+    /// Build the private on-disk key artifact from one validated master
+    /// secret. Callers keep the returned bytes zeroized and install them
+    /// through the wallet's atomic replacement path.
+    pub(super) fn encode_plain_file(master_secret: &[u8; SECRET_LEN]) -> Zeroizing<Vec<u8>> {
+        let mut encoded = Zeroizing::new(Vec::with_capacity(PLAIN_FILE_LEN));
+        encoded.extend_from_slice(PLAIN_MAGIC);
+        encoded.extend_from_slice(master_secret);
+        encoded
+    }
+
+    fn read_plain_bytes(&self) -> Result<Zeroizing<Vec<u8>>, KeystoreError> {
         if !self.exists() {
             return Err(KeystoreError::NotFound(self.path.clone()));
         }
@@ -245,11 +273,7 @@ impl Keystore {
         if &data[..16] != PLAIN_MAGIC.as_ref() {
             return Err(KeystoreError::InvalidFormat);
         }
-        let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
-        secret.copy_from_slice(&data[16..]);
-        let master = MasterSecret(*secret);
-        secret.zeroize();
-        Ok(master)
+        Ok(data)
     }
 }
 

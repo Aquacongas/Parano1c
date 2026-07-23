@@ -16,6 +16,7 @@ use jsonrpsee::server::Server;
 use jsonrpsee::types::ErrorObject;
 use tokio::sync::RwLock;
 
+use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use noid_chain::consensus::pow::{
     block_id, pow_header_fields, validate_pow, POW_NONCE_FIELD_INDEX,
 };
@@ -29,12 +30,15 @@ use noid_miner::{AdaptiveProofCapacity, PreparedBlockAttempt};
 
 use crate::api::ParanoidApiServer;
 use crate::types::{
-    AddressInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeBreakdownInfo, FeeEstimate,
-    MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus, ReceiptInputInfo,
-    ReceiptOutputInfo, ReceiptSummaryInfo, ReceiptVerifyResult, SlotInfo, StateInfo, StateMapInfo,
-    TxInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletInputLimitExceeded,
-    WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
-    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
+    BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
+    FeeEstimate, MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus,
+    ReceiptInputInfo, ReceiptOutputInfo, ReceiptSummaryInfo, ReceiptVerifyResult,
+    RecentTransactionInfo, RecentTransactionsPage, RetainedBlockInfo, SlotInfo, StateInfo,
+    StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
+    WalletInputLimitExceeded, WalletMinedBlockInfo, WalletMinedBlocksPage, WalletReceiptInfo,
+    WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo, WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -50,6 +54,156 @@ type ExternalMiningTemplateId = [u8; 16];
 
 fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
+}
+
+fn discover_contiguous_funded_prefix<E>(
+    expected_next_index: u32,
+    candidates: &[(u32, [u8; 32])],
+    mut is_funded: impl FnMut(&[u8; 32]) -> Result<bool, E>,
+) -> Result<u32, E> {
+    let mut discovered_next_index = expected_next_index;
+    for (index, owner) in candidates {
+        if !is_funded(owner)? {
+            break;
+        }
+        discovered_next_index = index.saturating_add(1);
+    }
+    Ok(discovered_next_index)
+}
+
+fn block_header_info(header: &noid_chain::BlockHeader) -> BlockHeaderInfo {
+    use noid_poseidon2b::primitives::Address;
+
+    BlockHeaderInfo {
+        height: header.height,
+        hash: hex::encode(block_id(header)),
+        prev_hash: hex::encode(header.prev_block_hash),
+        state_root: hex::encode(header.state_root),
+        tx_root: hex::encode(header.tx_root),
+        timestamp: header.timestamp,
+        miner: Address(header.miner_address.0).to_bech32(),
+        nonce_hex: hex::encode(header.nonce.to_le_bytes()),
+        difficulty_target: hex::encode(header.difficulty_target),
+        log_slots: header.log_slots,
+        active_slot_count: header.active_slot_count,
+        alloc_counter: header.alloc_counter,
+    }
+}
+
+fn retained_transaction_summaries(
+    header: &noid_chain::BlockHeader,
+    bundle_bytes: &[u8],
+    address: Option<&noid_poseidon2b::primitives::Address>,
+) -> Result<Vec<RecentTransactionInfo>, String> {
+    let bundle = noid_chain::AcceptedBlockBundle::decode(bundle_bytes)
+        .map_err(|error| format!("decode retained block bundle: {error}"))?;
+    let block = noid_chain::Block::from_bytes(bundle.block_bytes())
+        .map_err(|error| format!("decode retained block: {error:?}"))?;
+    if block.header != *header {
+        return Err("retained block header does not match canonical header".into());
+    }
+    let stream = noid_chain::validate_block_page_stream(&block.transactions)
+        .map_err(|error| format!("decode retained transaction stream: {error}"))?;
+    let logical_txids = noid_chain::try_compute_logical_txids(&block.transactions)
+        .map_err(|error| format!("derive retained transaction ids: {error}"))?;
+    let coinbase = block
+        .transactions
+        .first()
+        .ok_or_else(|| "retained block is missing coinbase".to_string())?;
+    let block_hash = hex::encode(block_id(header));
+
+    let coinbase_output_sum = coinbase
+        .body
+        .live_outputs()
+        .map(|(_, output)| u128::from(output.amount))
+        .sum::<u128>();
+    let coinbase_received = address.map(|owner| {
+        coinbase
+            .body
+            .live_outputs()
+            .filter(|(_, output)| &output.owner == owner)
+            .map(|(_, output)| u128::from(output.amount))
+            .sum::<u128>()
+    });
+    let coinbase_outputs = u16::try_from(coinbase.body.live_outputs().count())
+        .map_err(|_| "coinbase output count does not fit u16".to_string())?;
+    let mut transactions = Vec::with_capacity(logical_txids.len());
+    if coinbase_received.is_none_or(|received| received > 0) {
+        transactions.push(RecentTransactionInfo {
+            height: header.height,
+            block_hash: block_hash.clone(),
+            timestamp: header.timestamp,
+            position: 0,
+            txid: hex::encode(
+                logical_txids
+                    .first()
+                    .ok_or_else(|| "retained block has no logical coinbase id".to_string())?
+                    .0,
+            ),
+            page_count: 1,
+            live_inputs: 0,
+            live_outputs: coinbase_outputs,
+            fee_micronoid: 0,
+            coinbase: true,
+            input_owner: None,
+            input_sum_micronoid: "0".into(),
+            output_sum_micronoid: coinbase_output_sum.to_string(),
+            address_spent_micronoid: address.map(|_| "0".into()),
+            address_received_micronoid: coinbase_received.map(|value| value.to_string()),
+        });
+    }
+
+    for (index, group) in stream.groups.iter().enumerate() {
+        let (address_spent, address_received) = if let Some(owner) = address {
+            let spent = if &group.spend.input_owner == owner {
+                group.spend.input_sum
+            } else {
+                0
+            };
+            let start = 1usize
+                .checked_add(usize::from(group.start_page))
+                .ok_or_else(|| "retained transaction page offset overflow".to_string())?;
+            let end = start
+                .checked_add(usize::from(group.page_count))
+                .ok_or_else(|| "retained transaction page range overflow".to_string())?;
+            let pages = block
+                .transactions
+                .get(start..end)
+                .ok_or_else(|| "retained transaction page range is unavailable".to_string())?;
+            let received = pages
+                .iter()
+                .flat_map(|page| page.body.live_outputs())
+                .filter(|(_, output)| &output.owner == owner)
+                .map(|(_, output)| u128::from(output.amount))
+                .sum::<u128>();
+            if spent == 0 && received == 0 {
+                continue;
+            }
+            (Some(spent.to_string()), Some(received.to_string()))
+        } else {
+            (None, None)
+        };
+
+        transactions.push(RecentTransactionInfo {
+            height: header.height,
+            block_hash: block_hash.clone(),
+            timestamp: header.timestamp,
+            position: u16::try_from(index + 1)
+                .map_err(|_| "logical transaction position does not fit u16".to_string())?,
+            txid: hex::encode(group.spend.logical_txid.0),
+            page_count: group.page_count,
+            live_inputs: group.spend.live_inputs,
+            live_outputs: group.spend.live_outputs,
+            fee_micronoid: group.spend.fee,
+            coinbase: false,
+            input_owner: Some(group.spend.input_owner.to_bech32()),
+            input_sum_micronoid: group.spend.input_sum.to_string(),
+            output_sum_micronoid: group.spend.output_sum.to_string(),
+            address_spent_micronoid: address_spent,
+            address_received_micronoid: address_received,
+        });
+    }
+    Ok(transactions)
 }
 
 fn wallet_plan_error(error: WalletSendPlanError) -> ErrorObject<'static> {
@@ -656,6 +810,11 @@ pub struct RpcHandler {
     pub p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     /// The same durable readiness watch consumed by the internal miner.
     pub initial_sync_ready: tokio::sync::watch::Receiver<bool>,
+    /// Live mining gate and its authenticated-peer count.
+    pub mining_network_ready: tokio::sync::watch::Receiver<bool>,
+    pub mining_confirmed_peers: tokio::sync::watch::Receiver<usize>,
+    pub mining_required_peers: usize,
+    pub isolated_mining: bool,
     /// Immutable process role and CPU plan selected at startup.
     pub internal_mining_enabled: bool,
     pub cpu_backend: String,
@@ -696,6 +855,18 @@ pub struct RpcHandler {
 }
 
 impl RpcHandler {
+    fn require_mining_network(&self) -> RpcResult<()> {
+        if *self.mining_network_ready.borrow() {
+            Ok(())
+        } else {
+            Err(rpc_err(format!(
+                "mining is waiting for authenticated peers ({}/{})",
+                *self.mining_confirmed_peers.borrow(),
+                self.mining_required_peers
+            )))
+        }
+    }
+
     fn resolved_mining_payout(&self) -> RpcResult<noid_poseidon2b::primitives::Address> {
         if let Some(address) = self.mining_payout_address {
             return Ok(address);
@@ -756,6 +927,7 @@ impl RpcHandler {
         requested: Option<noid_poseidon2b::primitives::Address>,
         preparation: ExternalMiningPreparationLease,
     ) -> RpcResult<BlockTemplateResponse> {
+        self.require_mining_network()?;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -859,6 +1031,7 @@ impl RpcHandler {
         .map_err(|error| rpc_err(format!("HistoryStep preparation task failed: {error}")))?;
         let prepared = prepared
             .map_err(|error| rpc_err(format!("HistoryStep preparation failed: {error}")))?;
+        self.require_mining_network()?;
 
         let proof_class = prepared.proof_class();
         let user_pages = prepared.user_page_count();
@@ -929,6 +1102,7 @@ impl RpcHandler {
         nonce: u128,
         nonce_submitted_at: Instant,
     ) -> RpcResult<String> {
+        self.require_mining_network()?;
         // Consume happened before this check, so a stale or losing template
         // cannot be retried. Atomic apply repeats the parent checks under the
         // chain write lock and closes the race with a peer block.
@@ -958,6 +1132,7 @@ impl RpcHandler {
         .await
         .map_err(|error| rpc_err(format!("HistoryStep task failed: {error}")))?
         .map_err(|error| rpc_err(format!("HistoryStep prove failed: {error}")))?;
+        self.require_mining_network()?;
         let seal_ms = seal_started.elapsed().as_millis();
         // Serialize canonical commit + wallet delta + mempool view replacement.
         let wallet_operation = self.wallet_operation_gate.lock().await;
@@ -1215,7 +1390,7 @@ impl ParanoidApiServer for RpcHandler {
         } else {
             1
         };
-        let bucket_count = num_segments.min(MAX_BUCKETS).max(1);
+        let bucket_count = num_segments.clamp(1, MAX_BUCKETS);
         let capacity = 1u64.checked_shl(log_slots).unwrap_or(u64::MAX);
         let bucket_capacity = capacity / bucket_count as u64;
         let mut live_counts = vec![0u64; bucket_count];
@@ -1246,27 +1421,21 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_block_header(&self, height: u64) -> RpcResult<Option<BlockHeaderInfo>> {
-        use noid_poseidon2b::primitives::Address;
         let chain = self.chain.read().await;
         match chain.get_header_from_store(height) {
-            Ok(Some(hdr)) => {
-                let hash = block_id(&hdr);
-                Ok(Some(BlockHeaderInfo {
-                    height: hdr.height,
-                    hash: hex::encode(hash),
-                    prev_hash: hex::encode(hdr.prev_block_hash),
-                    state_root: hex::encode(hdr.state_root),
-                    tx_root: hex::encode(hdr.tx_root),
-                    timestamp: hdr.timestamp,
-                    miner: Address(hdr.miner_address.0).to_bech32(),
-                    difficulty_target: hex::encode(hdr.difficulty_target),
-                    log_slots: hdr.log_slots,
-                    active_slot_count: hdr.active_slot_count,
-                    alloc_counter: hdr.alloc_counter,
-                }))
-            }
+            Ok(Some(header)) => Ok(Some(block_header_info(&header))),
             Ok(None) => Ok(None),
             Err(e) => Err(rpc_err(e.to_string())),
+        }
+    }
+
+    async fn get_block_header_by_hash(&self, hash: String) -> RpcResult<Option<BlockHeaderInfo>> {
+        let hash_bytes = decode_32_byte_hex("hash", &hash)?;
+        let chain = self.chain.read().await;
+        match chain.store.get_header_by_hash(&hash_bytes) {
+            Ok(Some(header)) => Ok(Some(block_header_info(&header))),
+            Ok(None) => Ok(None),
+            Err(error) => Err(rpc_err(error.to_string())),
         }
     }
 
@@ -1324,6 +1493,272 @@ impl ParanoidApiServer for RpcHandler {
         }
     }
 
+    async fn get_block_details(&self, height: u64) -> RpcResult<Option<BlockDetailsInfo>> {
+        let (header, retained_bytes) = {
+            let chain = self.chain.read().await;
+            let Some(header) = chain
+                .get_header_from_store(height)
+                .map_err(|error| rpc_err(error.to_string()))?
+            else {
+                return Ok(None);
+            };
+            let retained = chain
+                .store
+                .get_recent_accepted_block_bundle_bounded(height)
+                .map_err(|error| rpc_err(error.to_string()))?;
+            (header, retained)
+        };
+        let header_info = block_header_info(&header);
+        let Some(bundle_bytes) = retained_bytes else {
+            return Ok(Some(BlockDetailsInfo {
+                header: header_info,
+                retained: None,
+            }));
+        };
+
+        let bundle = noid_chain::AcceptedBlockBundle::decode(&bundle_bytes)
+            .map_err(|error| rpc_err(format!("decode retained block bundle: {error}")))?;
+        let block = noid_chain::Block::from_bytes(bundle.block_bytes())
+            .map_err(|error| rpc_err(format!("decode retained block: {error:?}")))?;
+        if block.header != header {
+            return Err(rpc_err(
+                "retained block header does not match canonical header",
+            ));
+        }
+        let stream = noid_chain::validate_block_page_stream(&block.transactions)
+            .map_err(|error| rpc_err(format!("decode retained transaction stream: {error}")))?;
+        let logical_txids = noid_chain::try_compute_logical_txids(&block.transactions)
+            .map_err(|error| rpc_err(format!("derive retained transaction ids: {error}")))?;
+        let coinbase = block
+            .transactions
+            .first()
+            .ok_or_else(|| rpc_err("retained block is missing coinbase"))?;
+        let reward_micronoid = coinbase
+            .body
+            .live_outputs()
+            .map(|(_, output)| output.amount)
+            .fold(0u64, u64::saturating_add);
+        let coinbase_outputs = u16::try_from(coinbase.body.live_outputs().count())
+            .map_err(|_| rpc_err("coinbase output count does not fit u16"))?;
+        let minted_outputs = u64::from(stream.live_outputs)
+            .checked_add(u64::from(coinbase_outputs))
+            .ok_or_else(|| rpc_err("retained block output count overflow"))?;
+        let mut alloc_cursor = header
+            .alloc_counter
+            .checked_sub(minted_outputs)
+            .ok_or_else(|| rpc_err("retained block allocator counter underflow"))?;
+
+        let mut transactions = Vec::with_capacity(logical_txids.len());
+        let mut coinbase_output_details = Vec::with_capacity(usize::from(coinbase_outputs));
+        for (lane, output) in coinbase.body.live_outputs() {
+            alloc_cursor = alloc_cursor
+                .checked_add(1)
+                .ok_or_else(|| rpc_err("retained block allocator counter overflow"))?;
+            coinbase_output_details.push(BlockTransactionOutputInfo {
+                page: 0,
+                lane: lane as u8,
+                slot_index: output.slot_index,
+                amount_micronoid: output.amount,
+                owner: output.owner.to_bech32(),
+                creation_id: noid_chain::consensus::params::coinbase_creation_id(header.height),
+            });
+        }
+        let coinbase_txid = hex::encode(logical_txids[0].0);
+        transactions.push(BlockTransactionInfo {
+            position: 0,
+            txid: coinbase_txid.clone(),
+            page_count: 1,
+            live_inputs: 0,
+            live_outputs: coinbase_outputs,
+            fee_micronoid: 0,
+            coinbase: true,
+            epoch_anchor: hex::encode(coinbase.body.epoch_anchor),
+            input_owner: None,
+            input_sum_micronoid: "0".into(),
+            output_sum_micronoid: reward_micronoid.to_string(),
+            page_hashes: vec![coinbase_txid],
+            inputs: Vec::new(),
+            outputs: coinbase_output_details,
+        });
+
+        for (index, group) in stream.groups.iter().enumerate() {
+            let start = 1usize
+                .checked_add(usize::from(group.start_page))
+                .ok_or_else(|| rpc_err("retained transaction page offset overflow"))?;
+            let end = start
+                .checked_add(usize::from(group.page_count))
+                .ok_or_else(|| rpc_err("retained transaction page range overflow"))?;
+            let pages = block
+                .transactions
+                .get(start..end)
+                .ok_or_else(|| rpc_err("retained transaction page range is unavailable"))?;
+
+            let mut inputs = Vec::with_capacity(usize::from(group.spend.live_inputs));
+            let mut outputs = Vec::with_capacity(usize::from(group.spend.live_outputs));
+            let mut page_hashes = Vec::with_capacity(pages.len());
+            for (page_index, page) in pages.iter().enumerate() {
+                page_hashes.push(hex::encode(page.txid().0));
+                for (lane, input) in page.body.live_inputs() {
+                    inputs.push(BlockTransactionInputInfo {
+                        page: page_index as u16,
+                        lane: lane as u8,
+                        slot_index: input.slot_index,
+                        amount_micronoid: input.amount,
+                        creation_id: input.creation_id,
+                    });
+                }
+                for (lane, output) in page.body.live_outputs() {
+                    alloc_cursor = alloc_cursor
+                        .checked_add(1)
+                        .ok_or_else(|| rpc_err("retained block allocator counter overflow"))?;
+                    outputs.push(BlockTransactionOutputInfo {
+                        page: page_index as u16,
+                        lane: lane as u8,
+                        slot_index: output.slot_index,
+                        amount_micronoid: output.amount,
+                        owner: output.owner.to_bech32(),
+                        creation_id: alloc_cursor,
+                    });
+                }
+            }
+
+            transactions.push(BlockTransactionInfo {
+                position: (index + 1) as u16,
+                txid: hex::encode(group.spend.logical_txid.0),
+                page_count: group.page_count,
+                live_inputs: group.spend.live_inputs,
+                live_outputs: group.spend.live_outputs,
+                fee_micronoid: group.spend.fee,
+                coinbase: false,
+                epoch_anchor: hex::encode(group.spend.epoch_anchor),
+                input_owner: Some(group.spend.input_owner.to_bech32()),
+                input_sum_micronoid: group.spend.input_sum.to_string(),
+                output_sum_micronoid: group.spend.output_sum.to_string(),
+                page_hashes,
+                inputs,
+                outputs,
+            });
+        }
+        if alloc_cursor != header.alloc_counter {
+            return Err(rpc_err(
+                "retained transaction outputs do not match the header allocator counter",
+            ));
+        }
+        let total_fees_micronoid = stream
+            .groups
+            .iter()
+            .map(|group| u128::from(group.spend.fee))
+            .sum::<u128>()
+            .to_string();
+        let proof_class = match stream.proof_class {
+            noid_chain::consensus::BlockProofClass::B64 => "B64 / m23",
+            noid_chain::consensus::BlockProofClass::B255 => "B255 / m24",
+        }
+        .to_string();
+        let retained = RetainedBlockInfo {
+            proof_class,
+            logical_transactions: logical_txids.len() as u16,
+            user_pages: stream.page_count,
+            live_inputs: stream.live_inputs,
+            live_outputs: stream.live_outputs.saturating_add(coinbase_outputs),
+            reward_micronoid,
+            reward_noid: crate::types::micronoid_to_noid(reward_micronoid),
+            total_fees_micronoid,
+            block_bytes: bundle.block_bytes().len() as u64,
+            history_step_bytes: bundle.history_step_terminal_bytes().len() as u64,
+            bundle_bytes: bundle_bytes.len() as u64,
+            transactions,
+        };
+        Ok(Some(BlockDetailsInfo {
+            header: header_info,
+            retained: Some(retained),
+        }))
+    }
+
+    async fn get_recent_transactions(
+        &self,
+        page: u32,
+        page_size: u32,
+        address: Option<String>,
+    ) -> RpcResult<RecentTransactionsPage> {
+        use noid_poseidon2b::primitives::Address;
+
+        const MAX_PAGE_SIZE: u32 = 32;
+        let page_size = page_size.clamp(1, MAX_PAGE_SIZE);
+        let filter = address
+            .as_deref()
+            .map(Address::parse)
+            .transpose()
+            .map_err(|error| rpc_err(format!("invalid address: {error}")))?;
+        let canonical_address = filter.as_ref().map(Address::to_bech32);
+
+        let (tip_height, retained_from_height, retained) = {
+            let chain = self.chain.read().await;
+            let tip_height = chain.tip_height();
+            let retained_from_height = if tip_height == 0 {
+                0
+            } else {
+                tip_height
+                    .saturating_sub(RECENT_BLOCK_RETENTION_DEPTH.saturating_sub(1))
+                    .max(1)
+            };
+            let mut retained = Vec::new();
+            for height in (retained_from_height..=tip_height).rev() {
+                let Some(header) = chain
+                    .get_header_from_store(height)
+                    .map_err(|error| rpc_err(error.to_string()))?
+                else {
+                    return Err(rpc_err(format!("canonical header {height} is unavailable")));
+                };
+                if let Some(bundle) = chain
+                    .store
+                    .get_recent_accepted_block_bundle_bounded(height)
+                    .map_err(|error| rpc_err(error.to_string()))?
+                {
+                    retained.push((header, bundle));
+                }
+            }
+            (tip_height, retained_from_height, retained)
+        };
+
+        let mut transactions = Vec::new();
+        for (header, bundle) in retained {
+            transactions.extend(
+                retained_transaction_summaries(&header, &bundle, filter.as_ref())
+                    .map_err(rpc_err)?,
+            );
+        }
+
+        let total = transactions.len();
+        let total_pages = if total == 0 {
+            0
+        } else {
+            u32::try_from(total.div_ceil(page_size as usize)).unwrap_or(u32::MAX)
+        };
+        let page = if total_pages == 0 {
+            1
+        } else {
+            page.max(1).min(total_pages)
+        };
+        let offset = (page.saturating_sub(1) as usize).saturating_mul(page_size as usize);
+        let transactions = transactions
+            .into_iter()
+            .skip(offset)
+            .take(page_size as usize)
+            .collect();
+
+        Ok(RecentTransactionsPage {
+            page,
+            page_size,
+            total,
+            total_pages,
+            tip_height,
+            retained_from_height,
+            address: canonical_address,
+            transactions,
+        })
+    }
+
     // -----------------------------------------------------------------------
     // Mining / network info
     // -----------------------------------------------------------------------
@@ -1364,6 +1799,10 @@ impl ParanoidApiServer for RpcHandler {
         Ok(NodeStatus {
             synced: *self.initial_sync_ready.borrow(),
             mining: self.internal_mining_enabled,
+            mining_ready: *self.mining_network_ready.borrow(),
+            mining_confirmed_peers: *self.mining_confirmed_peers.borrow(),
+            mining_required_peers: self.mining_required_peers,
+            isolated_mining: self.isolated_mining,
             backend: self.cpu_backend.clone(),
             available_threads: self.available_threads,
             worker_threads: self.worker_threads,
@@ -1552,6 +1991,7 @@ impl ParanoidApiServer for RpcHandler {
                 "external mining API is disabled; start this node with --mode extminer",
             ));
         }
+        self.require_mining_network()?;
 
         let requested = if miner_address.is_empty() {
             None
@@ -1583,6 +2023,7 @@ impl ParanoidApiServer for RpcHandler {
                 "external mining API is disabled; start this node with --mode extminer",
             ));
         }
+        self.require_mining_network()?;
 
         let template_id = decode_external_template_id(&template_id)?;
         let nonce = decode_external_nonce_hex(&nonce_hex)?;
@@ -1632,7 +2073,14 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn wallet_get_balance(&self) -> RpcResult<WalletBalance> {
-        Ok(self.wallet.get_balance())
+        let mut balance = self.wallet.get_balance();
+        if let Some((_, address)) = self.wallet.active_address() {
+            let owner = noid_poseidon2b::primitives::Address::parse(&address)
+                .map_err(|error| rpc_err(format!("active wallet address: {error}")))?;
+            balance.pending_incoming_micronoid =
+                self.mempool.pending_incoming_for_owner(&owner).await;
+        }
+        Ok(balance)
     }
 
     async fn wallet_list_utxos(&self) -> RpcResult<Vec<WalletUtxoInfo>> {
@@ -1643,12 +2091,182 @@ impl ParanoidApiServer for RpcHandler {
         Ok(self.wallet.history())
     }
 
+    async fn wallet_receipts(&self, page: u32, page_size: u32) -> RpcResult<WalletReceiptsPage> {
+        const MAX_PAGE_SIZE: u32 = 50;
+        if page == 0 {
+            return Err(rpc_err("page must be at least 1"));
+        }
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            return Err(rpc_err(format!("page_size must be in 1..={MAX_PAGE_SIZE}")));
+        }
+        let offset = usize::try_from(page.saturating_sub(1))
+            .ok()
+            .and_then(|page| page.checked_mul(page_size as usize))
+            .ok_or_else(|| rpc_err("receipt page offset overflow"))?;
+        let slice = self
+            .wallet
+            .receipts(offset, page_size as usize)
+            .map_err(rpc_err)?;
+        let total_pages = if slice.total == 0 {
+            0
+        } else {
+            u32::try_from(slice.total.div_ceil(page_size as usize))
+                .map_err(|_| rpc_err("receipt page count overflow"))?
+        };
+        let receipts = slice
+            .receipts
+            .into_iter()
+            .map(|receipt| WalletReceiptInfo {
+                txid: hex::encode(receipt.txid),
+                height: receipt.height,
+                timestamp: receipt.timestamp,
+                amount_micronoid: receipt.amount_micronoid,
+                fee_micronoid: receipt.fee_micronoid,
+                peer_address: receipt.peer_address,
+                own_address: receipt.own_address,
+                own_key_index: receipt.own_key_index,
+                input_count: receipt.input_count,
+                output_count: receipt.output_count,
+                receipt_bytes: receipt.receipt_bytes,
+            })
+            .collect();
+
+        Ok(WalletReceiptsPage {
+            page,
+            page_size,
+            total: slice.total,
+            total_pages,
+            receipts,
+        })
+    }
+
+    async fn wallet_mined_blocks(
+        &self,
+        page: u32,
+        page_size: u32,
+    ) -> RpcResult<WalletMinedBlocksPage> {
+        const MAX_PAGE_SIZE: u32 = 50;
+        if page == 0 {
+            return Err(rpc_err("page must be at least 1"));
+        }
+        if page_size == 0 || page_size > MAX_PAGE_SIZE {
+            return Err(rpc_err(format!("page_size must be in 1..={MAX_PAGE_SIZE}")));
+        }
+        let offset = usize::try_from(page.saturating_sub(1))
+            .ok()
+            .and_then(|page| page.checked_mul(page_size as usize))
+            .ok_or_else(|| rpc_err("mined-block page offset overflow"))?;
+        let slice = self.wallet.mined_blocks(offset, page_size as usize);
+        let total_pages = if slice.total == 0 {
+            0
+        } else {
+            u32::try_from(slice.total.div_ceil(page_size as usize))
+                .map_err(|_| rpc_err("mined-block page count overflow"))?
+        };
+
+        let chain = self.chain.read().await;
+        let tip = chain.tip_height();
+        let mut blocks = Vec::with_capacity(slice.blocks.len());
+        for record in slice.blocks {
+            let header = chain
+                .get_header_from_store(record.height)
+                .map_err(|error| rpc_err(error.to_string()))?
+                .ok_or_else(|| {
+                    rpc_err(format!(
+                        "mined block header {} is missing from canonical storage",
+                        record.height
+                    ))
+                })?;
+            let full_block_available = chain
+                .store
+                .get_recent_block(record.height)
+                .map_err(|error| rpc_err(error.to_string()))?
+                .is_some();
+            blocks.push(WalletMinedBlockInfo {
+                height: record.height,
+                block_hash: hex::encode(block_id(&header)),
+                coinbase_txid: hex::encode(record.coinbase_txid),
+                timestamp: record.timestamp,
+                reward_micronoid: record.reward_micronoid,
+                reward_noid: crate::types::micronoid_to_noid(record.reward_micronoid),
+                payout_address: record.payout_address,
+                payout_key_index: record.payout_key_index,
+                confirmations: tip.saturating_sub(record.height).saturating_add(1),
+                full_block_available,
+            });
+        }
+
+        Ok(WalletMinedBlocksPage {
+            page,
+            page_size,
+            total: slice.total,
+            total_pages,
+            blocks,
+        })
+    }
+
     async fn wallet_scan(&self) -> RpcResult<WalletScanResult> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         if !self.wallet.status().exists {
             return Err(rpc_err("wallet not initialized"));
         }
         self.reload_active_wallet().await
+    }
+
+    async fn wallet_discover_addresses(
+        &self,
+        max_additional: u32,
+    ) -> RpcResult<Vec<WalletAddressInfo>> {
+        const MAX_IMPORT_DISCOVERY_ADDRESSES: u32 = 20;
+        if max_additional == 0 || max_additional > MAX_IMPORT_DISCOVERY_ADDRESSES {
+            return Err(rpc_err(format!(
+                "max_additional must be in 1..={MAX_IMPORT_DISCOVERY_ADDRESSES}"
+            )));
+        }
+
+        let mut readiness = self.initial_sync_ready.clone();
+        if !*readiness.borrow() {
+            tokio::time::timeout(std::time::Duration::from_secs(180), async {
+                while !*readiness.borrow() {
+                    readiness
+                        .changed()
+                        .await
+                        .map_err(|_| rpc_err("node stopped before state synchronization"))?;
+                }
+                Ok::<(), ErrorObject<'static>>(())
+            })
+            .await
+            .map_err(|_| rpc_err("state synchronization timed out during address discovery"))??;
+        }
+
+        // Discovery is a read-mostly preview/commit operation. Keep sends and
+        // balance work available while the owner index is queried. The commit
+        // rejects a stale active/next index or newly pending wallet activity.
+        let preview = self
+            .wallet
+            .preview_address_discovery(max_additional)
+            .map_err(rpc_err)?;
+        let chain = self.chain.read().await;
+        let discovered_next_index = discover_contiguous_funded_prefix(
+            preview.expected_next_index,
+            &preview.candidates,
+            |owner| {
+                chain
+                    .store
+                    .has_verified_utxo_by_owner(owner)
+                    .map_err(|error| rpc_err(error.to_string()))
+            },
+        )?;
+        drop(chain);
+        let addresses = self
+            .wallet
+            .commit_address_discovery(
+                preview.expected_active_index,
+                preview.expected_next_index,
+                discovered_next_index,
+            )
+            .map_err(rpc_err)?;
+        Ok(addresses)
     }
 
     async fn wallet_plan_send(
@@ -1967,6 +2585,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn imported_address_discovery_stops_at_the_first_empty_owner() {
+        let candidates = (1u32..=5)
+            .map(|index| (index, [index as u8; 32]))
+            .collect::<Vec<_>>();
+        let mut queried = Vec::new();
+        let next_index = discover_contiguous_funded_prefix(1, &candidates, |owner| {
+            queried.push(owner[0]);
+            Ok::<bool, ()>(owner[0] < 3)
+        })
+        .unwrap();
+
+        assert_eq!(next_index, 3);
+        assert_eq!(queried, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn imported_address_discovery_can_add_exactly_twenty_funded_addresses() {
+        let candidates = (1u32..=20)
+            .map(|index| (index, [index as u8; 32]))
+            .collect::<Vec<_>>();
+        let mut queries = 0usize;
+        let next_index = discover_contiguous_funded_prefix(1, &candidates, |_| {
+            queries += 1;
+            Ok::<bool, ()>(true)
+        })
+        .unwrap();
+
+        assert_eq!(queries, 20);
+        assert_eq!(next_index, 21);
+    }
+
+    #[test]
     fn external_mining_slot_owns_exactly_one_attempt() {
         let now = Instant::now();
         let mut slot = ExternalMiningAttemptSlot::new(7);
@@ -2185,6 +2835,10 @@ pub async fn start_rpc_server(
     wallet_operation_gate: WalletOperationGate,
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     initial_sync_ready: tokio::sync::watch::Receiver<bool>,
+    mining_network_ready: tokio::sync::watch::Receiver<bool>,
+    mining_confirmed_peers: tokio::sync::watch::Receiver<usize>,
+    mining_required_peers: usize,
+    isolated_mining: bool,
     internal_mining_enabled: bool,
     cpu_backend: String,
     available_threads: usize,
@@ -2211,6 +2865,10 @@ pub async fn start_rpc_server(
         wallet_operation_gate,
         p2p_cmd,
         initial_sync_ready,
+        mining_network_ready,
+        mining_confirmed_peers,
+        mining_required_peers,
+        isolated_mining,
         internal_mining_enabled,
         cpu_backend,
         available_threads,

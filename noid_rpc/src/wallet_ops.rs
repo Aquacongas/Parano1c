@@ -44,6 +44,54 @@ pub struct WalletActivationPreview {
     pub advance_next_index: bool,
 }
 
+/// Immutable contiguous address-discovery intent captured under the wallet
+/// lock. Candidates are derived from the one master secret but remain inactive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletAddressDiscoveryPreview {
+    pub expected_active_index: u32,
+    pub expected_next_index: u32,
+    pub candidates: Vec<(u32, [u8; 32])>,
+}
+
+/// Internal bounded view used to build the public mined-block RPC page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletMinedBlockRecord {
+    pub coinbase_txid: [u8; 32],
+    pub height: u64,
+    pub timestamp: u64,
+    pub reward_micronoid: u64,
+    pub payout_address: String,
+    pub payout_key_index: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletMinedBlockSlice {
+    pub total: usize,
+    pub blocks: Vec<WalletMinedBlockRecord>,
+}
+
+/// Internal receipt record before JSON pagination metadata is attached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletReceiptRecord {
+    pub txid: [u8; 32],
+    pub height: u64,
+    pub timestamp: u64,
+    pub amount_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub peer_address: Option<String>,
+    pub own_address: Option<String>,
+    pub own_key_index: Option<u32>,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub receipt_bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalletReceiptSlice {
+    pub total: usize,
+    pub receipts: Vec<WalletReceiptRecord>,
+}
+
 pub trait WalletOps: Send + Sync {
     /// Overall wallet status (exists, address, balance).
     fn status(&self) -> WalletStatus;
@@ -60,6 +108,12 @@ pub trait WalletOps: Send + Sync {
     /// Transaction history (most recent last).
     fn history(&self) -> Vec<WalletHistoryEntry>;
 
+    /// Newest-first bounded slice of every durable outgoing receipt.
+    fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String>;
+
+    /// Newest-first bounded slice of every coinbase paid to any local address.
+    fn mined_blocks(&self, offset: usize, limit: usize) -> WalletMinedBlockSlice;
+
     /// Preview a reload of the current active address without mutation.
     fn preview_active_reload(&self) -> Result<WalletActivationPreview, String>;
 
@@ -68,6 +122,22 @@ pub trait WalletOps: Send + Sync {
 
     /// Preview generating the next address without mutation.
     fn preview_next_address(&self) -> Result<WalletActivationPreview, String>;
+
+    /// Derive at most `max_additional` sequential inactive addresses without
+    /// changing the address book or loading their balances.
+    fn preview_address_discovery(
+        &self,
+        max_additional: u32,
+    ) -> Result<WalletAddressDiscoveryPreview, String>;
+
+    /// Persist the contiguous funded prefix found from a discovery preview.
+    /// The active address and its loaded UTXO snapshot remain unchanged.
+    fn commit_address_discovery(
+        &self,
+        expected_active_index: u32,
+        expected_next_index: u32,
+        discovered_next_index: u32,
+    ) -> Result<Vec<WalletAddressInfo>, String>;
 
     /// Atomically validate a preview, persist its indices, and install the
     /// exact durable owner snapshot while holding one wallet lock.

@@ -144,6 +144,10 @@ pub struct WalletBalance {
     /// Confirmed UTXOs being spent by pending (mempool) txs.
     /// These are locked and cannot be spent again until confirmed or evicted.
     pub pending_outbound_micronoid: u64,
+    /// Pending external outputs addressed to the ACTIVE address. Change from
+    /// this same address is deliberately excluded.
+    #[serde(default)]
+    pub pending_incoming_micronoid: u64,
     /// Spendable = active balance - pending_outbound.
     pub spendable_micronoid: u64,
     pub spendable_noid: f64,
@@ -171,6 +175,9 @@ pub struct WalletHistoryEntry {
     pub tx_hash: String,
     pub height: u64,
     pub direction: String, // "sent" or "received"
+    /// True only for the canonical coinbase at logical transaction zero.
+    #[serde(default)]
+    pub is_coinbase: bool,
     pub amount_micronoid: u64,
     pub amount_noid: f64,
     pub peer_address: Option<String>,
@@ -179,6 +186,60 @@ pub struct WalletHistoryEntry {
     pub own_address: Option<String>,
     /// Key index of the own address.
     pub own_key_index: Option<u32>,
+}
+
+/// One durable receipt for a locally sent transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletReceiptInfo {
+    pub txid: String,
+    pub height: u64,
+    pub timestamp: u64,
+    pub amount_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub peer_address: Option<String>,
+    pub own_address: Option<String>,
+    pub own_key_index: Option<u32>,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub receipt_bytes: usize,
+}
+
+/// Newest-first bounded page over every durable outgoing receipt in the
+/// local wallet, independent of the currently active address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletReceiptsPage {
+    pub page: u32,
+    pub page_size: u32,
+    pub total: usize,
+    pub total_pages: u32,
+    pub receipts: Vec<WalletReceiptInfo>,
+}
+
+/// One canonical block whose coinbase was paid to this local wallet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletMinedBlockInfo {
+    pub height: u64,
+    pub block_hash: String,
+    pub coinbase_txid: String,
+    pub timestamp: u64,
+    pub reward_micronoid: u64,
+    pub reward_noid: f64,
+    pub payout_address: String,
+    pub payout_key_index: u32,
+    /// Tip-inclusive confirmation count on the current canonical chain.
+    pub confirmations: u64,
+    /// Exact truth from retained storage, not an inferred height comparison.
+    pub full_block_available: bool,
+}
+
+/// Bounded newest-first page of blocks mined by this local wallet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletMinedBlocksPage {
+    pub page: u32,
+    pub page_size: u32,
+    pub total: usize,
+    pub total_pages: u32,
+    pub blocks: Vec<WalletMinedBlockInfo>,
 }
 
 /// Result of reloading the active owner from one verified durable snapshot.
@@ -284,6 +345,8 @@ pub struct BlockHeaderInfo {
     pub timestamp: u64,
     /// Coinbase recipient address (bech32m).
     pub miner: String,
+    /// Fixed-width hexadecimal encoding of the little-endian u128 PoW nonce.
+    pub nonce_hex: String,
     /// Poseidon2b PoW difficulty target (64-char hex, LE).
     pub difficulty_target: String,
     /// log₂ of total UTXO slot space capacity.
@@ -292,6 +355,116 @@ pub struct BlockHeaderInfo {
     pub active_slot_count: u64,
     /// Monotonic PRNG seed for coinbase slot allocation.
     pub alloc_counter: u64,
+}
+
+/// One logical transaction summary decoded from a retained full block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockTransactionInfo {
+    pub position: u16,
+    pub txid: String,
+    pub page_count: u16,
+    pub live_inputs: u16,
+    pub live_outputs: u16,
+    pub fee_micronoid: u64,
+    pub coinbase: bool,
+    /// Shared anti-replay anchor carried by every physical page.
+    pub epoch_anchor: String,
+    /// One owner shared by every live input. Coinbase has no input owner.
+    pub input_owner: Option<String>,
+    /// Decimal u128 strings preserve exact aggregate values in JSON.
+    pub input_sum_micronoid: String,
+    pub output_sum_micronoid: String,
+    /// Hash of every physical Tx8x2 page composing this logical transaction.
+    pub page_hashes: Vec<String>,
+    pub inputs: Vec<BlockTransactionInputInfo>,
+    pub outputs: Vec<BlockTransactionOutputInfo>,
+}
+
+/// One live input inside a retained logical transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockTransactionInputInfo {
+    pub page: u16,
+    pub lane: u8,
+    pub slot_index: u32,
+    pub amount_micronoid: u64,
+    pub creation_id: u64,
+}
+
+/// One live output inside a retained logical transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockTransactionOutputInfo {
+    pub page: u16,
+    pub lane: u8,
+    pub slot_index: u32,
+    pub amount_micronoid: u64,
+    pub owner: String,
+    /// Incarnation assigned when this output was applied to the state.
+    pub creation_id: u64,
+}
+
+/// Body-dependent detail available only while the node retains the full block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetainedBlockInfo {
+    pub proof_class: String,
+    /// Coinbase plus logical PagedSpend groups.
+    pub logical_transactions: u16,
+    pub user_pages: u16,
+    pub live_inputs: u16,
+    /// Includes the mandatory coinbase output.
+    pub live_outputs: u16,
+    pub reward_micronoid: u64,
+    pub reward_noid: f64,
+    /// Decimal u128 string; a complete block can aggregate more than u64.
+    pub total_fees_micronoid: String,
+    pub block_bytes: u64,
+    pub history_step_bytes: u64,
+    pub bundle_bytes: u64,
+    pub transactions: Vec<BlockTransactionInfo>,
+}
+
+/// Permanent canonical header plus optional data from the retained body window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockDetailsInfo {
+    pub header: BlockHeaderInfo,
+    pub retained: Option<RetainedBlockInfo>,
+}
+
+/// Compact logical-transaction row from the consensus-retained body window.
+/// Full inputs, outputs and page hashes remain lazy and are returned only by
+/// `getBlockDetails` after the user opens one row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentTransactionInfo {
+    pub height: u64,
+    pub block_hash: String,
+    pub timestamp: u64,
+    pub position: u16,
+    pub txid: String,
+    pub page_count: u16,
+    pub live_inputs: u16,
+    pub live_outputs: u16,
+    pub fee_micronoid: u64,
+    pub coinbase: bool,
+    pub input_owner: Option<String>,
+    /// Decimal u128 strings preserve exact aggregates in JSON.
+    pub input_sum_micronoid: String,
+    pub output_sum_micronoid: String,
+    /// Present only when the request filters by an address.
+    pub address_spent_micronoid: Option<String>,
+    /// Present only when the request filters by an address.
+    pub address_received_micronoid: Option<String>,
+}
+
+/// One bounded page over logical transactions in retained full blocks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentTransactionsPage {
+    pub page: u32,
+    pub page_size: u32,
+    pub total: usize,
+    pub total_pages: u32,
+    pub tip_height: u64,
+    pub retained_from_height: u64,
+    pub address: Option<String>,
+    pub transactions: Vec<RecentTransactionInfo>,
 }
 
 /// Transaction location info (from the permanent tx index).
@@ -327,10 +500,18 @@ pub struct MiningInfo {
 /// Runtime status of the daemon which serves this RPC endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
-    /// Durable initial-sync readiness used by the production miner.
+    /// Whether the node has established a current canonical chain view.
     pub synced: bool,
     /// Whether this process owns the built-in miner.
     pub mining: bool,
+    /// Whether block production currently has the required network quorum.
+    pub mining_ready: bool,
+    /// Authenticated peers which have confirmed or advanced the canonical tip.
+    pub mining_confirmed_peers: usize,
+    /// Confirmed peers required for ordinary block production.
+    pub mining_required_peers: usize,
+    /// Explicit isolated/genesis mode bypasses the peer quorum.
+    pub isolated_mining: bool,
     /// Runtime-selected CPU implementation.
     pub backend: String,
     /// Logical CPUs visible to the process.
