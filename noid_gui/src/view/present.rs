@@ -352,6 +352,7 @@ fn telemetry_value(
 
 fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     let address = app.snapshot.active_address();
+    let address_field_width = if compact { 516.0 } else { 552.0 };
     let owner_tab = container(text("ACTIVE ADDRESS").size(13))
         .padding([6, 9])
         .style(theme::title_bar_proof);
@@ -378,7 +379,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
                     .size(if compact { 14 } else { 15 })
                     .line_height(1.0)
                     .padding(0)
-                    .width(Length::Fixed(if compact { 448.0 } else { 480.0 }))
+                    .width(Length::Fixed(address_field_width))
                     .style(theme::selectable_address)
             )
             .on_right_press(Message::CopyAddress(address.key_index))

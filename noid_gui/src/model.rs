@@ -690,7 +690,7 @@ impl AppSnapshot {
         let mut addresses = vec![
             AddressSnapshot {
                 key_index: 0,
-                address: "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp".into(),
+                address: "o12p4r8dl49ys3462zrqqys5vz8ll8m93su6lc70wu7rrwg3nn7fgsd7jnnt".into(),
                 label: "Main".into(),
                 balance_micronoid: PREVIEW_BALANCE_MICRONOID,
                 utxo_count: PREVIEW_UTXO_COUNT,
@@ -700,7 +700,7 @@ impl AppSnapshot {
             },
             AddressSnapshot {
                 key_index: 1,
-                address: "o1y7m4h2p8vz5k9c3d6ta0er4wn8qx2f5j7l9s3u6g1b4n8kp2mc".into(),
+                address: "o17z7pfmh09rjztwga8y9pzpy05ncznl5teqe23a48d0sumjcnrlaszlk2vj".into(),
                 label: "Savings".into(),
                 balance_micronoid: 312_000_000,
                 utxo_count: 6,
@@ -710,7 +710,7 @@ impl AppSnapshot {
             },
             AddressSnapshot {
                 key_index: 2,
-                address: "o1k3v8s5q2nc7r4m9x6df0wa8h1yt5p3j7u9e2l6b4z8g0cm5nr".into(),
+                address: "o1ajnpfqtpkpugpwvpgjtkhk432fhd86l6vnvurgzn97hmvpcldpesewn8k6".into(),
                 label: "Shop".into(),
                 balance_micronoid: 0,
                 utxo_count: 0,
@@ -722,7 +722,9 @@ impl AppSnapshot {
         addresses.extend((addresses.len()..PREVIEW_ADDRESS_COUNT).map(|key_index| {
             AddressSnapshot {
                 key_index: key_index as u32,
-                address: format!("o1q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc"),
+                address: format!(
+                    "o1q{key_index:02}n7k4v9s2p8m5x3d6ta0er4wh1yc5j7l9u3g6b2n8k5p4mc7x9m2qadc"
+                ),
                 label: format!("Address {key_index}"),
                 balance_micronoid: 0,
                 utxo_count: 0,
@@ -885,5 +887,14 @@ mod tests {
                 .collect::<Vec<_>>(),
             utxo_slots
         );
+    }
+
+    #[test]
+    fn preview_addresses_match_the_canonical_display_width() {
+        let snapshot = AppSnapshot::design_preview();
+        assert!(snapshot
+            .addresses
+            .iter()
+            .all(|address| address.address.chars().count() == 60));
     }
 }
