@@ -70,7 +70,10 @@ pub struct BlockTemplate {
     pub previous_active_counts: Vec<u64>,
     pub previous_timestamps: Vec<u64>,
     pub asert_anchor: AnchorInfo,
-    pub tx_epoch_anchor_header: BlockHeader,
+    /// Canonical anchor carried by the parent terminal. This is deliberately
+    /// distinct from the anchor selected for this template's child
+    /// transactions at a 144-block boundary.
+    pub parent_tx_epoch_anchor_header: BlockHeader,
     pub parent_history_step_terminal_bytes: Option<Vec<u8>>,
     /// One-shot post-state/undo capability minted by the same canonical
     /// builder that fixed `inner.state_root`.
@@ -112,21 +115,48 @@ pub struct TemplateChainSnapshot {
     pub prev_timestamps: Vec<u64>,
     pub anchor: AnchorInfo,
     pub state: ChainState,
-    pub tx_epoch_anchor_header: BlockHeader,
+    /// Anchor committed by the current parent terminal.
+    pub parent_tx_epoch_anchor_header: BlockHeader,
+    /// Anchor that user transactions in the next child block must bind.
+    pub child_tx_epoch_anchor_header: BlockHeader,
     pub parent_history_step_terminal_bytes: Option<Vec<u8>>,
     store: MdbxStore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TemplateEpochAnchorHeights {
+    parent_terminal: u64,
+    child_transactions: u64,
+}
+
+fn template_epoch_anchor_heights(parent_height: u64) -> Option<TemplateEpochAnchorHeights> {
+    let child_height = parent_height.checked_add(1)?;
+    Some(TemplateEpochAnchorHeights {
+        parent_terminal: noid_chain::consensus::tx_epoch_anchor_height_for_child(parent_height),
+        child_transactions: noid_chain::consensus::tx_epoch_anchor_height_for_child(child_height),
+    })
 }
 
 impl TemplateChainSnapshot {
     pub fn from_context(ctx: &mut MdbxChainContext) -> Result<Self, MdbxContextError> {
         let parent = *ctx.tip_header();
-        let anchor_height =
-            noid_chain::consensus::tx_epoch_anchor_height_for_child(parent.height + 1);
-        let tx_epoch_anchor_header =
-            ctx.get_header_from_store(anchor_height)?
-                .ok_or(MdbxContextError::Corrupt(
-                    "transaction epoch anchor header missing",
-                ))?;
+        let anchor_heights = template_epoch_anchor_heights(parent.height).ok_or(
+            MdbxContextError::Corrupt("tip height cannot produce a child block template"),
+        )?;
+        let parent_tx_epoch_anchor_header = ctx
+            .get_header_from_store(anchor_heights.parent_terminal)?
+            .ok_or(MdbxContextError::Corrupt(
+                "parent terminal transaction epoch anchor header missing",
+            ))?;
+        let child_tx_epoch_anchor_header =
+            if anchor_heights.child_transactions == anchor_heights.parent_terminal {
+                parent_tx_epoch_anchor_header
+            } else {
+                ctx.get_header_from_store(anchor_heights.child_transactions)?
+                    .ok_or(MdbxContextError::Corrupt(
+                        "child transaction epoch anchor header missing",
+                    ))?
+            };
         let parent_history_step_terminal_bytes = if parent.height == 0 {
             None
         } else {
@@ -149,7 +179,8 @@ impl TemplateChainSnapshot {
                 .ok_or(MdbxContextError::Corrupt(
                     "template snapshot requested outside durable state boundary",
                 ))?,
-            tx_epoch_anchor_header,
+            parent_tx_epoch_anchor_header,
+            child_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
             store: ctx.store.clone(),
         })
@@ -303,7 +334,7 @@ impl TemplateBuilder {
         // Select top txs from mempool (coinbase is added separately by the chain template).
         let consensus_max = noid_chain::consensus::params::BLOCK_MAX_USER_PAGES;
         let max_user_pages = max_user_pages.min(consensus_max);
-        let user_epoch_anchor = block_id(&snapshot.tx_epoch_anchor_header);
+        let user_epoch_anchor = block_id(&snapshot.child_tx_epoch_anchor_header);
         // Filter against the captured anchor while entries are still borrowed
         // under the mempool lock. This preserves the same fee-ordered prefix
         // while cloning only the authorization bundles selected for this block.
@@ -402,9 +433,35 @@ impl TemplateBuilder {
             previous_active_counts: snapshot.prev_active_counts,
             previous_timestamps: snapshot.prev_timestamps,
             asert_anchor: snapshot.anchor,
-            tx_epoch_anchor_header: snapshot.tx_epoch_anchor_header,
+            parent_tx_epoch_anchor_header: snapshot.parent_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes: snapshot.parent_history_step_terminal_bytes,
             prepared_state_commit,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn template_separates_parent_and_child_anchors_at_transaction_epoch_boundary() {
+        for (parent_height, parent_terminal, child_transactions) in [
+            (143, 0, 0),
+            (144, 0, 144),
+            (145, 144, 144),
+            (287, 144, 144),
+            (288, 144, 288),
+        ] {
+            assert_eq!(
+                template_epoch_anchor_heights(parent_height),
+                Some(TemplateEpochAnchorHeights {
+                    parent_terminal,
+                    child_transactions,
+                }),
+                "parent height {parent_height}",
+            );
+        }
+        assert_eq!(template_epoch_anchor_heights(u64::MAX), None);
     }
 }

@@ -100,7 +100,7 @@ impl PreparedBlockAttempt {
             previous_active_counts,
             previous_timestamps,
             asert_anchor,
-            tx_epoch_anchor_header,
+            parent_tx_epoch_anchor_header,
             parent_history_step_terminal_bytes,
             prepared_state_commit,
             ..
@@ -114,7 +114,8 @@ impl PreparedBlockAttempt {
             .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
             .ok_or_else(|| "prepared authorization byte weight overflow".to_string())?;
         let authorization_proofs = decode_template_authorizations(authorization_bytes)?;
-        let start_accumulator = accumulator_from_header_boundary(&parent, &tx_epoch_anchor_header);
+        let start_accumulator =
+            accumulator_from_header_boundary(&parent, &parent_tx_epoch_anchor_header);
         let parent_terminal = match (parent.height, parent_history_step_terminal_bytes) {
             (0, None) => None,
             (0, Some(_)) => {
@@ -138,7 +139,7 @@ impl PreparedBlockAttempt {
         let user_pages = block.transactions.len().saturating_sub(1);
         let context = noid_block::HistoryStepPreparationContext {
             parent_header: &parent,
-            tx_epoch_anchor_header: &tx_epoch_anchor_header,
+            tx_epoch_anchor_header: &parent_tx_epoch_anchor_header,
             parent_state: &parent_state,
             start_accumulator: &start_accumulator,
             previous_timestamps: &previous_timestamps,
@@ -319,5 +320,57 @@ impl CommittedBlock {
 
     pub fn into_parts(self) -> (Block, noid_chain::AcceptedBlockBundle) {
         (self.block, self.bundle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_chain::consensus::params::GENESIS_TARGET;
+    use noid_poseidon2b::primitives::Address;
+
+    fn header(height: u64, prev_block_hash: [u8; 32]) -> noid_chain::BlockHeader {
+        noid_chain::BlockHeader {
+            prev_block_hash,
+            state_root: [height as u8; 32],
+            tx_root: [0x33; 32],
+            timestamp: 1_000 + height,
+            height,
+            miner_address: Address([0x44; 32]),
+            nonce: height as u128,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: 24,
+            active_slot_count: height,
+            alloc_counter: height,
+        }
+    }
+
+    #[test]
+    fn production_boundary_uses_parent_anchor_before_advancing_child_anchor() {
+        let genesis = noid_chain::consensus::genesis_header();
+        let boundary = header(144, [0x11; 32]);
+        let child = header(145, block_id(&boundary));
+
+        let start = accumulator_from_header_boundary(&boundary, &genesis);
+        start
+            .validate_local_header_boundary(&boundary, &genesis)
+            .expect("block 144 terminal still carries the genesis anchor");
+
+        let end = start
+            .advance(&boundary, &child)
+            .expect("144 -> 145 advances the recursive boundary");
+        end.validate_local_header_boundary(&child, &boundary)
+            .expect("block 145 terminal carries the derived block-144 anchor");
+
+        let conflated = accumulator_from_header_boundary(&boundary, &boundary);
+        assert!(matches!(
+            conflated.validate_local_header_boundary(&boundary, &boundary),
+            Err(
+                noid_recursive::ChainAccumulatorLocalBoundaryError::EpochAnchorHeight {
+                    expected: 0,
+                    actual: 144,
+                }
+            )
+        ));
     }
 }
