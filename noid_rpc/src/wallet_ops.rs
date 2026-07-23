@@ -12,8 +12,8 @@ use noid_chain::block::Block;
 use noid_chain::storage::VerifiedOwnerSnapshot;
 
 use crate::types::{
-    WalletAddressInfo, WalletBalance, WalletHistoryEntry, WalletScanResult, WalletSendPlan,
-    WalletStatus, WalletUtxoInfo,
+    WalletAddressInfo, WalletBalance, WalletConsolidationPlan, WalletHistoryEntry,
+    WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
 };
 
 /// Deterministic send-planning failure. Keeping the input-limit case typed
@@ -188,6 +188,33 @@ pub trait WalletOps: Send + Sync {
         &self,
         to_address: [u8; 32],
         amount_micronoid: u64,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String>;
+
+    /// Plan one active-wallet consolidation from the smallest available UTXOs.
+    ///
+    /// The returned slot list is an immutable build boundary: block rewards or
+    /// unrelated wallet refreshes cannot silently change which UTXOs the user
+    /// approved while the proof is being prepared.
+    fn plan_consolidation(
+        &self,
+        max_inputs: usize,
+        active_slot_count: u64,
+        log_slots: u32,
+        relay_floor: u64,
+    ) -> Result<WalletConsolidationPlan, WalletSendPlanError>;
+
+    /// Build, prove, and serialize the exact consolidation approved above.
+    ///
+    /// Every selected input must still be live, active-owner, and unreserved.
+    /// The transaction creates exactly one output back to the active address.
+    fn build_consolidation(
+        &self,
+        selected_input_slots: Vec<u32>,
+        output_value_micronoid: u64,
         fee_micronoid: u64,
         epoch_anchor: [u8; 32],
         slot_hints: Vec<u32>,

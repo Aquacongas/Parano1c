@@ -9,8 +9,9 @@ use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, ChainInfo, FeeEstimate,
     MempoolInfo, MempoolStats, MiningInfo, NodeStatus, ReceiptVerifyResult, RecentTransactionsPage,
     SlotInfo, StateInfo, StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance,
-    WalletHistoryEntry, WalletMinedBlocksPage, WalletReceiptsPage, WalletScanResult,
-    WalletSendPlan, WalletSendResult, WalletStatus, WalletUtxoInfo,
+    WalletConsolidationPlan, WalletConsolidationResult, WalletHistoryEntry, WalletMinedBlocksPage,
+    WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
+    WalletUtxoInfo,
 };
 
 #[rpc(server, namespace = "paranoid")]
@@ -277,6 +278,20 @@ pub trait ParanoidApi {
         amount_micronoid: u64,
         fee_micronoid: u64,
     ) -> RpcResult<WalletSendResult>;
+
+    /// Exact live quote for merging up to 64 of the active wallet's smallest
+    /// spendable UTXOs into one output.
+    #[method(name = "walletPlanConsolidation")]
+    async fn wallet_plan_consolidation(&self) -> RpcResult<WalletConsolidationPlan>;
+
+    /// Build, prove, and submit the exact active-wallet consolidation.
+    #[method(name = "walletConsolidate")]
+    async fn wallet_consolidate(
+        &self,
+        selected_input_slots: Vec<u32>,
+        expected_fee_micronoid: u64,
+        expected_output_value_micronoid: u64,
+    ) -> RpcResult<WalletConsolidationResult>;
 
     /// Export a receipt for a confirmed transaction (hex-encoded bytes).
     #[method(name = "walletExportReceipt")]

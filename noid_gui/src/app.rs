@@ -6,7 +6,10 @@ use std::time::{Duration, Instant};
 use iced::widget::text_editor;
 use iced::{Element, Subscription, Task};
 
-use crate::backend::{Backend, BackendSnapshot, ExplorerLookup, NodeMode, PaymentSubmission};
+use crate::backend::{
+    Backend, BackendSnapshot, ConsolidationPlan, ConsolidationSubmission, ExplorerLookup, NodeMode,
+    PaymentSubmission,
+};
 use crate::model::{
     AppSnapshot, BlockDetailsSnapshot, ExplorerSearchResultSnapshot, ExplorerSnapshot, LogLevel,
     MatrixCacheState, MatrixClass, NodeSettingsSnapshot, ProofsTab, ReceiptDetailSnapshot,
@@ -72,6 +75,11 @@ pub struct App {
     pub send_in_flight: bool,
     pub send_result: Option<PaymentSubmission>,
     pub send_error: Option<String>,
+    pub consolidation_plan: Option<ConsolidationPlan>,
+    pub consolidation_plan_in_flight: bool,
+    pub consolidation_in_flight: bool,
+    pub consolidation_result: Option<ConsolidationSubmission>,
+    pub consolidation_error: Option<String>,
     pub copied_value: Option<String>,
     pub copied_address: Option<u32>,
     pub editing_address: Option<u32>,
@@ -166,6 +174,9 @@ pub enum Message {
     SendAmountChanged(String),
     SubmitSend,
     SendFinished(Result<PaymentSubmission, String>),
+    ConsolidationPlanned(Result<ConsolidationPlan, String>),
+    SubmitConsolidation,
+    ConsolidationFinished(Result<ConsolidationSubmission, String>),
     CopyValue(String),
     ResetSend,
     CopyAddress(u32),
@@ -325,6 +336,11 @@ impl App {
             send_in_flight: false,
             send_result: None,
             send_error: None,
+            consolidation_plan: None,
+            consolidation_plan_in_flight: false,
+            consolidation_in_flight: false,
+            consolidation_result: None,
+            consolidation_error: None,
             copied_value: None,
             copied_address: None,
             editing_address: None,
@@ -396,6 +412,7 @@ impl App {
                 if self.secret_action_in_flight
                     || self.photo_scan_active
                     || self.address_operation.is_some()
+                    || self.wallet_action_in_flight()
                 {
                     return Task::none();
                 }
@@ -420,7 +437,9 @@ impl App {
                 }
             }
             Message::ToggleAddressPicker => {
-                if self.address_picker_open && self.address_operation.is_some() {
+                if self.wallet_action_in_flight()
+                    || (self.address_picker_open && self.address_operation.is_some())
+                {
                     return Task::none();
                 }
                 self.address_picker_open = !self.address_picker_open;
@@ -434,7 +453,8 @@ impl App {
                 self.close_consolidation_hint();
             }
             Message::SelectAddress(key_index) => {
-                if self.address_operation.is_some()
+                if self.wallet_action_in_flight()
+                    || self.address_operation.is_some()
                     || !matches!(
                         self.backend_state,
                         BackendState::Online | BackendState::Mock
@@ -460,7 +480,8 @@ impl App {
                 }
             }
             Message::CreateAddress => {
-                if self.address_operation.is_some()
+                if self.wallet_action_in_flight()
+                    || self.address_operation.is_some()
                     || !matches!(
                         self.backend_state,
                         BackendState::Online | BackendState::Mock
@@ -482,7 +503,7 @@ impl App {
                 }
             }
             Message::OpenAction(action) => {
-                if self.address_operation.is_some() {
+                if self.address_operation.is_some() || self.wallet_action_in_flight() {
                     return Task::none();
                 }
                 self.action = Some(action);
@@ -493,13 +514,35 @@ impl App {
                 if action == Action::Send {
                     self.send_result = None;
                     self.send_error = None;
+                    return Task::none();
                 }
+
+                self.consolidation_plan = None;
+                self.consolidation_result = None;
+                self.consolidation_error = None;
+                if !matches!(
+                    self.backend_state,
+                    BackendState::Online | BackendState::Mock
+                ) {
+                    self.consolidation_error =
+                        Some("The wallet must be online to calculate the transaction.".into());
+                    return Task::none();
+                }
+                self.consolidation_plan_in_flight = true;
+                let backend = self.backend.clone();
+                return Task::perform(
+                    async move { backend.plan_consolidation().await },
+                    Message::ConsolidationPlanned,
+                );
             }
             Message::CloseAction => {
-                if !self.send_in_flight {
+                if !self.wallet_action_in_flight() {
                     self.action = None;
                     self.send_result = None;
                     self.send_error = None;
+                    self.consolidation_plan = None;
+                    self.consolidation_result = None;
+                    self.consolidation_error = None;
                 }
             }
             Message::SendRecipientChanged(recipient) => {
@@ -555,6 +598,65 @@ impl App {
                         return self.refresh_snapshot();
                     }
                     Err(error) => self.send_error = Some(error),
+                }
+            }
+            Message::ConsolidationPlanned(result) => {
+                self.consolidation_plan_in_flight = false;
+                if self.action != Some(Action::Consolidate) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(plan) => {
+                        self.consolidation_plan = Some(plan);
+                        self.consolidation_error = None;
+                    }
+                    Err(error) => {
+                        self.consolidation_plan = None;
+                        self.consolidation_error = Some(error);
+                    }
+                }
+            }
+            Message::SubmitConsolidation => {
+                if self.consolidation_in_flight
+                    || self.consolidation_plan_in_flight
+                    || self.consolidation_plan.is_none()
+                    || self.action != Some(Action::Consolidate)
+                    || !matches!(
+                        self.backend_state,
+                        BackendState::Online | BackendState::Mock
+                    )
+                {
+                    return Task::none();
+                }
+                self.consolidation_in_flight = true;
+                self.consolidation_result = None;
+                self.consolidation_error = None;
+                let backend = self.backend.clone();
+                let plan = self
+                    .consolidation_plan
+                    .as_ref()
+                    .expect("consolidation plan checked above")
+                    .clone();
+                return Task::perform(
+                    async move { backend.consolidate(plan).await },
+                    Message::ConsolidationFinished,
+                );
+            }
+            Message::ConsolidationFinished(result) => {
+                self.consolidation_in_flight = false;
+                if self.action != Some(Action::Consolidate) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(submission) => {
+                        self.consolidation_result = Some(submission);
+                        self.consolidation_error = None;
+                        return self.refresh_snapshot();
+                    }
+                    Err(error) => {
+                        self.consolidation_plan = None;
+                        self.consolidation_error = Some(error);
+                    }
                 }
             }
             Message::CopyValue(value) => {
@@ -694,7 +796,7 @@ impl App {
                     && !self.refresh_in_flight
                     && !self.ensure_in_flight
                     && !self.node_action_in_flight
-                    && !self.send_in_flight
+                    && !self.wallet_action_in_flight()
                     && self.address_operation.is_none()
                     && !self.shutting_down
                 {
@@ -835,6 +937,7 @@ impl App {
             }
             Message::SetMining(enabled) => {
                 if self.node_action_in_flight
+                    || self.wallet_action_in_flight()
                     || self.address_operation.is_some()
                     || self.snapshot.mining.enabled == enabled
                 {
@@ -1864,7 +1967,7 @@ impl App {
             Message::Keyboard(_) => {}
             Message::Noop => {}
             Message::Exit => {
-                if self.shutting_down {
+                if self.shutting_down || self.wallet_action_in_flight() {
                     return Task::none();
                 }
                 self.shutting_down = true;
@@ -1916,6 +2019,10 @@ impl App {
 
     pub fn consolidation_pulse(&self) -> f32 {
         0.5 + 0.5 * self.consolidation_pulse_phase.sin()
+    }
+
+    pub fn wallet_action_in_flight(&self) -> bool {
+        self.send_in_flight || self.consolidation_plan_in_flight || self.consolidation_in_flight
     }
 
     pub fn settings_dirty(&self) -> bool {

@@ -8,10 +8,9 @@ use iced::widget::{
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::app::{Action, AddressOperation, App, Message};
-use crate::backend::PaymentSubmission;
+use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmission};
 use crate::model::{
     format_creation_origin, format_micronoid, grouped, AddressSnapshot, UtxoSnapshot,
-    WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::StateField;
@@ -20,9 +19,6 @@ use super::copy_value_button;
 
 const DESKTOP_METER_CELLS: usize = 34;
 const COMPACT_METER_CELLS: usize = 16;
-const PREVIEW_FEE_BASE_MICRONOID: u64 = 5_000;
-const PREVIEW_FEE_PER_INPUT_MICRONOID: u64 = 100;
-const PREVIEW_FEE_PER_OUTPUT_MICRONOID: u64 = 700;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
     let page = if compact {
@@ -1183,55 +1179,8 @@ fn address_label_editor(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-struct ConsolidationPreview {
-    input_count: usize,
-    input_value_micronoid: u64,
-    fee_micronoid: u64,
-    output_value_micronoid: u64,
-    untouched_count: usize,
-    remaining_count: usize,
-    balance_after_micronoid: u64,
-    freed_slots: usize,
-}
-
-fn consolidation_preview(app: &App) -> ConsolidationPreview {
-    let address = app.snapshot.active_address();
-    let mut spendable = app
-        .snapshot
-        .utxos
-        .iter()
-        .filter(|utxo| !utxo.reserved)
-        .collect::<Vec<_>>();
-    spendable.sort_by_key(|utxo| (utxo.value_micronoid, utxo.slot_index));
-
-    let input_count = spendable.len().min(WALLET_CONSOLIDATION_INPUT_LIMIT);
-    let input_value_micronoid = spendable
-        .into_iter()
-        .take(input_count)
-        .fold(0u64, |sum, utxo| sum.saturating_add(utxo.value_micronoid));
-
-    // Design preview only. The connected backend will provide the exact quote,
-    // including the live relay floor, before confirmation.
-    let fee_micronoid = PREVIEW_FEE_BASE_MICRONOID
-        .saturating_add(PREVIEW_FEE_PER_INPUT_MICRONOID.saturating_mul(input_count as u64))
-        .saturating_add(PREVIEW_FEE_PER_OUTPUT_MICRONOID);
-    let untouched_count = address.spendable_utxo_count().saturating_sub(input_count);
-
-    ConsolidationPreview {
-        input_count,
-        input_value_micronoid,
-        fee_micronoid,
-        output_value_micronoid: input_value_micronoid.saturating_sub(fee_micronoid),
-        untouched_count,
-        remaining_count: untouched_count + usize::from(input_count > 0),
-        balance_after_micronoid: address.balance_micronoid.saturating_sub(fee_micronoid),
-        freed_slots: input_count.saturating_sub(1),
-    }
-}
-
 fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message> {
     let address = app.snapshot.active_address();
-    let consolidation = consolidation_preview(app);
 
     let (label, content): (String, Element<'_, Message>) = match action {
         Action::Send => (
@@ -1240,100 +1189,14 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         ),
         Action::Consolidate => (
             format!("CONSOLIDATE · [{}] {}", address.key_index, address.label),
-            column![
-                form_line(
-                    "INPUTS",
-                    format!(
-                        "{} smallest of {} · {} NOID",
-                        consolidation.input_count,
-                        address.spendable_utxo_count(),
-                        format_micronoid(consolidation.input_value_micronoid)
-                    ),
-                    compact,
-                ),
-                form_line(
-                    "NETWORK FEE",
-                    format!("{} NOID", format_micronoid(consolidation.fee_micronoid)),
-                    compact,
-                ),
-                form_line(
-                    "NEW OUTPUT",
-                    format!(
-                        "1 · {} NOID",
-                        format_micronoid(consolidation.output_value_micronoid)
-                    ),
-                    compact,
-                ),
-                form_line(
-                    "STATE",
-                    format!(
-                        "{} → {} outputs · {} slots freed",
-                        address.spendable_utxo_count(),
-                        consolidation.remaining_count,
-                        consolidation.freed_slots,
-                    ),
-                    compact,
-                ),
-                container(
-                    column![
-                        text("TOTAL BALANCE").size(10).color(theme::DIM),
-                        row![
-                            text(address.balance()).size(16).color(theme::TEXT),
-                            text("①")
-                                .size(16)
-                                .line_height(1.0)
-                                .font(theme::SYMBOL_FONT)
-                                .color(theme::ACCENT),
-                            text("→").size(14).color(theme::DIM),
-                            text(format_micronoid(consolidation.balance_after_micronoid))
-                                .size(16)
-                                .color(theme::TEXT),
-                            text("①")
-                                .size(16)
-                                .line_height(1.0)
-                                .font(theme::SYMBOL_FONT)
-                                .color(theme::ACCENT),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                        text("Only the network fee changes the balance.")
-                            .size(12)
-                            .color(theme::MUTED),
-                        text(format!(
-                            "{} outputs remain untouched.",
-                            consolidation.untouched_count,
-                        ))
-                        .size(12)
-                        .color(theme::MUTED),
-                    ]
-                    .spacing(if compact { 4 } else { 6 })
-                )
-                .padding(if compact { [9, 11] } else { [12, 14] })
-                .width(Length::Fill)
-                .style(theme::surface),
-                row![
-                    iced::widget::Space::new().width(Length::Fill),
-                    button(text("CANCEL").size(12))
-                        .on_press(Message::CloseAction)
-                        .padding(if compact { [7, 12] } else { [9, 14] })
-                        .style(|_, status| theme::button(ButtonKind::Secondary, status)),
-                    button(text("CONSOLIDATE").size(12))
-                        .on_press(Message::CloseAction)
-                        .padding(if compact { [7, 14] } else { [9, 16] })
-                        .style(|_, status| theme::button(ButtonKind::Primary, status)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            ]
-            .spacing(if compact { 7 } else { 12 })
-            .into(),
+            consolidation_form(app, compact),
         ),
     };
 
     let mut close = button(text("ESC CLOSE").size(12))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
-    if !app.send_in_flight {
+    if !app.wallet_action_in_flight() {
         close = close.on_press(Message::CloseAction);
     }
 
@@ -1365,6 +1228,285 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         .padding(Padding::from(if compact { [8, 12] } else { [24, 18] }))
         .style(theme::overlay)
         .into()
+}
+
+fn consolidation_form(app: &App, compact: bool) -> Element<'_, Message> {
+    if let Some(result) = app.consolidation_result.as_ref() {
+        return consolidation_success(app, result, compact);
+    }
+
+    let Some(plan) = app.consolidation_plan.as_ref() else {
+        let (title, detail, color) = if app.consolidation_plan_in_flight {
+            (
+                "CALCULATING TRANSACTION",
+                "Checking available outputs and the network fee…",
+                theme::WARNING,
+            )
+        } else {
+            (
+                "CANNOT CONSOLIDATE",
+                app.consolidation_error
+                    .as_deref()
+                    .unwrap_or("The wallet could not calculate the transaction."),
+                theme::DANGER,
+            )
+        };
+        let mut close = button(text("CANCEL").size(12))
+            .padding(if compact { [9, 13] } else { [10, 15] })
+            .style(|_, status| theme::button(ButtonKind::Secondary, status));
+        if !app.wallet_action_in_flight() {
+            close = close.on_press(Message::CloseAction);
+        }
+        let mut retry = button(text("TRY AGAIN").size(12))
+            .padding(if compact { [9, 13] } else { [10, 17] })
+            .style(|_, status| theme::button(ButtonKind::Primary, status));
+        if !app.wallet_action_in_flight() {
+            retry = retry.on_press(Message::OpenAction(Action::Consolidate));
+        }
+        return column![
+            container(
+                column![
+                    text(title).size(12).color(color),
+                    text(detail).size(11).color(theme::TEXT),
+                ]
+                .spacing(6),
+            )
+            .padding(if compact { 12 } else { 16 })
+            .width(Length::Fill)
+            .style(theme::surface),
+            row![iced::widget::Space::new().width(Length::Fill), close, retry,]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(if compact { 9 } else { 12 })
+        .into();
+    };
+
+    consolidation_confirmation(app, plan, compact)
+}
+
+fn consolidation_confirmation<'a>(
+    app: &'a App,
+    plan: &'a ConsolidationPlan,
+    compact: bool,
+) -> Element<'a, Message> {
+    let original_count = plan.input_count.saturating_add(plan.untouched_count);
+    let proof_label = if app.consolidation_in_flight {
+        "BUILDING"
+    } else {
+        "READY"
+    };
+    let proof_color = if app.consolidation_in_flight {
+        theme::WARNING
+    } else {
+        theme::PROOF
+    };
+    let feedback: Element<'_, Message> = if let Some(error) = app.consolidation_error.as_ref() {
+        container(
+            column![
+                text("TRANSACTION NOT SENT").size(11).color(theme::DANGER),
+                text(error).size(11).color(theme::TEXT),
+            ]
+            .spacing(5),
+        )
+        .padding(if compact { 10 } else { 12 })
+        .width(Length::Fill)
+        .style(theme::surface)
+        .into()
+    } else {
+        container(
+            text("Calculated from the current wallet state. Your secret stays on this device.")
+                .size(11)
+                .color(theme::DIM),
+        )
+        .padding([5, 2])
+        .width(Length::Fill)
+        .into()
+    };
+
+    let mut cancel = button(text("CANCEL").size(12))
+        .padding(if compact { [9, 13] } else { [10, 15] })
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if !app.wallet_action_in_flight() {
+        cancel = cancel.on_press(Message::CloseAction);
+    }
+    let mut submit = button(
+        text(if app.consolidation_in_flight {
+            "BUILDING PROOF…"
+        } else {
+            "PROVE & CONSOLIDATE"
+        })
+        .size(12),
+    )
+    .padding(if compact { [9, 13] } else { [10, 17] })
+    .style(|_, status| theme::button(ButtonKind::Primary, status));
+    if !app.wallet_action_in_flight()
+        && matches!(
+            app.backend_state,
+            crate::app::BackendState::Online | crate::app::BackendState::Mock
+        )
+    {
+        submit = submit.on_press(Message::SubmitConsolidation);
+    }
+
+    column![
+        form_line(
+            "INPUTS",
+            format!(
+                "{} smallest of {} · {} NOID",
+                plan.input_count,
+                original_count,
+                format_micronoid(plan.input_value_micronoid)
+            ),
+            compact,
+        ),
+        form_line(
+            "NETWORK FEE",
+            format!("{} NOID", format_micronoid(plan.fee_micronoid)),
+            compact,
+        ),
+        form_line(
+            "NEW OUTPUT",
+            format!("1 · {} NOID", format_micronoid(plan.output_value_micronoid)),
+            compact,
+        ),
+        form_line(
+            "STATE",
+            format!(
+                "{} → {} outputs · {} slots freed",
+                original_count, plan.remaining_count, plan.freed_slots,
+            ),
+            compact,
+        ),
+        container(
+            column![
+                text("TOTAL BALANCE").size(10).color(theme::DIM),
+                row![
+                    text(format_micronoid(plan.balance_before_micronoid))
+                        .size(16)
+                        .color(theme::TEXT),
+                    text("①")
+                        .size(16)
+                        .line_height(1.0)
+                        .font(theme::SYMBOL_FONT)
+                        .color(theme::ACCENT),
+                    text("→").size(14).color(theme::DIM),
+                    text(format_micronoid(plan.balance_after_micronoid))
+                        .size(16)
+                        .color(theme::TEXT),
+                    text("①")
+                        .size(16)
+                        .line_height(1.0)
+                        .font(theme::SYMBOL_FONT)
+                        .color(theme::ACCENT),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                text("Only the network fee changes the balance.")
+                    .size(12)
+                    .color(theme::MUTED),
+                text(format!(
+                    "{} output{} remain{} untouched.",
+                    plan.untouched_count,
+                    if plan.untouched_count == 1 { "" } else { "s" },
+                    if plan.untouched_count == 1 { "s" } else { "" },
+                ))
+                .size(12)
+                .color(theme::MUTED),
+            ]
+            .spacing(if compact { 4 } else { 6 })
+        )
+        .padding(if compact { [9, 11] } else { [12, 14] })
+        .width(Length::Fill)
+        .style(theme::surface),
+        row![
+            send_status("SPENDING SECRET", "LOCAL", theme::ACCENT),
+            send_status("PROOF", proof_label, proof_color),
+        ]
+        .spacing(8),
+        feedback,
+        row![
+            iced::widget::Space::new().width(Length::Fill),
+            cancel,
+            submit,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(if compact { 7 } else { 10 })
+    .into()
+}
+
+fn consolidation_success<'a>(
+    app: &'a App,
+    result: &'a ConsolidationSubmission,
+    compact: bool,
+) -> Element<'a, Message> {
+    let txid = row![
+        text("TXID")
+            .size(10)
+            .color(theme::CYAN)
+            .width(if compact { 54 } else { 70 }),
+        text_input("", &result.txid)
+            .on_input(|_| Message::Noop)
+            .size(12)
+            .padding([8, 10])
+            .width(Length::Fill)
+            .style(theme::text_input),
+        copy_value_button(
+            &result.txid,
+            app.copied_value.as_deref() == Some(result.txid.as_str()),
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    let metrics = row![
+        send_result_metric("INPUTS", result.input_count.to_string()),
+        send_result_metric("OUTPUTS", result.output_count.to_string()),
+        send_result_metric(
+            "FEE",
+            format!("{} ①", format_micronoid(result.fee_micronoid)),
+        ),
+        send_result_metric("FREED", result.freed_slots.to_string()),
+    ]
+    .spacing(7);
+    let close = button(text("CLOSE").size(12))
+        .on_press(Message::CloseAction)
+        .padding(if compact { [9, 13] } else { [10, 15] })
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+
+    column![
+        row![
+            text("CONSOLIDATION SENT").size(12).color(theme::ACCENT),
+            iced::widget::Space::new().width(Length::Fill),
+            text("PENDING CONFIRMATION").size(10).color(theme::WARNING),
+        ]
+        .align_y(Alignment::Center),
+        container(txid)
+            .padding([7, 9])
+            .width(Length::Fill)
+            .style(theme::surface),
+        metrics,
+        form_line(
+            "NEW OUTPUT",
+            format!("{} NOID", format_micronoid(result.output_value_micronoid)),
+            compact,
+        ),
+        form_line(
+            "INPUT VALUE",
+            format!(
+                "{} NOID selected",
+                format_micronoid(result.input_value_micronoid),
+            ),
+            compact,
+        ),
+        text("Broadcasting to the network...")
+            .size(11)
+            .color(theme::DIM),
+        row![iced::widget::Space::new().width(Length::Fill), close,].align_y(Alignment::Center),
+    ]
+    .spacing(if compact { 7 } else { 10 })
+    .into()
 }
 
 fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
@@ -1412,9 +1554,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
     let feedback: Element<'_, Message> = if let Some(error) = app.send_error.as_ref() {
         container(
             column![
-                text("TRANSACTION NOT SUBMITTED")
-                    .size(11)
-                    .color(theme::DANGER),
+                text("TRANSACTION NOT SENT").size(11).color(theme::DANGER),
                 text(error).size(11).color(theme::TEXT),
             ]
             .spacing(5),
@@ -1425,7 +1565,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         .into()
     } else {
         container(
-            text("The secret remains local. Only the proved transaction is submitted.")
+            text("Your secret stays on this device. Only the transaction is sent.")
                 .size(11)
                 .color(theme::DIM),
         )
@@ -1493,7 +1633,11 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         ),
         recipient,
         amount,
-        form_line("NETWORK FEE", "AUTOMATIC · quoted by the node", compact),
+        form_line(
+            "NETWORK FEE",
+            "AUTOMATIC · calculated by the wallet",
+            compact
+        ),
         status,
         feedback,
         controls,
@@ -1578,7 +1722,7 @@ fn send_success<'a>(
 
     column![
         row![
-            text("TRANSACTION SUBMITTED").size(12).color(theme::ACCENT),
+            text("TRANSACTION SENT").size(12).color(theme::ACCENT),
             iced::widget::Space::new().width(Length::Fill),
             text("PENDING CONFIRMATION").size(10).color(theme::WARNING),
         ]
@@ -1592,7 +1736,7 @@ fn send_success<'a>(
             .width(Length::Fill)
             .style(theme::surface),
         metrics,
-        text("The proof was admitted to the local mempool.")
+        text("Broadcasting to the network...")
             .size(11)
             .color(theme::DIM),
         row![

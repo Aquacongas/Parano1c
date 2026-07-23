@@ -35,10 +35,11 @@ use crate::types::{
     FeeEstimate, MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus,
     ReceiptInputInfo, ReceiptOutputInfo, ReceiptSummaryInfo, ReceiptVerifyResult,
     RecentTransactionInfo, RecentTransactionsPage, RetainedBlockInfo, SlotInfo, StateInfo,
-    StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
-    WalletInputLimitExceeded, WalletMinedBlockInfo, WalletMinedBlocksPage, WalletReceiptInfo,
-    WalletReceiptsPage, WalletScanResult, WalletSendPlan, WalletSendResult, WalletStatus,
-    WalletUtxoInfo, WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
+    StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
+    WalletConsolidationResult, WalletHistoryEntry, WalletInputLimitExceeded, WalletMinedBlockInfo,
+    WalletMinedBlocksPage, WalletReceiptInfo, WalletReceiptsPage, WalletScanResult, WalletSendPlan,
+    WalletSendResult, WalletStatus, WalletUtxoInfo, WALLET_CONSOLIDATION_INPUT_LIMIT,
+    WALLET_INPUT_LIMIT_EXCEEDED_CODE, WALLET_INPUT_LIMIT_EXCEEDED_MESSAGE,
 };
 use crate::wallet_ops::{WalletActivationPreview, WalletOps, WalletSendPlanError};
 use crate::wallet_submit::{
@@ -860,6 +861,24 @@ pub struct RpcHandler {
     external_mining_capacity: Arc<Mutex<AdaptiveProofCapacity>>,
 }
 
+#[derive(Clone)]
+enum WalletSubmissionBuild {
+    Payment,
+    Consolidation { selected_input_slots: Vec<u32> },
+}
+
+#[derive(Clone)]
+struct WalletSubmissionRequest {
+    to_address: [u8; 32],
+    amount_micronoid: u64,
+    fee_micronoid: u64,
+    expected_input_count: usize,
+    expected_output_count: usize,
+    pending_history_amount_micronoid: u64,
+    build: WalletSubmissionBuild,
+    failure_label: &'static str,
+}
+
 impl RpcHandler {
     fn require_mining_network(&self) -> RpcResult<()> {
         if *self.mining_network_ready.borrow() {
@@ -908,6 +927,177 @@ impl RpcHandler {
         let preview = self.wallet.preview_active_reload().map_err(rpc_err)?;
         let (_address, scan) = self.install_wallet_activation(preview).await?;
         Ok(scan)
+    }
+
+    async fn submit_wallet_transaction(
+        &self,
+        request: WalletSubmissionRequest,
+    ) -> RpcResult<WalletSendResult> {
+        let WalletSubmissionRequest {
+            to_address,
+            amount_micronoid,
+            fee_micronoid,
+            expected_input_count,
+            expected_output_count,
+            pending_history_amount_micronoid,
+            build,
+            failure_label,
+        } = request;
+        let call_nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        let mut last_error = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let reserved_outputs = self.mempool.reserved_output_slots().await;
+            let selection = {
+                let chain = self.chain.read().await;
+                let tip = chain.tip_header();
+                let unique_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
+                    .wrapping_add(
+                        call_nonce
+                            .wrapping_add(attempt as u64)
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    );
+                next_user_epoch_anchor(&chain).and_then(|epoch_anchor| {
+                    collect_empty_slot_hints(
+                        &chain,
+                        &reserved_outputs,
+                        unique_seed,
+                        noid_tx::TX_OUTPUTS,
+                    )
+                    .map(|slot_hints| (epoch_anchor, tip.log_slots, slot_hints))
+                })
+            };
+            let (epoch_anchor, log_slots, slot_hints) = match selection {
+                Ok(selection) => selection,
+                Err(error) => {
+                    last_error = error;
+                    break;
+                }
+            };
+            if slot_hints.len() < expected_output_count {
+                last_error = "not enough empty output slots available".to_string();
+                break;
+            }
+
+            let wallet = Arc::clone(&self.wallet);
+            let build_attempt = build.clone();
+            let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
+                noid_miner::install_wallet_proof_cpu(|| match build_attempt {
+                    WalletSubmissionBuild::Payment => wallet.build_send(
+                        to_address,
+                        amount_micronoid,
+                        fee_micronoid,
+                        epoch_anchor,
+                        slot_hints,
+                        log_slots,
+                    ),
+                    WalletSubmissionBuild::Consolidation {
+                        selected_input_slots,
+                    } => wallet.build_consolidation(
+                        selected_input_slots,
+                        amount_micronoid,
+                        fee_micronoid,
+                        epoch_anchor,
+                        slot_hints,
+                        log_slots,
+                    ),
+                })
+                .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
+                .and_then(|result| result)
+            })
+            .await
+            {
+                Ok(Ok(parts)) => parts,
+                Ok(Err(error)) => {
+                    last_error = error;
+                    break;
+                }
+                Err(error) => {
+                    last_error = format!("wallet proof task: {error}");
+                    break;
+                }
+            };
+
+            let intent = match noid_tx::PagedSpendIntent::from_bytes(&intent_bytes) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    last_error = format!("intent decode: {error:?}");
+                    break;
+                }
+            };
+            let facts = noid_tx::validate_paged_spend(&intent.pages)
+                .map_err(|error| rpc_err(format!("wallet PagedSpend: {error}")))?;
+            let input_count = usize::from(facts.live_inputs);
+            let output_count = usize::from(facts.live_outputs);
+            let actual_fee = facts.fee;
+            let failed_txid = facts.logical_txid.0;
+            let output_slots: Vec<u32> = intent
+                .pages
+                .iter()
+                .flat_map(|page| page.body.live_outputs())
+                .map(|(_, output)| output.slot_index)
+                .collect();
+            if actual_fee != fee_micronoid
+                || input_count != expected_input_count
+                || output_count != expected_output_count
+            {
+                last_error = format!(
+                    "wallet builder diverged from plan: expected fee/counts {fee_micronoid}/{expected_input_count}/{expected_output_count}, got {actual_fee}/{input_count}/{output_count}"
+                );
+                break;
+            }
+
+            let reservation = match PendingAdmissionGuard::reserve(
+                Arc::clone(&self.wallet),
+                failed_txid,
+                input_slots,
+                output_slots,
+                pending_history_amount_micronoid,
+                to_address,
+            ) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    last_error = error;
+                    break;
+                }
+            };
+            match self
+                .wallet_submission_mempool
+                .submit(intent, intent_bytes)
+                .await
+            {
+                Ok(txid) => {
+                    reservation.commit();
+                    if attempt > 0 {
+                        tracing::info!(
+                            attempt,
+                            failure_label,
+                            "wallet submission succeeded after retry"
+                        );
+                    }
+                    return Ok(WalletSendResult {
+                        txid: hex::encode(txid.0),
+                        amount_micronoid,
+                        fee_micronoid: actual_fee,
+                        input_count,
+                        output_count,
+                    });
+                }
+                Err(error) => {
+                    drop(reservation);
+                    last_error = error.to_string();
+                }
+            }
+        }
+
+        Err(rpc_err(format!(
+            "{failure_label} failed after 3 attempts: {last_error}"
+        )))
     }
 
     async fn collect_slot_hints(&self, count: u32, salt_seed: u64) -> RpcResult<Vec<u32>> {
@@ -2331,147 +2521,98 @@ impl ParanoidApiServer for RpcHandler {
             "wallet_send deterministic plan ready"
         );
 
-        let call_nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as u64;
-        let mut last_error = String::new();
-        for attempt in 0..3u32 {
-            if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            }
-            let reserved_outputs = self.mempool.reserved_output_slots().await;
-            let selection = {
-                let chain = self.chain.read().await;
-                let tip = chain.tip_header();
-                let unique_seed = u64::from_le_bytes(tip.state_root[..8].try_into().unwrap())
-                    .wrapping_add(
-                        call_nonce
-                            .wrapping_add(attempt as u64)
-                            .wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                    );
-                next_user_epoch_anchor(&chain).and_then(|epoch_anchor| {
-                    collect_empty_slot_hints(
-                        &chain,
-                        &reserved_outputs,
-                        unique_seed,
-                        noid_tx::TX_OUTPUTS,
-                    )
-                    .map(|slot_hints| (epoch_anchor, tip.log_slots, slot_hints))
-                })
-            };
-            let (epoch_anchor, log_slots, slot_hints) = match selection {
-                Ok(selection) => selection,
-                Err(error) => {
-                    last_error = error;
-                    break;
-                }
-            };
-            if slot_hints.len() < plan.output_count {
-                last_error = "not enough empty output slots available".to_string();
-                break;
-            }
+        self.submit_wallet_transaction(WalletSubmissionRequest {
+            to_address,
+            amount_micronoid,
+            fee_micronoid: plan.fee_micronoid,
+            expected_input_count: plan.input_count,
+            expected_output_count: plan.output_count,
+            pending_history_amount_micronoid: amount_micronoid,
+            build: WalletSubmissionBuild::Payment,
+            failure_label: "wallet send",
+        })
+        .await
+    }
 
-            let wallet = Arc::clone(&self.wallet);
-            let (intent_bytes, input_slots) = match tokio::task::spawn_blocking(move || {
-                noid_miner::install_wallet_proof_cpu(|| {
-                    wallet.build_send(
-                        to_address,
-                        amount_micronoid,
-                        plan.fee_micronoid,
-                        epoch_anchor,
-                        slot_hints,
-                        log_slots,
-                    )
-                })
-                .map_err(|error| format!("wallet proof CPU admission failed: {error}"))
-                .and_then(|result| result)
-            })
-            .await
-            {
-                Ok(Ok(parts)) => parts,
-                Ok(Err(error)) => {
-                    last_error = error;
-                    break;
-                }
-                Err(error) => {
-                    last_error = format!("wallet proof task: {error}");
-                    break;
-                }
-            };
+    async fn wallet_plan_consolidation(&self) -> RpcResult<WalletConsolidationPlan> {
+        let _wallet_operation = self.wallet_operation_gate.lock().await;
+        self.reload_active_wallet().await?;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let relay_floor = self.mempool.fee_floor().await;
+        self.wallet
+            .plan_consolidation(
+                WALLET_CONSOLIDATION_INPUT_LIMIT,
+                active_slot_count,
+                log_slots,
+                relay_floor,
+            )
+            .map_err(wallet_plan_error)
+    }
 
-            let intent = match noid_tx::PagedSpendIntent::from_bytes(&intent_bytes) {
-                Ok(intent) => intent,
-                Err(error) => {
-                    last_error = format!("intent decode: {error:?}");
-                    break;
-                }
-            };
-            let facts = noid_tx::validate_paged_spend(&intent.pages)
-                .map_err(|error| rpc_err(format!("wallet PagedSpend: {error}")))?;
-            let input_count = usize::from(facts.live_inputs);
-            let output_count = usize::from(facts.live_outputs);
-            let actual_fee = facts.fee;
-            let failed_txid = facts.logical_txid.0;
-            let output_slots: Vec<u32> = intent
-                .pages
-                .iter()
-                .flat_map(|page| page.body.live_outputs())
-                .map(|(_, output)| output.slot_index)
-                .collect();
-            if actual_fee != plan.fee_micronoid
-                || input_count != plan.input_count
-                || output_count != plan.output_count
-            {
-                last_error = format!(
-                    "wallet builder diverged from plan: expected fee/counts {}/{}/{}, got {actual_fee}/{input_count}/{output_count}",
-                    plan.fee_micronoid, plan.input_count, plan.output_count
-                );
-                break;
-            }
-
-            let reservation = match PendingAdmissionGuard::reserve(
-                Arc::clone(&self.wallet),
-                failed_txid,
-                input_slots,
-                output_slots,
-                amount_micronoid,
-                to_address,
-            ) {
-                Ok(reservation) => reservation,
-                Err(error) => {
-                    last_error = error;
-                    break;
-                }
-            };
-            match self
-                .wallet_submission_mempool
-                .submit(intent, intent_bytes)
-                .await
-            {
-                Ok(txid) => {
-                    reservation.commit();
-                    if attempt > 0 {
-                        tracing::info!(attempt, "wallet_send succeeded after retry");
-                    }
-                    return Ok(WalletSendResult {
-                        txid: hex::encode(txid.0),
-                        amount_micronoid,
-                        fee_micronoid: actual_fee,
-                        input_count,
-                        output_count,
-                    });
-                }
-                Err(error) => {
-                    drop(reservation);
-                    last_error = error.to_string();
-                }
-            }
+    async fn wallet_consolidate(
+        &self,
+        selected_input_slots: Vec<u32>,
+        expected_fee_micronoid: u64,
+        expected_output_value_micronoid: u64,
+    ) -> RpcResult<WalletConsolidationResult> {
+        let _wallet_operation = self.wallet_operation_gate.lock().await;
+        self.reload_active_wallet().await?;
+        let (_, active_address) = self
+            .wallet
+            .active_address()
+            .ok_or_else(|| rpc_err("wallet not initialized"))?;
+        let active_address = parse_address_param(&active_address)?.0;
+        let (active_slot_count, log_slots) = self.mempool.fee_context().await;
+        let relay_floor = self.mempool.fee_floor().await;
+        let plan = self
+            .wallet
+            .plan_consolidation(
+                WALLET_CONSOLIDATION_INPUT_LIMIT,
+                active_slot_count,
+                log_slots,
+                relay_floor,
+            )
+            .map_err(wallet_plan_error)?;
+        if selected_input_slots != plan.selected_input_slots
+            || expected_fee_micronoid != plan.fee_micronoid
+            || expected_output_value_micronoid != plan.output_value_micronoid
+        {
+            return Err(rpc_err(
+                "consolidation quote changed; request a new live quote before submitting",
+            ));
         }
+        tracing::info!(
+            input_count = plan.input_count,
+            input_value_micronoid = plan.input_value_micronoid,
+            fee_micronoid = plan.fee_micronoid,
+            output_value_micronoid = plan.output_value_micronoid,
+            untouched_count = plan.untouched_count,
+            "wallet_consolidate deterministic plan ready"
+        );
 
-        Err(rpc_err(format!(
-            "wallet send failed after 3 attempts: {last_error}"
-        )))
+        let submitted = self
+            .submit_wallet_transaction(WalletSubmissionRequest {
+                to_address: active_address,
+                amount_micronoid: plan.output_value_micronoid,
+                fee_micronoid: plan.fee_micronoid,
+                expected_input_count: plan.input_count,
+                expected_output_count: 1,
+                pending_history_amount_micronoid: plan.fee_micronoid,
+                build: WalletSubmissionBuild::Consolidation {
+                    selected_input_slots: plan.selected_input_slots.clone(),
+                },
+                failure_label: "wallet consolidation",
+            })
+            .await?;
+        Ok(WalletConsolidationResult {
+            txid: submitted.txid,
+            input_value_micronoid: plan.input_value_micronoid,
+            fee_micronoid: submitted.fee_micronoid,
+            output_value_micronoid: submitted.amount_micronoid,
+            input_count: submitted.input_count,
+            output_count: submitted.output_count,
+            freed_slots: plan.freed_slots,
+        })
     }
 
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String> {

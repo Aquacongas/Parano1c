@@ -78,8 +78,9 @@ use std::sync::Arc;
 
 use noid_chain::storage::VerifiedOwnerSnapshot;
 use noid_rpc::types::{
-    micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletHistoryEntry,
-    WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
+    micronoid_to_noid, FeeBreakdownInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
+    WalletHistoryEntry, WalletScanResult, WalletSendPlan, WalletStatus, WalletUtxoInfo,
+    WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use noid_rpc::wallet_ops::{
     WalletActivationPreview, WalletAddressDiscoveryPreview, WalletMinedBlockRecord,
@@ -1036,6 +1037,137 @@ impl WalletOps for WalletHandle {
         Ok((intent_bytes, input_slots))
     }
 
+    fn plan_consolidation(
+        &self,
+        max_inputs: usize,
+        active_slot_count: u64,
+        log_slots: u32,
+        relay_floor: u64,
+    ) -> Result<WalletConsolidationPlan, WalletSendPlanError> {
+        if !(2..=WALLET_CONSOLIDATION_INPUT_LIMIT).contains(&max_inputs) {
+            return Err(WalletSendPlanError::Other(format!(
+                "consolidation input limit must be within 2..={WALLET_CONSOLIDATION_INPUT_LIMIT}"
+            )));
+        }
+
+        let guard = self.inner.lock().unwrap();
+        let wallet = guard
+            .as_ref()
+            .ok_or_else(|| WalletSendPlanError::Other("wallet not initialized".to_string()))?;
+        if !wallet.pending_input_slots.is_empty() || !wallet.pending_output_slots.is_empty() {
+            return Err(WalletSendPlanError::Other(
+                "wallet has a pending transaction".to_string(),
+            ));
+        }
+
+        let mut available: Vec<&state::WalletUtxo> = wallet
+            .utxos
+            .values()
+            .filter(|utxo| utxo.key_index == wallet.active_index)
+            .collect();
+        available.sort_by_key(|utxo| {
+            (
+                utxo.value,
+                utxo.slot_index >> noid_chain::consensus::params::LOG_SEGMENT_SIZE,
+                utxo.slot_index,
+            )
+        });
+        if available.len() < 2 {
+            return Err(WalletSendPlanError::Other(
+                "consolidation requires at least two spendable UTXOs".to_string(),
+            ));
+        }
+
+        let balance_before_micronoid = available
+            .iter()
+            .map(|utxo| utxo.value)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| {
+                WalletSendPlanError::Other("wallet balance arithmetic overflow".to_string())
+            })?;
+        let input_count = available.len().min(max_inputs);
+        let selected = &available[..input_count];
+        let input_value_micronoid = selected
+            .iter()
+            .map(|utxo| utxo.value)
+            .try_fold(0u64, u64::checked_add)
+            .ok_or_else(|| {
+                WalletSendPlanError::Other("wallet balance arithmetic overflow".to_string())
+            })?;
+        let breakdown = noid_chain::consensus::fee_breakdown(
+            input_count as u64,
+            1,
+            active_slot_count,
+            log_slots,
+        );
+        let fee_micronoid = breakdown.required_total.max(relay_floor);
+        let Some(output_value_micronoid) = input_value_micronoid.checked_sub(fee_micronoid) else {
+            return Err(WalletSendPlanError::InsufficientFunds {
+                needed_micronoid: fee_micronoid.saturating_add(1),
+                available_micronoid: input_value_micronoid,
+            });
+        };
+        if output_value_micronoid == 0 {
+            return Err(WalletSendPlanError::InsufficientFunds {
+                needed_micronoid: fee_micronoid.saturating_add(1),
+                available_micronoid: input_value_micronoid,
+            });
+        }
+
+        let untouched_count = available.len() - input_count;
+        Ok(WalletConsolidationPlan {
+            input_value_micronoid,
+            fee_micronoid,
+            output_value_micronoid,
+            balance_before_micronoid,
+            balance_after_micronoid: balance_before_micronoid - fee_micronoid,
+            input_count,
+            untouched_count,
+            remaining_count: untouched_count + 1,
+            freed_slots: input_count - 1,
+            selected_input_slots: selected.iter().map(|utxo| utxo.slot_index).collect(),
+            fee_breakdown: fee_breakdown_info(breakdown, relay_floor, fee_micronoid),
+        })
+    }
+
+    fn build_consolidation(
+        &self,
+        selected_input_slots: Vec<u32>,
+        output_value_micronoid: u64,
+        fee_micronoid: u64,
+        epoch_anchor: [u8; 32],
+        slot_hints: Vec<u32>,
+        _log_slots: u32,
+    ) -> Result<(Vec<u8>, Vec<u32>), String> {
+        let (build_data, active_address) = {
+            let guard = self.inner.lock().unwrap();
+            let wallet = guard
+                .as_ref()
+                .ok_or_else(|| "wallet not initialized".to_string())?;
+            let pending_outputs = wallet.pending_output_slots.clone();
+            let data = builder::extract_consolidation_build_data(
+                wallet,
+                &selected_input_slots,
+                output_value_micronoid,
+                fee_micronoid,
+                epoch_anchor,
+                slot_hints,
+                &pending_outputs,
+            )
+            .map_err(|error| error.to_string())?;
+            (data, wallet.active_address().0)
+        };
+
+        let (_txid, intent_bytes) = builder::build_and_prove_tx(
+            active_address,
+            output_value_micronoid,
+            fee_micronoid,
+            build_data,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((intent_bytes, selected_input_slots))
+    }
+
     fn reserve_pending_submission(
         &self,
         txid: [u8; 32],
@@ -1301,6 +1433,60 @@ mod tests {
             WalletSendPlanError::InputLimitExceeded {
                 max_inputs: MAX_PAGED_SPEND_INPUTS,
             }
+        );
+    }
+
+    #[test]
+    fn consolidation_below_limit_merges_every_spendable_utxo() {
+        let values: Vec<u64> = (0..63).map(|index| 100_000 + index * 1_000).collect();
+        let expected_balance: u64 = values.iter().sum();
+        let (_dir, handle) = handle_with_utxos(&values);
+        let plan = handle
+            .plan_consolidation(WALLET_CONSOLIDATION_INPUT_LIMIT, 0, 24, 0)
+            .unwrap();
+
+        assert_eq!(plan.input_count, 63);
+        assert_eq!(plan.untouched_count, 0);
+        assert_eq!(plan.remaining_count, 1);
+        assert_eq!(plan.freed_slots, 62);
+        assert_eq!(plan.selected_input_slots, (0..63).collect::<Vec<_>>());
+        assert_eq!(plan.input_value_micronoid, expected_balance);
+        assert_eq!(
+            plan.output_value_micronoid + plan.fee_micronoid,
+            expected_balance
+        );
+        assert_eq!(
+            plan.balance_after_micronoid,
+            expected_balance - plan.fee_micronoid
+        );
+    }
+
+    #[test]
+    fn consolidation_above_limit_selects_exactly_the_64_smallest_utxos() {
+        let values: Vec<u64> = (0..65)
+            .map(|index| 100_000 + (64 - index) * 1_000)
+            .collect();
+        let expected_selected_slots: Vec<u32> = (1..65).rev().collect();
+        let expected_input_value: u64 = expected_selected_slots
+            .iter()
+            .map(|slot| values[*slot as usize])
+            .sum();
+        let expected_balance: u64 = values.iter().sum();
+        let (_dir, handle) = handle_with_utxos(&values);
+        let plan = handle
+            .plan_consolidation(WALLET_CONSOLIDATION_INPUT_LIMIT, 0, 24, 0)
+            .unwrap();
+
+        assert_eq!(plan.input_count, WALLET_CONSOLIDATION_INPUT_LIMIT);
+        assert_eq!(plan.untouched_count, 1);
+        assert_eq!(plan.remaining_count, 2);
+        assert_eq!(plan.freed_slots, 63);
+        assert_eq!(plan.selected_input_slots, expected_selected_slots);
+        assert_eq!(plan.input_value_micronoid, expected_input_value);
+        assert_eq!(plan.balance_before_micronoid, expected_balance);
+        assert_eq!(
+            plan.balance_after_micronoid,
+            expected_balance - plan.fee_micronoid
         );
     }
 

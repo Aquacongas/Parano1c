@@ -37,6 +37,7 @@ use crate::model::{
     ReceiptSummarySnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot,
     RecentTransactionSnapshot, RecentTransactionsSnapshot, RetainedBlockSnapshot, SegmentSnapshot,
     SensitiveString, UtxoSnapshot, EXPLORER_PAGE_SIZE, MINED_BLOCK_PAGE_SIZE, RECEIPT_PAGE_SIZE,
+    WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 
 const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9401";
@@ -145,6 +146,63 @@ pub struct PaymentSubmission {
     pub fee_micronoid: u64,
     pub input_count: usize,
     pub output_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsolidationPlan {
+    pub input_value_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub output_value_micronoid: u64,
+    pub balance_before_micronoid: u64,
+    pub balance_after_micronoid: u64,
+    pub input_count: usize,
+    pub untouched_count: usize,
+    pub remaining_count: usize,
+    pub freed_slots: usize,
+    selected_input_slots: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConsolidationSubmission {
+    pub txid: String,
+    pub input_value_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub output_value_micronoid: u64,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub freed_slots: usize,
+}
+
+fn mock_consolidation_plan() -> ConsolidationPlan {
+    let snapshot = AppSnapshot::design_preview();
+    let address = snapshot.active_address();
+    let mut spendable = snapshot
+        .utxos
+        .iter()
+        .filter(|utxo| !utxo.reserved)
+        .collect::<Vec<_>>();
+    spendable.sort_by_key(|utxo| (utxo.value_micronoid, utxo.slot_index));
+    let input_count = spendable.len().min(WALLET_CONSOLIDATION_INPUT_LIMIT);
+    let selected = spendable.into_iter().take(input_count).collect::<Vec<_>>();
+    let input_value_micronoid = selected
+        .iter()
+        .fold(0u64, |sum, utxo| sum.saturating_add(utxo.value_micronoid));
+    let fee_micronoid = 5_000u64
+        .saturating_add(100u64.saturating_mul(input_count as u64))
+        .saturating_add(700);
+    let untouched_count = address.spendable_utxo_count().saturating_sub(input_count);
+    ConsolidationPlan {
+        input_value_micronoid,
+        fee_micronoid,
+        output_value_micronoid: input_value_micronoid.saturating_sub(fee_micronoid),
+        balance_before_micronoid: address.balance_micronoid,
+        balance_after_micronoid: address.balance_micronoid.saturating_sub(fee_micronoid),
+        input_count,
+        untouched_count,
+        remaining_count: untouched_count + usize::from(input_count > 0),
+        freed_slots: input_count.saturating_sub(1),
+        selected_input_slots: selected.iter().map(|utxo| utxo.slot_index).collect(),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -632,6 +690,45 @@ impl Backend {
             input_count: result.input_count,
             output_count: result.output_count,
         })
+    }
+
+    pub async fn plan_consolidation(&self) -> Result<ConsolidationPlan, String> {
+        if self.is_mock() {
+            return Ok(mock_consolidation_plan());
+        }
+        let plan = self
+            .rpc::<WalletConsolidationPlan>("walletPlanConsolidation", json!([]))
+            .await?;
+        Ok(plan.into())
+    }
+
+    pub async fn consolidate(
+        &self,
+        plan: ConsolidationPlan,
+    ) -> Result<ConsolidationSubmission, String> {
+        if self.is_mock() {
+            return Ok(ConsolidationSubmission {
+                txid: "a74d1db8ee61aa359e753f9724788d4077c554a408bac1380caf17133e90335c".into(),
+                input_value_micronoid: plan.input_value_micronoid,
+                fee_micronoid: plan.fee_micronoid,
+                output_value_micronoid: plan.output_value_micronoid,
+                input_count: plan.input_count,
+                output_count: 1,
+                freed_slots: plan.freed_slots,
+            });
+        }
+        let result = self
+            .rpc_with_timeout::<WalletConsolidationResult>(
+                "walletConsolidate",
+                json!([
+                    plan.selected_input_slots,
+                    plan.fee_micronoid,
+                    plan.output_value_micronoid
+                ]),
+                Duration::from_secs(120),
+            )
+            .await?;
+        Ok(result.into())
     }
 
     pub async fn snapshot(&self, mining_page: u32) -> Result<BackendSnapshot, String> {
@@ -1864,6 +1961,62 @@ struct WalletSendResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct WalletConsolidationPlan {
+    input_value_micronoid: u64,
+    fee_micronoid: u64,
+    output_value_micronoid: u64,
+    balance_before_micronoid: u64,
+    balance_after_micronoid: u64,
+    input_count: usize,
+    untouched_count: usize,
+    remaining_count: usize,
+    freed_slots: usize,
+    selected_input_slots: Vec<u32>,
+}
+
+impl From<WalletConsolidationPlan> for ConsolidationPlan {
+    fn from(plan: WalletConsolidationPlan) -> Self {
+        Self {
+            input_value_micronoid: plan.input_value_micronoid,
+            fee_micronoid: plan.fee_micronoid,
+            output_value_micronoid: plan.output_value_micronoid,
+            balance_before_micronoid: plan.balance_before_micronoid,
+            balance_after_micronoid: plan.balance_after_micronoid,
+            input_count: plan.input_count,
+            untouched_count: plan.untouched_count,
+            remaining_count: plan.remaining_count,
+            freed_slots: plan.freed_slots,
+            selected_input_slots: plan.selected_input_slots,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WalletConsolidationResult {
+    txid: String,
+    input_value_micronoid: u64,
+    fee_micronoid: u64,
+    output_value_micronoid: u64,
+    input_count: usize,
+    output_count: usize,
+    freed_slots: usize,
+}
+
+impl From<WalletConsolidationResult> for ConsolidationSubmission {
+    fn from(result: WalletConsolidationResult) -> Self {
+        Self {
+            txid: result.txid,
+            input_value_micronoid: result.input_value_micronoid,
+            fee_micronoid: result.fee_micronoid,
+            output_value_micronoid: result.output_value_micronoid,
+            input_count: result.input_count,
+            output_count: result.output_count,
+            freed_slots: result.freed_slots,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct WalletUtxoInfo {
     slot_index: u32,
     value_micronoid: u64,
@@ -2610,6 +2763,23 @@ mod tests {
         assert_eq!(average_block_time_window_start(2), 1);
         assert_eq!(average_block_time_window_start(11), 1);
         assert_eq!(average_block_time_window_start(12), 2);
+    }
+
+    #[test]
+    fn mock_consolidation_quote_obeys_the_b64_boundary() {
+        let plan = mock_consolidation_plan();
+        assert_eq!(plan.input_count, WALLET_CONSOLIDATION_INPUT_LIMIT);
+        assert_eq!(plan.selected_input_slots.len(), plan.input_count);
+        assert_eq!(plan.remaining_count, plan.untouched_count.saturating_add(1));
+        assert_eq!(plan.freed_slots, plan.input_count - 1);
+        assert_eq!(
+            plan.input_value_micronoid,
+            plan.output_value_micronoid + plan.fee_micronoid
+        );
+        assert_eq!(
+            plan.balance_after_micronoid,
+            plan.balance_before_micronoid - plan.fee_micronoid
+        );
     }
 
     #[test]

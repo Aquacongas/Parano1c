@@ -12,6 +12,7 @@
 //!
 use noid_gkr::OwnerAuthWitness;
 use noid_poseidon2b::primitives::{derive_address, Address};
+use noid_rpc::types::WALLET_CONSOLIDATION_INPUT_LIMIT;
 use noid_tx::{
     output_bitmap_bit,
     types::{TxBody, TxInput, TxOutput},
@@ -67,6 +68,20 @@ pub enum BuildError {
 
     #[error("selected UTXO set is not owned exclusively by the active address")]
     ActiveOwnerMismatch,
+
+    #[error("consolidation requires 2..={max} inputs, got {selected}")]
+    InvalidConsolidationInputCount { selected: usize, max: usize },
+
+    #[error("consolidation input slot {slot_index} is unavailable")]
+    ConsolidationInputUnavailable { slot_index: u32 },
+
+    #[error(
+        "consolidation value mismatch: selected inputs total {selected_total} μNOID, expected output+fee {expected_total} μNOID"
+    )]
+    ConsolidationValueMismatch {
+        selected_total: u64,
+        expected_total: u64,
+    },
 
     #[error("wallet amount arithmetic overflow")]
     AmountOverflow,
@@ -176,6 +191,81 @@ pub fn extract_build_data(
         change_address: wallet.active_address(),
         epoch_anchor,
         output_slot_hints: slot_hints,
+    })
+}
+
+/// Extract the exact active-owner UTXOs approved by a consolidation plan.
+///
+/// Unlike ordinary payment selection, consolidation intentionally merges the
+/// smallest UTXOs. The caller therefore supplies the immutable slot list from
+/// the live quote instead of re-running the wallet's largest-first payment
+/// selector while the proof is being built.
+pub fn extract_consolidation_build_data(
+    wallet: &WalletState,
+    selected_input_slots: &[u32],
+    output_value_micronoid: u64,
+    fee_micronoid: u64,
+    epoch_anchor: [u8; 32],
+    slot_hints: Vec<u32>,
+    pending_output_slots: &std::collections::HashSet<u32>,
+) -> Result<TxBuildData, BuildError> {
+    if selected_input_slots.len() < 2
+        || selected_input_slots.len() > WALLET_CONSOLIDATION_INPUT_LIMIT
+    {
+        return Err(BuildError::InvalidConsolidationInputCount {
+            selected: selected_input_slots.len(),
+            max: WALLET_CONSOLIDATION_INPUT_LIMIT,
+        });
+    }
+
+    let mut unique_slots = std::collections::HashSet::with_capacity(selected_input_slots.len());
+    let mut selected_utxos = Vec::with_capacity(selected_input_slots.len());
+    for &slot_index in selected_input_slots {
+        if !unique_slots.insert(slot_index) {
+            return Err(BuildError::ConsolidationInputUnavailable { slot_index });
+        }
+        let utxo = wallet
+            .utxos
+            .get(&slot_index)
+            .filter(|utxo| utxo.key_index == wallet.active_index)
+            .filter(|_| !wallet.pending_input_slots.contains(&slot_index))
+            .ok_or(BuildError::ConsolidationInputUnavailable { slot_index })?;
+        selected_utxos.push(utxo.clone());
+    }
+
+    let selected_total = selected_utxos
+        .iter()
+        .try_fold(0u64, |sum, utxo| sum.checked_add(utxo.value))
+        .ok_or(BuildError::AmountOverflow)?;
+    let expected_total = output_value_micronoid
+        .checked_add(fee_micronoid)
+        .ok_or(BuildError::AmountOverflow)?;
+    if selected_total != expected_total {
+        return Err(BuildError::ConsolidationValueMismatch {
+            selected_total,
+            expected_total,
+        });
+    }
+
+    let output_slot_hints: Vec<u32> = slot_hints
+        .into_iter()
+        .filter(|slot| !pending_output_slots.contains(slot))
+        .take(1)
+        .collect();
+    if output_slot_hints.len() != 1 {
+        return Err(BuildError::NotEnoughSlots {
+            need: 1,
+            got: output_slot_hints.len(),
+        });
+    }
+
+    let owner_auth_witness = active_owner_witness(wallet, &selected_utxos)?;
+    Ok(TxBuildData {
+        selected_utxos,
+        owner_auth_witness,
+        change_address: wallet.active_address(),
+        epoch_anchor,
+        output_slot_hints,
     })
 }
 
@@ -379,6 +469,96 @@ mod tests {
                 selected,
                 max: MAX_PAGED_SPEND_INPUTS,
             } if selected == MAX_PAGED_SPEND_INPUTS + 1
+        ));
+    }
+
+    #[test]
+    fn consolidation_extractor_preserves_the_approved_slots_exactly() {
+        let (_dir, wallet) = wallet_with_utxos(5, 1_000);
+        let pending_outputs = std::collections::HashSet::from([50_000]);
+        let data = extract_consolidation_build_data(
+            &wallet,
+            &[3, 1, 4],
+            2_800,
+            200,
+            [0x11; 32],
+            vec![50_000, 50_001],
+            &pending_outputs,
+        )
+        .unwrap();
+
+        assert_eq!(
+            data.selected_utxos
+                .iter()
+                .map(|utxo| utxo.slot_index)
+                .collect::<Vec<_>>(),
+            vec![3, 1, 4]
+        );
+        assert_eq!(data.output_slot_hints, vec![50_001]);
+    }
+
+    #[test]
+    fn consolidation_extractor_rejects_duplicate_or_reserved_inputs() {
+        let (_dir, mut wallet) = wallet_with_utxos(3, 1_000);
+        let duplicate = match extract_consolidation_build_data(
+            &wallet,
+            &[1, 1],
+            1_900,
+            100,
+            [0x11; 32],
+            vec![50_000],
+            &std::collections::HashSet::new(),
+        ) {
+            Ok(_) => panic!("duplicate consolidation slot was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            duplicate,
+            BuildError::ConsolidationInputUnavailable { slot_index: 1 }
+        ));
+
+        wallet.pending_input_slots.insert(2);
+        let reserved = match extract_consolidation_build_data(
+            &wallet,
+            &[1, 2],
+            1_900,
+            100,
+            [0x11; 32],
+            vec![50_000],
+            &std::collections::HashSet::new(),
+        ) {
+            Ok(_) => panic!("reserved consolidation slot was accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            reserved,
+            BuildError::ConsolidationInputUnavailable { slot_index: 2 }
+        ));
+    }
+
+    #[test]
+    fn consolidation_extractor_rejects_more_than_the_interactive_limit() {
+        let count = WALLET_CONSOLIDATION_INPUT_LIMIT as u32 + 1;
+        let (_dir, wallet) = wallet_with_utxos(count, 1_000);
+        let selected_input_slots = (0..count).collect::<Vec<_>>();
+        let error = match extract_consolidation_build_data(
+            &wallet,
+            &selected_input_slots,
+            count as u64 * 1_000,
+            0,
+            [0x11; 32],
+            vec![50_000],
+            &std::collections::HashSet::new(),
+        ) {
+            Ok(_) => panic!("more than 64 consolidation inputs were accepted"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            BuildError::InvalidConsolidationInputCount {
+                selected,
+                max: WALLET_CONSOLIDATION_INPUT_LIMIT,
+            } if selected == WALLET_CONSOLIDATION_INPUT_LIMIT + 1
         ));
     }
 

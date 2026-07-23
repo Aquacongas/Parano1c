@@ -329,6 +329,41 @@ pub struct WalletSendResult {
     pub output_count: usize,
 }
 
+/// Maximum number of active-owner UTXOs merged by one GUI consolidation.
+///
+/// The protocol supports larger paged spends, but keeping the wallet action at
+/// the B64 boundary bounds interactive proving latency and leaves additional
+/// UTXOs untouched for a later consolidation.
+pub const WALLET_CONSOLIDATION_INPUT_LIMIT: usize = 64;
+
+/// Exact live consolidation quote produced from the active wallet snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConsolidationPlan {
+    pub input_value_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub output_value_micronoid: u64,
+    pub balance_before_micronoid: u64,
+    pub balance_after_micronoid: u64,
+    pub input_count: usize,
+    pub untouched_count: usize,
+    pub remaining_count: usize,
+    pub freed_slots: usize,
+    pub selected_input_slots: Vec<u32>,
+    pub fee_breakdown: FeeBreakdownInfo,
+}
+
+/// One successfully admitted active-wallet consolidation transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WalletConsolidationResult {
+    pub txid: String,
+    pub input_value_micronoid: u64,
+    pub fee_micronoid: u64,
+    pub output_value_micronoid: u64,
+    pub input_count: usize,
+    pub output_count: usize,
+    pub freed_slots: usize,
+}
+
 /// Decoded block header (structured, not raw bytes).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockHeaderInfo {
