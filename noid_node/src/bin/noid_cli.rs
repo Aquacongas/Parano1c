@@ -264,7 +264,7 @@ enum Command {
     /// Show and manage wallet addresses.
     #[command(alias = "addr")]
     Address {
-        /// Generate the next address and make it active.
+        /// Generate the next inactive address.
         #[arg(long)]
         new: bool,
         /// List locally generated addresses (the active one is marked).
@@ -1298,7 +1298,7 @@ async fn cmd_address(
         }
         let addr = result["address"].as_str().unwrap_or("");
         let idx = result["key_index"].as_u64().unwrap_or(0);
-        section(&format!("New active address [index={idx}]"));
+        section(&format!("New address [index={idx}]"));
         if is_tty() {
             println!("  {}{}{}", BOLD, addr, RST);
         } else {
@@ -1306,7 +1306,7 @@ async fn cmd_address(
         }
         println!();
         println!(
-            "  {} This address is now active; its balance and UTXOs were loaded.",
+            "  {} The active address is unchanged. Activate this address with 'address --use {idx}'.",
             c!(DIM, "↑")
         );
     } else if let Some(idx) = index {

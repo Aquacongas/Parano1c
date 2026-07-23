@@ -7,7 +7,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Padding};
 
-use crate::app::{Action, App, Message};
+use crate::app::{Action, AddressOperation, App, Message};
 use crate::backend::PaymentSubmission;
 use crate::model::{
     format_creation_origin, format_micronoid, grouped, AddressSnapshot, UtxoSnapshot,
@@ -933,13 +933,17 @@ fn legend_item(color: iced::Color, label: &'static str) -> Element<'static, Mess
 }
 
 fn address_picker(app: &App, compact: bool) -> Element<'_, Message> {
+    let busy = app.address_operation.is_some();
+    let mut close = button(text("ESC CLOSE").size(12))
+        .padding([6, 9])
+        .style(|_, status| theme::button(ButtonKind::Ghost, status));
+    if !busy {
+        close = close.on_press(Message::ToggleAddressPicker);
+    }
     let title = row![
         text("ADDRESS BOOK").size(13),
         iced::widget::Space::new().width(Length::Fill),
-        button(text("ESC CLOSE").size(12))
-            .on_press(Message::ToggleAddressPicker)
-            .padding([6, 9])
-            .style(|_, status| theme::button(ButtonKind::Ghost, status)),
+        close,
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -972,6 +976,39 @@ fn address_picker(app: &App, compact: bool) -> Element<'_, Message> {
         rows = rows.push(address_row(app, address, is_active, index % 2 == 1));
     }
 
+    let mut new_address = button(
+        text(if app.address_operation == Some(AddressOperation::Create) {
+            "CREATING..."
+        } else {
+            "NEW ADDRESS"
+        })
+        .size(13),
+    )
+    .padding([10, 14])
+    .style(|_, status| theme::button(ButtonKind::Primary, status));
+    if !busy {
+        new_address = new_address.on_press(Message::CreateAddress);
+    }
+
+    let mut controls =
+        column![container(row![new_address].align_y(Alignment::Center)).padding(12),].spacing(0);
+    if let Some(error) = &app.address_error {
+        controls = controls.push(
+            container(text(error).size(11).color(theme::DANGER))
+                .width(Length::Fill)
+                .padding([9, 12])
+                .style(theme::surface),
+        );
+    }
+    controls = controls.push(
+        container(
+            text("LABELS ARE LOCAL · ADDRESSES CANNOT BE DELETED")
+                .size(11)
+                .color(theme::DIM),
+        )
+        .padding([8, 12]),
+    );
+
     let card = container(
         column![
             container(title)
@@ -987,20 +1024,7 @@ fn address_picker(app: &App, compact: bool) -> Element<'_, Message> {
                 ))
                 .height(Length::Fill)
                 .style(theme::scrollable),
-            container(
-                row![button(text("NEW ADDRESS").size(13))
-                    .on_press(Message::CreateAddress)
-                    .padding([10, 14])
-                    .style(|_, status| theme::button(ButtonKind::Primary, status)),]
-                .align_y(Alignment::Center)
-            )
-            .padding(12),
-            container(
-                text("LABELS ARE LOCAL · ADDRESSES CANNOT BE DELETED")
-                    .size(11)
-                    .color(theme::DIM)
-            )
-            .padding([8, 12]),
+            controls,
         ]
         .spacing(0),
     )
@@ -1028,7 +1052,15 @@ fn address_row<'a>(
     active: bool,
     alternate: bool,
 ) -> Element<'a, Message> {
-    let status = if active { "ACTIVE" } else { "GENERATED" };
+    let activating = app.address_operation == Some(AddressOperation::Activate(address.key_index));
+    let busy = app.address_operation.is_some();
+    let status = if active {
+        "ACTIVE"
+    } else if activating {
+        "SWITCHING"
+    } else {
+        "GENERATED"
+    };
     let details = row![
         table_cell(address.key_index.to_string(), 2, theme::CYAN),
         table_cell(address.label.clone(), 5, theme::TEXT),
@@ -1045,7 +1077,13 @@ fn address_row<'a>(
         table_cell(
             status.to_string(),
             5,
-            if active { theme::ACCENT } else { theme::DIM },
+            if active {
+                theme::ACCENT
+            } else if activating {
+                theme::PROOF
+            } else {
+                theme::DIM
+            },
         ),
     ]
     .width(Length::Fill)
@@ -1056,22 +1094,25 @@ fn address_row<'a>(
             .on_press(Message::Noop)
             .style(|_, status| theme::button(ButtonKind::Primary, status))
     } else {
-        button(text("USE").size(11))
-            .on_press(Message::SelectAddress(address.key_index))
-            .style(|_, status| theme::button(ButtonKind::Secondary, status))
+        let mut button = button(text(if activating { "USING..." } else { "USE" }).size(11))
+            .style(|_, status| theme::button(ButtonKind::Secondary, status));
+        if !busy {
+            button = button.on_press(Message::SelectAddress(address.key_index));
+        }
+        button
     };
 
+    let mut edit = button(text("EDIT").size(11))
+        .width(Length::Fixed(68.0))
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if !busy {
+        edit = edit.on_press(Message::BeginEditAddress(address.key_index));
+    }
+
     container(
-        row![
-            details,
-            button(text("EDIT").size(11))
-                .width(Length::Fixed(68.0))
-                .on_press(Message::BeginEditAddress(address.key_index))
-                .style(|_, status| theme::button(ButtonKind::Secondary, status)),
-            activate.width(Length::Fixed(76.0)),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
+        row![details, edit, activate.width(Length::Fixed(76.0)),]
+            .spacing(6)
+            .align_y(Alignment::Center),
     )
     .width(Length::Fill)
     .padding([5, 9])

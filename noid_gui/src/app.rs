@@ -64,6 +64,8 @@ pub struct App {
     requested_block_transaction_position: Option<u16>,
     pub genesis_enabled: bool,
     pub address_picker_open: bool,
+    pub address_operation: Option<AddressOperation>,
+    pub address_error: Option<String>,
     pub action: Option<Action>,
     pub send_recipient: String,
     pub send_amount: String,
@@ -146,6 +148,12 @@ pub enum WalletSetupMode {
     Photo,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressOperation {
+    Create,
+    Activate(u32),
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     Navigate(Section),
@@ -175,7 +183,8 @@ pub enum Message {
     EnsureNodeFinished(Result<(), String>),
     RefreshTick,
     SnapshotLoaded(Result<Box<BackendSnapshot>, String>),
-    AddressActionFinished(Result<(), String>),
+    AddressCreated(Result<(), String>),
+    AddressActivated(u32, Result<(), String>),
     AddressDiscoveryFinished(Result<String, String>),
     #[cfg(feature = "dev-genesis")]
     ToggleGenesis(bool),
@@ -308,6 +317,8 @@ impl App {
             requested_block_transaction_position: None,
             genesis_enabled: false,
             address_picker_open: false,
+            address_operation: None,
+            address_error: None,
             action: None,
             send_recipient: String::new(),
             send_amount: String::new(),
@@ -382,7 +393,10 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Navigate(section) => {
-                if self.secret_action_in_flight || self.photo_scan_active {
+                if self.secret_action_in_flight
+                    || self.photo_scan_active
+                    || self.address_operation.is_some()
+                {
                     return Task::none();
                 }
                 if section != Section::Explorer {
@@ -406,46 +420,71 @@ impl App {
                 }
             }
             Message::ToggleAddressPicker => {
+                if self.address_picker_open && self.address_operation.is_some() {
+                    return Task::none();
+                }
                 self.address_picker_open = !self.address_picker_open;
                 if self.address_picker_open {
                     self.action = None;
                     self.block_details = None;
                     self.block_transaction_position = None;
+                    self.address_error = None;
                 }
                 self.editing_address = None;
                 self.close_consolidation_hint();
             }
             Message::SelectAddress(key_index) => {
-                self.address_picker_open = false;
-                self.copied_address = None;
-                self.selected_utxo_slot = None;
+                if self.address_operation.is_some()
+                    || !matches!(
+                        self.backend_state,
+                        BackendState::Online | BackendState::Mock
+                    )
+                    || key_index == self.snapshot.active_address().key_index
+                {
+                    return Task::none();
+                }
+                self.address_error = None;
                 self.close_consolidation_hint();
                 if self.backend.is_mock() {
                     self.snapshot.activate_address(key_index);
+                    self.address_picker_open = false;
+                    self.copied_address = None;
+                    self.selected_utxo_slot = None;
                 } else {
+                    self.address_operation = Some(AddressOperation::Activate(key_index));
                     let backend = self.backend.clone();
                     return Task::perform(
                         async move { backend.set_active_address(key_index).await },
-                        Message::AddressActionFinished,
+                        move |result| Message::AddressActivated(key_index, result),
                     );
                 }
             }
             Message::CreateAddress => {
-                self.address_picker_open = false;
-                self.copied_address = None;
-                self.selected_utxo_slot = None;
+                if self.address_operation.is_some()
+                    || !matches!(
+                        self.backend_state,
+                        BackendState::Online | BackendState::Mock
+                    )
+                {
+                    return Task::none();
+                }
+                self.address_error = None;
                 self.close_consolidation_hint();
                 if self.backend.is_mock() {
                     self.snapshot.create_preview_address();
                 } else {
+                    self.address_operation = Some(AddressOperation::Create);
                     let backend = self.backend.clone();
                     return Task::perform(
                         async move { backend.create_address().await },
-                        Message::AddressActionFinished,
+                        Message::AddressCreated,
                     );
                 }
             }
             Message::OpenAction(action) => {
+                if self.address_operation.is_some() {
+                    return Task::none();
+                }
                 self.action = Some(action);
                 self.address_picker_open = false;
                 self.block_details = None;
@@ -656,6 +695,7 @@ impl App {
                     && !self.ensure_in_flight
                     && !self.node_action_in_flight
                     && !self.send_in_flight
+                    && self.address_operation.is_none()
                     && !self.shutting_down
                 {
                     return self.refresh_snapshot();
@@ -737,10 +777,28 @@ impl App {
                     }
                 }
             }
-            Message::AddressActionFinished(result) => match result {
-                Ok(()) => return self.refresh_snapshot(),
-                Err(error) => self.backend_error = Some(error),
-            },
+            Message::AddressCreated(result) => {
+                self.address_operation = None;
+                match result {
+                    Ok(()) => return self.refresh_snapshot(),
+                    Err(error) => self.address_error = Some(error),
+                }
+            }
+            Message::AddressActivated(key_index, result) => {
+                if self.address_operation != Some(AddressOperation::Activate(key_index)) {
+                    return Task::none();
+                }
+                self.address_operation = None;
+                match result {
+                    Ok(()) => {
+                        self.address_picker_open = false;
+                        self.copied_address = None;
+                        self.selected_utxo_slot = None;
+                        return self.refresh_snapshot();
+                    }
+                    Err(error) => self.address_error = Some(error),
+                }
+            }
             Message::AddressDiscoveryFinished(result) => {
                 self.address_discovery_in_flight = false;
                 self.address_discovery_pending = false;
@@ -776,7 +834,10 @@ impl App {
                 }
             }
             Message::SetMining(enabled) => {
-                if self.node_action_in_flight || self.snapshot.mining.enabled == enabled {
+                if self.node_action_in_flight
+                    || self.address_operation.is_some()
+                    || self.snapshot.mining.enabled == enabled
+                {
                     return Task::none();
                 }
                 if enabled && self.matrix_b64 != MatrixCacheState::Ready {

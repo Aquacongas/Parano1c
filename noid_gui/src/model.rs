@@ -577,8 +577,6 @@ impl AppSnapshot {
             pending_outbound_micronoid: 0,
             incoming_micronoid: 0,
         });
-        self.active_address = self.addresses.len() - 1;
-        self.utxos.clear();
     }
 
     pub fn preserve_local_labels_from(&mut self, previous: &Self) {
@@ -841,7 +839,7 @@ pub fn format_micronoid(value: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_creation_origin, SensitiveString};
+    use super::{format_creation_origin, AppSnapshot, SensitiveString};
 
     #[test]
     fn formats_creation_id_namespaces_semantically() {
@@ -860,5 +858,32 @@ mod tests {
 
         value.clear();
         assert!(value.is_empty());
+    }
+
+    #[test]
+    fn preview_address_creation_does_not_change_the_active_owner() {
+        let mut snapshot = AppSnapshot::design_preview();
+        let active_index = snapshot.active_address;
+        let active_key_index = snapshot.active_address().key_index;
+        let utxo_slots = snapshot
+            .utxos
+            .iter()
+            .map(|utxo| utxo.slot_index)
+            .collect::<Vec<_>>();
+        let address_count = snapshot.addresses.len();
+
+        snapshot.create_preview_address();
+
+        assert_eq!(snapshot.addresses.len(), address_count + 1);
+        assert_eq!(snapshot.active_address, active_index);
+        assert_eq!(snapshot.active_address().key_index, active_key_index);
+        assert_eq!(
+            snapshot
+                .utxos
+                .iter()
+                .map(|utxo| utxo.slot_index)
+                .collect::<Vec<_>>(),
+            utxo_slots
+        );
     }
 }

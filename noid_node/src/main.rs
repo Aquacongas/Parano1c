@@ -886,10 +886,9 @@ async fn main() -> anyhow::Result<()> {
         tokio::sync::watch::channel(cli.genesis);
     let (mining_confirmed_peer_count_tx, mining_confirmed_peer_count_rx) =
         tokio::sync::watch::channel(0usize);
-    // Edge-triggered tip changes cancel active proof/PoW work. Broadcast keeps
-    // no stale permit from advances that happened before the miner subscribed;
-    // its initial chain snapshot already includes those advances.
-    let (tip_change_tx, _) = tokio::sync::broadcast::channel::<()>(16);
+    // Edge-triggered changes cancel active proof/PoW work when either the
+    // canonical parent or a dynamic wallet payout changes.
+    let (template_change_tx, _) = tokio::sync::broadcast::channel::<()>(16);
     // Extminer mode owns one prepared/proving attempt. P2P canonical advances
     // use this same handle to invalidate stale ready capabilities immediately.
     let external_mining_attempts = ExternalMiningAttemptInvalidator::new();
@@ -969,7 +968,6 @@ async fn main() -> anyhow::Result<()> {
                     active_index,
                     next_index,
                     active_index,
-                    false,
                     owner,
                     snapshot,
                     &reserved_inputs,
@@ -1039,7 +1037,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_wallet = shared_wallet.clone();
     let p2p_events = p2p.subscribe();
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
-    let p2p_tip_changes = tip_change_tx.clone();
+    let p2p_template_changes = template_change_tx.clone();
     let p2p_initial_sync_ready = initial_sync_ready_tx.clone();
     let p2p_mining_peer_quorum = MiningPeerQuorum::new(
         cli.genesis,
@@ -1059,7 +1057,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_cmd_for_events,
             p2p_initial_sync_ready,
             p2p_mining_peer_quorum,
-            p2p_tip_changes,
+            p2p_template_changes,
             p2p_wallet_operation_gate,
             p2p_snapshot_staging_root,
             p2p_history_step_runtime,
@@ -1131,6 +1129,7 @@ async fn main() -> anyhow::Result<()> {
         history_step_runtime.clone(),
         history_step_ghost.clone(),
         external_mining_attempts,
+        template_change_tx.clone(),
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
         cli.mining_key,
@@ -1164,7 +1163,7 @@ async fn main() -> anyhow::Result<()> {
             mempool.clone(),
             chain.clone(),
             mining_network_ready_rx,
-            tip_change_tx.clone(),
+            template_change_tx.clone(),
             Arc::clone(
                 history_step_runtime
                     .as_ref()
@@ -2184,7 +2183,7 @@ async fn handle_p2p_events(
     p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     initial_sync_ready: tokio::sync::watch::Sender<bool>,
     mut mining_peer_quorum: MiningPeerQuorum,
-    tip_changes: tokio::sync::broadcast::Sender<()>,
+    template_changes: tokio::sync::broadcast::Sender<()>,
     wallet_operation_gate: WalletOperationGate,
     snapshot_staging_root: PathBuf,
     history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
@@ -2951,7 +2950,7 @@ async fn handle_p2p_events(
                                         last_tip_advance = Instant::now();
                                         mark_initial_sync_ready(&initial_sync_ready);
                                         mining_peer_quorum.confirm(from);
-                                        let _ = tip_changes.send(());
+                                        let _ = template_changes.send(());
                                         tracing::info!(
                                             new_tip = new_tip_height,
                                             reverted,
@@ -3122,7 +3121,7 @@ async fn handle_p2p_events(
                                 last_tip_advance = Instant::now();
                                 mark_initial_sync_ready(&initial_sync_ready);
                                 mining_peer_quorum.confirm(from);
-                                let _ = tip_changes.send(()); // cancel/rebuild any active stale template
+                                let _ = template_changes.send(()); // cancel/rebuild any active stale template
 
                                 // Continue only to the authenticated/announced target. Pulling
                                 // one height beyond a caught-up tip used to turn an ordinary
@@ -3335,7 +3334,7 @@ async fn handle_p2p_events(
                                                     last_tip_advance = Instant::now();
                                                     mark_initial_sync_ready(&initial_sync_ready);
                                                     mining_peer_quorum.confirm(from);
-                                                    let _ = tip_changes.send(());
+                                                    let _ = template_changes.send(());
                                                     let new_tip = new_tip_height;
                                                     tracing::info!(
                                                         new_tip,
@@ -5116,7 +5115,7 @@ async fn handle_p2p_events(
                     last_tip_advance = Instant::now();
                     mark_initial_sync_ready(&initial_sync_ready);
                     mining_peer_quorum.confirm(completed.key.from);
-                    let _ = tip_changes.send(());
+                    let _ = template_changes.send(());
                     if highest_announced > height {
                         let peer = last_announcement_peer.unwrap_or(completed.key.from);
                         let count = (highest_announced - height)
@@ -5665,7 +5664,6 @@ async fn rescan_wallet_from_chain(
                 active_index,
                 next_index,
                 active_index,
-                false,
                 owner,
                 snapshot,
                 &reserved_inputs,

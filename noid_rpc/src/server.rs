@@ -849,6 +849,8 @@ pub struct RpcHandler {
     >,
     /// Every handler clone shares the same one-attempt lifecycle owner.
     external_mining_attempts: ExternalMiningAttemptInvalidator,
+    /// Wakes the internal miner when a dynamic wallet payout changes.
+    mining_template_changes: tokio::sync::broadcast::Sender<()>,
     /// Node-side proof capacity for external PoW templates. External workers
     /// do not choose the B64/B255 class.
     external_mining_capacity: Arc<Mutex<AdaptiveProofCapacity>>,
@@ -2466,10 +2468,7 @@ impl ParanoidApiServer for RpcHandler {
 
     async fn wallet_next_address(&self) -> RpcResult<WalletAddressInfo> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
-        self.reload_active_wallet().await?;
-        let preview = self.wallet.preview_next_address().map_err(rpc_err)?;
-        let (generated, _scan) = self.install_wallet_activation(preview).await?;
-        Ok(generated)
+        self.wallet.create_next_address().map_err(rpc_err)
     }
 
     async fn wallet_list_addresses(&self) -> RpcResult<Vec<WalletAddressInfo>> {
@@ -2491,8 +2490,18 @@ impl ParanoidApiServer for RpcHandler {
     async fn wallet_set_active_address(&self, index: u32) -> RpcResult<WalletAddressInfo> {
         let _wallet_operation = self.wallet_operation_gate.lock().await;
         self.reload_active_wallet().await?;
+        if self
+            .wallet
+            .active_address()
+            .is_some_and(|(active_index, _)| active_index == index)
+        {
+            return self.wallet_active_address().await;
+        }
         let preview = self.wallet.preview_address_switch(index).map_err(rpc_err)?;
         let (activated, _scan) = self.install_wallet_activation(preview).await?;
+        if self.mining_payout_address.is_none() {
+            let _ = self.mining_template_changes.send(());
+        }
         Ok(activated)
     }
 
@@ -2848,6 +2857,7 @@ pub async fn start_rpc_server(
         Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
     >,
     external_mining_attempts: ExternalMiningAttemptInvalidator,
+    mining_template_changes: tokio::sync::broadcast::Sender<()>,
     mining_api_enabled: bool,
     mining_payout_address: Option<noid_poseidon2b::primitives::Address>,
     mining_key: Option<String>,
@@ -2881,6 +2891,7 @@ pub async fn start_rpc_server(
         history_step_runtime,
         history_step_ghost,
         external_mining_attempts,
+        mining_template_changes,
         external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::default())),
     };
 

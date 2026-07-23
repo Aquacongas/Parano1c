@@ -282,7 +282,8 @@ pub trait ParanoidApi {
     #[method(name = "walletExportReceipt")]
     async fn wallet_export_receipt(&self, txhash_hex: String) -> RpcResult<String>;
 
-    /// Generate the next address, make it active, and load its current UTXOs.
+    /// Generate the next inactive address. The active owner, loaded UTXOs,
+    /// and mining payout remain unchanged until walletSetActiveAddress.
     #[method(name = "walletNextAddress")]
     async fn wallet_next_address(&self) -> RpcResult<WalletAddressInfo>;
 

@@ -332,7 +332,6 @@ pub fn install_reorg_snapshot_and_artifacts(
         expected_active_index,
         expected_next_index,
         expected_active_index,
-        false,
         owner,
         snapshot,
         reserved_input_slots,
@@ -665,7 +664,6 @@ impl WalletOps for WalletHandle {
             expected_next_index: w.next_index,
             target_index: w.active_index,
             owner: owner.0,
-            advance_next_index: false,
         })
     }
 
@@ -680,22 +678,19 @@ impl WalletOps for WalletHandle {
             expected_next_index: w.next_index,
             target_index: index,
             owner: owner.0,
-            advance_next_index: false,
         })
     }
 
-    fn preview_next_address(&self) -> Result<WalletActivationPreview, String> {
-        let guard = self.inner.lock().unwrap();
+    fn create_next_address(&self) -> Result<WalletAddressInfo, String> {
+        let mut guard = self.inner.lock().unwrap();
         let w = guard
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| "wallet not initialized".to_string())?;
-        let (index, owner) = w.preview_next_index().map_err(str::to_string)?;
-        Ok(WalletActivationPreview {
-            expected_active_index: w.active_index,
-            expected_next_index: w.next_index,
-            target_index: index,
-            owner: owner.0,
-            advance_next_index: true,
+        let (key_index, address) = w.create_next_inactive_address()?;
+        Ok(WalletAddressInfo {
+            address: address.to_bech32(),
+            key_index,
+            is_active: false,
         })
     }
 
@@ -772,7 +767,6 @@ impl WalletOps for WalletHandle {
             preview.expected_active_index,
             preview.expected_next_index,
             preview.target_index,
-            preview.advance_next_index,
             preview.owner,
             snapshot,
             reserved_input_slots,
@@ -1502,7 +1496,7 @@ mod tests {
             guard.as_mut().unwrap().next_index = MAX_WALLET_ADDRESSES;
         }
 
-        assert!(handle.preview_next_address().is_err());
+        assert!(handle.create_next_address().is_err());
         assert!(handle.get_address(MAX_WALLET_ADDRESSES).is_none());
     }
 
@@ -1551,27 +1545,42 @@ mod tests {
     }
 
     #[test]
-    fn address_list_is_local_metadata_and_new_address_becomes_active() {
+    fn address_list_keeps_new_address_inactive() {
         let (_dir, handle) = handle_with_utxos(&[1_000]);
-        let preview = handle.preview_next_address().unwrap();
-        let (generated, _scan) = handle
-            .commit_activation_snapshot(
-                preview.clone(),
-                empty_snapshot(preview.owner),
-                &std::collections::HashSet::new(),
-                &std::collections::HashSet::new(),
-            )
-            .unwrap();
+        let balance_before = handle.get_balance();
+        let slots_before = handle
+            .list_utxos()
+            .into_iter()
+            .map(|utxo| (utxo.slot_index, utxo.value_micronoid, utxo.creation_id))
+            .collect::<Vec<_>>();
+        let generated = handle.create_next_address().unwrap();
         assert_eq!(generated.key_index, 1);
-        assert!(generated.is_active);
+        assert!(!generated.is_active);
 
         let addresses = handle.list_addresses();
         assert_eq!(addresses.len(), 2);
-        assert!(!addresses[0].is_active);
-        assert!(addresses[1].is_active);
-        assert!(
-            handle.list_utxos().is_empty(),
-            "switch clears the old cache"
+        assert!(addresses[0].is_active);
+        assert!(!addresses[1].is_active);
+        let balance_after = handle.get_balance();
+        assert_eq!(
+            (
+                balance_after.balance_micronoid,
+                balance_after.utxo_count,
+                balance_after.spendable_micronoid,
+            ),
+            (
+                balance_before.balance_micronoid,
+                balance_before.utxo_count,
+                balance_before.spendable_micronoid,
+            )
+        );
+        assert_eq!(
+            handle
+                .list_utxos()
+                .into_iter()
+                .map(|utxo| (utxo.slot_index, utxo.value_micronoid, utxo.creation_id))
+                .collect::<Vec<_>>(),
+            slots_before
         );
     }
 

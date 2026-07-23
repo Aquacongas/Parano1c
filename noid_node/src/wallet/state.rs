@@ -197,18 +197,18 @@ impl WalletState {
         Ok(self.secret.derive_address(index))
     }
 
-    /// Preview exactly the next local address without mutation.
-    pub fn preview_next_index(&self) -> Result<(u32, Address), &'static str> {
+    /// Persist exactly one new inactive address. The active owner, UTXO cache,
+    /// pending transaction state, and mining payout remain unchanged.
+    pub fn create_next_inactive_address(&mut self) -> Result<(u32, Address), String> {
         if self.next_index >= MAX_WALLET_ADDRESSES {
-            return Err("wallet address limit reached");
-        }
-        if self.has_pending_activity() {
-            return Err(
-                "cannot generate a new active address while a wallet transaction is pending",
-            );
+            return Err("wallet address limit reached".into());
         }
         let index = self.next_index;
-        Ok((index, self.secret.derive_address(index)))
+        let address = self.secret.derive_address(index);
+        let next_index = index + 1;
+        self.persist_metadata(next_index, self.active_index)?;
+        self.next_index = next_index;
+        Ok((index, address))
     }
 
     pub fn has_pending_activity(&self) -> bool {
@@ -255,7 +255,6 @@ impl WalletState {
         expected_active_index: u32,
         expected_next_index: u32,
         target_index: u32,
-        advance_next_index: bool,
         queried_owner: [u8; 32],
         snapshot: VerifiedOwnerSnapshot,
         reserved_input_slots: &HashSet<u32>,
@@ -271,17 +270,9 @@ impl WalletState {
                 "cannot switch active address while a wallet transaction is pending".into(),
             );
         }
-        let new_next_index = if advance_next_index {
-            if target_index != self.next_index || target_index >= MAX_WALLET_ADDRESSES {
-                return Err("stale next-address preview".to_string());
-            }
-            target_index + 1
-        } else {
-            if target_index >= self.next_index {
-                return Err("active address index has not been generated".to_string());
-            }
-            self.next_index
-        };
+        if target_index >= self.next_index {
+            return Err("active address index has not been generated".to_string());
+        }
         let active_address = self.secret.derive_address(target_index);
         if active_address.0 != queried_owner {
             return Err("owner snapshot does not match activation preview".to_string());
@@ -315,11 +306,10 @@ impl WalletState {
 
         // Persist first. If the filesystem operation fails, the live wallet
         // remains byte-for-byte on the old account/cache.
-        if target_index != self.active_index || new_next_index != self.next_index {
-            self.persist_metadata(new_next_index, target_index)?;
+        if target_index != self.active_index {
+            self.persist_metadata(self.next_index, target_index)?;
         }
         self.active_index = target_index;
-        self.next_index = new_next_index;
         self.utxos = new_utxos;
         self.active_snapshot = Some(new_snapshot);
         self.pending_input_slots = self
@@ -1076,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_address_becomes_active_and_only_generated_indices_can_be_selected() {
+    fn generated_address_stays_inactive_until_explicitly_selected() {
         let dir = tempfile::tempdir().unwrap();
         let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
         assert_eq!(wallet.active_index, 0);
@@ -1086,18 +1076,20 @@ mod tests {
             Err("active address index has not been generated")
         );
 
-        let (index, address) = wallet.preview_next_index().unwrap();
+        let (index, address) = wallet.create_next_inactive_address().unwrap();
         assert_eq!(index, 1);
         assert_ne!(address, wallet.active_address());
-        assert_eq!(wallet.active_index, 0, "preview must not switch accounts");
-        assert_eq!(wallet.next_index, 1, "preview must not consume an index");
+        assert_eq!(
+            wallet.active_index, 0,
+            "generation must not switch accounts"
+        );
+        assert_eq!(wallet.next_index, 2, "generation must consume one index");
 
         wallet
             .commit_verified_activation(
                 0,
-                1,
+                2,
                 index,
-                true,
                 address.0,
                 snapshot(address.0, None),
                 &HashSet::new(),
@@ -1116,7 +1108,6 @@ mod tests {
                 1,
                 2,
                 0,
-                false,
                 address0.0,
                 snapshot(address0.0, None),
                 &HashSet::new(),
@@ -1136,7 +1127,6 @@ mod tests {
                 0,
                 1,
                 0,
-                false,
                 owner.0,
                 snapshot(owner.0, Some(123)),
                 &HashSet::new(),
@@ -1157,7 +1147,6 @@ mod tests {
                 0,
                 1,
                 0,
-                false,
                 wrong_owner,
                 snapshot(wrong_owner, None),
                 &HashSet::new(),
@@ -1178,7 +1167,6 @@ mod tests {
                 0,
                 1,
                 0,
-                false,
                 owner.0,
                 snapshot(owner.0, Some(456)),
                 &HashSet::new(),
@@ -1202,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_next_address_lookup_does_not_consume_index_or_clear_cache() {
+    fn inactive_address_creation_preserves_active_snapshot_and_cache() {
         let dir = tempfile::tempdir().unwrap();
         let mut wallet = WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
         let owner = wallet.active_address();
@@ -1211,7 +1199,6 @@ mod tests {
                 0,
                 1,
                 0,
-                false,
                 owner.0,
                 snapshot(owner.0, Some(789)),
                 &HashSet::new(),
@@ -1221,15 +1208,20 @@ mod tests {
         let old_snapshot = wallet.active_snapshot.clone();
         let old_utxos = wallet.utxos.clone();
 
-        let (preview_index, _owner) = wallet.preview_next_index().unwrap();
-        assert_eq!(preview_index, 1);
+        let (created_index, created_address) = wallet.create_next_inactive_address().unwrap();
+        assert_eq!(created_index, 1);
+        assert_ne!(created_address, owner);
 
         assert_eq!(wallet.active_index, 0);
-        assert_eq!(wallet.next_index, 1);
+        assert_eq!(wallet.next_index, 2);
         assert_eq!(wallet.balance(), 789);
         assert_eq!(wallet.active_snapshot, old_snapshot);
         assert_eq!(wallet.utxos.len(), old_utxos.len());
         assert_eq!(wallet.utxos[&5].value, old_utxos[&5].value);
+
+        let reloaded = WalletState::create_or_load(wallet.keystore_path.clone()).unwrap();
+        assert_eq!(reloaded.active_index, 0);
+        assert_eq!(reloaded.next_index, 2);
     }
 
     #[test]
@@ -1245,7 +1237,6 @@ mod tests {
                 0,
                 1,
                 0,
-                false,
                 owner.0,
                 snapshot(owner.0, Some(100)),
                 &HashSet::from([5, 99]),
@@ -1261,7 +1252,6 @@ mod tests {
                 0,
                 1,
                 0,
-                false,
                 owner.0,
                 snapshot(owner.0, Some(100)),
                 &HashSet::new(),
@@ -1283,15 +1273,16 @@ mod tests {
             .preview_generated_index(1)
             .unwrap_err()
             .contains("pending"));
-        assert!(wallet.preview_next_index().unwrap_err().contains("pending"));
+        let (created_index, _) = wallet.create_next_inactive_address().unwrap();
+        assert_eq!(created_index, 2);
+        assert_eq!(wallet.active_index, 0);
         assert!(wallet.preview_generated_index(0).is_ok());
 
         wallet
             .commit_verified_activation(
                 0,
-                2,
+                3,
                 0,
-                false,
                 owner.0,
                 snapshot(owner.0, Some(100)),
                 &HashSet::new(),

@@ -41,7 +41,6 @@ pub struct WalletActivationPreview {
     pub expected_next_index: u32,
     pub target_index: u32,
     pub owner: [u8; 32],
-    pub advance_next_index: bool,
 }
 
 /// Immutable contiguous address-discovery intent captured under the wallet
@@ -120,8 +119,9 @@ pub trait WalletOps: Send + Sync {
     /// Preview switching to an already-generated address without mutation.
     fn preview_address_switch(&self, index: u32) -> Result<WalletActivationPreview, String>;
 
-    /// Preview generating the next address without mutation.
-    fn preview_next_address(&self) -> Result<WalletActivationPreview, String>;
+    /// Atomically derive and persist the next inactive address without
+    /// changing the active owner or its loaded UTXO snapshot.
+    fn create_next_address(&self) -> Result<WalletAddressInfo, String>;
 
     /// Derive at most `max_additional` sequential inactive addresses without
     /// changing the address book or loading their balances.

@@ -135,8 +135,10 @@ def main():
 
         address1, generate1_s = timed_rpc(node, "walletNextAddress")
         require(int(address1["key_index"]) == 1, f"next address is wrong: {address1}")
-        list_after_generate1 = assert_address_list(node, 2, 1)
-        require(balance(node)["balance_micronoid"] == 0, "new address is not empty")
+        require(not address1["is_active"], f"new address activated itself: {address1}")
+        list_after_generate1 = assert_address_list(node, 2, 0)
+        require(active(node) == address0, "address generation changed the active owner")
+        require(balance(node)["balance_micronoid"] == 0, "active balance changed at h0")
 
         invalid_switch_error = expected_rpc_error(
             node,
@@ -144,7 +146,7 @@ def main():
             [2],
             "active address index has not been generated",
         )
-        require(active(node) == address1, "failed switch mutated the active account")
+        require(active(node) == address0, "failed switch mutated the active account")
 
         restored0, restore0_s = timed_rpc(node, "walletSetActiveAddress", [0])
         require(restored0["address"] == address0["address"], "failed to restore address 0")
@@ -217,8 +219,12 @@ def main():
 
         address2, generate2_s = timed_rpc(node, "walletNextAddress")
         require(int(address2["key_index"]) == 2, f"third address is wrong: {address2}")
-        require(balance(node)["balance_micronoid"] == 0, "new index 2 inherited a balance")
-        list_after_generate2 = assert_address_list(node, 3, 2)
+        require(not address2["is_active"], f"third address activated itself: {address2}")
+        require(
+            balance(node) == index1_balance,
+            "inactive address generation changed the active balance",
+        )
+        list_after_generate2 = assert_address_list(node, 3, 1)
 
         restored1, restore1_s = timed_rpc(node, "walletSetActiveAddress", [1])
         require(restored1 == activated1, "restored index 1 metadata changed")

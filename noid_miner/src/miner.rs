@@ -62,8 +62,8 @@ pub struct MinerConfig {
     /// Safety-net heartbeat interval (seconds).
     ///
     /// Fires only if the miner has been stuck without a block for this long.
-    /// Normal template refreshes happen immediately via tip-change events (P2P
-    /// block received) and `TxAdmitted` for coinbase-only sealed templates.
+    /// Normal template refreshes happen immediately when the parent, dynamic
+    /// payout, or coinbase-only mempool input changes.
     /// This timer exists only for edge cases where both are silent.
     ///
     /// Must be > BLOCK_TIME to avoid firing during active proving and
@@ -75,7 +75,7 @@ impl Default for MinerConfig {
     fn default() -> Self {
         Self {
             miner_address: Address([0u8; 32]),
-            refresh_interval_secs: 75, // 5 × BLOCK_TIME; real triggers are tip changes + TxAdmitted
+            refresh_interval_secs: 75, // 5 × BLOCK_TIME; real template changes are event-driven
         }
     }
 }
@@ -182,13 +182,12 @@ pub struct BlockMiner {
     /// Live network gate. Normal miners require an authenticated peer quorum;
     /// explicit isolated/genesis mode keeps this true without peers.
     mining_network_ready: watch::Receiver<bool>,
-    /// Edge-triggered canonical-tip changes observed after this miner was
-    /// created. Broadcast deliberately retains no pre-subscription permit:
-    /// the initial chain snapshot already includes every earlier advance.
-    tip_changes: broadcast::Receiver<()>,
+    /// Edge-triggered changes which invalidate a prepared template: a new
+    /// canonical tip or a dynamic wallet payout switch.
+    template_changes: broadcast::Receiver<()>,
     /// Keep the channel open for library-only miners even when their caller
     /// does not retain a sender after construction.
-    _tip_change_sender: broadcast::Sender<()>,
+    _template_change_sender: broadcast::Sender<()>,
     history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
     ghost_authorization:
         Arc<noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization>,
@@ -212,7 +211,7 @@ impl BlockMiner {
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
         mining_network_ready: watch::Receiver<bool>,
-        tip_change_sender: broadcast::Sender<()>,
+        template_change_sender: broadcast::Sender<()>,
         history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
         ghost_authorization: Arc<
             noid_recursive::acceptance::history_step::PreparedHistoryStepGhostAuthorization,
@@ -244,8 +243,8 @@ impl BlockMiner {
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
             mining_network_ready,
-            tip_changes: tip_change_sender.subscribe(),
-            _tip_change_sender: tip_change_sender,
+            template_changes: template_change_sender.subscribe(),
+            _template_change_sender: template_change_sender,
             history_step_runtime,
             ghost_authorization,
             on_block_applied: None,
@@ -353,6 +352,16 @@ impl BlockMiner {
             }
             if !self.wait_for_mining_network().await {
                 break;
+            }
+
+            // Changes already observed before this iteration are represented
+            // by the fresh parent and payout captured below.
+            loop {
+                match self.template_changes.try_recv() {
+                    Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Closed) => unreachable!(),
+                }
             }
 
             // --- Build template ---
@@ -492,6 +501,22 @@ impl BlockMiner {
                 tracing::debug!(height, "prepared template parent changed before PoW");
                 continue;
             }
+            match self.template_changes.try_recv() {
+                Ok(()) => {
+                    tracing::debug!(height, "prepared template input changed before PoW");
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    tracing::debug!(
+                        height,
+                        skipped,
+                        "template-change receiver lagged before PoW"
+                    );
+                    continue;
+                }
+                Err(broadcast::error::TryRecvError::Empty) => {}
+                Err(broadcast::error::TryRecvError::Closed) => unreachable!(),
+            }
 
             tracing::info!(
                 height,
@@ -609,7 +634,7 @@ impl BlockMiner {
                             // IMPORTANT: apply and store the block FIRST, THEN fire the event.
                             // The announcement triggers peers to request the block immediately;
                             // if we fire the event before storing, a fast peer gets None.
-                            let proved = match self.apply_found_block(proved).await {
+                            let proved = match self.apply_found_block(proved, addr).await {
                                 Ok(proved) => proved,
                                 Err(error) => {
                                     tracing::warn!(height, "miner: block superseded: {error}");
@@ -675,15 +700,14 @@ impl BlockMiner {
                     }
                 }
 
-                tip_change = self.tip_changes.recv() => {
-                    // A new chain tip is available (P2P block applied or snapshot synced).
-                    // Cancel current PoW so the next iteration mines on the correct tip.
+                template_change = self.template_changes.recv() => {
+                    // A new chain tip or wallet payout invalidates this exact template.
                     cancel.store(true, Ordering::Relaxed);
                     let _ = pow_handle.await;
-                    match tip_change {
-                        Ok(()) => tracing::debug!("new chain tip: cancelling PoW to rebuild"),
+                    match template_change {
+                        Ok(()) => tracing::debug!("template input changed: cancelling PoW to rebuild"),
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::debug!(skipped, "chain-tip receiver lagged: cancelling PoW to rebuild");
+                            tracing::debug!(skipped, "template-change receiver lagged: cancelling PoW to rebuild");
                         }
                         // The miner owns a sender, so closure is unreachable
                         // until the miner itself is dropped.
@@ -718,6 +742,7 @@ impl BlockMiner {
     async fn apply_found_block(
         &self,
         proved: ProvedBlock,
+        expected_payout: Address,
     ) -> anyhow::Result<crate::block_production::CommittedBlock> {
         use noid_mempool::ChainView;
 
@@ -729,6 +754,12 @@ impl BlockMiner {
             Some(gate) => Some(gate.lock().await),
             None => None,
         };
+        if self.payout_resolver.is_some()
+            && resolve_mining_payout(self.config.miner_address, self.payout_resolver.as_ref())
+                != expected_payout
+        {
+            anyhow::bail!("wallet mining payout changed");
+        }
 
         // --- MDBX commit + ChainView build off the async executor ---
         //
