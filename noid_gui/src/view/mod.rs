@@ -7,7 +7,7 @@ mod present;
 mod proofs;
 
 use iced::widget::{
-    button, canvas, column, container, image, responsive, row, scrollable, stack, text,
+    button, canvas, column, container, image, opaque, responsive, row, scrollable, stack, text,
     text_editor, text_input, Space,
 };
 use iced::{Alignment, ContentFit, Element, Length, Padding};
@@ -15,7 +15,7 @@ use iced::{Alignment, ContentFit, Element, Length, Padding};
 use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode};
 use crate::model::{SecretImportMode, Section, SettingsTab};
 use crate::theme::{self, ButtonKind};
-use crate::widgets::{PhotoScanner, SecretArrow};
+use crate::widgets::{PhotoScanner, SecretArrow, ShutdownForge};
 
 pub fn root(app: &App) -> Element<'_, Message> {
     let body = responsive(|size| {
@@ -26,11 +26,33 @@ pub fn root(app: &App) -> Element<'_, Message> {
         }
     });
 
-    container(body)
+    let wallet: Element<'_, Message> = container(body)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::root)
-        .into()
+        .into();
+
+    if app.shutting_down() {
+        stack([wallet, shutdown_forge_overlay(app)])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        wallet
+    }
+}
+
+fn shutdown_forge_overlay(app: &App) -> Element<'_, Message> {
+    let animation = canvas(ShutdownForge::new(app.shutdown_forge_elapsed_seconds()))
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    opaque(
+        container(animation)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::shutdown_forge_overlay),
+    )
 }
 
 fn wallet_setup(app: &App, compact: bool) -> Element<'_, Message> {

@@ -2,8 +2,8 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 use iced::widget::{
-    button, column, container, mouse_area, opaque, pin, responsive, row, scrollable, stack, text,
-    text_input,
+    button, canvas, column, container, mouse_area, opaque, pin, responsive, row, scrollable, stack,
+    text, text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
@@ -13,7 +13,7 @@ use crate::model::{
     format_creation_origin, format_micronoid, grouped, AddressSnapshot, UtxoSnapshot,
 };
 use crate::theme::{self, ButtonKind};
-use crate::widgets::StateField;
+use crate::widgets::{ProofForge, StateField};
 
 use super::copy_value_button;
 
@@ -1200,7 +1200,7 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         close = close.on_press(Message::CloseAction);
     }
 
-    let card = container(
+    let card_base = container(
         column![
             container(
                 row![
@@ -1217,8 +1217,19 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         .spacing(0),
     )
     .width(Length::Fill)
-    .max_width(680)
     .style(theme::surface_alt);
+    let forging = match action {
+        Action::Send => app.send_in_flight,
+        Action::Consolidate => app.consolidation_in_flight,
+    };
+    let card: Element<'_, Message> = if forging {
+        stack([card_base.into(), proof_forge_overlay(app, compact)])
+            .width(Length::Fill)
+            .into()
+    } else {
+        card_base.into()
+    };
+    let card = container(card).width(Length::Fill).max_width(680);
 
     container(card)
         .width(Length::Fill)
@@ -1228,6 +1239,32 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         .padding(Padding::from(if compact { [8, 12] } else { [24, 18] }))
         .style(theme::overlay)
         .into()
+}
+
+fn proof_forge_overlay(app: &App, compact: bool) -> Element<'_, Message> {
+    let animation = canvas(ProofForge::new(app.proof_forge_elapsed_seconds()))
+        .width(Length::Fixed(if compact { 270.0 } else { 340.0 }))
+        .height(Length::Fixed(if compact { 160.0 } else { 190.0 }));
+    let content = container(
+        column![
+            animation,
+            text("FORGING THE PROOF")
+                .size(if compact { 14 } else { 16 })
+                .font(theme::BRAND_FONT)
+                .color(theme::TEXT),
+            text("LOCAL PROOF CONSTRUCTION").size(9).color(theme::PROOF),
+        ]
+        .spacing(if compact { 5 } else { 7 })
+        .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .padding(if compact { 10 } else { 14 })
+    .style(theme::proof_forge_overlay);
+
+    opaque(content)
 }
 
 fn consolidation_form(app: &App, compact: bool) -> Element<'_, Message> {
@@ -1479,7 +1516,6 @@ fn consolidation_success<'a>(
         row![
             text("CONSOLIDATION SENT").size(12).color(theme::ACCENT),
             iced::widget::Space::new().width(Length::Fill),
-            text("PENDING CONFIRMATION").size(10).color(theme::WARNING),
         ]
         .align_y(Alignment::Center),
         container(txid)
@@ -1500,9 +1536,6 @@ fn consolidation_success<'a>(
             ),
             compact,
         ),
-        text("Broadcasting to the network...")
-            .size(11)
-            .color(theme::DIM),
         row![iced::widget::Space::new().width(Length::Fill), close,].align_y(Alignment::Center),
     ]
     .spacing(if compact { 7 } else { 10 })
@@ -1724,7 +1757,6 @@ fn send_success<'a>(
         row![
             text("TRANSACTION SENT").size(12).color(theme::ACCENT),
             iced::widget::Space::new().width(Length::Fill),
-            text("PENDING CONFIRMATION").size(10).color(theme::WARNING),
         ]
         .align_y(Alignment::Center),
         container(recipient)
@@ -1736,9 +1768,6 @@ fn send_success<'a>(
             .width(Length::Fill)
             .style(theme::surface),
         metrics,
-        text("Broadcasting to the network...")
-            .size(11)
-            .color(theme::DIM),
         row![
             if compact {
                 iced::widget::Space::new().width(Length::Shrink)

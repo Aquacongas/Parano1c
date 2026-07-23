@@ -424,6 +424,38 @@ pub fn overlay(_: &Theme) -> container::Style {
     container::Style::default().background(Color::from_rgba8(12, 13, 19, 0.78))
 }
 
+pub fn proof_forge_overlay(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(Color::from_rgba8(18, 20, 29, 0.97))),
+        border: Border {
+            color: Color::from_rgba8(206, 88, 214, 0.42),
+            width: 1.0,
+            radius: Radius::from(8.0),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(206, 88, 214, 0.16),
+            offset: Vector::new(0.0, 0.0),
+            blur_radius: 14.0,
+        },
+        snap: true,
+    }
+}
+
+pub fn shutdown_forge_overlay(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(Color::from_rgba8(12, 13, 19, 0.94))),
+        border: Border {
+            color: Color::from_rgba8(206, 88, 214, 0.34),
+            width: 1.0,
+            radius: Radius::from(0.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 pub fn key_cap(color: Color) -> impl Fn(&Theme) -> container::Style {
     move |_| container::Style {
         text_color: Some(INK),

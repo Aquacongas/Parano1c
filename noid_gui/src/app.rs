@@ -23,6 +23,8 @@ pub const BLOCK_DETAILS_SCROLL_ID: &str = "block-details-scroll";
 pub const TRANSACTION_DETAILS_SCROLL_ID: &str = "transaction-details-scroll";
 
 const PHOTO_SCAN_FRAME: Duration = Duration::from_millis(16);
+const PROOF_FORGE_FRAME: Duration = Duration::from_millis(16);
+const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(16);
 const PHOTO_SCAN_COMPLETE_HOLD: Duration = Duration::from_millis(160);
 const PHOTO_SCAN_SPEED: f32 = 0.58;
 const PHOTO_SCAN_CRAWL_SPEED: f32 = 0.025;
@@ -73,6 +75,7 @@ pub struct App {
     pub send_recipient: String,
     pub send_amount: String,
     pub send_in_flight: bool,
+    proof_forge_started_at: Option<Instant>,
     pub send_result: Option<PaymentSubmission>,
     pub send_error: Option<String>,
     pub consolidation_plan: Option<ConsolidationPlan>,
@@ -125,6 +128,7 @@ pub struct App {
     ensure_in_flight: bool,
     consecutive_refresh_failures: u8,
     shutting_down: bool,
+    shutdown_forge_started_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +177,7 @@ pub enum Message {
     SendRecipientChanged(String),
     SendAmountChanged(String),
     SubmitSend,
+    ProofForgeTick,
     SendFinished(Result<PaymentSubmission, String>),
     ConsolidationPlanned(Result<ConsolidationPlan, String>),
     SubmitConsolidation,
@@ -267,6 +272,7 @@ pub enum Message {
     Keyboard(iced::keyboard::Event),
     Noop,
     Exit,
+    ShutdownForgeTick,
     ExitReady,
 }
 
@@ -334,6 +340,7 @@ impl App {
             send_recipient: String::new(),
             send_amount: String::new(),
             send_in_flight: false,
+            proof_forge_started_at: None,
             send_result: None,
             send_error: None,
             consolidation_plan: None,
@@ -394,6 +401,7 @@ impl App {
             ensure_in_flight: !mock && !wallet_setup_required,
             consecutive_refresh_failures: 0,
             shutting_down: false,
+            shutdown_forge_started_at: None,
         };
         let task = if mock || wallet_setup_required {
             Task::none()
@@ -511,6 +519,7 @@ impl App {
                 self.block_details = None;
                 self.block_transaction_position = None;
                 self.close_consolidation_hint();
+                self.proof_forge_started_at = None;
                 if action == Action::Send {
                     self.send_result = None;
                     self.send_error = None;
@@ -538,6 +547,7 @@ impl App {
             Message::CloseAction => {
                 if !self.wallet_action_in_flight() {
                     self.action = None;
+                    self.proof_forge_started_at = None;
                     self.send_result = None;
                     self.send_error = None;
                     self.consolidation_plan = None;
@@ -581,6 +591,7 @@ impl App {
                     }
                 };
                 self.send_in_flight = true;
+                self.proof_forge_started_at = Some(Instant::now());
                 self.send_result = None;
                 self.send_error = None;
                 let backend = self.backend.clone();
@@ -589,8 +600,10 @@ impl App {
                     Message::SendFinished,
                 );
             }
+            Message::ProofForgeTick => {}
             Message::SendFinished(result) => {
                 self.send_in_flight = false;
+                self.proof_forge_started_at = None;
                 match result {
                     Ok(submission) => {
                         self.send_result = Some(submission);
@@ -629,6 +642,7 @@ impl App {
                     return Task::none();
                 }
                 self.consolidation_in_flight = true;
+                self.proof_forge_started_at = Some(Instant::now());
                 self.consolidation_result = None;
                 self.consolidation_error = None;
                 let backend = self.backend.clone();
@@ -644,6 +658,7 @@ impl App {
             }
             Message::ConsolidationFinished(result) => {
                 self.consolidation_in_flight = false;
+                self.proof_forge_started_at = None;
                 if self.action != Some(Action::Consolidate) {
                     return Task::none();
                 }
@@ -1971,6 +1986,7 @@ impl App {
                     return Task::none();
                 }
                 self.shutting_down = true;
+                self.shutdown_forge_started_at = Some(Instant::now());
                 let backend = self.backend.clone();
                 return Task::perform(
                     async move {
@@ -1979,6 +1995,7 @@ impl App {
                     |_| Message::ExitReady,
                 );
             }
+            Message::ShutdownForgeTick => {}
             Message::ExitReady => return iced::exit(),
         }
 
@@ -2004,6 +2021,14 @@ impl App {
         if self.photo_scan_active {
             subscriptions.push(iced::time::every(PHOTO_SCAN_FRAME).map(|_| Message::PhotoScanTick));
         }
+        if self.send_in_flight || self.consolidation_in_flight {
+            subscriptions
+                .push(iced::time::every(PROOF_FORGE_FRAME).map(|_| Message::ProofForgeTick));
+        }
+        if self.shutting_down {
+            subscriptions
+                .push(iced::time::every(SHUTDOWN_FORGE_FRAME).map(|_| Message::ShutdownForgeTick));
+        }
         if self.section == Section::Present && self.consolidation_recommended() {
             subscriptions.push(
                 iced::time::every(Duration::from_millis(80))
@@ -2019,6 +2044,22 @@ impl App {
 
     pub fn consolidation_pulse(&self) -> f32 {
         0.5 + 0.5 * self.consolidation_pulse_phase.sin()
+    }
+
+    pub fn proof_forge_elapsed_seconds(&self) -> f32 {
+        self.proof_forge_started_at
+            .map(|started_at| started_at.elapsed().as_secs_f32())
+            .unwrap_or(0.0)
+    }
+
+    pub fn shutting_down(&self) -> bool {
+        self.shutting_down
+    }
+
+    pub fn shutdown_forge_elapsed_seconds(&self) -> f32 {
+        self.shutdown_forge_started_at
+            .map(|started_at| started_at.elapsed().as_secs_f32())
+            .unwrap_or(0.0)
     }
 
     pub fn wallet_action_in_flight(&self) -> bool {
