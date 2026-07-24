@@ -3,8 +3,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
-use iced::{Alignment, Element, Length, Padding};
+use iced::widget::{button, column, container, row, scrollable, stack, text, text_input, Space};
+use iced::{Alignment, Color, Element, Length, Padding};
 
 use crate::app::{App, Message};
 use crate::model::{
@@ -17,27 +17,19 @@ use crate::theme::{self, ButtonKind};
 use super::copy_value_button;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
-    let page_title = container(
-        container(text("STATEPLORER").size(13))
-            .padding([6, 9])
-            .style(theme::title_bar_cyan),
-    )
-    .width(Length::Fill)
-    .style(theme::surface_alt);
-
     let search = search_bar(app, compact);
     let body = match &app.explorer_result {
         Some(result) => search_result(app, result, compact),
         None => explorer_home(app, compact),
     };
 
-    let mut content = column![page_title, search].spacing(10);
+    let mut content = column![search].spacing(10);
     if let Some(error) = &app.explorer_error {
         content = content.push(
             container(
                 row![
-                    text("SEARCH").size(11).color(theme::DANGER),
-                    text(error).size(12).color(theme::MUTED),
+                    text("SEARCH").size(13).color(theme::DANGER),
+                    text(error).size(13).color(theme::MUTED),
                 ]
                 .spacing(12)
                 .align_y(Alignment::Center),
@@ -59,32 +51,49 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
 }
 
 fn search_bar(app: &App, compact: bool) -> Element<'_, Message> {
-    let query = text_input(
-        "Address · block height/hash · txid · slot:<number>",
-        &app.explorer_query,
-    )
-    .on_input(Message::ExplorerQueryChanged)
-    .on_submit(Message::SubmitExplorerSearch)
-    .size(13)
-    .padding([9, 11])
-    .width(Length::Fill)
-    .style(theme::text_input);
+    let query_input = text_input("", &app.explorer_query)
+        .on_input(Message::ExplorerQueryChanged)
+        .on_submit(Message::SubmitExplorerSearch)
+        .size(14)
+        .padding([11, 13])
+        .width(Length::Fill)
+        .style(theme::scope_search_input);
+    let query: Element<'_, Message> = if app.explorer_query.is_empty() {
+        stack![
+            query_input,
+            container(
+                text("ADDRESS · BLOCK HEIGHT/HASH · TXID · SLOT:<NUMBER>")
+                    .size(12)
+                    .color(Color {
+                        a: 0.52,
+                        ..theme::MUTED
+                    }),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding::ZERO.left(14))
+            .align_y(Alignment::Center),
+        ]
+        .into()
+    } else {
+        query_input.into()
+    };
 
     let label = if app.explorer_searching {
         "SEARCHING…"
     } else {
         "SEARCH"
     };
-    let mut submit = button(text(label).size(12))
+    let mut submit = button(text(label).size(13))
         .padding([9, 14])
-        .style(|_, status| theme::button(ButtonKind::Primary, status));
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if !app.explorer_searching {
         submit = submit.on_press(Message::SubmitExplorerSearch);
     }
-    let clear = button(text("CLEAR").size(12))
+    let clear = button(text("CLEAR").size(13))
         .on_press(Message::ClearExplorerSearch)
         .padding([9, 12])
-        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+        .style(|_, status| theme::button(ButtonKind::Ghost, status));
     let mut refresh = button(text(if app.explorer_loading {
         "REFRESHING…"
     } else {
@@ -112,29 +121,12 @@ fn search_bar(app: &App, compact: bool) -> Element<'_, Message> {
             .into()
     };
 
-    let retention_note: Element<'_, Message> = if compact {
-        column![
-            text("LIVE STATE AND CANONICAL HEADERS REMAIN SEARCHABLE")
-                .size(9)
-                .color(theme::DIM),
-            text("FULL BLOCKS: 18 · OLDER PAYMENTS: RECEIPTS")
-                .size(9)
-                .color(theme::PROOF),
-        ]
-        .spacing(3)
-        .into()
-    } else {
-        row![
-            text("Search live state and every canonical header.")
-                .size(9)
-                .color(theme::DIM),
-            text("Full block data is retained for 18 blocks; receipts prove older payments.")
-                .size(9)
-                .color(theme::PROOF),
-        ]
-        .spacing(8)
-        .into()
-    };
+    let retention_note: Element<'_, Message> =
+        text("Search live state. Full block data is retained for 18 blocks; receipts prove older payments.")
+            .size(13)
+            .color(theme::MUTED)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .into();
 
     container(column![controls, retention_note].spacing(8))
         .width(Length::Fill)
@@ -149,7 +141,7 @@ fn explorer_home(app: &App, compact: bool) -> Element<'_, Message> {
             column![
                 text("READING CANONICAL STATE").size(13).color(theme::CYAN),
                 text("Headers, retained transactions and live state remain node-verified.")
-                    .size(11)
+                    .size(13)
                     .color(theme::DIM),
             ]
             .spacing(6)
@@ -231,9 +223,9 @@ fn explorer_home(app: &App, compact: bool) -> Element<'_, Message> {
 
 fn blocks_panel(app: &App, compact: bool) -> Element<'_, Message> {
     let title = row![
-        text("CANONICAL BLOCKS").size(12).color(theme::CYAN),
+        text("CANONICAL BLOCKS").size(13).color(theme::CYAN),
         text(format!("[0…{}]", grouped(app.explorer.tip_height)))
-            .size(11)
+            .size(13)
             .color(theme::MUTED),
         Space::new().width(Length::Fill),
         legend("FULL", theme::ACCENT),
@@ -253,21 +245,21 @@ fn blocks_panel(app: &App, compact: bool) -> Element<'_, Message> {
     } else {
         let header = container(
             row![
-                table_cell("HEIGHT", 2, theme::INK),
-                table_cell("AGE", 2, theme::INK),
-                table_cell("BLOCK", 6, theme::INK),
-                table_cell("STATE", 2, theme::INK),
-                table_cell("AVAILABLE", 3, theme::INK),
+                table_cell("HEIGHT", 2, theme::MUTED),
+                table_cell("AGE", 2, theme::MUTED),
+                table_cell("BLOCK", 6, theme::MUTED),
+                table_cell("STATE", 2, theme::MUTED),
+                table_cell("AVAILABLE", 3, theme::MUTED),
                 text("OPEN")
-                    .size(12)
-                    .color(theme::INK)
+                    .size(13)
+                    .color(theme::MUTED)
                     .width(Length::Fixed(88.0)),
             ]
             .spacing(7)
             .align_y(Alignment::Center),
         )
         .padding([7, 9])
-        .style(theme::table_header);
+        .style(theme::scope_table_header);
         let mut list = column![header].spacing(0);
         for (index, block) in app.explorer.blocks.iter().enumerate() {
             list = list.push(block_row(app, block, index % 2 == 1));
@@ -356,19 +348,19 @@ fn compact_block<'a>(app: &'a App, block: &'a ExplorerBlockSnapshot) -> Element<
         column![
             row![
                 text(format!("BLOCK #{}", block.header.height))
-                    .size(12)
+                    .size(13)
                     .color(theme::CYAN),
                 text(format_age(block.header.timestamp))
-                    .size(11)
+                    .size(13)
                     .color(theme::MUTED),
                 Space::new().width(Length::Fill),
-                text(available.0).size(10).color(available.1),
+                text(available.0).size(12).color(available.1),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
             row![
                 text(short_digest(&block.header.hash))
-                    .size(11)
+                    .size(13)
                     .color(theme::MUTED),
                 copy_value_button(
                     &block.header.hash,
@@ -379,7 +371,7 @@ fn compact_block<'a>(app: &'a App, block: &'a ExplorerBlockSnapshot) -> Element<
                     "m{} · {} conf",
                     block.header.log_slots, block.confirmations
                 ))
-                .size(10)
+                .size(12)
                 .color(theme::DIM),
                 open,
             ]
@@ -412,24 +404,24 @@ fn recent_transactions_panel<'a>(
     let title: Element<'_, Message> = if compact {
         column![
             row![
-                text(title_label).size(12).color(theme::PROOF),
+                text(title_label).size(13).color(theme::PROOF),
                 text(format!("[{}]", recent.total))
-                    .size(11)
+                    .size(13)
                     .color(theme::MUTED),
             ]
             .spacing(9),
-            text(retained_label).size(9).color(theme::DIM),
+            text(retained_label).size(12).color(theme::DIM),
         ]
         .spacing(3)
         .into()
     } else {
         row![
-            text(title_label).size(12).color(theme::PROOF),
+            text(title_label).size(13).color(theme::PROOF),
             text(format!("[{}]", recent.total))
-                .size(11)
+                .size(13)
                 .color(theme::MUTED),
             Space::new().width(Length::Fill),
-            text(retained_label).size(9).color(theme::DIM),
+            text(retained_label).size(12).color(theme::DIM),
         ]
         .spacing(9)
         .align_y(Alignment::Center)
@@ -451,22 +443,26 @@ fn recent_transactions_panel<'a>(
     } else {
         let header = container(
             row![
-                table_cell("BLOCK", 2, theme::INK),
-                table_cell("TYPE", 2, theme::INK),
-                table_cell("TXID", 7, theme::INK),
-                table_cell(if address_mode { "SPENT" } else { "IN" }, 2, theme::INK),
-                table_cell(if address_mode { "RECEIVED" } else { "OUT" }, 2, theme::INK),
-                table_cell("FEE", 3, theme::INK),
+                table_cell("BLOCK", 2, theme::MUTED),
+                table_cell("TYPE", 2, theme::MUTED),
+                table_cell("TXID", 7, theme::MUTED),
+                table_cell(if address_mode { "SPENT" } else { "IN" }, 2, theme::MUTED),
+                table_cell(
+                    if address_mode { "RECEIVED" } else { "OUT" },
+                    2,
+                    theme::MUTED,
+                ),
+                table_cell("FEE", 3, theme::MUTED),
                 text("OPEN")
-                    .size(12)
-                    .color(theme::INK)
+                    .size(13)
+                    .color(theme::MUTED)
                     .width(Length::Fixed(78.0)),
             ]
             .spacing(7)
             .align_y(Alignment::Center),
         )
         .padding([7, 9])
-        .style(theme::table_header);
+        .style(theme::scope_table_header);
         let mut list = column![header].spacing(0);
         for (index, transaction) in recent.transactions.iter().enumerate() {
             list = list.push(transaction_row(
@@ -492,7 +488,7 @@ fn recent_transactions_panel<'a>(
                         Message::NextExplorerTransactionPage,
                     ),
                     text("After 18 blocks, a payment receipt carries the proof; the transaction body is not retained.")
-                        .size(9)
+                        .size(12)
                         .color(theme::DIM),
                 ]
                 .spacing(6),
@@ -535,7 +531,7 @@ fn transaction_row<'a>(
     } else {
         transaction.live_outputs.to_string()
     };
-    let open = button(text("VIEW →").size(10))
+    let open = button(text("VIEW →").size(12))
         .width(Length::Fixed(78.0))
         .padding([6, 8])
         .on_press(Message::OpenLocatedTransaction(
@@ -612,26 +608,26 @@ fn compact_transaction<'a>(
         column![
             row![
                 text(format!("#{}", transaction.height))
-                    .size(12)
+                    .size(13)
                     .color(theme::CYAN),
-                text(kind.0).size(10).color(kind.1),
+                text(kind.0).size(12).color(kind.1),
                 Space::new().width(Length::Fill),
                 text(format_age(transaction.timestamp))
-                    .size(10)
+                    .size(12)
                     .color(theme::DIM),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
             row![
                 text(short_digest(&transaction.txid))
-                    .size(11)
+                    .size(13)
                     .color(theme::MUTED),
                 copy_value_button(
                     &transaction.txid,
                     app.copied_value.as_deref() == Some(transaction.txid.as_str()),
                 ),
                 Space::new().width(Length::Fill),
-                button(text("VIEW →").size(10))
+                button(text("VIEW →").size(12))
                     .on_press(Message::OpenLocatedTransaction(
                         transaction.height,
                         transaction.position,
@@ -641,7 +637,7 @@ fn compact_transaction<'a>(
             ]
             .spacing(6)
             .align_y(Alignment::Center),
-            text(flow).size(10).color(theme::DIM),
+            text(flow).size(12).color(theme::DIM),
         ]
         .spacing(5),
     )
@@ -675,11 +671,11 @@ fn address_result<'a>(
 
     let title = result_title("ADDRESS / LIVE STATE", "OWNER INDEX");
     let address_line = column![
-        text("ADDRESS").size(9).color(theme::DIM),
+        text("ADDRESS").size(12).color(theme::DIM),
         row![
             text_input("", &address.address)
                 .on_input(|_| Message::Noop)
-                .size(if compact { 11 } else { 13 })
+                .size(14)
                 .padding([7, 9])
                 .width(Length::Fill)
                 .style(theme::text_input),
@@ -721,7 +717,7 @@ fn address_result<'a>(
                 title,
                 address_line,
                 text("Current live outputs come directly from the proved state—not from replayed history.")
-                    .size(9)
+                    .size(12)
                     .color(theme::DIM),
                 metrics,
             ]
@@ -745,9 +741,9 @@ fn address_slots<'a>(
     compact: bool,
 ) -> Element<'a, Message> {
     let title = row![
-        text("LIVE OUTPUTS").size(12).color(theme::ACCENT),
+        text("LIVE OUTPUTS").size(13).color(theme::ACCENT),
         Space::new().width(Length::Fill),
-        text("CURRENT STATE ONLY").size(9).color(theme::DIM),
+        text("CURRENT STATE ONLY").size(12).color(theme::DIM),
     ]
     .align_y(Alignment::Center);
     let rows: Element<'_, Message> = if slots.is_empty() {
@@ -760,13 +756,13 @@ fn address_slots<'a>(
                     row![
                         column![
                             text(format!("SLOT {}", grouped(u64::from(slot.slot_index))))
-                                .size(12)
+                                .size(13)
                                 .color(theme::CYAN),
                             text(format!(
                                 "ORIGIN {}",
                                 format_creation_origin(slot.creation_id)
                             ))
-                            .size(9)
+                            .size(12)
                             .color(theme::DIM),
                         ]
                         .spacing(3),
@@ -775,7 +771,7 @@ fn address_slots<'a>(
                             "{} ①",
                             crate::model::format_micronoid(slot.value_micronoid)
                         ))
-                        .size(12)
+                        .size(13)
                         .color(theme::ACCENT),
                     ]
                     .align_y(Alignment::Center),
@@ -788,15 +784,15 @@ fn address_slots<'a>(
     } else {
         let header = container(
             row![
-                table_cell("SLOT", 3, theme::INK),
-                table_cell("VALUE / NOID", 4, theme::INK),
-                table_cell("ORIGIN", 4, theme::INK),
-                table_cell("STATE", 2, theme::INK),
+                table_cell("SLOT", 3, theme::MUTED),
+                table_cell("VALUE / NOID", 4, theme::MUTED),
+                table_cell("ORIGIN", 4, theme::MUTED),
+                table_cell("STATE", 2, theme::MUTED),
             ]
             .spacing(8),
         )
         .padding([7, 9])
-        .style(theme::table_header);
+        .style(theme::scope_table_header);
         let mut list = column![header].spacing(0);
         for (index, slot) in slots.iter().enumerate() {
             list = list.push(
@@ -851,16 +847,16 @@ fn slot_result<'a>(
     };
     let owner: Element<'_, Message> = if slot.empty {
         text("No owner in the current state.")
-            .size(12)
+            .size(13)
             .color(theme::DIM)
             .into()
     } else {
         column![
-            text("OWNER").size(9).color(theme::DIM),
+            text("OWNER").size(12).color(theme::DIM),
             row![
                 text_input("", &slot.owner)
                     .on_input(|_| Message::Noop)
-                    .size(if compact { 11 } else { 13 })
+                    .size(14)
                     .padding([7, 9])
                     .width(Length::Fill)
                     .style(theme::text_input),
@@ -905,12 +901,12 @@ fn slot_result<'a>(
 
 fn result_title(title: &'static str, status: &'static str) -> Element<'static, Message> {
     row![
-        container(text(title).size(12))
+        container(text(title).size(13))
             .padding([6, 9])
             .style(theme::title_bar_proof),
         Space::new().width(Length::Fill),
-        text(status).size(10).color(theme::DIM),
-        button(text("ESC CLEAR").size(11))
+        text(status).size(12).color(theme::DIM),
+        button(text("ESC CLEAR").size(13))
             .on_press(Message::ClearExplorerSearch)
             .padding([6, 9])
             .style(|_, button_status| theme::button(ButtonKind::Ghost, button_status)),
@@ -923,7 +919,7 @@ fn result_title(title: &'static str, status: &'static str) -> Element<'static, M
 fn metric(label: &'static str, value: String, color: iced::Color) -> Element<'static, Message> {
     container(
         column![
-            text(label).size(9).color(theme::DIM),
+            text(label).size(12).color(theme::DIM),
             text(value).size(15).color(color),
         ]
         .spacing(3),
@@ -940,7 +936,7 @@ fn table_cell(
     color: iced::Color,
 ) -> Element<'static, Message> {
     text(value.into())
-        .size(11)
+        .size(13)
         .color(color)
         .width(Length::FillPortion(portion))
         .into()
@@ -953,7 +949,7 @@ fn digest_cell<'a>(
     color: iced::Color,
 ) -> Element<'a, Message> {
     row![
-        text(short_digest(digest)).size(11).color(color),
+        text(short_digest(digest)).size(13).color(color),
         copy_value_button(digest, app.copied_value.as_deref() == Some(digest)),
         Space::new().width(Length::Fill),
     ]
@@ -971,13 +967,13 @@ fn pagination(
 ) -> Element<'static, Message> {
     let total_pages = total_pages.max(1);
     let page = page.max(1).min(total_pages);
-    let mut previous = button(text("← PREV").size(11))
+    let mut previous = button(text("← PREV").size(13))
         .padding([7, 11])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if page > 1 {
         previous = previous.on_press(previous_message);
     }
-    let mut next = button(text("NEXT →").size(11))
+    let mut next = button(text("NEXT →").size(13))
         .padding([7, 11])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if page < total_pages {
@@ -986,7 +982,7 @@ fn pagination(
     row![
         previous,
         text(format!("PAGE {page} / {total_pages}"))
-            .size(11)
+            .size(13)
             .color(theme::MUTED),
         next,
     ]
@@ -1015,7 +1011,7 @@ fn legend(label: &'static str, color: iced::Color) -> Element<'static, Message> 
             .width(7)
             .height(7)
             .style(theme::status_dot(color)),
-        text(label).size(9).color(theme::DIM),
+        text(label).size(12).color(theme::DIM),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
@@ -1023,7 +1019,7 @@ fn legend(label: &'static str, color: iced::Color) -> Element<'static, Message> 
 }
 
 fn empty_state(label: &'static str) -> Element<'static, Message> {
-    container(text(label).size(11).color(theme::DIM))
+    container(text(label).size(13).color(theme::DIM))
         .width(Length::Fill)
         .height(Length::Fixed(72.0))
         .align_x(Alignment::Center)

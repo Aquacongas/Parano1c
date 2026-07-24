@@ -7,20 +7,22 @@ mod present;
 mod proofs;
 
 use iced::widget::{
-    button, canvas, column, container, image, opaque, responsive, row, scrollable, stack, text,
-    text_editor, text_input, Space,
+    button, canvas, column, container, image, opaque, responsive, rich_text, row, scrollable, span,
+    stack, text, text_editor, text_input, Space,
 };
 use iced::{Alignment, ContentFit, Element, Length, Padding};
 
-use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode};
+use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode, NODE_LOG_LINE_LIMIT};
 use crate::model::{SecretImportMode, Section, SettingsTab};
 use crate::theme::{self, ButtonKind};
-use crate::widgets::{PhotoScanner, SecretArrow, ShutdownForge};
+use crate::widgets::{PhotoScanner, ProofForge, SecretArrow};
+
+const SECRET_DESKTOP_WORKSPACE_HEIGHT: f32 = 360.0;
 
 pub fn root(app: &App) -> Element<'_, Message> {
     let body = responsive(|size| {
         if app.wallet_setup_required {
-            wallet_setup(app, size.width < 900.0)
+            wallet_setup(app, size.width < 900.0, size.width < 1_000.0)
         } else {
             application(app, size.width < 1_040.0)
         }
@@ -43,19 +45,43 @@ pub fn root(app: &App) -> Element<'_, Message> {
 }
 
 fn shutdown_forge_overlay(app: &App) -> Element<'_, Message> {
-    let animation = canvas(ShutdownForge::new(app.shutdown_forge_elapsed_seconds()))
-        .width(Length::Fill)
-        .height(Length::Fill);
-
     opaque(
-        container(animation)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::shutdown_forge_overlay),
+        container(responsive(move |size| {
+            let compact = size.width < 720.0 || size.height < 560.0;
+            let animation = canvas(ProofForge::new(app.shutdown_forge_elapsed_seconds()))
+                .width(Length::Fixed(if compact { 280.0 } else { 400.0 }))
+                .height(Length::Fixed(if compact { 166.0 } else { 238.0 }));
+            let content = column![
+                animation,
+                text("CLOSING WALLET SAFELY")
+                    .size(if compact { 15 } else { 18 })
+                    .font(theme::BRAND_FONT)
+                    .color(theme::TEXT),
+                text("FINISHING THE CURRENT PROOF STEP")
+                    .size(if compact { 12 } else { 13 })
+                    .color(theme::PROOF),
+                text("THE WALLET WILL CLOSE AUTOMATICALLY")
+                    .size(12)
+                    .color(theme::DIM),
+            ]
+            .spacing(if compact { 6 } else { 8 })
+            .align_x(Alignment::Center);
+
+            container(content)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_x(Alignment::Center)
+                .align_y(Alignment::Center)
+                .padding(if compact { 12 } else { 20 })
+                .into()
+        }))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::shutdown_forge_overlay),
     )
 }
 
-fn wallet_setup(app: &App, compact: bool) -> Element<'_, Message> {
+fn wallet_setup(app: &App, compact: bool, narrow: bool) -> Element<'_, Message> {
     let brand = row![
         text("Paran")
             .size(22)
@@ -76,8 +102,8 @@ fn wallet_setup(app: &App, compact: bool) -> Element<'_, Message> {
             brand,
             Space::new().width(Length::Fill),
             column![
-                text("FIRST RUN").size(10).color(theme::CYAN),
-                text("MASTER KEY SETUP").size(11).color(theme::MUTED),
+                text("FIRST RUN").size(12).color(theme::CYAN),
+                text("MASTER KEY SETUP").size(13).color(theme::MUTED),
             ]
             .spacing(3)
             .align_x(Alignment::End),
@@ -89,17 +115,17 @@ fn wallet_setup(app: &App, compact: bool) -> Element<'_, Message> {
     .style(theme::top_bar);
 
     let body: Element<'_, Message> = match app.wallet_setup_mode {
-        WalletSetupMode::Choose => wallet_setup_choices(app, compact),
+        WalletSetupMode::Choose => wallet_setup_choices(app, compact, narrow),
         WalletSetupMode::Generate => wallet_setup_generate(app, compact),
         WalletSetupMode::Raw => wallet_setup_raw(app, compact),
         WalletSetupMode::Photo => wallet_setup_photo(app, compact),
     };
     let footer = row![
         text("ONE SECRET · EVERY ADDRESS")
-            .size(10)
+            .size(12)
             .color(theme::PROOF),
         Space::new().width(Length::Fill),
-        text("THE KEY IS STORED LOCALLY").size(9).color(theme::DIM),
+        text("THE KEY IS STORED LOCALLY").size(12).color(theme::DIM),
     ]
     .align_y(Alignment::Center);
 
@@ -115,9 +141,9 @@ fn wallet_setup(app: &App, compact: bool) -> Element<'_, Message> {
     .into()
 }
 
-fn wallet_setup_choices(app: &App, compact: bool) -> Element<'_, Message> {
+fn wallet_setup_choices(app: &App, compact: bool, narrow: bool) -> Element<'_, Message> {
     let busy = app.secret_action_in_flight;
-    let visual = owner_model_visual(compact);
+    let visual = owner_model_visual(compact, narrow);
     let generate = setup_source_button(
         "01",
         "GENERATE",
@@ -129,7 +155,7 @@ fn wallet_setup_choices(app: &App, compact: bool) -> Element<'_, Message> {
     let raw = setup_source_button(
         "02",
         "IMPORT",
-        "Restore from 64 hex characters",
+        "Restore from existing key",
         theme::CYAN,
         WalletSetupMode::Raw,
         busy,
@@ -137,7 +163,7 @@ fn wallet_setup_choices(app: &App, compact: bool) -> Element<'_, Message> {
     let photo = setup_source_button(
         "03",
         "USE PHOTO",
-        "Derive the same key from pixels",
+        "Derive the 256-bit key from pixels",
         theme::PROOF,
         WalletSetupMode::Photo,
         busy,
@@ -146,7 +172,7 @@ fn wallet_setup_choices(app: &App, compact: bool) -> Element<'_, Message> {
         column![
             text("INITIALIZE OWNER").size(16).color(theme::TEXT),
             text("Choose how this device obtains the master key.")
-                .size(10)
+                .size(12)
                 .color(theme::MUTED),
             Space::new().height(4),
             generate,
@@ -177,7 +203,7 @@ fn wallet_setup_choices(app: &App, compact: bool) -> Element<'_, Message> {
     let mut content = column![workspace].spacing(10);
     if let Some(error) = &app.settings_error {
         content = content.push(
-            container(text(error).size(11).color(theme::DANGER))
+            container(text(error).size(13).color(theme::DANGER))
                 .width(Length::Fill)
                 .padding([10, 12])
                 .style(theme::surface_alt),
@@ -195,9 +221,9 @@ fn wallet_setup_choices(app: &App, compact: bool) -> Element<'_, Message> {
         .into()
 }
 
-fn owner_model_visual(compact: bool) -> iced::widget::Container<'static, Message> {
+fn owner_model_visual(compact: bool, narrow: bool) -> iced::widget::Container<'static, Message> {
     let addresses = column![
-        text("ADDRESSES").size(10).color(theme::CYAN),
+        text("ADDRESSES").size(12).color(theme::CYAN),
         row![
             address_index("[0]", 0),
             address_index("[1]", 1),
@@ -215,7 +241,7 @@ fn owner_model_visual(compact: bool) -> iced::widget::Container<'static, Message
                 .font(theme::SYMBOL_FONT)
                 .size(if compact { 42 } else { 50 })
                 .color(theme::ACCENT),
-            text("256-BIT KEY").size(10).color(theme::CYAN),
+            text("256-BIT KEY").size(12).color(theme::CYAN),
         ]
         .spacing(6)
         .align_x(Alignment::Center),
@@ -233,6 +259,25 @@ fn owner_model_visual(compact: bool) -> iced::widget::Container<'static, Message
     ]
     .spacing(if compact { 12 } else { 18 })
     .align_y(Alignment::Center);
+    let claim_size = if compact { 14 } else { 16 };
+    let security_claim: Element<'static, Message> = if narrow {
+        column![
+            text("No keypair. No signature.")
+                .size(claim_size)
+                .color(theme::PROOF),
+            text("Quantum\u{2011}resistant.")
+                .size(claim_size)
+                .color(theme::PROOF),
+        ]
+        .spacing(2)
+        .align_x(Alignment::Center)
+        .into()
+    } else {
+        text("No keypair. No signature. Quantum\u{2011}resistant.")
+            .size(claim_size)
+            .color(theme::PROOF)
+            .into()
+    };
 
     container(
         column![
@@ -240,9 +285,7 @@ fn owner_model_visual(compact: bool) -> iced::widget::Container<'static, Message
             text("A secret is enough.")
                 .size(if compact { 23 } else { 28 })
                 .color(theme::TEXT),
-            text("No keypair. No signature.")
-                .size(if compact { 14 } else { 16 })
-                .color(theme::PROOF),
+            security_claim,
             Space::new().height(if compact { 18 } else { 26 }),
             map,
             Space::new().height(Length::Fill),
@@ -259,7 +302,7 @@ fn owner_model_visual(compact: bool) -> iced::widget::Container<'static, Message
 }
 
 fn address_index(label: &'static str, depth: u8) -> iced::widget::Container<'static, Message> {
-    container(text(label).size(10).color(theme::TEXT))
+    container(text(label).size(12).color(theme::TEXT))
         .padding([6, 7])
         .style(move |_| theme::secret_address_token(depth))
 }
@@ -274,10 +317,10 @@ fn setup_source_button(
 ) -> iced::widget::Button<'static, Message> {
     let mut select = button(
         row![
-            text(number).size(10).color(theme::DIM),
+            text(number).size(12).color(theme::DIM),
             column![
-                text(title).size(12).color(color),
-                text(detail).size(9).color(theme::MUTED),
+                text(title).size(13).color(color),
+                text(detail).size(12).color(theme::MUTED),
             ]
             .spacing(3),
             Space::new().width(Length::Fill),
@@ -316,7 +359,7 @@ fn wallet_setup_generate<'a>(app: &'a App, compact: bool) -> Element<'a, Message
     let control = column![
         setup_back_header("GENERATE", theme::ACCENT, app.secret_action_in_flight),
         text("A cryptographically random key will be created and stored in the local keystore.")
-            .size(12)
+            .size(13)
             .color(theme::TEXT),
         Space::new().height(Length::Fill),
         create,
@@ -332,7 +375,7 @@ fn wallet_setup_raw<'a>(app: &'a App, compact: bool) -> Element<'a, Message> {
         app.imported_master_secret.as_str(),
     )
     .on_input(|value| Message::ImportSecretChanged(crate::model::SensitiveString::new(value)))
-    .size(12)
+    .size(14)
     .padding([12, 13])
     .style(theme::text_input);
     let mut import = button(text(if app.secret_action_in_flight {
@@ -349,7 +392,7 @@ fn wallet_setup_raw<'a>(app: &'a App, compact: bool) -> Element<'a, Message> {
     let control = column![
         setup_back_header("IMPORT KEY", theme::CYAN, app.secret_action_in_flight),
         text("The key restores the same deterministic address sequence.")
-            .size(11)
+            .size(13)
             .color(theme::MUTED),
         input,
         Space::new().height(Length::Fill),
@@ -409,11 +452,11 @@ fn wallet_setup_photo<'a>(app: &'a App, compact: bool) -> Element<'a, Message> {
     let control = column![
         setup_back_header("PHOTO KEY", theme::PROOF, photo_busy),
         text("The key is derived from decoded pixels. Metadata and the file name are ignored.")
-            .size(11)
+            .size(13)
             .color(theme::TEXT),
         choose,
         text("Keep the private original. Restore from the unchanged file; recompression changes the key.")
-            .size(10)
+            .size(12)
             .color(theme::WARNING),
         Space::new().height(Length::Fill),
         use_photo,
@@ -432,7 +475,7 @@ fn setup_raw_visual<'a>(
         column![
             text("①").font(theme::SYMBOL_FONT).size(74).color(color),
             text(title).size(14).color(color),
-            text(detail).size(10).color(theme::MUTED),
+            text(detail).size(12).color(theme::MUTED),
         ]
         .spacing(8)
         .align_x(Alignment::Center),
@@ -449,7 +492,7 @@ fn setup_photo_empty<'a>(compact: bool) -> iced::widget::Container<'a, Message> 
         column![
             text("▦").size(72).color(theme::PROOF),
             text("PRIVATE PHOTO").size(14).color(theme::PROOF),
-            text("PIXELS → 256-BIT KEY").size(10).color(theme::MUTED),
+            text("PIXELS → 256-BIT KEY").size(12).color(theme::MUTED),
         ]
         .spacing(8)
         .align_x(Alignment::Center),
@@ -466,7 +509,7 @@ fn setup_back_header(
     color: iced::Color,
     busy: bool,
 ) -> Element<'static, Message> {
-    let mut back = button(text("← ESC BACK").size(11).color(theme::PROOF))
+    let mut back = button(text("← ESC BACK").size(13).color(theme::PROOF))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
     if !busy {
@@ -510,7 +553,7 @@ fn wallet_setup_workspace<'a>(
     let mut body = column![workspace].spacing(10);
     if let Some(error) = &app.settings_error {
         body = body.push(
-            container(text(error).size(11).color(theme::DANGER))
+            container(text(error).size(13).color(theme::DANGER))
                 .width(Length::Fill)
                 .padding([9, 11])
                 .style(theme::surface_alt),
@@ -589,21 +632,14 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         ("MINING OFF".into(), theme::DIM)
     };
 
-    let wordmark = row![
-        text("Paran")
-            .size(19)
-            .font(theme::BRAND_FONT)
-            .color(theme::TEXT),
-        text("O(1)")
-            .size(19)
-            .font(theme::BRAND_FONT)
-            .color(theme::ACCENT),
-        text("d")
-            .size(19)
-            .font(theme::BRAND_FONT)
-            .color(theme::TEXT),
-    ]
-    .spacing(0);
+    let wordmark = rich_text([
+        span::<(), iced::Font>("Paran").color(theme::TEXT),
+        span::<(), iced::Font>("O(1)").color(theme::ACCENT),
+        span::<(), iced::Font>("d").color(theme::TEXT),
+    ])
+    .size(19)
+    .line_height(1.0)
+    .font(theme::BRAND_FONT);
     let brand = container(wordmark).padding(Padding::ZERO.top(4));
 
     let network_status = container(
@@ -665,7 +701,7 @@ fn live_status(label: impl Into<String>, color: iced::Color) -> Element<'static,
 
 fn status_value(label: &'static str, value: String) -> Element<'static, Message> {
     row![
-        text(label).size(11).color(theme::DIM),
+        text(label).size(13).color(theme::DIM),
         text(value).size(13).color(theme::TEXT),
     ]
     .spacing(6)
@@ -715,7 +751,7 @@ fn command_bar(app: &App) -> Element<'static, Message> {
         command("F3", "Send", Message::OpenAction(Action::Send), send_active,),
         command(
             "F4",
-            "Proofs",
+            "Receipts",
             Message::Navigate(Section::Proofs),
             app.section == Section::Proofs,
         ),
@@ -727,7 +763,7 @@ fn command_bar(app: &App) -> Element<'static, Message> {
         ),
         command(
             "F6",
-            "Explorer",
+            "Scope",
             Message::Navigate(Section::Explorer),
             app.section == Section::Explorer,
         ),
@@ -801,7 +837,7 @@ fn settings(app: &App, compact: bool) -> Element<'_, Message> {
     let tabs = settings_tabs(app);
     let body: Element<'_, Message> = match app.settings_tab {
         SettingsTab::Secret => secret_settings(app, compact),
-        SettingsTab::Node => settings_with_controls(app, node_settings_group(app).into()),
+        SettingsTab::Node => node_settings(app),
         SettingsTab::Network => settings_with_controls(app, network_settings_group(app).into()),
     };
     let mut settings = column![tabs, body].spacing(10);
@@ -831,7 +867,7 @@ fn settings_tabs(app: &App) -> Element<'_, Message> {
 
 fn settings_tab(label: &'static str, tab: SettingsTab, app: &App) -> Element<'static, Message> {
     let active = app.settings_tab == tab;
-    button(text(label).size(12))
+    button(text(label).size(13))
         .on_press(Message::SetSettingsTab(tab))
         .padding([8, 14])
         .style(move |_, status| {
@@ -853,15 +889,15 @@ fn secret_settings(app: &App, compact: bool) -> Element<'_, Message> {
             column![
                 text("MASTER SECRET").size(18).color(theme::PROOF),
                 text("ONE SECRET · EVERY ADDRESS")
-                    .size(12)
+                    .size(13)
                     .color(theme::TEXT),
             ]
             .spacing(5),
             Space::new().width(Length::Fill),
             column![
-                text("PROTECTION").size(10).color(theme::DIM),
+                text("PROTECTION").size(12).color(theme::DIM),
                 text("LOCAL KEYSTORE · OWNER ONLY")
-                    .size(12)
+                    .size(13)
                     .color(theme::CYAN),
             ]
             .spacing(5)
@@ -891,7 +927,11 @@ fn secret_settings(app: &App, compact: bool) -> Element<'_, Message> {
 }
 
 fn secret_visual(app: &App, compact: bool) -> iced::widget::Container<'_, Message> {
-    let height = if compact { 220.0 } else { 320.0 };
+    let height = if compact {
+        220.0
+    } else {
+        SECRET_DESKTOP_WORKSPACE_HEIGHT
+    };
     let content: Element<'_, Message> = if let Some(photo) = app.secret_photo.as_ref() {
         let scan_percent = ((app.photo_scan_progress * 100.0).floor() as u32).min(100);
         let (status, color) = if app.photo_scan_active && app.photo_scan_progress >= 1.0 {
@@ -907,18 +947,18 @@ fn secret_visual(app: &App, compact: bool) -> iced::widget::Container<'_, Messag
             photo_preview(app, height - 72.0),
             row![
                 column![
-                    text(status).size(11).color(color),
+                    text(status).size(13).color(color),
                     text(format!("KEY ID  {}", photo.key_id))
-                        .size(10)
+                        .size(12)
                         .color(theme::TEXT),
                 ]
                 .spacing(4),
                 Space::new().width(Length::Fill),
                 column![
                     text(format!("{} × {}", photo.width, photo.height))
-                        .size(10)
+                        .size(12)
                         .color(theme::MUTED),
-                    text("PREVIEW NOT STORED").size(9).color(theme::DIM),
+                    text("PREVIEW NOT STORED").size(12).color(theme::DIM),
                 ]
                 .spacing(4)
                 .align_x(Alignment::End),
@@ -935,9 +975,9 @@ fn secret_visual(app: &App, compact: bool) -> iced::widget::Container<'_, Messag
                     .size(66)
                     .color(theme::ACCENT),
                 text("KEY ACTIVE").size(13).color(theme::CYAN),
-                text("ONE KEY · EVERY ADDRESS").size(11).color(theme::TEXT),
+                text("ONE KEY · EVERY ADDRESS").size(13).color(theme::TEXT),
                 text("No source media is stored.")
-                    .size(10)
+                    .size(12)
                     .color(theme::DIM),
             ]
             .spacing(7)
@@ -1013,7 +1053,7 @@ fn secret_control(app: &App, compact: bool) -> iced::widget::Container<'_, Messa
         .height(if compact {
             Length::Shrink
         } else {
-            Length::Fixed(320.0)
+            Length::Fixed(SECRET_DESKTOP_WORKSPACE_HEIGHT)
         })
         .padding(14)
         .style(theme::surface)
@@ -1031,9 +1071,9 @@ fn secret_control_home(busy: bool) -> Element<'static, Message> {
         generate = generate.on_press(Message::BeginGenerateSecret);
     }
     column![
-        text("KEY CONTROL").size(12).color(theme::PROOF),
+        text("KEY CONTROL").size(13).color(theme::PROOF),
         text("The keystore always contains one 256-bit key.")
-            .size(10)
+            .size(12)
             .color(theme::MUTED),
         Space::new().height(3),
         raw,
@@ -1049,14 +1089,14 @@ fn secret_control_button(
     label: &'static str,
     busy: bool,
 ) -> iced::widget::Button<'static, Message> {
-    button(text(if busy { "WORKING…" } else { label }).size(11))
+    button(text(if busy { "WORKING…" } else { label }).size(13))
         .width(Length::Fill)
         .padding([10, 13])
         .style(|_, status| theme::button(ButtonKind::Secondary, status))
 }
 
 fn secret_back_button(busy: bool) -> iced::widget::Button<'static, Message> {
-    let mut back = button(text("← ESC BACK").size(11).color(theme::PROOF))
+    let mut back = button(text("← ESC BACK").size(13).color(theme::PROOF))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
     if !busy {
@@ -1071,7 +1111,7 @@ fn secret_control_header(
     busy: bool,
 ) -> Element<'static, Message> {
     row![
-        text(title).size(12).color(color),
+        text(title).size(13).color(color),
         Space::new().width(Length::Fill),
         secret_back_button(busy),
     ]
@@ -1083,7 +1123,7 @@ fn secret_export_control(app: &App, busy: bool, compact: bool) -> Element<'_, Me
     let secret: Element<'_, Message> = if app.exported_master_secret.is_empty() {
         container(
             text("Reading local master secret…")
-                .size(if compact { 10 } else { 11 })
+                .size(if compact { 12 } else { 13 })
                 .color(theme::MUTED),
         )
         .width(Length::Fill)
@@ -1093,7 +1133,7 @@ fn secret_export_control(app: &App, busy: bool, compact: bool) -> Element<'_, Me
     } else {
         text_input("", app.exported_master_secret.as_str())
             .on_input(|_| Message::Noop)
-            .size(if compact { 10 } else { 11 })
+            .size(14)
             .padding([12, 13])
             .style(theme::text_input)
             .into()
@@ -1115,7 +1155,7 @@ fn secret_export_control(app: &App, busy: bool, compact: bool) -> Element<'_, Me
         secret_control_header("EXPORT KEY", theme::PROOF, busy),
         secret,
         text("Anyone with this key controls every derived address.")
-            .size(10)
+            .size(12)
             .color(theme::WARNING),
         Space::new().height(Length::Fill),
         copy,
@@ -1130,7 +1170,7 @@ fn secret_raw_import_control(app: &App, busy: bool) -> Element<'_, Message> {
         app.imported_master_secret.as_str(),
     )
     .on_input(|value| Message::ImportSecretChanged(crate::model::SensitiveString::new(value)))
-    .size(12)
+    .size(14)
     .padding([11, 12])
     .style(theme::text_input);
     let mut confirm = button(text(if busy {
@@ -1175,24 +1215,24 @@ fn secret_photo_import_control(app: &App, busy: bool) -> Element<'_, Message> {
     }
     let detail: Element<'_, Message> = if let Some(photo) = app.secret_photo.as_ref() {
         column![
-            text(&photo.name).size(11).color(theme::TEXT),
+            text(&photo.name).size(13).color(theme::TEXT),
             text(format!(
                 "{} × {} · {} · METADATA IGNORED",
                 photo.width,
                 photo.height,
                 format_file_size(photo.size)
             ))
-            .size(9)
+            .size(12)
             .color(theme::CYAN),
             text(format!("KEY ID  {}", photo.key_id))
-                .size(10)
+                .size(12)
                 .color(theme::PROOF),
         ]
         .spacing(4)
         .into()
     } else {
         text("JPEG · PNG · WEBP · GIF · BMP · TIFF")
-            .size(10)
+            .size(12)
             .color(theme::DIM)
             .into()
     };
@@ -1219,7 +1259,7 @@ fn secret_photo_import_control(app: &App, busy: bool) -> Element<'_, Message> {
         choose,
         detail,
         text("Keep the private original. Changed pixels create a different wallet.")
-            .size(9)
+            .size(12)
             .color(theme::WARNING),
         Space::new().height(Length::Fill),
         confirm,
@@ -1244,7 +1284,7 @@ fn secret_generate_control(busy: bool) -> Element<'static, Message> {
         secret_control_header("GENERATE NEW", theme::ACCENT, busy),
         replacement_warning(),
         text("A fresh random 256-bit key will replace every local address.")
-            .size(11)
+            .size(13)
             .color(theme::TEXT),
         Space::new().height(Length::Fill),
         generate,
@@ -1268,7 +1308,7 @@ fn settings_with_controls<'a>(
     if app.settings_dirty() && !busy {
         apply = apply.on_press(Message::ApplySettings);
     }
-    let mut reset = button(text("RESET").size(11))
+    let mut reset = button(text("RESET").size(13))
         .padding([9, 13])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if app.settings_dirty() && !busy {
@@ -1281,7 +1321,7 @@ fn settings_with_controls<'a>(
             reset,
             Space::new().width(Length::Fill),
             text("CHANGES RESTART THE LOCAL NODE")
-                .size(10)
+                .size(12)
                 .color(theme::DIM),
         ]
         .spacing(8)
@@ -1295,7 +1335,7 @@ fn settings_feedback(app: &App) -> Option<Element<'_, Message>> {
     app.settings_error
         .as_ref()
         .map(|error| {
-            container(text(error).size(11).color(theme::DANGER))
+            container(text(error).size(13).color(theme::DANGER))
                 .width(Length::Fill)
                 .padding([9, 11])
                 .style(theme::surface_alt)
@@ -1303,7 +1343,7 @@ fn settings_feedback(app: &App) -> Option<Element<'_, Message>> {
         })
         .or_else(|| {
             app.settings_notice.as_ref().map(|notice| {
-                container(text(notice).size(11).color(theme::ACCENT))
+                container(text(notice).size(13).color(theme::ACCENT))
                     .width(Length::Fill)
                     .padding([9, 11])
                     .style(theme::surface_alt)
@@ -1312,13 +1352,99 @@ fn settings_feedback(app: &App) -> Option<Element<'_, Message>> {
         })
 }
 
+fn node_settings(app: &App) -> Element<'_, Message> {
+    column![
+        settings_with_controls(app, node_settings_group(app).into()),
+        node_log_terminal(app),
+    ]
+    .spacing(10)
+    .into()
+}
+
+fn node_log_terminal(app: &App) -> Element<'_, Message> {
+    let selection_active = app.node_log.selection().is_some();
+    let inspecting = app.node_log_paused || selection_active;
+    let (status, status_color) = if inspecting {
+        ("PAUSED · INSPECTING", theme::WARNING)
+    } else if app.node_log_loading {
+        ("READING…", theme::CYAN)
+    } else if app.node_log_error.is_some() {
+        ("READ ERROR", theme::DANGER)
+    } else if app.node_log.is_empty() {
+        ("WAITING FOR OUTPUT", theme::DIM)
+    } else {
+        ("LIVE", theme::ACCENT)
+    };
+
+    let mut refresh = button(
+        text(if inspecting {
+            "RESUME"
+        } else if app.node_log_loading {
+            "READING…"
+        } else {
+            "REFRESH"
+        })
+        .size(12),
+    )
+    .padding([5, 8])
+    .style(|_, state| theme::button(ButtonKind::Ghost, state));
+    if !app.node_log_loading {
+        refresh = refresh.on_press(Message::RefreshNodeLog);
+    }
+
+    let output = text_editor(&app.node_log)
+        .placeholder("Waiting for paranoid-node.log output…")
+        .on_action(Message::EditNodeLog)
+        .font(theme::TECH_FONT)
+        .size(12)
+        .line_height(1.35)
+        .height(250)
+        .padding([10, 12])
+        .wrapping(iced::widget::text::Wrapping::None)
+        .style(theme::node_log_editor);
+
+    let mut body = column![
+        row![
+            text("LOGS").size(13).color(theme::CYAN),
+            text("paranoid-node.log").size(12).color(theme::DIM),
+            Space::new().width(Length::Fill),
+            text(status).size(12).color(status_color),
+            refresh,
+        ]
+        .spacing(9)
+        .align_y(Alignment::Center),
+        output,
+        row![
+            text(format!("LATEST {NODE_LOG_LINE_LIMIT} LINES"))
+                .size(12)
+                .color(theme::DIM),
+            Space::new().width(Length::Fill),
+            text("SELECT TEXT · CTRL+C TO COPY")
+                .size(12)
+                .color(theme::DIM),
+        ]
+        .align_y(Alignment::Center),
+    ]
+    .spacing(8);
+
+    if let Some(error) = &app.node_log_error {
+        body = body.push(text(error).size(12).color(theme::DANGER));
+    }
+
+    container(body)
+        .width(Length::Fill)
+        .padding([9, 10])
+        .style(theme::node_log_panel)
+        .into()
+}
+
 fn node_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
     let data_dir = text_input("Node data directory", &app.settings_data_dir)
         .on_input(Message::SettingsDataDirectoryChanged)
-        .size(11)
+        .size(14)
         .padding([8, 10])
         .style(theme::text_input);
-    let choose = button(text("CHOOSE").size(10))
+    let choose = button(text("CHOOSE").size(12))
         .on_press(Message::ChooseDataDirectory)
         .padding([9, 10])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
@@ -1326,7 +1452,7 @@ fn node_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
     let mut levels = row![].spacing(5).width(Length::Fill);
     for level in crate::model::LogLevel::ALL {
         let active = app.settings_log_level == level;
-        let mut select = button(text(level.label()).size(10).color(if active {
+        let mut select = button(text(level.label()).size(12).color(if active {
             theme::INK
         } else {
             theme::TEXT
@@ -1372,13 +1498,13 @@ fn node_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
 fn network_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
     let listen = text_input("0.0.0.0:9400", &app.settings_p2p_listen)
         .on_input(Message::SettingsP2pListenChanged)
-        .size(11)
+        .size(14)
         .padding([8, 10])
         .style(theme::text_input);
     let seeds = text_editor(&app.settings_seeds)
         .placeholder("One seed peer per line")
         .on_action(Message::EditSettingsSeeds)
-        .size(11)
+        .size(14)
         .padding([8, 10])
         .height(76)
         .wrapping(iced::widget::text::Wrapping::None)
@@ -1410,7 +1536,7 @@ fn settings_panel<'a>(
 ) -> iced::widget::Container<'a, Message> {
     container(
         column![
-            container(text(title).size(12).color(color)).padding([7, 10]),
+            container(text(title).size(13).color(color)).padding([7, 10]),
             content,
         ]
         .spacing(0),
@@ -1427,9 +1553,9 @@ fn settings_field<'a>(
     container(
         column![
             row![
-                text(label).size(11).color(theme::TEXT),
+                text(label).size(13).color(theme::TEXT),
                 Space::new().width(Length::Fill),
-                text(description).size(9).color(theme::DIM),
+                text(description).size(12).color(theme::DIM),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -1446,9 +1572,9 @@ fn settings_field<'a>(
 fn replacement_warning() -> iced::widget::Container<'static, Message> {
     container(
         column![
-            text("IMPORTANT").size(10).color(theme::WARNING),
+            text("IMPORTANT").size(12).color(theme::WARNING),
             text("The current master secret cannot be recovered after replacement. Export it first if you need to keep it.")
-                .size(11)
+                .size(13)
                 .color(theme::TEXT),
         ]
         .spacing(4),

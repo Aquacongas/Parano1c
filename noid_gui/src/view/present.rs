@@ -10,7 +10,7 @@ use iced::{Alignment, Element, Length, Padding};
 use crate::app::{Action, AddressOperation, App, Message};
 use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmission};
 use crate::model::{
-    format_creation_origin, format_micronoid, grouped, AddressSnapshot, UtxoSnapshot,
+    format_creation_origin, format_micronoid, AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::{ProofForge, StateField};
@@ -261,7 +261,7 @@ fn terminal_meter(
 
     row![
         text(label)
-            .size(12)
+            .size(13)
             .color(label_color)
             .wrapping(text::Wrapping::None)
             .width(label_width),
@@ -287,9 +287,11 @@ fn state_scale(current: u32, compact: bool) -> Element<'static, Message> {
         levels = levels.push(
             container(
                 column![
-                    text(log_slots.to_string())
-                        .size(if compact { 11 } else { 13 })
-                        .color(if active { theme::ACCENT } else { theme::DIM }),
+                    text(log_slots.to_string()).size(13).color(if active {
+                        theme::ACCENT
+                    } else {
+                        theme::DIM
+                    }),
                     container(iced::widget::Space::new())
                         .width(Length::Fill)
                         .height(if active { 3 } else { 1 })
@@ -311,7 +313,7 @@ fn state_scale(current: u32, compact: bool) -> Element<'static, Message> {
 
     row![
         text("STATE LVL")
-            .size(12)
+            .size(13)
             .color(theme::CYAN)
             .wrapping(text::Wrapping::None)
             .width(label_width),
@@ -331,7 +333,7 @@ fn telemetry_value(
     container(
         row![
             text(label)
-                .size(12)
+                .size(13)
                 .color(theme::CYAN)
                 .wrapping(text::Wrapping::None),
             text(format!("[{value}]"))
@@ -351,7 +353,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     let address_field_width = if compact { 516.0 } else { 552.0 };
     let owner_tab = container(text("ACTIVE ADDRESS").size(13))
         .padding([6, 9])
-        .style(theme::title_bar_proof);
+        .style(theme::title_bar_accent);
 
     let title = row![owner_tab, iced::widget::Space::new().width(Length::Fill)]
         .spacing(8)
@@ -361,7 +363,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
         row![
             container(
                 text(format!("[{}] {}", address.key_index, address.label))
-                    .size(12)
+                    .size(13)
                     .color(theme::PROOF)
                     .wrapping(text::Wrapping::None)
             )
@@ -384,7 +386,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
                 address.key_index,
                 app.copied_address == Some(address.key_index),
             ),
-            button(text("SWITCH").size(12))
+            button(text("SWITCH").size(13))
                 .on_press(Message::ToggleAddressPicker)
                 .padding([6, 12])
                 .style(|_, status| theme::button(ButtonKind::Secondary, status)),
@@ -397,7 +399,7 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     .width(Length::Fill);
 
     let balance_size = if compact { 25.0 } else { 28.0 };
-    let metric_label_size = if compact { 10.0 } else { 11.0 };
+    let metric_label_size = if compact { 12.0 } else { 13.0 };
     let metric_value_size = if compact { 16.0 } else { 18.0 };
     let balance_metric = container(
         column![
@@ -467,8 +469,8 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     .width(Length::Shrink);
 
     let pulse = app.consolidation_pulse();
-    let consolidate = button(text("CONSOLIDATE").size(if compact { 11 } else { 12 }))
-        .padding([9, if compact { 10 } else { 13 }]);
+    let consolidate =
+        button(text("CONSOLIDATE").size(13)).padding([9, if compact { 10 } else { 13 }]);
     let consolidate = if app.consolidation_recommended() {
         consolidate.style(move |_, status| theme::consolidation_button(pulse, status))
     } else {
@@ -541,7 +543,7 @@ fn spendable_stat(
         .align_y(Alignment::Center);
 
     if recommended {
-        let badge = container(text("i").size(12).color(theme::ADVISORY))
+        let badge = container(text("i").size(13).color(theme::ADVISORY))
             .width(19)
             .height(19)
             .align_x(Alignment::Center)
@@ -579,15 +581,15 @@ fn consolidation_hint(compact: bool) -> Element<'static, Message> {
         let card = container(
             column![
                 text("CONSOLIDATION RECOMMENDED")
-                    .size(11)
+                    .size(13)
                     .color(theme::ADVISORY),
                 text(
                     "Please consolidate up to 64 UTXOs into one state slot to support the network and speed up wallet operations."
                 )
-                .size(12)
+                .size(13)
                 .color(theme::MUTED)
                 .width(Length::Fill),
-                button(text("CONSOLIDATE").size(11))
+                button(text("CONSOLIDATE").size(13))
                     .on_press(Message::OpenAction(Action::Consolidate))
                     .padding([7, 12])
                     .style(|_, status| theme::consolidation_button(1.0, status)),
@@ -649,19 +651,52 @@ fn account_separator() -> Element<'static, Message> {
 
 fn utxo_table(app: &App) -> container::Container<'_, Message> {
     let address = app.snapshot.active_address();
+    let segment_filter = app.utxo_segment_filter;
+    let visible_count = app.visible_utxo_count();
+    let total_pages = app.utxo_page_count();
+    let page = app.utxo_page.min(total_pages);
+    let page_start = (page - 1) * UTXO_PAGE_SIZE;
+    let filter_status: Element<'_, Message> = if let Some(segment) = segment_filter {
+        row![
+            text(format!(
+                "SEGMENT {segment:03} · {visible_count} / {}",
+                address.utxo_count
+            ))
+            .size(12)
+            .color(theme::PROOF),
+            button(text("ALL").size(12))
+                .on_press(Message::SelectSegment(segment))
+                .padding([4, 8])
+                .style(|_, status| theme::button(ButtonKind::Secondary, status)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        text(format!("{} OUTPUTS", address.utxo_count))
+            .size(13)
+            .into()
+    };
     let title = row![
-        container(text("ACTIVE UTXO SET").size(13))
+        container(text("MY UTXO SET").size(13))
             .padding([6, 9])
             .style(theme::title_bar_cyan),
         iced::widget::Space::new().width(Length::Fill),
-        container(text(format!("{} OUTPUTS", address.utxo_count)).size(11))
-            .padding(Padding::ZERO.right(9)),
+        container(filter_status).padding(Padding::ZERO.right(9)),
     ]
     .align_y(Alignment::Center);
 
-    let header = table_columns("SLOT", "VALUE / NOID", "ORIGIN", "SEGMENT", "STATE");
+    let header = table_columns("SLOT", "VALUE / NOID", "ORIGIN", "SEGMENT", "STATUS");
     let mut rows = column![].spacing(0);
-    for (index, utxo) in app.snapshot.utxos.iter().enumerate() {
+    for (index, utxo) in app
+        .snapshot
+        .utxos
+        .iter()
+        .filter(|utxo| segment_filter.is_none_or(|segment| utxo.segment == segment))
+        .skip(page_start)
+        .take(UTXO_PAGE_SIZE)
+        .enumerate()
+    {
         rows = rows.push(utxo_row(
             utxo,
             index % 2 == 1,
@@ -669,17 +704,33 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
         ));
     }
 
+    let visible_reserved = app
+        .snapshot
+        .utxos
+        .iter()
+        .filter(|utxo| {
+            segment_filter.is_none_or(|segment| utxo.segment == segment) && utxo.reserved
+        })
+        .count();
     let output_status = row![
-        state_metric("OWNED", address.utxo_count.to_string(), theme::CYAN),
+        state_metric(
+            if segment_filter.is_some() {
+                "SHOWN"
+            } else {
+                "OWNED"
+            },
+            visible_count.to_string(),
+            theme::CYAN
+        ),
         state_metric(
             "SPENDABLE",
-            address.spendable_utxo_count().to_string(),
+            visible_count.saturating_sub(visible_reserved).to_string(),
             theme::ACCENT,
         ),
         state_metric(
             "RESERVED",
-            address.reserved_utxo_count.to_string(),
-            if address.reserved_utxo_count == 0 {
+            visible_reserved.to_string(),
+            if visible_reserved == 0 {
                 theme::DIM
             } else {
                 theme::WARNING
@@ -688,12 +739,45 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
     ]
     .spacing(12)
     .align_y(Alignment::Center);
+    let mut previous = button(text("← PREV").size(12))
+        .padding([5, 8])
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if page > 1 {
+        previous = previous.on_press(Message::PreviousUtxoPage);
+    }
+    let mut next = button(text("NEXT →").size(12))
+        .padding([5, 8])
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if page < total_pages {
+        next = next.on_press(Message::NextUtxoPage);
+    }
+    let pagination = row![
+        previous,
+        text(format!("PAGE {page} / {total_pages}"))
+            .size(12)
+            .color(theme::MUTED),
+        next,
+    ]
+    .spacing(7)
+    .align_y(Alignment::Center);
+    let footer = row![
+        output_status,
+        iced::widget::Space::new().width(Length::Fill),
+        pagination,
+    ]
+    .align_y(Alignment::Center);
 
     container(
         column![
             container(title).style(theme::surface_alt),
             header,
             scrollable(rows)
+                .id(format!(
+                    "present-utxos-{}",
+                    segment_filter
+                        .map(|segment| segment.to_string())
+                        .unwrap_or_else(|| "all".into())
+                ))
                 .direction(iced::widget::scrollable::Direction::Vertical(
                     iced::widget::scrollable::Scrollbar::new()
                         .width(8)
@@ -702,7 +786,7 @@ fn utxo_table(app: &App) -> container::Container<'_, Message> {
                 ))
                 .height(Length::Fill)
                 .style(theme::scrollable),
-            container(output_status).padding([7, 9]),
+            container(footer).padding([7, 9]),
         ]
         .spacing(0),
     )
@@ -719,23 +803,23 @@ fn table_columns(
 ) -> Element<'static, Message> {
     container(
         row![
-            table_cell(slot.to_string(), 3, theme::INK),
-            table_cell(value.to_string(), 5, theme::INK),
-            table_cell(creation.to_string(), 5, theme::INK),
-            table_cell(segment.to_string(), 3, theme::INK),
-            table_cell(state.to_string(), 4, theme::INK),
+            slot_cell(slot.to_string(), theme::MUTED),
+            table_cell(value.to_string(), 5, theme::MUTED),
+            table_cell(creation.to_string(), 5, theme::MUTED),
+            table_cell(segment.to_string(), 3, theme::MUTED),
+            table_cell(state.to_string(), 4, theme::MUTED),
         ]
         .align_y(Alignment::Center),
     )
     .padding([7, 9])
-    .style(theme::table_header)
+    .style(theme::utxo_table_header)
     .into()
 }
 
 fn utxo_row(utxo: &UtxoSnapshot, alternate: bool, selected: bool) -> Element<'_, Message> {
     button(
         row![
-            table_cell(grouped(utxo.slot_index as u64), 3, theme::CYAN),
+            slot_cell(utxo.slot_index.to_string(), theme::CYAN),
             table_cell(utxo.value(), 5, theme::TEXT),
             table_cell(format_creation_origin(utxo.creation_id), 5, theme::MUTED),
             table_cell(format!("{:03}", utxo.segment), 3, theme::PROOF),
@@ -762,6 +846,15 @@ fn utxo_row(utxo: &UtxoSnapshot, alternate: bool, selected: bool) -> Element<'_,
     .into()
 }
 
+fn slot_cell(value: String, color: iced::Color) -> Element<'static, Message> {
+    text(value)
+        .size(14)
+        .color(color)
+        .wrapping(text::Wrapping::None)
+        .width(Length::FillPortion(3))
+        .into()
+}
+
 fn table_cell(value: String, portion: u16, color: iced::Color) -> Element<'static, Message> {
     text(value)
         .size(14)
@@ -782,6 +875,7 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
         &app.snapshot.segments,
         &app.snapshot.utxos,
         selected_segment,
+        app.utxo_segment_filter,
     ))
     .width(Length::Fill)
     .height(Length::Fill);
@@ -795,11 +889,11 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
 
         column![
             row![
-                text("SELECTED OUTPUT").size(11).color(theme::PROOF),
+                text("SELECTED OUTPUT").size(13).color(theme::PROOF),
                 iced::widget::Space::new().width(Length::Fill),
-                state_detail("SLOT", grouped(utxo.slot_index as u64), theme::CYAN),
+                state_detail("SLOT", utxo.slot_index.to_string(), theme::CYAN),
                 state_detail("SEG", format!("{:03}", utxo.segment), theme::PROOF),
-                text(state.0).size(11).color(state.1),
+                text(state.0).size(13).color(state.1),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
@@ -822,19 +916,53 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
         ]
         .spacing(4)
         .into()
+    } else if let Some(segment) = app.utxo_segment_filter {
+        let state = app.snapshot.segments.get(segment as usize);
+        let (mine_count, mine_value) = app
+            .snapshot
+            .utxos
+            .iter()
+            .filter(|utxo| utxo.segment == segment)
+            .fold((0usize, 0u64), |(count, total), utxo| {
+                (count + 1, total.saturating_add(utxo.value_micronoid))
+            });
+        let live_count = state.map(|state| state.live_count).unwrap_or(0);
+        let capacity = state.map(|state| state.capacity).unwrap_or(0);
+
+        column![
+            row![
+                text(format!("SEGMENT {segment:03}"))
+                    .size(13)
+                    .color(theme::PROOF),
+                iced::widget::Space::new().width(Length::Fill),
+                text("FILTER ACTIVE").size(12).color(theme::CYAN),
+            ]
+            .align_y(Alignment::Center),
+            row![
+                state_detail("NETWORK", format!("{live_count}/{capacity}"), theme::CYAN),
+                state_detail("MINE", mine_count.to_string(), theme::PROOF),
+                state_detail("VALUE", format_micronoid(mine_value), theme::ACCENT),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(5)
+        .into()
     } else {
         row![
-            text("NO OUTPUT SELECTED").size(11).color(theme::DIM),
+            text("STATE MAP READY").size(13).color(theme::CYAN),
             iced::widget::Space::new().width(Length::Fill),
-            text("SELECT A MAGENTA CELL").size(10).color(theme::MUTED),
+            text("SELECT A MAGENTA SEGMENT")
+                .size(12)
+                .color(theme::MUTED),
         ]
         .into()
     };
 
     let atlas_legend = row![
-        legend_item(theme::CYAN, "STATE OCCUPANCY"),
-        legend_item(theme::PROOF, "ACTIVE ADDRESS"),
-        legend_item(theme::TEXT, "SELECTED"),
+        legend_item(theme::CYAN, "STATE DENSITY"),
+        legend_item(theme::PROOF, "MY UTXOS"),
+        legend_item(theme::TEXT, "SELECTED OUTPUT"),
     ]
     .spacing(13)
     .align_y(Alignment::Center);
@@ -856,14 +984,14 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
                     container(
                         row![
                             text(format!("[{}]", terminal_status.0))
-                                .size(10)
+                                .size(12)
                                 .color(terminal_status.1),
-                            text("ROOT").size(9).color(theme::DIM),
+                            text("ROOT").size(12).color(theme::DIM),
                             text(format!(
                                 "[{}]",
                                 short_digest(&app.snapshot.network.state_root)
                             ))
-                            .size(10)
+                            .size(12)
                             .color(theme::PROOF),
                         ]
                         .spacing(7)
@@ -875,7 +1003,9 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
             )
             .style(theme::surface_alt),
             field,
-            container(column![selection, atlas_legend].spacing(7)).padding([8, 10]),
+            container(column![selection, atlas_legend].spacing(7))
+                .padding([8, 10])
+                .style(theme::surface_alt),
         ]
         .spacing(0),
     )
@@ -889,8 +1019,14 @@ fn state_detail(
     color: iced::Color,
 ) -> Element<'static, Message> {
     row![
-        text(label).size(10).color(theme::DIM),
-        text(format!("[{value}]")).size(11).color(color),
+        text(label)
+            .size(12)
+            .color(theme::DIM)
+            .wrapping(text::Wrapping::None),
+        text(format!("[{value}]"))
+            .size(13)
+            .color(color)
+            .wrapping(text::Wrapping::None),
     ]
     .spacing(4)
     .align_y(Alignment::Center)
@@ -911,8 +1047,8 @@ fn state_metric(
     color: iced::Color,
 ) -> Element<'static, Message> {
     row![
-        text(label).size(10).color(theme::DIM),
-        text(format!("[{value}]")).size(11).color(color),
+        text(label).size(12).color(theme::DIM),
+        text(format!("[{value}]")).size(13).color(color),
     ]
     .spacing(4)
     .align_y(Alignment::Center)
@@ -921,8 +1057,8 @@ fn state_metric(
 
 fn legend_item(color: iced::Color, label: &'static str) -> Element<'static, Message> {
     row![
-        text("■").size(11).color(color),
-        text(label).size(10).color(theme::MUTED),
+        text("■").size(13).color(color),
+        text(label).size(12).color(theme::MUTED),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
@@ -931,7 +1067,7 @@ fn legend_item(color: iced::Color, label: &'static str) -> Element<'static, Mess
 
 fn address_picker(app: &App, compact: bool) -> Element<'_, Message> {
     let busy = app.address_operation.is_some();
-    let mut close = button(text("ESC CLOSE").size(12))
+    let mut close = button(text("ESC CLOSE").size(13))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
     if !busy {
@@ -991,7 +1127,7 @@ fn address_picker(app: &App, compact: bool) -> Element<'_, Message> {
         column![container(row![new_address].align_y(Alignment::Center)).padding(12),].spacing(0);
     if let Some(error) = &app.address_error {
         controls = controls.push(
-            container(text(error).size(11).color(theme::DANGER))
+            container(text(error).size(13).color(theme::DANGER))
                 .width(Length::Fill)
                 .padding([9, 12])
                 .style(theme::surface),
@@ -1000,7 +1136,7 @@ fn address_picker(app: &App, compact: bool) -> Element<'_, Message> {
     controls = controls.push(
         container(
             text("LABELS ARE LOCAL · ADDRESSES CANNOT BE DELETED")
-                .size(11)
+                .size(13)
                 .color(theme::DIM),
         )
         .padding([8, 12]),
@@ -1087,11 +1223,11 @@ fn address_row<'a>(
     .align_y(Alignment::Center);
 
     let activate = if active {
-        button(text("ACTIVE").size(11))
+        button(text("ACTIVE").size(13))
             .on_press(Message::Noop)
             .style(|_, status| theme::button(ButtonKind::Primary, status))
     } else {
-        let mut button = button(text(if activating { "USING..." } else { "USE" }).size(11))
+        let mut button = button(text(if activating { "USING..." } else { "USE" }).size(13))
             .style(|_, status| theme::button(ButtonKind::Secondary, status));
         if !busy {
             button = button.on_press(Message::SelectAddress(address.key_index));
@@ -1099,7 +1235,7 @@ fn address_row<'a>(
         button
     };
 
-    let mut edit = button(text("EDIT").size(11))
+    let mut edit = button(text("EDIT").size(13))
         .width(Length::Fixed(68.0))
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if !busy {
@@ -1125,7 +1261,7 @@ fn address_label_editor(app: &App) -> Element<'_, Message> {
                 row![
                     text(format!("EDIT ADDRESS [{key_index}]")).size(13),
                     iced::widget::Space::new().width(Length::Fill),
-                    button(text("ESC CANCEL").size(12))
+                    button(text("ESC CANCEL").size(13))
                         .on_press(Message::CancelAddressLabel)
                         .padding([6, 9])
                         .style(|_, status| theme::button(ButtonKind::Ghost, status)),
@@ -1136,7 +1272,7 @@ fn address_label_editor(app: &App) -> Element<'_, Message> {
             .style(theme::title_bar_proof),
             container(
                 column![
-                    text("LOCAL LABEL").size(11).color(theme::DIM),
+                    text("LOCAL LABEL").size(13).color(theme::DIM),
                     text_input("Address label", &app.edit_label)
                         .on_input(Message::EditAddressLabel)
                         .on_submit(Message::SaveAddressLabel)
@@ -1145,14 +1281,14 @@ fn address_label_editor(app: &App) -> Element<'_, Message> {
                         .style(theme::text_input),
                     row![
                         text("The label is stored only on this device.")
-                            .size(11)
+                            .size(13)
                             .color(theme::DIM),
                         iced::widget::Space::new().width(Length::Fill),
-                        button(text("CANCEL").size(12))
+                        button(text("CANCEL").size(13))
                             .on_press(Message::CancelAddressLabel)
                             .padding([8, 12])
                             .style(|_, status| theme::button(ButtonKind::Secondary, status)),
-                        button(text("SAVE").size(12))
+                        button(text("SAVE").size(13))
                             .on_press(Message::SaveAddressLabel)
                             .padding([8, 16])
                             .style(|_, status| theme::button(ButtonKind::Primary, status)),
@@ -1193,7 +1329,7 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
         ),
     };
 
-    let mut close = button(text("ESC CLOSE").size(12))
+    let mut close = button(text("ESC CLOSE").size(13))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
     if !app.wallet_action_in_flight() {
@@ -1252,7 +1388,9 @@ fn proof_forge_overlay(app: &App, compact: bool) -> Element<'_, Message> {
                 .size(if compact { 14 } else { 16 })
                 .font(theme::BRAND_FONT)
                 .color(theme::TEXT),
-            text("LOCAL PROOF CONSTRUCTION").size(9).color(theme::PROOF),
+            text("LOCAL PROOF CONSTRUCTION")
+                .size(12)
+                .color(theme::PROOF),
         ]
         .spacing(if compact { 5 } else { 7 })
         .align_x(Alignment::Center),
@@ -1288,13 +1426,13 @@ fn consolidation_form(app: &App, compact: bool) -> Element<'_, Message> {
                 theme::DANGER,
             )
         };
-        let mut close = button(text("CANCEL").size(12))
+        let mut close = button(text("CANCEL").size(13))
             .padding(if compact { [9, 13] } else { [10, 15] })
             .style(|_, status| theme::button(ButtonKind::Secondary, status));
         if !app.wallet_action_in_flight() {
             close = close.on_press(Message::CloseAction);
         }
-        let mut retry = button(text("TRY AGAIN").size(12))
+        let mut retry = button(text("TRY AGAIN").size(13))
             .padding(if compact { [9, 13] } else { [10, 17] })
             .style(|_, status| theme::button(ButtonKind::Primary, status));
         if !app.wallet_action_in_flight() {
@@ -1303,8 +1441,8 @@ fn consolidation_form(app: &App, compact: bool) -> Element<'_, Message> {
         return column![
             container(
                 column![
-                    text(title).size(12).color(color),
-                    text(detail).size(11).color(theme::TEXT),
+                    text(title).size(13).color(color),
+                    text(detail).size(13).color(theme::TEXT),
                 ]
                 .spacing(6),
             )
@@ -1341,8 +1479,8 @@ fn consolidation_confirmation<'a>(
     let feedback: Element<'_, Message> = if let Some(error) = app.consolidation_error.as_ref() {
         container(
             column![
-                text("TRANSACTION NOT SENT").size(11).color(theme::DANGER),
-                text(error).size(11).color(theme::TEXT),
+                text("TRANSACTION NOT SENT").size(13).color(theme::DANGER),
+                text(error).size(13).color(theme::TEXT),
             ]
             .spacing(5),
         )
@@ -1353,7 +1491,7 @@ fn consolidation_confirmation<'a>(
     } else {
         container(
             text("Calculated from the current wallet state. Your secret stays on this device.")
-                .size(11)
+                .size(13)
                 .color(theme::DIM),
         )
         .padding([5, 2])
@@ -1361,7 +1499,7 @@ fn consolidation_confirmation<'a>(
         .into()
     };
 
-    let mut cancel = button(text("CANCEL").size(12))
+    let mut cancel = button(text("CANCEL").size(13))
         .padding(if compact { [9, 13] } else { [10, 15] })
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if !app.wallet_action_in_flight() {
@@ -1373,7 +1511,7 @@ fn consolidation_confirmation<'a>(
         } else {
             "PROVE & CONSOLIDATE"
         })
-        .size(12),
+        .size(13),
     )
     .padding(if compact { [9, 13] } else { [10, 17] })
     .style(|_, status| theme::button(ButtonKind::Primary, status));
@@ -1417,7 +1555,7 @@ fn consolidation_confirmation<'a>(
         ),
         container(
             column![
-                text("TOTAL BALANCE").size(10).color(theme::DIM),
+                text("TOTAL BALANCE").size(12).color(theme::DIM),
                 row![
                     text(format_micronoid(plan.balance_before_micronoid))
                         .size(16)
@@ -1440,7 +1578,7 @@ fn consolidation_confirmation<'a>(
                 .spacing(6)
                 .align_y(Alignment::Center),
                 text("Only the network fee changes the balance.")
-                    .size(12)
+                    .size(13)
                     .color(theme::MUTED),
                 text(format!(
                     "{} output{} remain{} untouched.",
@@ -1448,7 +1586,7 @@ fn consolidation_confirmation<'a>(
                     if plan.untouched_count == 1 { "" } else { "s" },
                     if plan.untouched_count == 1 { "s" } else { "" },
                 ))
-                .size(12)
+                .size(13)
                 .color(theme::MUTED),
             ]
             .spacing(if compact { 4 } else { 6 })
@@ -1481,12 +1619,12 @@ fn consolidation_success<'a>(
 ) -> Element<'a, Message> {
     let txid = row![
         text("TXID")
-            .size(10)
+            .size(12)
             .color(theme::CYAN)
             .width(if compact { 54 } else { 70 }),
         text_input("", &result.txid)
             .on_input(|_| Message::Noop)
-            .size(12)
+            .size(14)
             .padding([8, 10])
             .width(Length::Fill)
             .style(theme::text_input),
@@ -1507,14 +1645,14 @@ fn consolidation_success<'a>(
         send_result_metric("FREED", result.freed_slots.to_string()),
     ]
     .spacing(7);
-    let close = button(text("CLOSE").size(12))
+    let close = button(text("CLOSE").size(13))
         .on_press(Message::CloseAction)
         .padding(if compact { [9, 13] } else { [10, 15] })
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
 
     column![
         row![
-            text("CONSOLIDATION SENT").size(12).color(theme::ACCENT),
+            text("CONSOLIDATION SENT").size(13).color(theme::ACCENT),
             iced::widget::Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center),
@@ -1587,8 +1725,8 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
     let feedback: Element<'_, Message> = if let Some(error) = app.send_error.as_ref() {
         container(
             column![
-                text("TRANSACTION NOT SENT").size(11).color(theme::DANGER),
-                text(error).size(11).color(theme::TEXT),
+                text("TRANSACTION NOT SENT").size(13).color(theme::DANGER),
+                text(error).size(13).color(theme::TEXT),
             ]
             .spacing(5),
         )
@@ -1599,7 +1737,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
     } else {
         container(
             text("Your secret stays on this device. Only the transaction is sent.")
-                .size(11)
+                .size(13)
                 .color(theme::DIM),
         )
         .padding([5, 2])
@@ -1607,7 +1745,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         .into()
     };
 
-    let mut cancel = button(text("CANCEL").size(12))
+    let mut cancel = button(text("CANCEL").size(13))
         .padding(if compact { [9, 13] } else { [10, 15] })
         .width(if compact {
             Length::Fill
@@ -1624,7 +1762,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         } else {
             "PROVE & SEND"
         })
-        .size(12),
+        .size(13),
     )
     .padding(if compact { [9, 13] } else { [10, 17] })
     .width(if compact {
@@ -1686,12 +1824,12 @@ fn send_success<'a>(
 ) -> Element<'a, Message> {
     let recipient = row![
         text("TO")
-            .size(10)
+            .size(12)
             .color(theme::CYAN)
             .width(if compact { 54 } else { 70 }),
         text_input("", &result.recipient)
             .on_input(|_| Message::Noop)
-            .size(12)
+            .size(14)
             .padding([8, 10])
             .width(Length::Fill)
             .style(theme::text_input),
@@ -1704,12 +1842,12 @@ fn send_success<'a>(
     .align_y(Alignment::Center);
     let txid = row![
         text("TXID")
-            .size(10)
+            .size(12)
             .color(theme::CYAN)
             .width(if compact { 54 } else { 70 }),
         text_input("", &result.txid)
             .on_input(|_| Message::Noop)
-            .size(12)
+            .size(14)
             .padding([8, 10])
             .width(Length::Fill)
             .style(theme::text_input),
@@ -1734,7 +1872,7 @@ fn send_success<'a>(
     ]
     .spacing(7);
 
-    let close = button(text("CLOSE").size(12))
+    let close = button(text("CLOSE").size(13))
         .on_press(Message::CloseAction)
         .padding(if compact { [9, 13] } else { [10, 15] })
         .width(if compact {
@@ -1743,7 +1881,7 @@ fn send_success<'a>(
             Length::Shrink
         })
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
-    let another = button(text("SEND ANOTHER").size(12))
+    let another = button(text("SEND ANOTHER").size(13))
         .on_press(Message::ResetSend)
         .padding(if compact { [9, 13] } else { [10, 17] })
         .width(if compact {
@@ -1755,7 +1893,7 @@ fn send_success<'a>(
 
     column![
         row![
-            text("TRANSACTION SENT").size(12).color(theme::ACCENT),
+            text("TRANSACTION SENT").size(13).color(theme::ACCENT),
             iced::widget::Space::new().width(Length::Fill),
         ]
         .align_y(Alignment::Center),
@@ -1787,8 +1925,8 @@ fn send_success<'a>(
 fn send_result_metric(label: &'static str, value: String) -> Element<'static, Message> {
     container(
         column![
-            text(label).size(9).color(theme::DIM),
-            text(value).size(11).color(theme::TEXT),
+            text(label).size(12).color(theme::DIM),
+            text(value).size(13).color(theme::TEXT),
         ]
         .spacing(3),
     )
@@ -1807,7 +1945,7 @@ fn send_input_line<'a>(
     disabled: bool,
 ) -> Element<'a, Message> {
     let mut input = text_input(placeholder, value)
-        .size(13)
+        .size(14)
         .padding([9, 10])
         .width(Length::Fill)
         .style(theme::text_input);
@@ -1816,7 +1954,7 @@ fn send_input_line<'a>(
     }
     let content: Element<'a, Message> = row![
         text(label)
-            .size(if compact { 10 } else { 11 })
+            .size(if compact { 12 } else { 13 })
             .color(theme::CYAN)
             .width(if compact { 110 } else { 120 }),
         input
@@ -1838,9 +1976,9 @@ fn send_status(
 ) -> Element<'static, Message> {
     container(
         row![
-            text(label).size(10).color(theme::DIM),
+            text(label).size(12).color(theme::DIM),
             iced::widget::Space::new().width(Length::Fill),
-            text(value).size(11).color(color),
+            text(value).size(13).color(color),
         ]
         .align_y(Alignment::Center),
     )
@@ -1857,7 +1995,7 @@ fn form_line(
 ) -> Element<'static, Message> {
     container(
         row![
-            text(label).size(12).color(theme::CYAN).width(120),
+            text(label).size(13).color(theme::CYAN).width(120),
             text(value.into()).size(13).color(theme::TEXT),
         ]
         .align_y(Alignment::Center),

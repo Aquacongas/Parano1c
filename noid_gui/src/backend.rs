@@ -11,8 +11,8 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,7 +24,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sysinfo::System;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
 use crate::model::{
@@ -271,6 +271,11 @@ impl Backend {
                 custom_seeds: Vec::new(),
                 log_level: LogLevel::Info,
             })
+    }
+
+    pub async fn node_log_tail(&self, max_bytes: u64, max_lines: usize) -> Result<String, String> {
+        let log_path = self.config_snapshot()?.data_dir.join("paranoid-node.log");
+        read_node_log_tail(&log_path, max_bytes, max_lines).await
     }
 
     pub fn available_threads(&self) -> usize {
@@ -749,7 +754,7 @@ impl Backend {
             addresses,
             active_address,
             balance,
-            wallet_utxos,
+            mut wallet_utxos,
             mined_blocks,
         ) = tokio::try_join!(
             self.rpc::<ChainInfo>("getChainInfo", json!([])),
@@ -768,6 +773,7 @@ impl Backend {
                 json!([mining_page.max(1), MINED_BLOCK_PAGE_SIZE]),
             ),
         )?;
+        sort_wallet_utxos_newest_first(&mut wallet_utxos);
 
         let tip_header = self
             .rpc::<Option<BlockHeaderInfo>>("getBlockHeader", json!([chain.height]))
@@ -903,6 +909,8 @@ impl Backend {
                 // normalising sparse early states against their busiest cell.
                 occupancy: ((*live_count as f32 / state_map.bucket_capacity.max(1) as f32).sqrt())
                     .max(*live_count as f32 / max_bucket_live as f32),
+                live_count: *live_count,
+                capacity: state_map.bucket_capacity,
                 owned: owned_buckets.contains(&(bucket as u8)),
             })
             .collect();
@@ -1710,6 +1718,16 @@ fn average_block_time_window_start(height: u64) -> u64 {
     }
 }
 
+fn sort_wallet_utxos_newest_first(utxos: &mut [WalletUtxoInfo]) {
+    utxos.sort_unstable_by(|left, right| {
+        right
+            .confirmed_height
+            .cmp(&left.confirmed_height)
+            .then_with(|| right.creation_id.cmp(&left.creation_id))
+            .then_with(|| right.slot_index.cmp(&left.slot_index))
+    });
+}
+
 fn target_difficulty(target_hex: &str) -> f64 {
     let Ok(bytes) = hex::decode(target_hex) else {
         return 1.0;
@@ -2021,6 +2039,7 @@ struct WalletUtxoInfo {
     slot_index: u32,
     value_micronoid: u64,
     creation_id: u64,
+    confirmed_height: u64,
     #[serde(default)]
     reserved: bool,
 }
@@ -2605,6 +2624,55 @@ fn normalize_receipt_hex(text: &str) -> Result<String, String> {
     Ok(receipt.to_ascii_lowercase())
 }
 
+async fn read_node_log_tail(
+    path: &Path,
+    max_bytes: u64,
+    max_lines: usize,
+) -> Result<String, String> {
+    if max_bytes == 0 || max_lines == 0 {
+        return Ok(String::new());
+    }
+
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(String::new());
+        }
+        Err(error) => {
+            return Err(format!("open node log {}: {error}", path.display()));
+        }
+    };
+    let file_len = file
+        .metadata()
+        .await
+        .map_err(|error| format!("inspect node log {}: {error}", path.display()))?
+        .len();
+    let start = file_len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(start))
+        .await
+        .map_err(|error| format!("seek node log {}: {error}", path.display()))?;
+
+    let read_limit = file_len.saturating_sub(start).min(max_bytes);
+    let capacity = usize::try_from(read_limit)
+        .map_err(|_| "node log tail exceeds this platform's address space".to_string())?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(read_limit)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| format!("read node log {}: {error}", path.display()))?;
+
+    if start > 0 {
+        if let Some(first_line_end) = bytes.iter().position(|byte| *byte == b'\n') {
+            bytes.drain(..=first_line_end);
+        }
+    }
+
+    let decoded = String::from_utf8_lossy(&bytes);
+    let mut lines = decoded.lines().rev().take(max_lines).collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
+}
+
 fn mock_receipt_records() -> Vec<ReceiptSnapshot> {
     const SENDER: &str = "o1q9p2w4t8k3ux7c5n0r6dmzfae9hj2ls4v8y6c3b7n5q2wk0t9xp";
     const RECIPIENTS: [&str; 3] = [
@@ -2763,6 +2831,95 @@ mod tests {
         assert_eq!(average_block_time_window_start(2), 1);
         assert_eq!(average_block_time_window_start(11), 1);
         assert_eq!(average_block_time_window_start(12), 2);
+    }
+
+    #[test]
+    fn wallet_utxos_are_sorted_newest_first_without_snapshot_state() {
+        let mut utxos = vec![
+            WalletUtxoInfo {
+                slot_index: 10,
+                value_micronoid: 1,
+                creation_id: 100,
+                confirmed_height: 40,
+                reserved: false,
+            },
+            WalletUtxoInfo {
+                slot_index: 30,
+                value_micronoid: 1,
+                creation_id: 90,
+                confirmed_height: 42,
+                reserved: false,
+            },
+            WalletUtxoInfo {
+                slot_index: 20,
+                value_micronoid: 1,
+                creation_id: 110,
+                confirmed_height: 42,
+                reserved: false,
+            },
+        ];
+
+        sort_wallet_utxos_newest_first(&mut utxos);
+
+        assert_eq!(
+            utxos.iter().map(|utxo| utxo.slot_index).collect::<Vec<_>>(),
+            vec![20, 30, 10]
+        );
+    }
+
+    #[test]
+    fn wallet_utxo_sort_handles_thousands_locally() {
+        let mut utxos = (0..10_000u32)
+            .rev()
+            .map(|slot_index| WalletUtxoInfo {
+                slot_index,
+                value_micronoid: 1,
+                creation_id: u64::from(slot_index),
+                confirmed_height: u64::from(slot_index / 4),
+                reserved: false,
+            })
+            .collect::<Vec<_>>();
+
+        sort_wallet_utxos_newest_first(&mut utxos);
+
+        assert!(utxos.windows(2).all(|pair| {
+            pair[0].confirmed_height > pair[1].confirmed_height
+                || (pair[0].confirmed_height == pair[1].confirmed_height
+                    && pair[0].creation_id >= pair[1].creation_id)
+        }));
+    }
+
+    #[tokio::test]
+    async fn node_log_tail_reads_only_the_latest_complete_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("paranoid-node.log");
+        let contents = (0..120)
+            .map(|line| format!("node-log-line-{line:03}\n"))
+            .collect::<String>();
+        std::fs::write(&path, contents).unwrap();
+
+        let tail = read_node_log_tail(&path, 128, 5).await.unwrap();
+
+        assert_eq!(
+            tail,
+            [
+                "node-log-line-115",
+                "node-log-line-116",
+                "node-log-line-117",
+                "node-log-line-118",
+                "node-log-line-119",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_node_log_is_an_empty_waiting_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let tail = read_node_log_tail(&directory.path().join("missing.log"), 64 * 1024, 80)
+            .await
+            .unwrap();
+        assert!(tail.is_empty());
     }
 
     #[test]

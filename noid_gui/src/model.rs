@@ -6,6 +6,7 @@ pub const MINED_BLOCK_PAGE_SIZE: u32 = 8;
 pub const EXPLORER_PAGE_SIZE: u32 = 8;
 pub const EXPLORER_SLOT_PAGE_SIZE: usize = 8;
 pub const RECEIPT_PAGE_SIZE: u32 = 7;
+pub const UTXO_PAGE_SIZE: usize = 25;
 
 #[derive(Clone, Default)]
 pub struct SensitiveString(zeroize::Zeroizing<String>);
@@ -220,6 +221,8 @@ impl AddressSnapshot {
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentSnapshot {
     pub occupancy: f32,
+    pub live_count: u64,
+    pub capacity: u64,
     pub owned: bool,
 }
 
@@ -631,6 +634,8 @@ impl AppSnapshot {
             segments: vec![
                 SegmentSnapshot {
                     occupancy: 0.0,
+                    live_count: 0,
+                    capacity: 1 << 16,
                     owned: false,
                 };
                 256
@@ -663,12 +668,15 @@ impl AppSnapshot {
                 } else {
                     raw.powf(2.0) * 0.22
                 };
+                let occupancy = if matches!(index, 28 | 73 | 119 | 164 | 213) {
+                    occupancy.max(0.04)
+                } else {
+                    occupancy
+                };
                 SegmentSnapshot {
-                    occupancy: if matches!(index, 28 | 73 | 119 | 164 | 213) {
-                        occupancy.max(0.04)
-                    } else {
-                        occupancy
-                    },
+                    occupancy,
+                    live_count: (occupancy * (1u64 << 16) as f32).round() as u64,
+                    capacity: 1 << 16,
                     owned: matches!(index, 28 | 73 | 119 | 164 | 213),
                 }
             })
@@ -678,6 +686,7 @@ impl AppSnapshot {
         let base_value = PREVIEW_BALANCE_MICRONOID / PREVIEW_UTXO_COUNT as u64;
         let remainder = PREVIEW_BALANCE_MICRONOID % PREVIEW_UTXO_COUNT as u64;
         let utxos = (0..PREVIEW_UTXO_COUNT)
+            .rev()
             .map(|index| UtxoSnapshot {
                 slot_index: 73 + index as u32 * 73,
                 value_micronoid: base_value + u64::from((index as u64) < remainder),

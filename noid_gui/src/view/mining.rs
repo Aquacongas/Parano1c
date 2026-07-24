@@ -18,24 +18,11 @@ use crate::theme::{self, ButtonKind};
 use super::copy_value_button;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
-    let page_title = container(
-        container(text("MINING").size(13))
-            .padding([6, 9])
-            .style(theme::title_bar_proof),
-    )
-    .width(Length::Fill)
-    .style(theme::surface_alt);
-
     let controls: Element<'_, Message> = if compact {
         column![miner_status(app), miner_controls(app)]
             .spacing(10)
             .into()
     } else {
-        let control_height = if cfg!(feature = "dev-genesis") {
-            276.0
-        } else {
-            212.0
-        };
         row![
             miner_status(app)
                 .width(Length::FillPortion(7))
@@ -45,11 +32,11 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
                 .height(Length::Fill),
         ]
         .spacing(10)
-        .height(Length::Fixed(control_height))
+        .height(Length::Fixed(160.0))
         .into()
     };
 
-    let mut page = column![page_title, controls].spacing(10);
+    let mut page = column![controls].spacing(10);
     let matrix_error = match (&app.matrix_b64, &app.matrix_b255) {
         (MatrixCacheState::Failed(error), _) => Some(format!("B64: {error}")),
         (_, MatrixCacheState::Failed(error)) => Some(format!("B255: {error}")),
@@ -59,10 +46,10 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
         page = page.push(
             container(
                 row![
-                    text("MATRIX CACHE").size(11).color(theme::DANGER),
-                    text(error).size(11).color(theme::MUTED),
+                    text("MATRIX CACHE").size(13).color(theme::DANGER),
+                    text(error).size(13).color(theme::MUTED),
                     iced::widget::Space::new().width(Length::Fill),
-                    button(text("RETRY").size(10))
+                    button(text("RETRY").size(12))
                         .on_press(Message::PrepareMatrices)
                         .padding([5, 8])
                         .style(|_, status| theme::button(ButtonKind::Secondary, status)),
@@ -79,8 +66,8 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
         page = page.push(
             container(
                 column![
-                    text("NODE ERROR").size(11).color(theme::DANGER),
-                    text(error).size(12).color(theme::MUTED),
+                    text("NODE ERROR").size(13).color(theme::DANGER),
+                    text(error).size(13).color(theme::MUTED),
                 ]
                 .spacing(5),
             )
@@ -162,12 +149,12 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
     );
     let matrix_failed = matches!(app.matrix_b64, MatrixCacheState::Failed(_))
         || matches!(app.matrix_b255, MatrixCacheState::Failed(_));
-    let mut matrix_summary = row![text(matrix_status).size(10).color(matrix_color)]
+    let mut matrix_summary = row![text(matrix_status).size(12).color(matrix_color)]
         .spacing(4)
         .align_y(Alignment::Center);
     if matrix_failed {
         matrix_summary = matrix_summary.push(
-            button(text("RETRY").size(9))
+            button(text("RETRY").size(12))
                 .on_press(Message::PrepareMatrices)
                 .padding([2, 5])
                 .style(|_, status| theme::button(ButtonKind::Ghost, status)),
@@ -178,13 +165,13 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
         column![
             container(
                 row![
-                    text("INTERNAL MINER").size(12).color(theme::PROOF),
+                    text("INTERNAL MINER").size(13).color(theme::PROOF),
                     iced::widget::Space::new().width(Length::Fill),
-                    text(format!("[{status}]")).size(12).color(status_color),
+                    text(format!("[{status}]")).size(13).color(status_color),
                 ]
                 .align_y(Alignment::Center),
             )
-            .padding([7, 10])
+            .padding([5, 9])
             .style(theme::surface_alt),
             container(
                 column![
@@ -194,7 +181,7 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
                     ),
                     row![
                         text(&address.address)
-                            .size(14)
+                            .size(13)
                             .color(theme::TEXT)
                             .wrapping(text::Wrapping::WordOrGlyph),
                         copy_value_button(
@@ -223,15 +210,15 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
                         detail("TARGET", "15 s".into()),
                         iced::widget::Space::new().width(Length::Fill),
                         matrix_summary,
-                        text("·").size(10).color(theme::DIM),
-                        text(connection).size(10).color(theme::DIM),
+                        text("·").size(12).color(theme::DIM),
+                        text(connection).size(12).color(theme::DIM),
                     ]
                     .spacing(6)
                     .align_y(Alignment::Center),
                 ]
-                .spacing(10),
+                .spacing(7),
             )
-            .padding([14, 16]),
+            .padding([9, 12]),
         ]
         .spacing(0),
     )
@@ -241,11 +228,11 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
 
 fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
     let can_edit_threads = !app.snapshot.mining.enabled && !app.node_action_in_flight;
-    let mut decrement = button(text("−").size(18))
-        .padding([7, 12])
+    let mut decrement = button(text("−").size(17))
+        .padding([5, 10])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
-    let mut increment = button(text("+").size(18))
-        .padding([7, 12])
+    let mut increment = button(text("+").size(17))
+        .padding([5, 10])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if can_edit_threads && app.snapshot.mining.selected_threads > 1 {
         decrement = decrement.on_press(Message::AdjustMiningThreads(-1));
@@ -261,15 +248,15 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
         container(
             column![
                 text(app.snapshot.mining.selected_threads.to_string())
-                    .size(24)
+                    .size(22)
                     .color(if can_edit_threads {
                         theme::TEXT
                     } else {
                         theme::DIM
                     }),
-                text("CPU THREADS").size(9).color(theme::DIM),
+                text("CPU THREADS").size(12).color(theme::DIM),
             ]
-            .spacing(2)
+            .spacing(1)
             .align_x(Alignment::Center),
         )
         .width(Length::Fill)
@@ -285,30 +272,20 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
             let allowed = !app.snapshot.mining.enabled && !app.node_action_in_flight;
             let mut control = checkbox(app.genesis_enabled)
                 .label("Genesis mode")
-                .size(18)
-                .text_size(12)
-                .spacing(9);
+                .size(16)
+                .text_size(13)
+                .spacing(7);
             if allowed {
                 control = control.on_toggle(Message::ToggleGenesis);
             }
-            column![
-                control,
-                text("Allow this local chain to mine without peers.")
-                    .size(10)
-                    .color(if allowed { theme::MUTED } else { theme::DIM }),
-                text("TEMPORARY DEVELOPMENT CONTROL")
-                    .size(9)
-                    .color(theme::WARNING),
-            ]
-            .spacing(5)
-            .into()
+            control.into()
         }
         #[cfg(not(feature = "dev-genesis"))]
         {
             column![
-                text("NETWORK READINESS").size(10).color(theme::DIM),
+                text("NETWORK READINESS").size(12).color(theme::DIM),
                 text("Mining requires two authenticated peers.")
-                    .size(11)
+                    .size(13)
                     .color(theme::MUTED),
             ]
             .spacing(5)
@@ -335,7 +312,7 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
             .align_x(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding([11, 14])
+    .padding([9, 12])
     .style(move |_, status| {
         theme::button(
             if mining_enabled {
@@ -356,9 +333,9 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
 
     container(
         column![
-            container(text("MINER CONTROL").size(12).color(theme::CYAN)).padding([7, 10]),
-            container(column![thread_control, divider(), genesis_control, toggle].spacing(12),)
-                .padding([14, 16]),
+            container(text("MINER CONTROL").size(13).color(theme::CYAN)).padding([5, 9]),
+            container(column![thread_control, divider(), genesis_control, toggle].spacing(6),)
+                .padding([7, 12]),
         ]
         .spacing(0),
     )
@@ -370,9 +347,9 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
     let history = &app.snapshot.mined_blocks;
     let page_count = history.total_pages.max(1);
     let title = row![
-        text("MINED BLOCKS").size(12).color(theme::CYAN),
+        text("MINED BLOCKS").size(13).color(theme::CYAN),
         text(format!("[{}]", history.total))
-            .size(11)
+            .size(13)
             .color(theme::MUTED),
         iced::widget::Space::new().width(Length::Fill),
         legend("FULL BLOCK", theme::ACCENT),
@@ -390,7 +367,7 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
             table_cell("BLOCK".into(), 5, theme::INK),
             table_cell("AVAILABLE".into(), 3, theme::INK),
             text("OPEN")
-                .size(12)
+                .size(13)
                 .color(theme::INK)
                 .width(Length::Fixed(92.0)),
         ]
@@ -407,7 +384,7 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
                     .size(13)
                     .color(theme::MUTED),
                 text("Start the miner; accepted coinbase blocks will appear here.")
-                    .size(11)
+                    .size(13)
                     .color(theme::DIM),
             ]
             .spacing(5)
@@ -429,13 +406,13 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
             .into()
     };
 
-    let mut previous = button(text("← PREV").size(11))
+    let mut previous = button(text("← PREV").size(13))
         .padding([7, 11])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if app.mining_page > 1 {
         previous = previous.on_press(Message::PreviousMiningPage);
     }
-    let mut next = button(text("NEXT →").size(11))
+    let mut next = button(text("NEXT →").size(13))
         .padding([7, 11])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if app.mining_page < history.total_pages {
@@ -444,12 +421,12 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
     let footer = row![
         previous,
         text(format!("PAGE {} / {page_count}", app.mining_page))
-            .size(11)
+            .size(13)
             .color(theme::MUTED),
         next,
         iced::widget::Space::new().width(Length::Fill),
         text("FULL BLOCK DATA FOLLOWS THE NODE'S 18-BLOCK WINDOW")
-            .size(9)
+            .size(12)
             .color(theme::DIM),
     ]
     .spacing(10)
@@ -537,10 +514,10 @@ fn block_details<'a>(
     let title = row![
         text(format!("BLOCK #{}", header.height)).size(13),
         text(format!("[{}]", availability.0))
-            .size(11)
+            .size(13)
             .color(availability.1),
         iced::widget::Space::new().width(Length::Fill),
-        button(text("ESC CLOSE").size(12))
+        button(text("ESC CLOSE").size(13))
             .on_press(Message::CloseBlockDetails)
             .padding([6, 9])
             .style(|_, status| theme::button(ButtonKind::Ghost, status)),
@@ -630,7 +607,7 @@ fn block_details<'a>(
                 table_cell("OUT".into(), 2, theme::INK),
                 table_cell("FEE / μNOID".into(), 4, theme::INK),
                 text("OPEN")
-                    .size(12)
+                    .size(13)
                     .color(theme::INK)
                     .width(Length::Fixed(52.0)),
             ]
@@ -663,7 +640,7 @@ fn block_details<'a>(
                         table_cell(transaction.live_outputs.to_string(), 2, theme::TEXT),
                         table_cell(transaction.fee_micronoid.to_string(), 4, theme::WARNING),
                         text("VIEW →")
-                            .size(10)
+                            .size(12)
                             .color(theme::CYAN)
                             .width(Length::Fixed(52.0)),
                     ]
@@ -678,7 +655,7 @@ fn block_details<'a>(
         column![
             summary,
             sizes,
-            text("LOGICAL TRANSACTIONS").size(11).color(theme::DIM),
+            text("LOGICAL TRANSACTIONS").size(13).color(theme::DIM),
             tx_header,
             scrollable(tx_rows)
                 .height(Length::Fixed(210.0))
@@ -689,9 +666,9 @@ fn block_details<'a>(
     } else {
         container(
             column![
-                text("HEADER ONLY").size(12).color(theme::DIM),
+                text("HEADER ONLY").size(13).color(theme::DIM),
                 text("The canonical header remains available. Full block data is retained for 18 blocks; payment receipts prove older transactions.")
-                .size(12)
+                .size(13)
                 .color(theme::MUTED),
                 copyable_detail_line(
                     app,
@@ -758,10 +735,10 @@ fn transaction_details<'a>(
             "[BLOCK #{} · POSITION {}]",
             details.header.height, transaction.position
         ))
-        .size(11)
+        .size(13)
         .color(theme::CYAN),
         iced::widget::Space::new().width(Length::Fill),
-        button(text("← ESC BACK TO BLOCK").size(12))
+        button(text("← ESC BACK TO BLOCK").size(13))
             .on_press(Message::CloseBlockTransaction)
             .padding([6, 9])
             .style(|_, status| theme::button(ButtonKind::Ghost, status)),
@@ -770,11 +747,11 @@ fn transaction_details<'a>(
     .align_y(Alignment::Center);
 
     let txid = column![
-        text("LOGICAL TRANSACTION ID").size(9).color(theme::DIM),
+        text("LOGICAL TRANSACTION ID").size(12).color(theme::DIM),
         row![
             text_input("", &transaction.txid)
                 .on_input(|_| Message::Noop)
-                .size(11)
+                .size(14)
                 .padding([7, 9])
                 .width(Length::Fill)
                 .style(theme::text_input),
@@ -843,12 +820,12 @@ fn transaction_details<'a>(
 
     let flow = if transaction.coinbase {
         column![
-            text("PROTOCOL ISSUANCE").size(9).color(theme::DIM),
+            text("PROTOCOL ISSUANCE").size(12).color(theme::DIM),
             text(format!(
                 "{} ① minted to the block miner. Coinbase has no spend inputs.",
                 format_micronoid_string(&transaction.output_sum_micronoid)
             ))
-            .size(12)
+            .size(13)
             .color(theme::ACCENT),
         ]
         .spacing(4)
@@ -946,15 +923,15 @@ fn transaction_inputs(
             column![
                 container(
                     row![
-                        text("INPUT UTXOS").size(11).color(theme::CYAN),
-                        text("[0]").size(10).color(theme::MUTED),
+                        text("INPUT UTXOS").size(13).color(theme::CYAN),
+                        text("[0]").size(12).color(theme::MUTED),
                     ]
                     .spacing(7),
                 )
                 .padding([7, 9]),
                 container(
                     text("NO INPUTS · PROTOCOL ISSUANCE")
-                        .size(11)
+                        .size(13)
                         .color(theme::DIM)
                 )
                 .width(Length::Fill)
@@ -1001,9 +978,9 @@ fn transaction_inputs(
         column![
             container(
                 row![
-                    text("INPUT UTXOS").size(11).color(theme::CYAN),
+                    text("INPUT UTXOS").size(13).color(theme::CYAN),
                     text(format!("[{}]", transaction.inputs.len()))
-                        .size(10)
+                        .size(12)
                         .color(theme::MUTED),
                 ]
                 .spacing(7),
@@ -1040,7 +1017,7 @@ fn transaction_outputs<'a>(
                             crate::model::format_micronoid(output.amount_micronoid),
                             if change { " · CHANGE" } else { "" }
                         ))
-                        .size(11)
+                        .size(13)
                         .color(if change {
                             theme::MUTED
                         } else {
@@ -1061,9 +1038,9 @@ fn transaction_outputs<'a>(
         column![
             container(
                 row![
-                    text("OUTPUT UTXOS").size(11).color(theme::CYAN),
+                    text("OUTPUT UTXOS").size(13).color(theme::CYAN),
                     text(format!("[{}]", transaction.outputs.len()))
-                        .size(10)
+                        .size(12)
                         .color(theme::MUTED),
                 ]
                 .spacing(7),
@@ -1083,11 +1060,11 @@ fn transaction_page_hashes<'a>(
     let header = container(
         row![
             text("PAGE")
-                .size(11)
+                .size(13)
                 .color(theme::INK)
                 .width(Length::FillPortion(2)),
             text("TX8x2 BODY HASH")
-                .size(11)
+                .size(13)
                 .color(theme::INK)
                 .width(Length::FillPortion(12)),
         ]
@@ -1101,12 +1078,12 @@ fn transaction_page_hashes<'a>(
             container(
                 row![
                     text(index.to_string())
-                        .size(11)
+                        .size(13)
                         .color(theme::CYAN)
                         .width(Length::FillPortion(2)),
                     row![
                         text(hash)
-                            .size(11)
+                            .size(13)
                             .color(theme::MUTED)
                             .wrapping(text::Wrapping::WordOrGlyph),
                         copy_value_button(
@@ -1128,9 +1105,9 @@ fn transaction_page_hashes<'a>(
         column![
             container(
                 row![
-                    text("PHYSICAL TX8x2 PAGES").size(11).color(theme::CYAN),
+                    text("PHYSICAL TX8x2 PAGES").size(13).color(theme::CYAN),
                     text(format!("[{}]", transaction.page_hashes.len()))
-                        .size(10)
+                        .size(12)
                         .color(theme::MUTED),
                 ]
                 .spacing(7),
@@ -1156,7 +1133,7 @@ fn format_micronoid_string(value: &str) -> String {
 
 fn table_cell(value: String, portion: u16, color: iced::Color) -> Element<'static, Message> {
     text(value)
-        .size(12)
+        .size(13)
         .color(color)
         .wrapping(text::Wrapping::None)
         .width(Length::FillPortion(portion))
@@ -1170,8 +1147,8 @@ fn metric(
 ) -> iced::widget::Container<'static, Message> {
     container(
         column![
-            text(label).size(9).color(theme::DIM),
-            text(value).size(12).color(color),
+            text(label).size(12).color(theme::DIM),
+            text(value).size(13).color(color),
         ]
         .spacing(3),
     )
@@ -1188,10 +1165,10 @@ fn copyable_detail_line(
 ) -> Element<'static, Message> {
     let copied = app.copied_value.as_deref() == Some(value.as_str());
     column![
-        text(label).size(9).color(theme::DIM),
+        text(label).size(12).color(theme::DIM),
         row![
             text(value.clone())
-                .size(11)
+                .size(13)
                 .color(color)
                 .wrapping(text::Wrapping::WordOrGlyph),
             copy_value_button(&value, copied),
@@ -1207,8 +1184,8 @@ fn copyable_detail_line(
 
 fn legend(label: &'static str, color: iced::Color) -> Element<'static, Message> {
     row![
-        text("■").size(10).color(color),
-        text(label).size(9).color(theme::MUTED),
+        text("■").size(12).color(color),
+        text(label).size(12).color(theme::MUTED),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
@@ -1217,8 +1194,8 @@ fn legend(label: &'static str, color: iced::Color) -> Element<'static, Message> 
 
 fn detail(label: &'static str, value: String) -> Element<'static, Message> {
     row![
-        text(label).size(10).color(theme::DIM),
-        text(format!("[{value}]")).size(11).color(theme::CYAN),
+        text(label).size(12).color(theme::DIM),
+        text(format!("[{value}]")).size(13).color(theme::CYAN),
     ]
     .spacing(6)
     .align_y(Alignment::Center)

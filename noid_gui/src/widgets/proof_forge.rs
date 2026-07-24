@@ -13,7 +13,7 @@ const DESIGN_HEIGHT: f32 = 190.0;
 const CYCLE_SECONDS: f32 = 1.22;
 const IMPACT_PHASE: f32 = 0.58;
 const SPARK_END_PHASE: f32 = 0.88;
-const HAMMER_HEAD_ROTATION: f32 = 0.864;
+const HAMMER_HEAD_ROTATION: f32 = 1.158;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ProofForge {
@@ -88,16 +88,16 @@ fn forge_motion(elapsed_seconds: f32) -> ForgeMotion {
     let phase = (elapsed_seconds / CYCLE_SECONDS).rem_euclid(1.0);
     let (hammer_angle, swing_progress) = if phase < 0.25 {
         let progress = smoothstep(phase / 0.25);
-        (lerp(0.72, 0.78, progress), 0.0)
+        (lerp(0.48, 0.54, progress), 0.0)
     } else if phase < IMPACT_PHASE {
         let progress = (phase - 0.25) / (IMPACT_PHASE - 0.25);
-        (lerp(0.78, -0.025, progress * progress * progress), progress)
+        (lerp(0.54, -0.025, progress * progress * progress), progress)
     } else if phase < 0.70 {
         let progress = smoothstep((phase - IMPACT_PHASE) / (0.70 - IMPACT_PHASE));
         (lerp(-0.025, 0.16, progress), 0.0)
     } else {
         let progress = smoothstep((phase - 0.70) / 0.30);
-        (lerp(0.16, 0.72, progress), 0.0)
+        (lerp(0.16, 0.48, progress), 0.0)
     };
     let impact = if (IMPACT_PHASE..0.76).contains(&phase) {
         1.0 - smoothstep((phase - IMPACT_PHASE) / (0.76 - IMPACT_PHASE))
@@ -302,17 +302,17 @@ fn anvil_silhouette() -> canvas::Path {
 
 fn draw_hammer(frame: &mut canvas::Frame, angle: f32, opacity: f32, impact: f32) {
     frame.with_save(|frame| {
-        frame.translate(Vector::new(231.0, 31.0 + impact * 1.2));
+        frame.translate(Vector::new(234.0, 56.0 + impact * 1.2));
         frame.rotate(angle);
 
-        let handle_shadow = canvas::Path::line(Point::new(-3.0, 4.0), Point::new(-66.0, 57.0));
+        let handle_shadow = canvas::Path::line(Point::new(-3.0, 4.0), Point::new(-68.0, 32.0));
         frame.stroke(
             &handle_shadow,
             canvas::Stroke::default()
                 .with_width(12.0)
                 .with_color(Color::from_rgba8(5, 7, 13, 0.34 * opacity)),
         );
-        let handle = canvas::Path::line(Point::new(-4.0, 1.0), Point::new(-66.0, 54.0));
+        let handle = canvas::Path::line(Point::new(-4.0, 1.0), Point::new(-68.0, 29.0));
         frame.stroke(
             &handle,
             canvas::Stroke::default()
@@ -327,7 +327,7 @@ fn draw_hammer(frame: &mut canvas::Frame, angle: f32, opacity: f32, impact: f32)
         );
 
         frame.with_save(|frame| {
-            frame.translate(Vector::new(-72.0, 57.5));
+            frame.translate(Vector::new(-74.0, 32.5));
             frame.rotate(HAMMER_HEAD_ROTATION);
 
             let head_shadow = hammer_head(Vector::new(2.0, 3.0));
@@ -450,7 +450,7 @@ mod tests {
         let recovery = forge_motion(CYCLE_SECONDS * 0.78);
         let repeated = forge_motion(CYCLE_SECONDS);
 
-        assert!(raised.hammer_angle > 0.70);
+        assert!(raised.hammer_angle > 0.47);
         assert!(strike.hammer_angle.abs() < 0.03);
         assert_eq!(strike.impact, 1.0);
         assert!(strike.spark_progress.is_some());
@@ -460,9 +460,19 @@ mod tests {
 
     #[test]
     fn hammer_head_is_perpendicular_to_the_handle() {
-        let handle_axis = 53.0_f32.atan2(-62.0);
+        let handle_axis = 28.0_f32.atan2(-64.0);
         let angle = (handle_axis - HAMMER_HEAD_ROTATION).abs();
 
         assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 0.01);
+    }
+
+    #[test]
+    fn lowered_hammer_still_hits_the_ingot_center() {
+        let strike_angle = -0.025_f32;
+        let head_x = 234.0 - 74.0 * strike_angle.cos() - 32.5 * strike_angle.sin();
+        let head_y = 56.0 - 74.0 * strike_angle.sin() + 32.5 * strike_angle.cos();
+
+        assert!((head_x - 161.0).abs() < 1.0);
+        assert!((head_y - 90.0).abs() < 1.0);
     }
 }

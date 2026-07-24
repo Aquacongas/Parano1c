@@ -18,20 +18,12 @@ use crate::theme::{self, ButtonKind};
 use super::copy_value_button;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
-    let page_title = container(
-        container(text("PROOFS").size(13))
-            .padding([6, 9])
-            .style(theme::title_bar_proof),
-    )
-    .width(Length::Fill)
-    .style(theme::surface_alt);
-
     let tabs = proof_tabs(app);
     let body = match app.proofs_tab {
         ProofsTab::Mine => my_proofs(app, compact),
         ProofsTab::Verify => verify_proof(app, compact),
     };
-    let mut content = column![page_title, tabs].spacing(10);
+    let mut content = column![tabs].spacing(10);
     if let Some(error) = &app.receipt_error {
         content = content.push(error_panel(error));
     }
@@ -49,7 +41,7 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
 fn proof_tabs(app: &App) -> Element<'_, Message> {
     row![
         tab_button(
-            "MY PROOFS",
+            "MY RECEIPTS",
             ProofsTab::Mine,
             app.proofs_tab == ProofsTab::Mine,
         ),
@@ -65,7 +57,7 @@ fn proof_tabs(app: &App) -> Element<'_, Message> {
 }
 
 fn tab_button(label: &'static str, tab: ProofsTab, active: bool) -> Element<'static, Message> {
-    button(text(label).size(12))
+    button(text(label).size(13))
         .on_press(Message::SetProofsTab(tab))
         .padding([8, 13])
         .style(move |_, status| {
@@ -83,7 +75,7 @@ fn tab_button(label: &'static str, tab: ProofsTab, active: bool) -> Element<'sta
 
 fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
     if app.receipts_loading && app.receipts.receipts.is_empty() {
-        return loading_panel("READING DURABLE PAYMENT PROOFS");
+        return loading_panel("READING PAYMENT RECEIPTS");
     }
 
     let receipt_count = container(
@@ -91,7 +83,7 @@ fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
             text(grouped_usize(app.receipts.total))
                 .size(22)
                 .color(theme::TEXT),
-            text("SAVED PROOFS").size(9).color(theme::DIM),
+            text("SAVED RECEIPTS").size(12).color(theme::DIM),
         ]
         .spacing(2)
         .align_x(Alignment::End),
@@ -102,10 +94,10 @@ fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
         row![
             column![
                 text("THE BLOCK BODY MAY EXPIRE. THE RECEIPT DOES NOT.")
-                    .size(12)
+                    .size(13)
                     .color(theme::PROOF),
-                text("Saved automatically at confirmation, a receipt authenticates the exact payment and its inclusion in a canonical block. Copy it as text and send it to anyone who needs independent proof.")
-                    .size(11)
+                text("Saved locally at confirmation, a receipt proves the exact payment and its inclusion in a canonical block. Key import on another device does not restore receipts.")
+                    .size(13)
                     .color(theme::MUTED),
             ]
             .spacing(5)
@@ -124,11 +116,11 @@ fn my_proofs(app: &App, compact: bool) -> Element<'_, Message> {
             introduction,
             container(
                 column![
-                    text("NO PAYMENT PROOFS YET")
+                    text("NO PAYMENT RECEIPTS YET")
                         .size(13)
                         .color(theme::MUTED),
-                    text("A proof appears automatically when one of your sent transactions is confirmed.")
-                        .size(11)
+                    text("A receipt appears automatically when one of your sent transactions is confirmed.")
+                        .size(13)
                         .color(theme::DIM),
                 ]
                 .spacing(6)
@@ -173,7 +165,7 @@ fn receipt_list(app: &App) -> Element<'_, Message> {
         refresh = refresh.on_press(Message::RefreshReceipts);
     }
     let title = row![
-        text("SENT TRANSACTIONS").size(11).color(theme::CYAN),
+        text("SENT TRANSACTIONS").size(13).color(theme::CYAN),
         Space::new().width(Length::Fill),
         refresh,
     ]
@@ -226,21 +218,21 @@ fn receipt_row(
                     .color(theme::ACCENT),
                 Space::new().width(Length::Fill),
                 text(format!("BLOCK #{}", grouped(receipt.height)))
-                    .size(10)
+                    .size(12)
                     .color(theme::CYAN),
             ]
             .align_y(Alignment::Center),
             row![
-                text(format!("TO {peer}")).size(10).color(theme::PROOF),
+                text(format!("TO {peer}")).size(12).color(theme::PROOF),
                 Space::new().width(Length::Fill),
                 text(format_age(receipt.timestamp))
-                    .size(10)
+                    .size(12)
                     .color(theme::DIM),
             ]
             .align_y(Alignment::Center),
             row![
                 text(short_digest(&receipt.txid))
-                    .size(10)
+                    .size(12)
                     .color(theme::MUTED),
                 Space::new().width(Length::Fill),
                 text(format!(
@@ -252,7 +244,7 @@ fn receipt_row(
                     receipt.output_count,
                     format_bytes(receipt.receipt_bytes),
                 ))
-                .size(9)
+                .size(12)
                 .color(theme::DIM),
             ]
             .align_y(Alignment::Center),
@@ -271,7 +263,7 @@ fn local_receipt_detail(app: &App, compact: bool) -> Element<'_, Message> {
         return loading_panel("VERIFYING SELECTED RECEIPT");
     }
     let Some(detail) = &app.receipt_detail else {
-        return container(text("SELECT A PAYMENT PROOF").size(12).color(theme::DIM))
+        return container(text("SELECT A PAYMENT RECEIPT").size(13).color(theme::DIM))
             .width(Length::Fill)
             .height(Length::Fixed(180.0))
             .align_x(Alignment::Center)
@@ -281,15 +273,15 @@ fn local_receipt_detail(app: &App, compact: bool) -> Element<'_, Message> {
     };
 
     let copied = app.copied_value.as_deref() == Some(detail.receipt_hex.as_str());
-    let copy = button(text(if copied { "COPIED" } else { "COPY PROOF" }).size(11))
+    let copy = button(text(if copied { "COPIED" } else { "COPY RECEIPT" }).size(13))
         .on_press(Message::CopyValue(detail.receipt_hex.clone()))
         .padding([7, 11])
         .style(|_, status| theme::button(ButtonKind::Primary, status));
     let header = row![
-        text("SELECTED PROOF").size(11).color(theme::PROOF),
+        text("SELECTED RECEIPT").size(13).color(theme::PROOF),
         Space::new().width(Length::Fill),
         text(format!("{} BYTES", detail.receipt_hex.len() / 2))
-            .size(9)
+            .size(12)
             .color(theme::DIM),
         copy,
     ]
@@ -312,12 +304,12 @@ fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
     let input = text_editor(&app.receipt_editor)
         .placeholder("Paste receipt hex")
         .on_action(Message::EditReceipt)
-        .size(12)
+        .size(14)
         .padding([9, 11])
         .height(if compact { 92 } else { 108 })
         .wrapping(iced::widget::text::Wrapping::Glyph)
         .style(theme::text_editor);
-    let paste = button(text("PASTE").size(11))
+    let paste = button(text("PASTE").size(13))
         .on_press(Message::PasteReceipt)
         .padding([10, 13])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
@@ -331,7 +323,7 @@ fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
     if !app.receipt_verifying {
         verify = verify.on_press(Message::VerifyReceipt);
     }
-    let clear = button(text("CLEAR").size(11))
+    let clear = button(text("CLEAR").size(13))
         .on_press(Message::ClearReceiptVerifier)
         .padding([10, 12])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
@@ -347,16 +339,16 @@ fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
     let entry = container(
         column![
             row![
-                text("VERIFY A PAYMENT").size(12).color(theme::PROOF),
+                text("VERIFY A PAYMENT").size(13).color(theme::PROOF),
                 Space::new().width(Length::Fill),
                 text("WHITESPACE IS IGNORED")
-                    .size(9)
+                    .size(12)
                     .color(theme::DIM),
             ]
             .align_y(Alignment::Center),
             controls,
             text("Verification checks the receipt against the network's canonical headers. The receipt stays local.")
-                .size(10)
+                .size(12)
                 .color(theme::MUTED),
         ]
         .spacing(8),
@@ -366,7 +358,7 @@ fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
     .style(theme::surface);
 
     let result: Element<'_, Message> = if app.receipt_verifying {
-        loading_panel("CHECKING PROOF AND CANONICAL HEADER")
+        loading_panel("CHECKING RECEIPT AND CANONICAL HEADER")
     } else if let Some(verification) = &app.receipt_verification {
         container(verification_result(app, verification, compact))
             .width(Length::Fill)
@@ -379,7 +371,7 @@ fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
                     .size(13)
                     .color(theme::CYAN),
                 text("The result authenticates the transaction, outputs, fee, block position and canonical-chain membership.")
-                    .size(11)
+                    .size(13)
                     .color(theme::DIM),
             ]
             .spacing(6)
@@ -404,9 +396,9 @@ fn verification_result<'a>(
     let (verdict, verdict_color) = if verification.confirmed {
         ("VALID · CANONICAL", theme::ACCENT)
     } else if verification.merkle_valid {
-        ("PROOF VALID · NOT CANONICAL", theme::WARNING)
+        ("RECEIPT VALID · NOT CANONICAL", theme::WARNING)
     } else {
-        ("INVALID PROOF", theme::DANGER)
+        ("INVALID RECEIPT", theme::DANGER)
     };
     let status = container(
         row![
@@ -427,7 +419,7 @@ fn verification_result<'a>(
 
     let mut content = column![status].spacing(9);
     if let Some(error) = &verification.error {
-        content = content.push(text(error).size(11).color(theme::DANGER));
+        content = content.push(text(error).size(13).color(theme::DANGER));
     }
     if let Some(summary) = &verification.authenticated_summary {
         content = content.push(authenticated_payment(app, summary, compact));
@@ -435,7 +427,7 @@ fn verification_result<'a>(
         content = content.push(
             container(
                 text("No payment fields are trusted because the Merkle proof did not verify.")
-                    .size(11)
+                    .size(13)
                     .color(theme::DIM),
             )
             .padding([12, 4]),
@@ -510,10 +502,10 @@ fn authenticated_payment<'a>(
 
     column![
         row![
-            text("AUTHENTICATED PAYMENT").size(11).color(theme::PROOF),
+            text("AUTHENTICATED PAYMENT").size(13).color(theme::PROOF),
             Space::new().width(Length::Fill),
             text(format!("UNIX {}", summary.confirmed_unix))
-                .size(9)
+                .size(12)
                 .color(theme::DIM),
         ]
         .align_y(Alignment::Center),
@@ -533,10 +525,10 @@ fn receipt_inputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Elem
             container(
                 row![
                     text(format!("SLOT {}", grouped(u64::from(input.slot_index))))
-                        .size(10)
+                        .size(12)
                         .color(theme::CYAN),
                     text(short_address(&input.owner))
-                        .size(10)
+                        .size(12)
                         .color(theme::MUTED),
                     copy_value_button(
                         &input.owner,
@@ -555,9 +547,9 @@ fn receipt_inputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Elem
         column![
             container(
                 row![
-                    text("INPUT OWNERSHIP").size(10).color(theme::CYAN),
+                    text("INPUT OWNERSHIP").size(12).color(theme::CYAN),
                     text(format!("[{}]", summary.inputs.len()))
-                        .size(9)
+                        .size(12)
                         .color(theme::DIM),
                 ]
                 .spacing(6),
@@ -582,7 +574,7 @@ fn receipt_outputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Ele
                 column![
                     row![
                         text(format!("SLOT {}", grouped(u64::from(output.slot_index))))
-                            .size(10)
+                            .size(12)
                             .color(theme::CYAN),
                         Space::new().width(Length::Fill),
                         text(format!(
@@ -590,7 +582,7 @@ fn receipt_outputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Ele
                             format_micronoid(output.amount_micronoid),
                             if change { " · CHANGE" } else { "" }
                         ))
-                        .size(11)
+                        .size(13)
                         .color(if change {
                             theme::MUTED
                         } else {
@@ -600,7 +592,7 @@ fn receipt_outputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Ele
                     .align_y(Alignment::Center),
                     row![
                         text(short_address(&output.owner))
-                            .size(10)
+                            .size(12)
                             .color(theme::PROOF),
                         copy_value_button(
                             &output.owner,
@@ -621,9 +613,9 @@ fn receipt_outputs<'a>(app: &'a App, summary: &'a ReceiptSummarySnapshot) -> Ele
         column![
             container(
                 row![
-                    text("AUTHENTICATED OUTPUTS").size(10).color(theme::CYAN),
+                    text("AUTHENTICATED OUTPUTS").size(12).color(theme::CYAN),
                     text(format!("[{}]", summary.outputs.len()))
-                        .size(9)
+                        .size(12)
                         .color(theme::DIM),
                 ]
                 .spacing(6),
@@ -645,11 +637,11 @@ fn copyable_line<'a>(
     color: iced::Color,
 ) -> Element<'a, Message> {
     column![
-        text(label).size(9).color(theme::DIM),
+        text(label).size(12).color(theme::DIM),
         row![
             text_input("", value)
                 .on_input(|_| Message::Noop)
-                .size(11)
+                .size(14)
                 .padding([7, 9])
                 .width(Length::Fill)
                 .style(theme::text_input),
@@ -667,7 +659,7 @@ fn copyable_line<'a>(
 
 fn proof_check(label: &'static str, valid: bool) -> Element<'static, Message> {
     text(format!("{label} [{}]", if valid { "OK" } else { "NO" }))
-        .size(10)
+        .size(12)
         .color(if valid { theme::ACCENT } else { theme::DANGER })
         .into()
 }
@@ -675,7 +667,7 @@ fn proof_check(label: &'static str, valid: bool) -> Element<'static, Message> {
 fn metric(label: &'static str, value: String, color: iced::Color) -> Element<'static, Message> {
     container(
         column![
-            text(label).size(9).color(theme::DIM),
+            text(label).size(12).color(theme::DIM),
             text(value).size(13).color(color),
         ]
         .spacing(3),
@@ -687,7 +679,7 @@ fn metric(label: &'static str, value: String, color: iced::Color) -> Element<'st
 }
 
 fn loading_panel(label: &'static str) -> Element<'static, Message> {
-    container(text(label).size(12).color(theme::CYAN))
+    container(text(label).size(13).color(theme::CYAN))
         .width(Length::Fill)
         .height(Length::Fixed(170.0))
         .align_x(Alignment::Center)
@@ -699,8 +691,8 @@ fn loading_panel(label: &'static str) -> Element<'static, Message> {
 fn error_panel(error: &str) -> Element<'_, Message> {
     container(
         row![
-            text("PROOF ERROR").size(11).color(theme::DANGER),
-            text(error).size(11).color(theme::MUTED),
+            text("RECEIPT ERROR").size(13).color(theme::DANGER),
+            text(error).size(13).color(theme::MUTED),
         ]
         .spacing(10)
         .align_y(Alignment::Center),
@@ -719,13 +711,13 @@ fn pagination(
 ) -> Element<'static, Message> {
     let total_pages = total_pages.max(1);
     let page = page.max(1).min(total_pages);
-    let mut previous = button(text("← PREV").size(10))
+    let mut previous = button(text("← PREV").size(12))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if page > 1 {
         previous = previous.on_press(previous_message);
     }
-    let mut next = button(text("NEXT →").size(10))
+    let mut next = button(text("NEXT →").size(12))
         .padding([6, 9])
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if page < total_pages {
@@ -734,7 +726,7 @@ fn pagination(
     row![
         previous,
         text(format!("PAGE {page} / {total_pages}"))
-            .size(10)
+            .size(12)
             .color(theme::MUTED),
         next,
     ]

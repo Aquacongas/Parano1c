@@ -14,23 +14,32 @@ use crate::model::{
     AppSnapshot, BlockDetailsSnapshot, ExplorerSearchResultSnapshot, ExplorerSnapshot, LogLevel,
     MatrixCacheState, MatrixClass, NodeSettingsSnapshot, ProofsTab, ReceiptDetailSnapshot,
     ReceiptVerificationSnapshot, ReceiptsSnapshot, SecretImportMode, Section, SensitiveString,
-    SettingsTab, EXPLORER_SLOT_PAGE_SIZE, WALLET_CONSOLIDATION_INPUT_LIMIT,
+    SettingsTab, EXPLORER_SLOT_PAGE_SIZE, UTXO_PAGE_SIZE, WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use crate::secret::PreparedPhoto;
 use crate::view;
 
 pub const BLOCK_DETAILS_SCROLL_ID: &str = "block-details-scroll";
 pub const TRANSACTION_DETAILS_SCROLL_ID: &str = "transaction-details-scroll";
+pub const NODE_LOG_LINE_LIMIT: usize = 80;
 
 const PHOTO_SCAN_FRAME: Duration = Duration::from_millis(16);
 const PROOF_FORGE_FRAME: Duration = Duration::from_millis(16);
 const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(16);
+const NODE_LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const NODE_LOG_BYTE_LIMIT: u64 = 64 * 1024;
 const PHOTO_SCAN_COMPLETE_HOLD: Duration = Duration::from_millis(160);
 const PHOTO_SCAN_SPEED: f32 = 0.58;
 const PHOTO_SCAN_CRAWL_SPEED: f32 = 0.025;
 const PHOTO_SCAN_WAIT_THRESHOLD: f32 = 0.88;
 const PHOTO_SCAN_WAIT_LIMIT: f32 = 0.975;
 const PHOTO_SCAN_RESPONSE: f32 = 9.0;
+
+fn node_log_content(contents: &str) -> text_editor::Content {
+    let mut content = text_editor::Content::with_text(contents);
+    content.perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+    content
+}
 
 #[derive(Debug)]
 pub struct App {
@@ -88,6 +97,8 @@ pub struct App {
     pub editing_address: Option<u32>,
     pub edit_label: String,
     pub selected_utxo_slot: Option<u32>,
+    pub utxo_segment_filter: Option<u8>,
+    pub utxo_page: usize,
     pub node_settings: NodeSettingsSnapshot,
     pub settings_tab: SettingsTab,
     pub settings_data_dir: String,
@@ -95,6 +106,12 @@ pub struct App {
     pub settings_seeds: text_editor::Content,
     pub settings_log_level: LogLevel,
     pub settings_applying: bool,
+    pub node_log: text_editor::Content,
+    pub node_log_loading: bool,
+    pub node_log_error: Option<String>,
+    pub node_log_paused: bool,
+    node_log_last_refresh: Option<Instant>,
+    node_log_request_id: u64,
     pub wallet_setup_required: bool,
     pub wallet_setup_mode: WalletSetupMode,
     pub secret_action_in_flight: bool,
@@ -187,6 +204,8 @@ pub enum Message {
     CopyAddress(u32),
     SelectUtxo(u32),
     SelectSegment(u8),
+    PreviousUtxoPage,
+    NextUtxoPage,
     BeginEditAddress(u32),
     EditAddressLabel(String),
     SaveAddressLabel,
@@ -247,6 +266,9 @@ pub enum Message {
     SettingsP2pListenChanged(String),
     EditSettingsSeeds(text_editor::Action),
     SetSettingsLogLevel(LogLevel),
+    EditNodeLog(text_editor::Action),
+    RefreshNodeLog,
+    NodeLogLoaded(u64, Result<String, String>),
     ApplySettings,
     SettingsApplied(Result<(), String>),
     ResetSettings,
@@ -285,7 +307,6 @@ impl App {
         } else {
             AppSnapshot::offline(backend.available_threads())
         };
-        let selected_utxo_slot = snapshot.utxos.first().map(|utxo| utxo.slot_index);
         let node_settings = backend.settings_snapshot();
         let settings_data_dir = node_settings.data_dir.clone();
         let settings_p2p_listen = node_settings.p2p_listen.clone();
@@ -352,7 +373,9 @@ impl App {
             copied_address: None,
             editing_address: None,
             edit_label: String::new(),
-            selected_utxo_slot,
+            selected_utxo_slot: None,
+            utxo_segment_filter: None,
+            utxo_page: 1,
             node_settings,
             settings_tab: SettingsTab::Secret,
             settings_data_dir,
@@ -360,6 +383,12 @@ impl App {
             settings_seeds,
             settings_log_level,
             settings_applying: false,
+            node_log: text_editor::Content::new(),
+            node_log_loading: false,
+            node_log_error: None,
+            node_log_paused: false,
+            node_log_last_refresh: None,
+            node_log_request_id: 0,
             wallet_setup_required,
             wallet_setup_mode: WalletSetupMode::Choose,
             secret_action_in_flight: false,
@@ -443,6 +472,10 @@ impl App {
                 if section == Section::Proofs {
                     return self.refresh_receipts_view();
                 }
+                if section == Section::Settings && self.settings_tab == SettingsTab::Node {
+                    self.resume_node_log();
+                    return self.refresh_node_log();
+                }
             }
             Message::ToggleAddressPicker => {
                 if self.wallet_action_in_flight()
@@ -478,6 +511,8 @@ impl App {
                     self.address_picker_open = false;
                     self.copied_address = None;
                     self.selected_utxo_slot = None;
+                    self.utxo_segment_filter = None;
+                    self.utxo_page = 1;
                 } else {
                     self.address_operation = Some(AddressOperation::Activate(key_index));
                     let backend = self.backend.clone();
@@ -707,25 +742,29 @@ impl App {
                 }
             }
             Message::SelectSegment(segment) => {
-                let matches = self
+                let owned = self
                     .snapshot
                     .utxos
                     .iter()
-                    .filter(|utxo| utxo.segment == segment)
-                    .map(|utxo| utxo.slot_index)
-                    .collect::<Vec<_>>();
-                self.selected_utxo_slot = if matches.is_empty() {
-                    None
-                } else if let Some(current) = self.selected_utxo_slot {
-                    let next = matches
-                        .iter()
-                        .position(|slot| *slot == current)
-                        .map(|position| (position + 1) % matches.len())
-                        .unwrap_or(0);
-                    Some(matches[next])
-                } else {
-                    Some(matches[0])
-                };
+                    .any(|utxo| utxo.segment == segment);
+                if owned {
+                    self.utxo_segment_filter =
+                        (self.utxo_segment_filter != Some(segment)).then_some(segment);
+                    self.selected_utxo_slot = None;
+                    self.utxo_page = 1;
+                }
+            }
+            Message::PreviousUtxoPage => {
+                if self.utxo_page > 1 {
+                    self.utxo_page -= 1;
+                    self.selected_utxo_slot = None;
+                }
+            }
+            Message::NextUtxoPage => {
+                if self.utxo_page < self.utxo_page_count() {
+                    self.utxo_page += 1;
+                    self.selected_utxo_slot = None;
+                }
             }
             Message::BeginEditAddress(key_index) => {
                 if let Some(address) = self
@@ -806,17 +845,27 @@ impl App {
                 }
             }
             Message::RefreshTick => {
-                if !self.backend.is_mock()
+                let refresh_snapshot = !self.backend.is_mock()
                     && !self.wallet_setup_required
                     && !self.refresh_in_flight
                     && !self.ensure_in_flight
                     && !self.node_action_in_flight
                     && !self.wallet_action_in_flight()
                     && self.address_operation.is_none()
-                    && !self.shutting_down
-                {
-                    return self.refresh_snapshot();
-                }
+                    && !self.shutting_down;
+                let refresh_node_log = self.node_log_refresh_due();
+                return Task::batch([
+                    if refresh_snapshot {
+                        self.refresh_snapshot()
+                    } else {
+                        Task::none()
+                    },
+                    if refresh_node_log {
+                        self.refresh_node_log()
+                    } else {
+                        Task::none()
+                    },
+                ]);
             }
             Message::SnapshotLoaded(result) => {
                 self.refresh_in_flight = false;
@@ -833,11 +882,21 @@ impl App {
                                 .iter()
                                 .any(|utxo| utxo.slot_index == slot)
                         });
+                        let filter_still_exists = self.utxo_segment_filter.is_some_and(|segment| {
+                            live.snapshot
+                                .utxos
+                                .iter()
+                                .any(|utxo| utxo.segment == segment)
+                        });
                         self.snapshot = live.snapshot;
                         if !selected_still_exists {
-                            self.selected_utxo_slot =
-                                self.snapshot.utxos.first().map(|utxo| utxo.slot_index);
+                            self.selected_utxo_slot = None;
                         }
+                        if !filter_still_exists {
+                            self.utxo_segment_filter = None;
+                            self.utxo_page = 1;
+                        }
+                        self.utxo_page = self.utxo_page.min(self.utxo_page_count());
                         self.backend_state = BackendState::Online;
                         self.backend_error = None;
                         self.consecutive_refresh_failures = 0;
@@ -911,6 +970,8 @@ impl App {
                         self.address_picker_open = false;
                         self.copied_address = None;
                         self.selected_utxo_slot = None;
+                        self.utxo_segment_filter = None;
+                        self.utxo_page = 1;
                         return self.refresh_snapshot();
                     }
                     Err(error) => self.address_error = Some(error),
@@ -1430,6 +1491,10 @@ impl App {
                     self.settings_tab = tab;
                     self.settings_notice = None;
                     self.settings_error = None;
+                    if tab == SettingsTab::Node {
+                        self.resume_node_log();
+                        return self.refresh_node_log();
+                    }
                 }
             }
             Message::SettingsDataDirectoryChanged(path) => {
@@ -1487,6 +1552,38 @@ impl App {
                     self.settings_error = None;
                 }
             }
+            Message::EditNodeLog(action) => {
+                if !action.is_edit() {
+                    self.node_log_paused = true;
+                    self.node_log.perform(action);
+                }
+            }
+            Message::RefreshNodeLog => {
+                if self.node_log_visible() && !self.node_log_loading {
+                    self.resume_node_log();
+                    return self.refresh_node_log();
+                }
+            }
+            Message::NodeLogLoaded(request_id, result) => {
+                if request_id != self.node_log_request_id {
+                    return Task::none();
+                }
+                self.node_log_loading = false;
+                match result {
+                    Ok(contents) => {
+                        self.node_log_error = None;
+                        if !self.node_log_paused
+                            && self.node_log.selection().is_none()
+                            && self.node_log.text() != contents
+                        {
+                            self.node_log = node_log_content(&contents);
+                        }
+                    }
+                    Err(error) => {
+                        self.node_log_error = Some(error);
+                    }
+                }
+            }
             Message::ApplySettings => {
                 if self.settings_applying || self.secret_action_in_flight || !self.settings_dirty()
                 {
@@ -1514,11 +1611,18 @@ impl App {
                         self.backend_state = BackendState::Online;
                         if data_dir_changed {
                             self.reset_wallet_views();
+                            self.node_log_request_id = self.node_log_request_id.wrapping_add(1);
+                            self.node_log_loading = false;
+                            self.node_log = text_editor::Content::new();
+                            self.node_log_error = None;
+                            self.node_log_paused = false;
+                            self.node_log_last_refresh = None;
                             self.matrix_b64 = MatrixCacheState::Pending;
                             self.matrix_b255 = MatrixCacheState::Pending;
                             return Task::batch([
                                 self.refresh_snapshot(),
                                 self.begin_matrix_preparation(),
+                                self.refresh_node_log(),
                             ]);
                         }
                         return self.refresh_snapshot();
@@ -2042,6 +2146,21 @@ impl App {
         self.snapshot.active_address().spendable_utxo_count() >= WALLET_CONSOLIDATION_INPUT_LIMIT
     }
 
+    pub fn visible_utxo_count(&self) -> usize {
+        self.snapshot
+            .utxos
+            .iter()
+            .filter(|utxo| {
+                self.utxo_segment_filter
+                    .is_none_or(|segment| utxo.segment == segment)
+            })
+            .count()
+    }
+
+    pub fn utxo_page_count(&self) -> usize {
+        utxo_page_count_for(self.visible_utxo_count())
+    }
+
     pub fn consolidation_pulse(&self) -> f32 {
         0.5 + 0.5 * self.consolidation_pulse_phase.sin()
     }
@@ -2143,6 +2262,8 @@ impl App {
             };
         }
         self.selected_utxo_slot = None;
+        self.utxo_segment_filter = None;
+        self.utxo_page = 1;
         self.copied_address = None;
         self.copied_value = None;
         self.mining_page = 1;
@@ -2162,6 +2283,47 @@ impl App {
         self.consolidation_badge_hovered = false;
         self.consolidation_card_hovered = false;
         self.consolidation_hint_close_ticks = 0;
+    }
+
+    fn node_log_visible(&self) -> bool {
+        !self.wallet_setup_required
+            && self.section == Section::Settings
+            && self.settings_tab == SettingsTab::Node
+    }
+
+    fn resume_node_log(&mut self) {
+        self.node_log = node_log_content(&self.node_log.text());
+        self.node_log_paused = false;
+        self.node_log_last_refresh = None;
+    }
+
+    fn node_log_refresh_due(&self) -> bool {
+        self.node_log_visible()
+            && !self.node_log_loading
+            && !self.node_log_paused
+            && self.node_log.selection().is_none()
+            && self
+                .node_log_last_refresh
+                .is_none_or(|refreshed| refreshed.elapsed() >= NODE_LOG_REFRESH_INTERVAL)
+    }
+
+    fn refresh_node_log(&mut self) -> Task<Message> {
+        if !self.node_log_visible() || self.node_log_loading {
+            return Task::none();
+        }
+        self.node_log_loading = true;
+        self.node_log_last_refresh = Some(Instant::now());
+        self.node_log_request_id = self.node_log_request_id.wrapping_add(1);
+        let request_id = self.node_log_request_id;
+        let backend = self.backend.clone();
+        Task::perform(
+            async move {
+                backend
+                    .node_log_tail(NODE_LOG_BYTE_LIMIT, NODE_LOG_LINE_LIMIT)
+                    .await
+            },
+            move |result| Message::NodeLogLoaded(request_id, result),
+        )
     }
 
     fn refresh_snapshot(&mut self) -> Task<Message> {
@@ -2308,9 +2470,13 @@ fn parse_noid_amount(input: &str) -> Result<u64, String> {
     Ok(amount)
 }
 
+fn utxo_page_count_for(output_count: usize) -> usize {
+    output_count.div_ceil(UTXO_PAGE_SIZE).max(1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_noid_amount;
+    use super::{parse_noid_amount, utxo_page_count_for};
 
     #[test]
     fn parses_noid_without_floating_point() {
@@ -2320,5 +2486,13 @@ mod tests {
         assert!(parse_noid_amount("0").is_err());
         assert!(parse_noid_amount("1.0000001").is_err());
         assert!(parse_noid_amount("1.2.3").is_err());
+    }
+
+    #[test]
+    fn utxo_pagination_handles_empty_boundaries_and_thousands() {
+        assert_eq!(utxo_page_count_for(0), 1);
+        assert_eq!(utxo_page_count_for(25), 1);
+        assert_eq!(utxo_page_count_for(26), 2);
+        assert_eq!(utxo_page_count_for(10_000), 400);
     }
 }

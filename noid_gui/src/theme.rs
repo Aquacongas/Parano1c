@@ -24,8 +24,14 @@ pub const WARNING: Color = Color::from_rgb8(231, 218, 61);
 pub const ADVISORY: Color = Color::from_rgb8(255, 176, 74);
 pub const DANGER: Color = Color::from_rgb8(255, 107, 119);
 pub const INK: Color = Color::from_rgb8(31, 33, 43);
+pub const TECH_FONT: Font = Font {
+    family: font::Family::Name("Noto Sans Mono"),
+    weight: font::Weight::Normal,
+    stretch: font::Stretch::Normal,
+    style: font::Style::Normal,
+};
 pub const BRAND_FONT: Font = Font {
-    family: font::Family::Monospace,
+    family: font::Family::Name("Noto Sans"),
     weight: font::Weight::Bold,
     stretch: font::Stretch::Normal,
     style: font::Style::Normal,
@@ -89,6 +95,20 @@ pub fn surface_alt(_: &Theme) -> container::Style {
             radius: Radius::from(6.0),
         },
         shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+pub fn node_log_panel(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(TEXT),
+        background: Some(Background::Color(SURFACE)),
+        border: Border {
+            color: Color { a: 0.42, ..CYAN },
+            width: 1.0,
+            radius: Radius::from(8.0),
+        },
+        shadow: soft_shadow(),
         snap: true,
     }
 }
@@ -250,6 +270,10 @@ pub fn title_bar_proof(_: &Theme) -> container::Style {
     title_style(PROOF)
 }
 
+pub fn title_bar_accent(_: &Theme) -> container::Style {
+    title_style(ACCENT)
+}
+
 pub fn table_header(_: &Theme) -> container::Style {
     container::Style {
         border: Border {
@@ -257,6 +281,34 @@ pub fn table_header(_: &Theme) -> container::Style {
             ..Border::default()
         },
         ..title_style(ACCENT)
+    }
+}
+
+pub fn utxo_table_header(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(MUTED),
+        background: Some(Background::Color(SURFACE_ALT)),
+        border: Border {
+            color: Color { a: 0.50, ..CYAN },
+            width: 1.0,
+            radius: Radius::from(3.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+pub fn scope_table_header(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(MUTED),
+        background: Some(Background::Color(SURFACE_ALT)),
+        border: Border {
+            color: Color::from_rgba8(206, 88, 214, 0.34),
+            width: 1.0,
+            radius: Radius::from(3.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
     }
 }
 
@@ -494,6 +546,33 @@ pub fn text_input(_: &Theme, status: input_widget::Status) -> input_widget::Styl
     }
 }
 
+pub fn scope_search_input(_: &Theme, status: input_widget::Status) -> input_widget::Style {
+    let focused = matches!(status, input_widget::Status::Focused { .. });
+    let hovered = matches!(status, input_widget::Status::Hovered);
+
+    input_widget::Style {
+        background: Background::Color(SURFACE),
+        border: Border {
+            color: Color {
+                a: if focused {
+                    1.0
+                } else if hovered {
+                    0.82
+                } else {
+                    0.64
+                },
+                ..ACCENT
+            },
+            width: if focused { 2.0 } else { 1.5 },
+            radius: Radius::from(6.0),
+        },
+        icon: ACCENT,
+        placeholder: MUTED,
+        value: TEXT,
+        selection: Color::from_rgba8(52, 224, 111, 0.28),
+    }
+}
+
 pub fn text_editor(_: &Theme, status: editor_widget::Status) -> editor_widget::Style {
     let focused = matches!(status, editor_widget::Status::Focused { .. });
     let hovered = matches!(status, editor_widget::Status::Hovered);
@@ -514,6 +593,29 @@ pub fn text_editor(_: &Theme, status: editor_widget::Status) -> editor_widget::S
         placeholder: DIM,
         value: TEXT,
         selection: Color::from_rgba8(103, 215, 246, 0.28),
+    }
+}
+
+pub fn node_log_editor(_: &Theme, status: editor_widget::Status) -> editor_widget::Style {
+    let focused = matches!(status, editor_widget::Status::Focused { .. });
+    let hovered = matches!(status, editor_widget::Status::Hovered);
+
+    editor_widget::Style {
+        background: Background::Color(Color::from_rgb8(18, 20, 27)),
+        border: Border {
+            color: if focused {
+                ACCENT
+            } else if hovered {
+                Color { a: 0.72, ..CYAN }
+            } else {
+                Color { a: 0.34, ..CYAN }
+            },
+            width: if focused { 1.5 } else { 1.0 },
+            radius: Radius::from(5.0),
+        },
+        placeholder: DIM,
+        value: Color::from_rgb8(196, 228, 207),
+        selection: Color::from_rgba8(103, 215, 246, 0.32),
     }
 }
 
