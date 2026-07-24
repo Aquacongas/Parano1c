@@ -191,10 +191,16 @@ pub fn update_wallet_artifacts_from_block(
         let end = 1 + group.end_page_exclusive();
         let pages = &block.transactions[start..end];
         let pending_send = pending_hashes.contains(&tx_hash);
+        let has_distinct_recipient = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
+            .any(|output| output.owner != group.spend.input_owner);
 
-        if pending_send {
+        if pending_send && has_distinct_recipient {
             let receipt = generate_receipt(&block.header, pages, tx_index, &block_tx_hashes);
             receipts.insert(tx_hash, receipt.to_bytes());
+            continue;
+        } else if pending_send {
             continue;
         }
 
@@ -233,7 +239,7 @@ pub fn update_wallet_artifacts_from_block(
 /// - Removes spent UTXOs (inputs consumed by this block)
 /// - Adds new UTXOs (outputs addressed to this wallet)
 /// - Appends to tx history
-/// - Generates and stores Merkle receipts for all wallet-relevant transactions
+/// - Generates receipts only when a payment leaves its input owner
 /// - Clears confirmed input slots from `pending_input_slots`
 pub fn update_active_wallet_from_block(
     utxos: &mut HashMap<u32, WalletUtxo>,
@@ -318,6 +324,10 @@ pub fn update_active_wallet_from_block(
         let start = 1 + usize::from(group.start_page);
         let end = 1 + group.end_page_exclusive();
         let pages = &block.transactions[start..end];
+        let has_distinct_recipient = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
+            .any(|output| output.owner != group.spend.input_owner);
         // Track value flow for this transaction
         let mut sent_from_wallet: u64 = 0;
         let mut received_by_wallet: u64 = 0;
@@ -410,7 +420,7 @@ pub fn update_active_wallet_from_block(
         // is intentionally absent from the active-address cache, so the durable
         // pending history tag is the ownership signal for receipt generation.
         // Incoming-only transactions still need no receipt.
-        if sent_from_wallet > 0 || already_pending {
+        if has_distinct_recipient && (sent_from_wallet > 0 || already_pending) {
             let receipt = generate_receipt(&block.header, pages, logical_index, &block_tx_hashes);
             receipts.insert(tx_hash, receipt.to_bytes());
         }
@@ -642,6 +652,80 @@ mod tests {
         assert!(receipts.contains_key(&outgoing_hash));
         assert_eq!(history.len(), 1, "pending history must not be duplicated");
         assert_eq!(history[0].own_key_index, Some(9));
+    }
+
+    #[test]
+    fn pending_same_owner_send_does_not_get_receipt() {
+        let source = Address([0xEE; 32]);
+        let coinbase = transaction(true, 10, Address([0xCC; 32]));
+        let outgoing = transaction(false, 20, source);
+        let outgoing_hash = logical_txid(&outgoing);
+        let block = block(vec![coinbase, outgoing], 2);
+        let mut utxos = HashMap::new();
+        let mut history = vec![TxHistoryEntry {
+            tx_hash: outgoing_hash,
+            height: 0,
+            direction: TxDirection::Sent,
+            is_coinbase: false,
+            amount_micronoid: 123,
+            peer_address: Some(source.0),
+            timestamp: 1,
+            own_address: Some(source.to_bech32()),
+            own_key_index: Some(9),
+        }];
+        let mut receipts = HashMap::new();
+        let mut pending_inputs = std::collections::HashSet::new();
+
+        update_active_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            source,
+            0,
+            &mut pending_inputs,
+            &block,
+        )
+        .unwrap();
+
+        assert!(!receipts.contains_key(&outgoing_hash));
+        assert_eq!(history.len(), 1, "pending history must still be confirmed");
+    }
+
+    #[test]
+    fn pending_send_to_an_inactive_wallet_address_still_gets_receipt() {
+        let source = Address([0xEE; 32]);
+        let inactive_wallet_recipient = Address([0xBB; 32]);
+        let coinbase = transaction(true, 10, Address([0xCC; 32]));
+        let outgoing = transaction(false, 20, inactive_wallet_recipient);
+        let outgoing_hash = logical_txid(&outgoing);
+        let block = block(vec![coinbase, outgoing], 2);
+        let mut utxos = HashMap::new();
+        let mut history = vec![TxHistoryEntry {
+            tx_hash: outgoing_hash,
+            height: 0,
+            direction: TxDirection::Sent,
+            is_coinbase: false,
+            amount_micronoid: 123,
+            peer_address: Some(inactive_wallet_recipient.0),
+            timestamp: 1,
+            own_address: Some(source.to_bech32()),
+            own_key_index: Some(9),
+        }];
+        let mut receipts = HashMap::new();
+        let mut pending_inputs = std::collections::HashSet::new();
+
+        update_active_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            source,
+            0,
+            &mut pending_inputs,
+            &block,
+        )
+        .unwrap();
+
+        assert!(receipts.contains_key(&outgoing_hash));
     }
 
     #[test]

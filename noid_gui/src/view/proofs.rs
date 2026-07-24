@@ -3,12 +3,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{
-    button, column, container, row, scrollable, text, text_editor, text_input, Space,
-};
+use iced::widget::{button, column, container, row, scrollable, text_editor, Space};
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::app::{App, Message};
+use crate::i18n::{text, text_input, translate};
 use crate::model::{
     format_micronoid, grouped, ProofsTab, ReceiptSnapshot, ReceiptSummarySnapshot,
     ReceiptVerificationSnapshot,
@@ -302,7 +301,7 @@ fn local_receipt_detail(app: &App, compact: bool) -> Element<'_, Message> {
 
 fn verify_proof(app: &App, compact: bool) -> Element<'_, Message> {
     let input = text_editor(&app.receipt_editor)
-        .placeholder("Paste receipt hex")
+        .placeholder(translate("Paste receipt hex"))
         .on_action(Message::EditReceipt)
         .size(14)
         .padding([9, 11])

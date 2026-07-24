@@ -8,6 +8,35 @@ pub const EXPLORER_SLOT_PAGE_SIZE: usize = 8;
 pub const RECEIPT_PAGE_SIZE: u32 = 7;
 pub const UTXO_PAGE_SIZE: usize = 25;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    #[default]
+    English,
+    Russian,
+    Chinese,
+}
+
+impl Language {
+    pub const ALL: [Self; 3] = [Self::English, Self::Russian, Self::Chinese];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::English => "EN",
+            Self::Russian => "RU",
+            Self::Chinese => "ZH",
+        }
+    }
+
+    pub const fn native_name(self) -> &'static str {
+        match self {
+            Self::English => "English",
+            Self::Russian => "Русский",
+            Self::Chinese => "简体中文",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct SensitiveString(zeroize::Zeroizing<String>);
 
@@ -117,6 +146,7 @@ pub enum ProofsTab {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
+    Interface,
     Secret,
     Node,
     Network,

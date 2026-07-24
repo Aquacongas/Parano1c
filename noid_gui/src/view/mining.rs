@@ -3,12 +3,15 @@
 
 #[cfg(feature = "dev-genesis")]
 use iced::widget::checkbox;
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, scrollable};
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::app::{
     App, BackendState, Message, BLOCK_DETAILS_SCROLL_ID, TRANSACTION_DETAILS_SCROLL_ID,
 };
+#[cfg(feature = "dev-genesis")]
+use crate::i18n::translate;
+use crate::i18n::{address_label, text, text_input};
 use crate::model::{
     format_creation_origin, BlockDetailsSnapshot, BlockTransactionSnapshot, MatrixCacheState,
     MinedBlockSnapshot,
@@ -177,13 +180,13 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
                 column![
                     detail(
                         "PAYOUT",
-                        format!("[{}] {}", address.key_index, address.label)
+                        format!("[{}] {}", address.key_index, address_label(&address.label))
                     ),
                     row![
                         text(&address.address)
                             .size(13)
                             .color(theme::TEXT)
-                            .wrapping(text::Wrapping::WordOrGlyph),
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph),
                         copy_value_button(
                             &address.address,
                             app.copied_value.as_deref() == Some(address.address.as_str()),
@@ -271,7 +274,7 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
         {
             let allowed = !app.snapshot.mining.enabled && !app.node_action_in_flight;
             let mut control = checkbox(app.genesis_enabled)
-                .label("Genesis mode")
+                .label(translate("Genesis mode"))
                 .size(16)
                 .text_size(13)
                 .spacing(7);
@@ -464,8 +467,8 @@ fn mined_block_row<'a>(
         .addresses
         .iter()
         .find(|address| address.key_index == block.payout_key_index)
-        .map(|address| address.label.as_str())
-        .unwrap_or("Address");
+        .map(|address| address_label(&address.label))
+        .unwrap_or_else(|| "Address".into());
     let mut open = button(text(if block.full_block_available {
         "DETAILS"
     } else {
@@ -639,7 +642,7 @@ fn block_details<'a>(
                         table_cell(transaction.live_inputs.to_string(), 2, theme::TEXT),
                         table_cell(transaction.live_outputs.to_string(), 2, theme::TEXT),
                         table_cell(transaction.fee_micronoid.to_string(), 4, theme::WARNING),
-                        text("VIEW →")
+                        text("VIEW")
                             .size(12)
                             .color(theme::CYAN)
                             .width(Length::Fixed(52.0)),
@@ -693,7 +696,12 @@ fn block_details<'a>(
             scrollable(
                 column![header_grid, consensus, divider(), body]
                     .spacing(12)
-                    .padding(14)
+                    .padding(Padding {
+                        top: 14.0,
+                        right: 28.0,
+                        bottom: 14.0,
+                        left: 14.0,
+                    })
             )
             .id(BLOCK_DETAILS_SCROLL_ID)
             .style(theme::scrollable),
@@ -738,7 +746,7 @@ fn transaction_details<'a>(
         .size(13)
         .color(theme::CYAN),
         iced::widget::Space::new().width(Length::Fill),
-        button(text("← ESC BACK TO BLOCK").size(13))
+        button(text("← ESC BACK TO BLOCK").size(11))
             .on_press(Message::CloseBlockTransaction)
             .padding([6, 9])
             .style(|_, status| theme::button(ButtonKind::Ghost, status)),
@@ -890,7 +898,12 @@ fn transaction_details<'a>(
             scrollable(
                 column![txid, binding, metrics, flow, divider(), io, hashes]
                     .spacing(12)
-                    .padding(14),
+                    .padding(Padding {
+                        top: 14.0,
+                        right: 28.0,
+                        bottom: 14.0,
+                        left: 14.0,
+                    }),
             )
             .id(TRANSACTION_DETAILS_SCROLL_ID)
             .style(theme::scrollable),
@@ -1010,7 +1023,6 @@ fn transaction_outputs<'a>(
                     row![
                         detail("REF", format!("P{}:O{}", output.page, output.lane)),
                         detail("SLOT", output.slot_index.to_string()),
-                        detail("ORIGIN", format_creation_origin(output.creation_id)),
                         iced::widget::Space::new().width(Length::Fill),
                         text(format!(
                             "{} ①{}",
@@ -1026,6 +1038,7 @@ fn transaction_outputs<'a>(
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
+                    detail("ORIGIN", format_creation_origin(output.creation_id)),
                     copyable_detail_line(app, "OWNER", output.owner.clone(), theme::PROOF),
                 ]
                 .spacing(5),
@@ -1083,9 +1096,11 @@ fn transaction_page_hashes<'a>(
                         .width(Length::FillPortion(2)),
                     row![
                         text(hash)
-                            .size(13)
+                            .size(10)
+                            .font(theme::TECH_FONT)
                             .color(theme::MUTED)
-                            .wrapping(text::Wrapping::WordOrGlyph),
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .width(Length::Fill),
                         copy_value_button(
                             hash,
                             app.copied_value.as_deref() == Some(hash.as_str()),
@@ -1135,7 +1150,7 @@ fn table_cell(value: String, portion: u16, color: iced::Color) -> Element<'stati
     text(value)
         .size(13)
         .color(color)
-        .wrapping(text::Wrapping::None)
+        .wrapping(iced::widget::text::Wrapping::None)
         .width(Length::FillPortion(portion))
         .into()
 }
@@ -1168,11 +1183,12 @@ fn copyable_detail_line(
         text(label).size(12).color(theme::DIM),
         row![
             text(value.clone())
-                .size(13)
+                .size(10)
+                .font(theme::TECH_FONT)
                 .color(color)
-                .wrapping(text::Wrapping::WordOrGlyph),
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Fill),
             copy_value_button(&value, copied),
-            iced::widget::Space::new().width(Length::Fill),
         ]
         .spacing(5)
         .align_y(Alignment::Center),

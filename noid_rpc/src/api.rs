@@ -233,7 +233,7 @@ pub trait ParanoidApi {
     #[method(name = "walletHistory")]
     async fn wallet_history(&self) -> RpcResult<Vec<WalletHistoryEntry>>;
 
-    /// Newest-first durable receipts for every locally sent transaction.
+    /// Newest-first durable receipts for payments to a different address.
     #[method(name = "walletReceipts")]
     async fn wallet_receipts(&self, page: u32, page_size: u32) -> RpcResult<WalletReceiptsPage>;
 

@@ -31,7 +31,7 @@ use crate::model::{
     AddressSnapshot, AppSnapshot, BlockDetailsSnapshot, BlockHeaderSnapshot,
     BlockTransactionInputSnapshot, BlockTransactionOutputSnapshot, BlockTransactionSnapshot,
     ExplorerAddressSnapshot, ExplorerBlockSnapshot, ExplorerSearchResultSnapshot,
-    ExplorerSlotSnapshot, ExplorerSnapshot, LogLevel, MatrixClass, MinedBlockSnapshot,
+    ExplorerSlotSnapshot, ExplorerSnapshot, Language, LogLevel, MatrixClass, MinedBlockSnapshot,
     MinedBlocksSnapshot, MiningSnapshot, NetworkSnapshot, NodeSettingsSnapshot,
     ReceiptDetailSnapshot, ReceiptInputSnapshot, ReceiptOutputSnapshot, ReceiptSnapshot,
     ReceiptSummarySnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot,
@@ -97,6 +97,7 @@ struct BackendConfig {
     node_binary: PathBuf,
     seeds: Vec<String>,
     log_level: LogLevel,
+    language: Option<Language>,
     settings_path: PathBuf,
     mock: bool,
 }
@@ -107,6 +108,8 @@ struct PersistedGuiSettings {
     p2p_listen: String,
     seeds: Vec<String>,
     log_level: LogLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    language: Option<Language>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +274,34 @@ impl Backend {
                 custom_seeds: Vec::new(),
                 log_level: LogLevel::Info,
             })
+    }
+
+    pub fn interface_language(&self) -> Option<Language> {
+        self.inner
+            .config
+            .lock()
+            .ok()
+            .and_then(|config| config.language)
+    }
+
+    pub fn persist_interface_language(&self, language: Language) -> Result<(), String> {
+        let mut config = self
+            .inner
+            .config
+            .lock()
+            .map_err(|_| "GUI settings lock is poisoned".to_string())?;
+        if config.language == Some(language) {
+            return Ok(());
+        }
+        let previous = config.language;
+        config.language = Some(language);
+        if !config.mock {
+            if let Err(error) = persist_gui_settings(&config) {
+                config.language = previous;
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 
     pub async fn node_log_tail(&self, max_bytes: u64, max_lines: usize) -> Result<String, String> {
@@ -1473,6 +1504,17 @@ impl BackendConfig {
             .and_then(|level| parse_log_level(&level))
             .or_else(|| persisted.as_ref().map(|settings| settings.log_level))
             .unwrap_or_default();
+        let language = std::env::var("NOID_GUI_LANGUAGE")
+            .ok()
+            .and_then(
+                |language| match language.trim().to_ascii_lowercase().as_str() {
+                    "en" | "eng" | "english" => Some(Language::English),
+                    "ru" | "rus" | "russian" => Some(Language::Russian),
+                    "zh" | "zho" | "chinese" | "simplified-chinese" => Some(Language::Chinese),
+                    _ => None,
+                },
+            )
+            .or_else(|| persisted.as_ref().and_then(|settings| settings.language));
         let mock = std::env::var("NOID_GUI_MOCK")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         Self {
@@ -1483,6 +1525,7 @@ impl BackendConfig {
             node_binary,
             seeds,
             log_level,
+            language,
             settings_path,
             mock,
         }
@@ -1598,6 +1641,7 @@ fn persist_gui_settings(config: &BackendConfig) -> Result<(), String> {
         p2p_listen: config.p2p_listen.clone(),
         seeds: config.seeds.clone(),
         log_level: config.log_level,
+        language: config.language,
     };
     let bytes = serde_json::to_vec_pretty(&persisted)
         .map_err(|error| format!("encode GUI settings: {error}"))?;
@@ -2959,6 +3003,7 @@ mod tests {
             node_binary: PathBuf::from("paranoid"),
             seeds: vec!["seed-a.example:9400".into(), "dnsaddr:noid.network".into()],
             log_level: LogLevel::Debug,
+            language: Some(Language::Russian),
             settings_path: settings_path.clone(),
             mock: false,
         };
@@ -2970,6 +3015,7 @@ mod tests {
         assert_eq!(decoded.p2p_listen, config.p2p_listen);
         assert_eq!(decoded.seeds, config.seeds);
         assert_eq!(decoded.log_level, LogLevel::Debug);
+        assert_eq!(decoded.language, Some(Language::Russian));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2982,5 +3028,62 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn legacy_gui_settings_require_a_one_time_language_choice() {
+        let decoded: PersistedGuiSettings = serde_json::from_str(
+            r#"{
+                "data_dir": "/tmp/paranoid",
+                "p2p_listen": "127.0.0.1:9400",
+                "seeds": [],
+                "log_level": "info"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(decoded.language, None);
+    }
+
+    #[test]
+    fn interface_language_persists_without_touching_node_supervision() {
+        let directory = tempfile::tempdir().unwrap();
+        let settings_path = directory.path().join("gui-settings.json");
+        let backend = Backend {
+            inner: Arc::new(BackendInner {
+                config: Mutex::new(BackendConfig {
+                    rpc_url: DEFAULT_RPC_URL.into(),
+                    rpc_listen: DEFAULT_RPC_LISTEN.into(),
+                    p2p_listen: DEFAULT_P2P_LISTEN.into(),
+                    data_dir: directory.path().join("node-data"),
+                    node_binary: PathBuf::from("paranoid"),
+                    seeds: Vec::new(),
+                    log_level: LogLevel::Info,
+                    language: None,
+                    settings_path: settings_path.clone(),
+                    mock: false,
+                }),
+                client: Client::new(),
+                next_request_id: AtomicU64::new(1),
+                supervisor: Mutex::new(SupervisorState {
+                    child: None,
+                    owned: false,
+                    desired_mode: NodeMode::Node,
+                    selected_threads: 1,
+                    genesis: false,
+                }),
+                system: Mutex::new(System::new()),
+            }),
+        };
+
+        backend
+            .persist_interface_language(Language::Chinese)
+            .unwrap();
+
+        let decoded: PersistedGuiSettings =
+            serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
+        assert_eq!(decoded.language, Some(Language::Chinese));
+        let supervisor = backend.inner.supervisor.lock().unwrap();
+        assert!(supervisor.child.is_none());
+        assert!(!supervisor.owned);
     }
 }

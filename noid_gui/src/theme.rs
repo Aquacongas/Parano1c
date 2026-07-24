@@ -24,6 +24,7 @@ pub const WARNING: Color = Color::from_rgb8(231, 218, 61);
 pub const ADVISORY: Color = Color::from_rgb8(255, 176, 74);
 pub const DANGER: Color = Color::from_rgb8(255, 107, 119);
 pub const INK: Color = Color::from_rgb8(31, 33, 43);
+pub const CHROME: Color = Color::from_rgb8(31, 34, 45);
 pub const TECH_FONT: Font = Font {
     family: font::Family::Name("Noto Sans Mono"),
     weight: font::Weight::Normal,
@@ -36,9 +37,21 @@ pub const BRAND_FONT: Font = Font {
     stretch: font::Stretch::Normal,
     style: font::Style::Normal,
 };
+pub const BRAND_REGULAR_FONT: Font = Font {
+    family: font::Family::Name("Noto Sans"),
+    weight: font::Weight::Normal,
+    stretch: font::Stretch::Normal,
+    style: font::Style::Normal,
+};
 pub const SYMBOL_FONT: Font = Font {
     family: font::Family::Name("Noto Sans Symbols"),
     weight: font::Weight::Bold,
+    stretch: font::Stretch::Normal,
+    style: font::Style::Normal,
+};
+pub const CJK_FONT: Font = Font {
+    family: font::Family::Name("Noto Sans CJK SC"),
+    weight: font::Weight::Normal,
     stretch: font::Stretch::Normal,
     style: font::Style::Normal,
 };
@@ -69,6 +82,10 @@ pub fn root(_: &Theme) -> container::Style {
     container::Style::default()
         .background(BACKGROUND)
         .color(TEXT)
+}
+
+pub fn chrome_background(_: &Theme) -> container::Style {
+    container::Style::default().background(CHROME).color(TEXT)
 }
 
 pub fn surface(_: &Theme) -> container::Style {
@@ -116,7 +133,7 @@ pub fn node_log_panel(_: &Theme) -> container::Style {
 pub fn top_bar(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
-        background: Some(Background::Color(Color::from_rgb8(31, 34, 45))),
+        background: Some(Background::Color(CHROME)),
         border: Border {
             color: LINE_STRONG,
             width: 1.0,
@@ -130,7 +147,7 @@ pub fn top_bar(_: &Theme) -> container::Style {
 pub fn command_bar(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
-        background: Some(Background::Color(Color::from_rgb8(31, 34, 45))),
+        background: Some(Background::Color(CHROME)),
         border: Border {
             color: LINE_STRONG,
             width: 1.0,
@@ -144,7 +161,7 @@ pub fn command_bar(_: &Theme) -> container::Style {
 pub fn status_panel(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
-        background: Some(Background::Color(Color::from_rgb8(31, 34, 45))),
+        background: Some(Background::Color(CHROME)),
         border: Border {
             color: Color::from_rgba8(103, 215, 246, 0.18),
             width: 1.0,
@@ -458,7 +475,7 @@ pub fn advisory_badge(pulse: f32) -> impl Fn(&Theme) -> container::Style {
 pub fn advisory_card(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
-        background: Some(Background::Color(Color::from_rgb8(31, 34, 45))),
+        background: Some(Background::Color(CHROME)),
         border: Border {
             color: Color {
                 a: 0.68,
@@ -639,6 +656,82 @@ pub enum ButtonKind {
     CommandActive,
 }
 
+fn primary_button_shadow(status: button_widget::Status) -> Shadow {
+    if matches!(status, button_widget::Status::Pressed) {
+        Shadow {
+            color: Color::from_rgba8(5, 7, 13, 0.30),
+            offset: Vector::new(0.0, 1.0),
+            blur_radius: 3.0,
+        }
+    } else {
+        Shadow {
+            color: Color::from_rgba8(5, 7, 13, 0.42),
+            offset: Vector::new(0.0, 4.0),
+            blur_radius: 9.0,
+        }
+    }
+}
+
+pub fn colored_primary(color: Color, status: button_widget::Status) -> button_widget::Style {
+    if matches!(status, button_widget::Status::Disabled) {
+        return button(ButtonKind::Primary, status);
+    }
+
+    let hovered = matches!(
+        status,
+        button_widget::Status::Hovered | button_widget::Status::Pressed
+    );
+    let pressed = matches!(status, button_widget::Status::Pressed);
+    let background = if pressed {
+        Color {
+            r: color.r * 0.82,
+            g: color.g * 0.82,
+            b: color.b * 0.82,
+            ..color
+        }
+    } else if hovered {
+        Color {
+            r: color.r + (1.0 - color.r) * 0.16,
+            g: color.g + (1.0 - color.g) * 0.16,
+            b: color.b + (1.0 - color.b) * 0.16,
+            ..color
+        }
+    } else {
+        color
+    };
+
+    button_widget::Style {
+        background: Some(Background::Color(background)),
+        text_color: INK,
+        border: Border {
+            color: Color {
+                r: color.r + (1.0 - color.r) * 0.68,
+                g: color.g + (1.0 - color.g) * 0.68,
+                b: color.b + (1.0 - color.b) * 0.68,
+                a: 0.32,
+            },
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
+        shadow: primary_button_shadow(status),
+        snap: true,
+    }
+}
+
+/// The first-run language controls use the ordinary primary-button language,
+/// with a firmer contact shadow to match the forged blocks above them.
+pub fn language_choice(color: Color, status: button_widget::Status) -> button_widget::Style {
+    let mut style = colored_primary(color, status);
+    let pressed = matches!(status, button_widget::Status::Pressed);
+    style.shadow = Shadow {
+        color: Color::from_rgba8(3, 5, 10, if pressed { 0.34 } else { 0.54 }),
+        offset: Vector::new(0.0, if pressed { 1.0 } else { 5.0 }),
+        blur_radius: if pressed { 2.0 } else { 8.0 },
+    };
+    style.border.width = if pressed { 1.0 } else { 1.25 };
+    style
+}
+
 pub fn button(kind: ButtonKind, status: button_widget::Status) -> button_widget::Style {
     if matches!(status, button_widget::Status::Disabled) {
         return button_widget::Style {
@@ -675,7 +768,7 @@ pub fn button(kind: ButtonKind, status: button_widget::Status) -> button_widget:
                 width: 1.0,
                 radius: Radius::from(6.0),
             },
-            shadow: Shadow::default(),
+            shadow: primary_button_shadow(status),
             snap: true,
         },
         ButtonKind::Secondary => button_widget::Style {

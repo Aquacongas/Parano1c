@@ -107,7 +107,7 @@ pub trait WalletOps: Send + Sync {
     /// Transaction history (most recent last).
     fn history(&self) -> Vec<WalletHistoryEntry>;
 
-    /// Newest-first bounded slice of every durable outgoing receipt.
+    /// Newest-first bounded slice of durable different-address receipts.
     fn receipts(&self, offset: usize, limit: usize) -> Result<WalletReceiptSlice, String>;
 
     /// Newest-first bounded slice of every coinbase paid to any local address.

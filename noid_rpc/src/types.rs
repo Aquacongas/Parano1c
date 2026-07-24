@@ -188,7 +188,7 @@ pub struct WalletHistoryEntry {
     pub own_key_index: Option<u32>,
 }
 
-/// One durable receipt for a locally sent transaction.
+/// One durable receipt for a payment whose recipient differs from its source.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletReceiptInfo {
     pub txid: String,
@@ -204,8 +204,8 @@ pub struct WalletReceiptInfo {
     pub receipt_bytes: usize,
 }
 
-/// Newest-first bounded page over every durable outgoing receipt in the
-/// local wallet, independent of the currently active address.
+/// Newest-first bounded page over durable payment receipts in the local
+/// wallet. Same-owner consolidations do not produce receipts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletReceiptsPage {
     pub page: u32,

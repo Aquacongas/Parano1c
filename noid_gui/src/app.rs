@@ -11,10 +11,11 @@ use crate::backend::{
     PaymentSubmission,
 };
 use crate::model::{
-    AppSnapshot, BlockDetailsSnapshot, ExplorerSearchResultSnapshot, ExplorerSnapshot, LogLevel,
-    MatrixCacheState, MatrixClass, NodeSettingsSnapshot, ProofsTab, ReceiptDetailSnapshot,
-    ReceiptVerificationSnapshot, ReceiptsSnapshot, SecretImportMode, Section, SensitiveString,
-    SettingsTab, EXPLORER_SLOT_PAGE_SIZE, UTXO_PAGE_SIZE, WALLET_CONSOLIDATION_INPUT_LIMIT,
+    AppSnapshot, BlockDetailsSnapshot, ExplorerSearchResultSnapshot, ExplorerSnapshot, Language,
+    LogLevel, MatrixCacheState, MatrixClass, NodeSettingsSnapshot, ProofsTab,
+    ReceiptDetailSnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot, SecretImportMode,
+    Section, SensitiveString, SettingsTab, EXPLORER_SLOT_PAGE_SIZE, UTXO_PAGE_SIZE,
+    WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 use crate::secret::PreparedPhoto;
 use crate::view;
@@ -26,6 +27,7 @@ pub const NODE_LOG_LINE_LIMIT: usize = 80;
 const PHOTO_SCAN_FRAME: Duration = Duration::from_millis(16);
 const PROOF_FORGE_FRAME: Duration = Duration::from_millis(16);
 const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(16);
+const LANGUAGE_FORGE_FRAME: Duration = Duration::from_millis(16);
 const NODE_LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NODE_LOG_BYTE_LIMIT: u64 = 64 * 1024;
 const PHOTO_SCAN_COMPLETE_HOLD: Duration = Duration::from_millis(160);
@@ -101,6 +103,9 @@ pub struct App {
     pub utxo_page: usize,
     pub node_settings: NodeSettingsSnapshot,
     pub settings_tab: SettingsTab,
+    pub language: Language,
+    pub language_selection_required: bool,
+    language_forge_started_at: Instant,
     pub settings_data_dir: String,
     pub settings_p2p_listen: String,
     pub settings_seeds: text_editor::Content,
@@ -261,6 +266,8 @@ pub enum Message {
     CloseBlockDetails,
     SettingsDataDirectoryChanged(String),
     SetSettingsTab(SettingsTab),
+    SetLanguage(Language),
+    LanguageForgeTick,
     ChooseDataDirectory,
     DataDirectoryChosen(Option<std::path::PathBuf>),
     SettingsP2pListenChanged(String),
@@ -314,6 +321,10 @@ impl App {
             text_editor::Content::with_text(&node_settings.custom_seeds.join("\n"));
         let settings_log_level = node_settings.log_level;
         let wallet_setup_required = backend.wallet_setup_required();
+        let persisted_language = backend.interface_language();
+        let language = persisted_language.unwrap_or_default();
+        let language_selection_required = persisted_language.is_none() && !mock;
+        crate::i18n::activate(language);
 
         let app = Self {
             snapshot,
@@ -378,6 +389,9 @@ impl App {
             utxo_page: 1,
             node_settings,
             settings_tab: SettingsTab::Secret,
+            language,
+            language_selection_required,
+            language_forge_started_at: Instant::now(),
             settings_data_dir,
             settings_p2p_listen,
             settings_seeds,
@@ -888,15 +902,20 @@ impl App {
                                 .iter()
                                 .any(|utxo| utxo.segment == segment)
                         });
+                        let filter_removed =
+                            self.utxo_segment_filter.is_some() && !filter_still_exists;
                         self.snapshot = live.snapshot;
                         if !selected_still_exists {
                             self.selected_utxo_slot = None;
                         }
-                        if !filter_still_exists {
+                        if filter_removed {
                             self.utxo_segment_filter = None;
-                            self.utxo_page = 1;
                         }
-                        self.utxo_page = self.utxo_page.min(self.utxo_page_count());
+                        self.utxo_page = normalize_utxo_page_after_refresh(
+                            self.utxo_page,
+                            self.utxo_page_count(),
+                            filter_removed,
+                        );
                         self.backend_state = BackendState::Online;
                         self.backend_error = None;
                         self.consecutive_refresh_failures = 0;
@@ -1497,6 +1516,14 @@ impl App {
                     }
                 }
             }
+            Message::SetLanguage(language) => {
+                self.language = language;
+                self.language_selection_required = false;
+                crate::i18n::activate(language);
+                self.settings_notice = None;
+                self.settings_error = self.backend.persist_interface_language(language).err();
+            }
+            Message::LanguageForgeTick => {}
             Message::SettingsDataDirectoryChanged(path) => {
                 if !self.settings_applying {
                     self.settings_data_dir = path;
@@ -2107,6 +2134,7 @@ impl App {
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        crate::i18n::activate(self.language);
         view::root(self)
     }
 
@@ -2124,6 +2152,10 @@ impl App {
         }
         if self.photo_scan_active {
             subscriptions.push(iced::time::every(PHOTO_SCAN_FRAME).map(|_| Message::PhotoScanTick));
+        }
+        if self.language_selection_required {
+            subscriptions
+                .push(iced::time::every(LANGUAGE_FORGE_FRAME).map(|_| Message::LanguageForgeTick));
         }
         if self.send_in_flight || self.consolidation_in_flight {
             subscriptions
@@ -2179,6 +2211,10 @@ impl App {
         self.shutdown_forge_started_at
             .map(|started_at| started_at.elapsed().as_secs_f32())
             .unwrap_or(0.0)
+    }
+
+    pub fn language_forge_elapsed_seconds(&self) -> f32 {
+        self.language_forge_started_at.elapsed().as_secs_f32()
     }
 
     pub fn wallet_action_in_flight(&self) -> bool {
@@ -2474,9 +2510,21 @@ fn utxo_page_count_for(output_count: usize) -> usize {
     output_count.div_ceil(UTXO_PAGE_SIZE).max(1)
 }
 
+fn normalize_utxo_page_after_refresh(
+    current_page: usize,
+    page_count: usize,
+    filter_removed: bool,
+) -> usize {
+    if filter_removed {
+        1
+    } else {
+        current_page.min(page_count.max(1))
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_noid_amount, utxo_page_count_for};
+    use super::{normalize_utxo_page_after_refresh, parse_noid_amount, utxo_page_count_for};
 
     #[test]
     fn parses_noid_without_floating_point() {
@@ -2494,5 +2542,12 @@ mod tests {
         assert_eq!(utxo_page_count_for(25), 1);
         assert_eq!(utxo_page_count_for(26), 2);
         assert_eq!(utxo_page_count_for(10_000), 400);
+    }
+
+    #[test]
+    fn utxo_refresh_preserves_the_current_page_without_a_segment_filter() {
+        assert_eq!(normalize_utxo_page_after_refresh(2, 4, false), 2);
+        assert_eq!(normalize_utxo_page_after_refresh(4, 2, false), 2);
+        assert_eq!(normalize_utxo_page_after_refresh(2, 4, true), 1);
     }
 }

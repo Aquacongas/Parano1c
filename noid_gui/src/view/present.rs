@@ -3,12 +3,12 @@
 
 use iced::widget::{
     button, canvas, column, container, mouse_area, opaque, pin, responsive, row, scrollable, stack,
-    text, text_input,
 };
 use iced::{Alignment, Element, Length, Padding};
 
 use crate::app::{Action, AddressOperation, App, Message};
 use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmission};
+use crate::i18n::{address_label, text, text_input};
 use crate::model::{
     format_creation_origin, format_micronoid, AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
 };
@@ -263,7 +263,7 @@ fn terminal_meter(
         text(label)
             .size(13)
             .color(label_color)
-            .wrapping(text::Wrapping::None)
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(label_width),
         text("[").size(17).color(bracket_color),
         cells,
@@ -315,7 +315,7 @@ fn state_scale(current: u32, compact: bool) -> Element<'static, Message> {
         text("STATE LVL")
             .size(13)
             .color(theme::CYAN)
-            .wrapping(text::Wrapping::None)
+            .wrapping(iced::widget::text::Wrapping::None)
             .width(label_width),
         levels,
     ]
@@ -335,11 +335,11 @@ fn telemetry_value(
             text(label)
                 .size(13)
                 .color(theme::CYAN)
-                .wrapping(text::Wrapping::None),
+                .wrapping(iced::widget::text::Wrapping::None),
             text(format!("[{value}]"))
                 .size(14)
                 .color(color)
-                .wrapping(text::Wrapping::None),
+                .wrapping(iced::widget::text::Wrapping::None),
         ]
         .spacing(6)
         .align_y(Alignment::Center),
@@ -362,10 +362,14 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     let address_line = container(
         row![
             container(
-                text(format!("[{}] {}", address.key_index, address.label))
-                    .size(13)
-                    .color(theme::PROOF)
-                    .wrapping(text::Wrapping::None)
+                text(format!(
+                    "[{}] {}",
+                    address.key_index,
+                    address_label(&address.label)
+                ))
+                .size(13)
+                .color(theme::PROOF)
+                .wrapping(iced::widget::text::Wrapping::None)
             )
             .padding(Padding::ZERO.top(2)),
             container(iced::widget::Space::new())
@@ -563,7 +567,7 @@ fn spendable_stat(
             text(label)
                 .size(label_size)
                 .color(theme::DIM)
-                .wrapping(text::Wrapping::None),
+                .wrapping(iced::widget::text::Wrapping::None),
             value_row,
         ]
         .spacing(5),
@@ -850,7 +854,7 @@ fn slot_cell(value: String, color: iced::Color) -> Element<'static, Message> {
     text(value)
         .size(14)
         .color(color)
-        .wrapping(text::Wrapping::None)
+        .wrapping(iced::widget::text::Wrapping::None)
         .width(Length::FillPortion(3))
         .into()
 }
@@ -962,7 +966,7 @@ fn state_panel(app: &App) -> container::Container<'_, Message> {
     let atlas_legend = row![
         legend_item(theme::CYAN, "STATE DENSITY"),
         legend_item(theme::PROOF, "MY UTXOS"),
-        legend_item(theme::TEXT, "SELECTED OUTPUT"),
+        legend_item(theme::CYAN, "SELECTED OUTPUT"),
     ]
     .spacing(13)
     .align_y(Alignment::Center);
@@ -1022,11 +1026,11 @@ fn state_detail(
         text(label)
             .size(12)
             .color(theme::DIM)
-            .wrapping(text::Wrapping::None),
+            .wrapping(iced::widget::text::Wrapping::None),
         text(format!("[{value}]"))
             .size(13)
             .color(color)
-            .wrapping(text::Wrapping::None),
+            .wrapping(iced::widget::text::Wrapping::None),
     ]
     .spacing(4)
     .align_y(Alignment::Center)
@@ -1196,7 +1200,7 @@ fn address_row<'a>(
     };
     let details = row![
         table_cell(address.key_index.to_string(), 2, theme::CYAN),
-        table_cell(address.label.clone(), 5, theme::TEXT),
+        table_cell(address_label(&address.label).into_owned(), 5, theme::TEXT),
         row![
             text(address.short_address()).size(14).color(theme::MUTED),
             copy_address_button(
@@ -1223,19 +1227,20 @@ fn address_row<'a>(
     .align_y(Alignment::Center);
 
     let activate = if active {
-        button(text("ACTIVE").size(13))
+        button(iced::widget::text("ACTIVE").size(13))
             .on_press(Message::Noop)
             .style(|_, status| theme::button(ButtonKind::Primary, status))
     } else {
-        let mut button = button(text(if activating { "USING..." } else { "USE" }).size(13))
-            .style(|_, status| theme::button(ButtonKind::Secondary, status));
+        let mut button =
+            button(iced::widget::text(if activating { "USE…" } else { "USE" }).size(13))
+                .style(|_, status| theme::button(ButtonKind::Secondary, status));
         if !busy {
             button = button.on_press(Message::SelectAddress(address.key_index));
         }
         button
     };
 
-    let mut edit = button(text("EDIT").size(13))
+    let mut edit = button(iced::widget::text("EDIT").size(13))
         .width(Length::Fixed(68.0))
         .style(|_, status| theme::button(ButtonKind::Secondary, status));
     if !busy {
@@ -1320,11 +1325,19 @@ fn action_sheet(app: &App, action: Action, compact: bool) -> Element<'_, Message
 
     let (label, content): (String, Element<'_, Message>) = match action {
         Action::Send => (
-            format!("SEND · [{}] {}", address.key_index, address.label),
+            format!(
+                "SEND · [{}] {}",
+                address.key_index,
+                address_label(&address.label)
+            ),
             send_form(app, compact),
         ),
         Action::Consolidate => (
-            format!("CONSOLIDATE · [{}] {}", address.key_index, address.label),
+            format!(
+                "CONSOLIDATE · [{}] {}",
+                address.key_index,
+                address_label(&address.label)
+            ),
             consolidation_form(app, compact),
         ),
     };
@@ -1797,7 +1810,7 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
             format!(
                 "[{}] {} · {} ① spendable",
                 address.key_index,
-                address.label,
+                address_label(&address.label),
                 format_micronoid(spendable)
             ),
             compact,

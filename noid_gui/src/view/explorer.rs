@@ -3,10 +3,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, stack, text, text_input, Space};
+use iced::widget::{button, column, container, row, scrollable, stack, Space};
 use iced::{Alignment, Color, Element, Length, Padding};
 
 use crate::app::{App, Message};
+use crate::i18n::{text, text_input};
 use crate::model::{
     format_creation_origin, grouped, ExplorerAddressSnapshot, ExplorerBlockSnapshot,
     ExplorerSearchResultSnapshot, ExplorerSlotSnapshot, RecentTransactionSnapshot,
@@ -531,7 +532,7 @@ fn transaction_row<'a>(
     } else {
         transaction.live_outputs.to_string()
     };
-    let open = button(text("VIEW →").size(12))
+    let open = button(text("DETAILS").size(12))
         .width(Length::Fixed(78.0))
         .padding([6, 8])
         .on_press(Message::OpenLocatedTransaction(
@@ -627,7 +628,7 @@ fn compact_transaction<'a>(
                     app.copied_value.as_deref() == Some(transaction.txid.as_str()),
                 ),
                 Space::new().width(Length::Fill),
-                button(text("VIEW →").size(12))
+                button(text("DETAILS").size(12))
                     .on_press(Message::OpenLocatedTransaction(
                         transaction.height,
                         transaction.position,

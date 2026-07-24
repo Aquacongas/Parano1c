@@ -4,6 +4,7 @@
 mod app;
 mod app_icon;
 mod backend;
+mod i18n;
 mod model;
 mod secret;
 mod theme;
@@ -22,8 +23,10 @@ fn main() -> iced::Result {
         .theme(app_theme)
         .subscription(app::App::subscription)
         .font(include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/NotoSans-Regular.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/NotoSans-Bold.ttf").as_slice())
         .font(include_bytes!("../assets/fonts/NotoSansSymbols-Bold.ttf").as_slice())
+        .font(include_bytes!("../assets/fonts/NotoSansCJKsc-UI.otf").as_slice())
         .default_font(theme::TECH_FONT)
         .window(window::Settings {
             size: Size::new(1200.0, 760.0),

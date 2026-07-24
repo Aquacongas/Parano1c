@@ -188,12 +188,16 @@ fn recover_outgoing_receipts_from_block(
         let start = 1 + usize::from(group.start_page);
         let end = 1 + group.end_page_exclusive();
         let pages = &block.transactions[start..end];
+        let has_distinct_recipient = pages
+            .iter()
+            .flat_map(|page| page.body.live_outputs().map(|(_, output)| output))
+            .any(|output| output.owner != group.spend.input_owner);
         let outgoing = sent_history.contains(&tx_hash)
             || pages.iter().any(|page| {
                 page.body.live_inputs().next().is_some()
                     && owned_addresses.contains(&page.body.input_owner.0)
             });
-        if !outgoing {
+        if !outgoing || !has_distinct_recipient {
             continue;
         }
         if let std::collections::hash_map::Entry::Vacant(entry) = wallet.receipts.entry(tx_hash) {
@@ -241,7 +245,19 @@ pub fn reconcile_receipts_at_startup(
             .and_then(|bytes| ParanoidReceipt::from_bytes(bytes).ok());
         let valid = match receipt {
             Some(receipt)
-                if receipt.summary.logical_txid == tx_hash && verify_merkle_inclusion(&receipt) =>
+                if receipt.summary.logical_txid == tx_hash
+                    && verify_merkle_inclusion(&receipt)
+                    && receipt
+                        .summary
+                        .inputs
+                        .first()
+                        .is_some_and(|(_, input_owner)| {
+                            receipt
+                                .summary
+                                .outputs
+                                .iter()
+                                .any(|(_, _, owner)| owner != input_owner)
+                        }) =>
             {
                 chain
                     .store
@@ -257,6 +273,9 @@ pub fn reconcile_receipts_at_startup(
         }
     }
 
+    // This set is used only to recover an outgoing transaction whose durable
+    // history write was lost. Receipt eligibility itself is strictly
+    // source-owner based and never scans wallet addresses.
     let owned_addresses = (0..wallet.next_index)
         .map(|index| wallet.address_at(index).0)
         .collect::<std::collections::HashSet<_>>();
@@ -575,18 +594,21 @@ impl WalletOps for WalletHandle {
                 entry.tx_hash == *txid && entry.direction == state::TxDirection::Sent
             });
             let input_owner = receipt.summary.inputs.first().map(|(_, owner)| *owner);
-            let external_outputs = receipt
+            let recipient_outputs = receipt
                 .summary
                 .outputs
                 .iter()
                 .filter(|(_, _, owner)| Some(*owner) != input_owner)
                 .collect::<Vec<_>>();
-            let derived_amount = external_outputs
+            if recipient_outputs.is_empty() {
+                continue;
+            }
+            let derived_amount = recipient_outputs
                 .iter()
                 .map(|(_, amount, _)| *amount)
                 .fold(0u64, u64::saturating_add);
             let derived_peer =
-                (external_outputs.len() == 1).then(|| external_outputs[0].2.to_bech32());
+                (recipient_outputs.len() == 1).then(|| recipient_outputs[0].2.to_bech32());
 
             receipts.push(WalletReceiptRecord {
                 txid: *txid,
@@ -1254,7 +1276,28 @@ impl WalletOps for WalletHandle {
             .ok_or_else(|| "wallet not initialized".to_string())?;
 
         match w.get_receipt(&tx_hash) {
-            Some(bytes) => Ok(hex::encode(bytes)),
+            Some(bytes) => {
+                let receipt = noid_chain::consensus::receipt::ParanoidReceipt::from_bytes(bytes)
+                    .map_err(|error| format!("decode durable receipt: {error}"))?;
+                let has_recipient =
+                    receipt
+                        .summary
+                        .inputs
+                        .first()
+                        .is_some_and(|(_, input_owner)| {
+                            receipt
+                                .summary
+                                .outputs
+                                .iter()
+                                .any(|(_, _, owner)| owner != input_owner)
+                        });
+                if !has_recipient {
+                    return Err(
+                        "same-owner consolidations do not create payment receipts".to_string()
+                    );
+                }
+                Ok(hex::encode(bytes))
+            }
             None => Err(format!(
                 "no receipt for {txhash_hex} — block already pruned or tx not found"
             )),

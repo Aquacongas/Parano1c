@@ -8,20 +8,23 @@ mod proofs;
 
 use iced::widget::{
     button, canvas, column, container, image, opaque, responsive, rich_text, row, scrollable, span,
-    stack, text, text_editor, text_input, Space,
+    stack, text_editor, Space,
 };
 use iced::{Alignment, ContentFit, Element, Length, Padding};
 
 use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode, NODE_LOG_LINE_LIMIT};
-use crate::model::{SecretImportMode, Section, SettingsTab};
+use crate::i18n::{navigation_label, text, text_input, translate};
+use crate::model::{Language, SecretImportMode, Section, SettingsTab};
 use crate::theme::{self, ButtonKind};
-use crate::widgets::{PhotoScanner, ProofForge, SecretArrow};
+use crate::widgets::{LanguageForge, PhotoScanner, ProofForge, SecretArrow};
 
 const SECRET_DESKTOP_WORKSPACE_HEIGHT: f32 = 360.0;
 
 pub fn root(app: &App) -> Element<'_, Message> {
     let body = responsive(|size| {
-        if app.wallet_setup_required {
+        if app.language_selection_required {
+            language_setup(app, size.width, size.height, size.width < 1_040.0)
+        } else if app.wallet_setup_required {
             wallet_setup(app, size.width < 900.0, size.width < 1_000.0)
         } else {
             application(app, size.width < 1_040.0)
@@ -42,6 +45,80 @@ pub fn root(app: &App) -> Element<'_, Message> {
     } else {
         wallet
     }
+}
+
+fn language_setup(
+    app: &App,
+    viewport_width: f32,
+    viewport_height: f32,
+    compact: bool,
+) -> Element<'_, Message> {
+    let elapsed = app.language_forge_elapsed_seconds();
+    let shake = LanguageForge::interface_offset(elapsed);
+    let mut choices = column![].spacing(if compact { 8 } else { 9 });
+    for language in Language::ALL {
+        let (label, color) = match language {
+            Language::English => ("ENGLISH", theme::ACCENT),
+            Language::Russian => ("РУССКИЙ", theme::CYAN),
+            Language::Chinese => ("简体中文", theme::DANGER),
+        };
+        let label = container(
+            text(label)
+                .size(14)
+                .font(if language == Language::Chinese {
+                    theme::CJK_FONT
+                } else {
+                    theme::TECH_FONT
+                })
+                .color(theme::INK),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+        let choice = button(label)
+            .on_press(Message::SetLanguage(language))
+            .width(Length::Fill)
+            .height(if compact { 36 } else { 38 })
+            .padding([6, 10])
+            .style(move |_, status| theme::language_choice(color, status));
+        choices = choices.push(choice);
+    }
+
+    let button_width = if compact { 155.0 } else { 165.0 };
+    let button_height = if compact { 124.0 } else { 132.0 };
+    let selector_position = LanguageForge::selector_position(
+        viewport_width,
+        viewport_height,
+        compact,
+        button_width,
+        button_height,
+    );
+    let selector = container(
+        container(choices)
+            .width(Length::Fixed(button_width))
+            .align_x(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(Padding {
+        top: selector_position.y + shake.y,
+        right: 0.0,
+        bottom: 0.0,
+        left: selector_position.x + shake.x,
+    });
+    let animation = canvas(LanguageForge::new(elapsed, compact))
+        .width(Length::Fill)
+        .height(Length::Fill);
+    let scene = stack([animation.into(), selector.into()])
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    container(scene)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::chrome_background)
+        .into()
 }
 
 fn shutdown_forge_overlay(app: &App) -> Element<'_, Message> {
@@ -85,15 +162,15 @@ fn wallet_setup(app: &App, compact: bool, narrow: bool) -> Element<'_, Message> 
     let brand = row![
         text("Paran")
             .size(22)
-            .font(theme::BRAND_FONT)
+            .font(theme::BRAND_REGULAR_FONT)
             .color(theme::TEXT),
         text("O(1)")
             .size(22)
-            .font(theme::BRAND_FONT)
+            .font(theme::BRAND_REGULAR_FONT)
             .color(theme::ACCENT),
         text("d")
             .size(22)
-            .font(theme::BRAND_FONT)
+            .font(theme::BRAND_REGULAR_FONT)
             .color(theme::TEXT),
     ]
     .spacing(0);
@@ -455,7 +532,7 @@ fn wallet_setup_photo<'a>(app: &'a App, compact: bool) -> Element<'a, Message> {
             .size(13)
             .color(theme::TEXT),
         choose,
-        text("Keep the private original. Restore from the unchanged file; recompression changes the key.")
+        text("Messaging apps may compress the image and change the key. Send the photo as a file.")
             .size(12)
             .color(theme::WARNING),
         Space::new().height(Length::Fill),
@@ -639,7 +716,7 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
     ])
     .size(19)
     .line_height(1.0)
-    .font(theme::BRAND_FONT);
+    .font(theme::BRAND_REGULAR_FONT);
     let brand = container(wordmark).padding(Padding::ZERO.top(4));
 
     let network_status = container(
@@ -725,6 +802,7 @@ pub(super) fn copy_value_button(value: &str, copied: bool) -> Element<'static, M
             .color(theme::ACCENT),
     )
     .on_press(Message::CopyValue(value.to_owned()))
+    .width(Length::Fixed(30.0))
     .padding([3, 5])
     .style(|_, status| theme::button(ButtonKind::Ghost, status))
     .into()
@@ -738,42 +816,47 @@ fn command_bar(app: &App) -> Element<'static, Message> {
     let commands = row![
         command(
             "F1",
-            "Main",
+            navigation_label("Main"),
             Message::Navigate(Section::Present),
             main_active,
         ),
         command(
             "F2",
-            "Addresses",
+            navigation_label("Addresses"),
             Message::ToggleAddressPicker,
             addresses_active,
         ),
-        command("F3", "Send", Message::OpenAction(Action::Send), send_active,),
+        command(
+            "F3",
+            navigation_label("Send"),
+            Message::OpenAction(Action::Send),
+            send_active,
+        ),
         command(
             "F4",
-            "Receipts",
+            navigation_label("Receipts"),
             Message::Navigate(Section::Proofs),
             app.section == Section::Proofs,
         ),
         command(
             "F5",
-            "Mining",
+            navigation_label("Mining"),
             Message::Navigate(Section::Mine),
             app.section == Section::Mine,
         ),
         command(
             "F6",
-            "Scope",
+            navigation_label("Scope"),
             Message::Navigate(Section::Explorer),
             app.section == Section::Explorer,
         ),
         command(
             "F7",
-            "Settings",
+            navigation_label("Settings"),
             Message::Navigate(Section::Settings),
             app.section == Section::Settings,
         ),
-        command("F10", "Quit", Message::Exit, false),
+        command("F10", navigation_label("Quit"), Message::Exit, false),
     ]
     .spacing(4)
     .height(32)
@@ -836,6 +919,7 @@ fn command(
 fn settings(app: &App, compact: bool) -> Element<'_, Message> {
     let tabs = settings_tabs(app);
     let body: Element<'_, Message> = match app.settings_tab {
+        SettingsTab::Interface => interface_settings(app),
         SettingsTab::Secret => secret_settings(app, compact),
         SettingsTab::Node => node_settings(app),
         SettingsTab::Network => settings_with_controls(app, network_settings_group(app).into()),
@@ -859,9 +943,65 @@ fn settings_tabs(app: &App) -> Element<'_, Message> {
         settings_tab("SECRET", SettingsTab::Secret, app),
         settings_tab("NODE", SettingsTab::Node, app),
         settings_tab("NETWORK", SettingsTab::Network, app),
+        settings_tab("INTERFACE", SettingsTab::Interface, app),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
+    .into()
+}
+
+fn interface_settings(app: &App) -> Element<'_, Message> {
+    let mut choices = row![].spacing(8).width(Length::Fill);
+    for language in Language::ALL {
+        let active = app.language == language;
+        let color = match language {
+            Language::English => theme::ACCENT,
+            Language::Russian => theme::PROOF,
+            Language::Chinese => theme::CYAN,
+        };
+        let choice = button(
+            row![
+                text(language.code())
+                    .size(12)
+                    .color(if active { theme::INK } else { color }),
+                text(language.native_name()).size(14),
+            ]
+            .spacing(9)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([11, 12])
+        .style(move |_, status| {
+            theme::button(
+                if active {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Secondary
+                },
+                status,
+            )
+        })
+        .on_press(Message::SetLanguage(language));
+        choices = choices.push(choice);
+    }
+
+    settings_panel(
+        "INTERFACE",
+        theme::CYAN,
+        column![
+            settings_control_field("LANGUAGE", choices.into()),
+            settings_field(
+                "KEYBOARD",
+                "Shortcuts are available from every wallet section.",
+                text("F1–F7 NAVIGATION · F10 QUIT · ESC BACK")
+                    .size(13)
+                    .color(theme::CYAN)
+                    .into(),
+            ),
+        ]
+        .spacing(1)
+        .into(),
+    )
     .into()
 }
 
@@ -1393,7 +1533,7 @@ fn node_log_terminal(app: &App) -> Element<'_, Message> {
     }
 
     let output = text_editor(&app.node_log)
-        .placeholder("Waiting for paranoid-node.log output…")
+        .placeholder(translate("Waiting for paranoid-node.log output…"))
         .on_action(Message::EditNodeLog)
         .font(theme::TECH_FONT)
         .size(12)
@@ -1502,7 +1642,7 @@ fn network_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
         .padding([8, 10])
         .style(theme::text_input);
     let seeds = text_editor(&app.settings_seeds)
-        .placeholder("One seed peer per line")
+        .placeholder(translate("One seed peer per line"))
         .on_action(Message::EditSettingsSeeds)
         .size(14)
         .padding([8, 10])
@@ -1567,6 +1707,17 @@ fn settings_field<'a>(
     .padding([8, 10])
     .style(theme::surface_alt)
     .into()
+}
+
+fn settings_control_field<'a>(
+    label: &'static str,
+    control: Element<'a, Message>,
+) -> Element<'a, Message> {
+    container(column![text(label).size(13).color(theme::TEXT), control].spacing(6))
+        .width(Length::Fill)
+        .padding([8, 10])
+        .style(theme::surface_alt)
+        .into()
 }
 
 fn replacement_warning() -> iced::widget::Container<'static, Message> {

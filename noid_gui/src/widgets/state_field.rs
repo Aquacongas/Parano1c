@@ -209,23 +209,25 @@ impl canvas::Program<Message> for StateField {
             }
 
             if self.selected_segment == Some(index as u8) {
-                let inset = (size.width.min(size.height) * 0.26).clamp(3.0, 6.0);
-                let marker_size = Size::new(
-                    (size.width - inset * 2.0).max(3.0),
-                    (size.height - inset * 2.0).max(3.0),
-                );
-                let marker = canvas::Path::rounded_rectangle(
-                    Point::new(top_left.x + inset, top_left.y + inset),
-                    marker_size,
-                    Radius::from(1.0),
-                );
-                frame.fill(&marker, theme::TEXT);
-
+                // Keep the density signal and owned-UTXO count visible. The
+                // former pale marker looked like a covered or corrupt cell.
+                frame.fill(&path, Color::from_rgba8(103, 215, 246, 0.10));
                 frame.stroke(
                     &path,
                     canvas::Stroke::default()
-                        .with_width(3.0)
+                        .with_width(2.2)
                         .with_color(theme::CYAN),
+                );
+                let halo = canvas::Path::rounded_rectangle(
+                    Point::new(top_left.x - 2.0, top_left.y - 2.0),
+                    Size::new(size.width + 4.0, size.height + 4.0),
+                    Radius::from(radius + 2.0),
+                );
+                frame.stroke(
+                    &halo,
+                    canvas::Stroke::default()
+                        .with_width(1.2)
+                        .with_color(Color::from_rgba8(103, 215, 246, 0.48)),
                 );
             } else if hovered == Some(index) {
                 frame.stroke(
