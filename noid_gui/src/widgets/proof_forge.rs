@@ -28,18 +28,23 @@ impl ProofForge {
     }
 }
 
+#[derive(Debug, Default)]
+pub struct ProofForgeState {
+    ground: canvas::Cache,
+    anvil: canvas::Cache,
+}
+
 impl canvas::Program<Message> for ProofForge {
-    type State = ();
+    type State = ProofForgeState;
 
     fn draw(
         &self,
-        _state: &Self::State,
+        state: &Self::State,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
         let scale = (bounds.width / DESIGN_WIDTH)
             .min(bounds.height / DESIGN_HEIGHT)
             .max(0.01);
@@ -49,14 +54,29 @@ impl canvas::Program<Message> for ProofForge {
         );
         let motion = forge_motion(self.elapsed_seconds);
 
-        frame.with_save(|frame| {
-            frame.translate(origin);
-            frame.scale(scale);
-
+        let mut field = canvas::Frame::new(renderer, bounds.size());
+        with_forge_layout(&mut field, origin, scale, |frame| {
             draw_forge_field(frame, self.elapsed_seconds, motion.impact);
-            draw_impact_glow(frame, motion);
-            draw_anvil(frame, motion.impact);
-
+        });
+        let ground = state.ground.draw(renderer, bounds.size(), |frame| {
+            with_forge_layout(frame, origin, scale, draw_forge_ground);
+        });
+        let anvil = if motion.impact <= 0.0 {
+            state.anvil.draw(renderer, bounds.size(), |frame| {
+                with_forge_layout(frame, origin, scale, |frame| {
+                    draw_anvil(frame, 0.0);
+                });
+            })
+        } else {
+            let mut anvil = canvas::Frame::new(renderer, bounds.size());
+            with_forge_layout(&mut anvil, origin, scale, |frame| {
+                draw_impact_glow(frame, motion);
+                draw_anvil(frame, motion.impact);
+            });
+            anvil.into_geometry()
+        };
+        let mut foreground = canvas::Frame::new(renderer, bounds.size());
+        with_forge_layout(&mut foreground, origin, scale, |frame| {
             if motion.swing_progress > 0.0 && motion.swing_progress < 1.0 {
                 for (offset, opacity) in [(0.09, 0.08), (0.16, 0.045)] {
                     draw_hammer(
@@ -72,8 +92,26 @@ impl canvas::Program<Message> for ProofForge {
             draw_sparks(frame, motion.spark_progress);
         });
 
-        vec![frame.into_geometry()]
+        vec![
+            field.into_geometry(),
+            ground,
+            anvil,
+            foreground.into_geometry(),
+        ]
     }
+}
+
+fn with_forge_layout(
+    frame: &mut canvas::Frame,
+    origin: Vector,
+    scale: f32,
+    draw: impl FnOnce(&mut canvas::Frame),
+) {
+    frame.with_save(|frame| {
+        frame.translate(origin);
+        frame.scale(scale);
+        draw(frame);
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -178,7 +216,9 @@ fn draw_forge_field(frame: &mut canvas::Frame, elapsed_seconds: f32, impact: f32
                 .with_color(with_alpha(color, 0.20 + impact * 0.28)),
         );
     }
+}
 
+fn draw_forge_ground(frame: &mut canvas::Frame) {
     let ground = canvas::Path::rounded_rectangle(
         Point::new(103.0, 177.0),
         Size::new(114.0, 5.0),

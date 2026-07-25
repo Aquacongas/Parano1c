@@ -6,12 +6,14 @@ use iced::widget::{
     button as button_widget, container, scrollable as scrollable_widget,
     text_editor as editor_widget, text_input as input_widget,
 };
-use iced::{font, theme::Palette, Background, Border, Color, Font, Shadow, Theme, Vector};
+use iced::{
+    font, gradient, theme::Palette, Background, Border, Color, Font, Radians, Shadow, Theme, Vector,
+};
 
-pub const BACKGROUND: Color = Color::from_rgb8(35, 37, 49);
-pub const SURFACE: Color = Color::from_rgb8(39, 42, 56);
-pub const SURFACE_ALT: Color = Color::from_rgb8(47, 50, 66);
-pub const SURFACE_HIGH: Color = Color::from_rgb8(59, 64, 81);
+pub const BACKGROUND: Color = Color::from_rgb8(10, 12, 20);
+pub const SURFACE: Color = Color::from_rgba8(39, 42, 58, 0.84);
+pub const SURFACE_ALT: Color = Color::from_rgba8(50, 54, 72, 0.88);
+pub const SURFACE_HIGH: Color = Color::from_rgba8(63, 68, 88, 0.93);
 pub const LINE: Color = Color::from_rgba8(214, 224, 255, 0.14);
 pub const LINE_STRONG: Color = Color::from_rgba8(224, 232, 255, 0.25);
 pub const TEXT: Color = Color::from_rgb8(246, 247, 250);
@@ -24,7 +26,7 @@ pub const WARNING: Color = Color::from_rgb8(231, 218, 61);
 pub const ADVISORY: Color = Color::from_rgb8(255, 176, 74);
 pub const DANGER: Color = Color::from_rgb8(255, 107, 119);
 pub const INK: Color = Color::from_rgb8(31, 33, 43);
-pub const CHROME: Color = Color::from_rgb8(31, 34, 45);
+pub const CHROME: Color = Color::from_rgba8(34, 37, 50, 0.86);
 pub const TECH_FONT: Font = Font {
     family: font::Family::Name("Noto Sans Mono"),
     weight: font::Weight::Normal,
@@ -80,12 +82,24 @@ pub fn paranoid_theme() -> Theme {
 
 pub fn root(_: &Theme) -> container::Style {
     container::Style::default()
-        .background(BACKGROUND)
+        .background(
+            gradient::Linear::new(Radians(0.0))
+                .add_stop(0.0, Color::from_rgb8(7, 9, 15))
+                .add_stop(0.48, Color::from_rgb8(14, 17, 27))
+                .add_stop(1.0, Color::from_rgb8(10, 12, 20)),
+        )
         .color(TEXT)
 }
 
-pub fn chrome_background(_: &Theme) -> container::Style {
-    container::Style::default().background(CHROME).color(TEXT)
+pub fn language_background(_: &Theme) -> container::Style {
+    container::Style::default()
+        .background(
+            gradient::Linear::new(Radians(0.0))
+                .add_stop(0.0, Color::from_rgb8(7, 9, 15))
+                .add_stop(0.48, Color::from_rgb8(14, 17, 27))
+                .add_stop(1.0, Color::from_rgb8(10, 12, 20)),
+        )
+        .color(TEXT)
 }
 
 pub fn surface(_: &Theme) -> container::Style {
@@ -133,13 +147,23 @@ pub fn node_log_panel(_: &Theme) -> container::Style {
 pub fn top_bar(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
-        background: Some(Background::Color(CHROME)),
+        background: Some(Background::Gradient(
+            gradient::Linear::new(Radians(0.0))
+                .add_stop(0.0, Color::from_rgba8(24, 27, 39, 0.62))
+                .add_stop(0.46, Color::from_rgba8(39, 43, 58, 0.72))
+                .add_stop(1.0, Color::from_rgba8(53, 57, 72, 0.66))
+                .into(),
+        )),
         border: Border {
-            color: LINE_STRONG,
+            color: Color::from_rgba8(230, 237, 255, 0.20),
             width: 1.0,
             radius: Radius::from(10.0),
         },
-        shadow: soft_shadow(),
+        shadow: Shadow {
+            color: Color::from_rgba8(1, 2, 7, 0.48),
+            offset: Vector::new(0.0, 5.0),
+            blur_radius: 13.0,
+        },
         snap: true,
     }
 }
@@ -175,7 +199,7 @@ pub fn status_panel(_: &Theme) -> container::Style {
 pub fn secret_visual(_: &Theme) -> container::Style {
     container::Style {
         text_color: Some(TEXT),
-        background: Some(Background::Color(Color::from_rgb8(28, 31, 41))),
+        background: Some(Background::Color(Color::from_rgba8(28, 31, 43, 0.88))),
         border: Border {
             color: Color::from_rgba8(206, 88, 214, 0.32),
             width: 1.0,
@@ -449,26 +473,23 @@ pub fn status_dot(color: Color) -> impl Fn(&Theme) -> container::Style {
     }
 }
 
-pub fn advisory_badge(pulse: f32) -> impl Fn(&Theme) -> container::Style {
-    move |_| {
-        let pulse = pulse.clamp(0.0, 1.0);
-        container::Style {
-            text_color: Some(ADVISORY),
-            background: Some(Background::Color(Color {
-                a: 0.10 + 0.12 * pulse,
+pub fn advisory_badge(_: &Theme) -> container::Style {
+    container::Style {
+        text_color: Some(ADVISORY),
+        background: Some(Background::Color(Color {
+            a: 0.18,
+            ..ADVISORY
+        })),
+        border: Border {
+            color: Color {
+                a: 0.76,
                 ..ADVISORY
-            })),
-            border: Border {
-                color: Color {
-                    a: 0.55 + 0.35 * pulse,
-                    ..ADVISORY
-                },
-                width: 1.0 + 0.5 * pulse,
-                radius: Radius::from(99.0),
             },
-            shadow: Shadow::default(),
-            snap: true,
-        }
+            width: 1.25,
+            radius: Radius::from(99.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
     }
 }
 
@@ -659,22 +680,22 @@ pub enum ButtonKind {
 fn primary_button_shadow(status: button_widget::Status) -> Shadow {
     if matches!(status, button_widget::Status::Pressed) {
         Shadow {
-            color: Color::from_rgba8(5, 7, 13, 0.30),
-            offset: Vector::new(0.0, 1.0),
+            color: Color::from_rgba8(1, 2, 6, 0.44),
+            offset: Vector::new(0.0, 1.5),
             blur_radius: 3.0,
         }
     } else {
         Shadow {
-            color: Color::from_rgba8(5, 7, 13, 0.42),
+            color: Color::from_rgba8(1, 2, 6, 0.58),
             offset: Vector::new(0.0, 4.0),
-            blur_radius: 9.0,
+            blur_radius: 8.0,
         }
     }
 }
 
 pub fn colored_primary(color: Color, status: button_widget::Status) -> button_widget::Style {
     if matches!(status, button_widget::Status::Disabled) {
-        return button(ButtonKind::Primary, status);
+        return disabled_button_style();
     }
 
     let hovered = matches!(
@@ -682,35 +703,23 @@ pub fn colored_primary(color: Color, status: button_widget::Status) -> button_wi
         button_widget::Status::Hovered | button_widget::Status::Pressed
     );
     let pressed = matches!(status, button_widget::Status::Pressed);
-    let background = if pressed {
-        Color {
-            r: color.r * 0.82,
-            g: color.g * 0.82,
-            b: color.b * 0.82,
-            ..color
-        }
+    let base = if pressed {
+        shade(color, 0.16)
     } else if hovered {
-        Color {
-            r: color.r + (1.0 - color.r) * 0.16,
-            g: color.g + (1.0 - color.g) * 0.16,
-            b: color.b + (1.0 - color.b) * 0.16,
-            ..color
-        }
+        tint(color, 0.10)
     } else {
         color
     };
 
     button_widget::Style {
-        background: Some(Background::Color(background)),
+        background: Some(raised_gradient(base)),
         text_color: INK,
         border: Border {
             color: Color {
-                r: color.r + (1.0 - color.r) * 0.68,
-                g: color.g + (1.0 - color.g) * 0.68,
-                b: color.b + (1.0 - color.b) * 0.68,
-                a: 0.32,
+                a: 0.38,
+                ..tint(color, 0.68)
             },
-            width: 1.0,
+            width: if pressed { 1.0 } else { 1.15 },
             radius: Radius::from(6.0),
         },
         shadow: primary_button_shadow(status),
@@ -724,27 +733,76 @@ pub fn language_choice(color: Color, status: button_widget::Status) -> button_wi
     let mut style = colored_primary(color, status);
     let pressed = matches!(status, button_widget::Status::Pressed);
     style.shadow = Shadow {
-        color: Color::from_rgba8(3, 5, 10, if pressed { 0.34 } else { 0.54 }),
-        offset: Vector::new(0.0, if pressed { 1.0 } else { 5.0 }),
-        blur_radius: if pressed { 2.0 } else { 8.0 },
+        color: Color::from_rgba8(1, 2, 6, if pressed { 0.44 } else { 0.72 }),
+        offset: Vector::new(0.0, if pressed { 2.0 } else { 7.0 }),
+        blur_radius: if pressed { 3.0 } else { 12.0 },
     };
     style.border.width = if pressed { 1.0 } else { 1.25 };
     style
 }
 
+fn raised_gradient(color: Color) -> Background {
+    Background::Gradient(
+        gradient::Linear::new(Radians(0.0))
+            .add_stop(0.0, shade(color, 0.17))
+            .add_stop(0.42, color)
+            .add_stop(1.0, tint(color, 0.18))
+            .into(),
+    )
+}
+
+fn tint(color: Color, amount: f32) -> Color {
+    Color {
+        r: color.r + (1.0 - color.r) * amount,
+        g: color.g + (1.0 - color.g) * amount,
+        b: color.b + (1.0 - color.b) * amount,
+        ..color
+    }
+}
+
+fn shade(color: Color, amount: f32) -> Color {
+    Color {
+        r: color.r * (1.0 - amount),
+        g: color.g * (1.0 - amount),
+        b: color.b * (1.0 - amount),
+        ..color
+    }
+}
+
+fn disabled_button_style() -> button_widget::Style {
+    button_widget::Style {
+        background: Some(raised_gradient(Color::from_rgba8(38, 42, 55, 0.72))),
+        text_color: DIM,
+        border: Border {
+            color: Color::from_rgba8(214, 224, 255, 0.09),
+            width: 1.0,
+            radius: Radius::from(6.0),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba8(1, 2, 6, 0.18),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 4.0,
+        },
+        snap: true,
+    }
+}
+
+fn neutral_button_shadow(status: button_widget::Status, visible: bool) -> Shadow {
+    let pressed = matches!(status, button_widget::Status::Pressed);
+    if !visible && !pressed {
+        return Shadow::default();
+    }
+
+    Shadow {
+        color: Color::from_rgba8(1, 2, 6, if pressed { 0.30 } else { 0.40 }),
+        offset: Vector::new(0.0, if pressed { 1.0 } else { 3.0 }),
+        blur_radius: if pressed { 2.0 } else { 7.0 },
+    }
+}
+
 pub fn button(kind: ButtonKind, status: button_widget::Status) -> button_widget::Style {
     if matches!(status, button_widget::Status::Disabled) {
-        return button_widget::Style {
-            background: Some(Background::Color(SURFACE)),
-            text_color: DIM,
-            border: Border {
-                color: LINE,
-                width: 1.0,
-                radius: Radius::from(6.0),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        };
+        return disabled_button_style();
     }
 
     let hovered = matches!(
@@ -754,130 +812,145 @@ pub fn button(kind: ButtonKind, status: button_widget::Status) -> button_widget:
     let pressed = matches!(status, button_widget::Status::Pressed);
 
     match kind {
-        ButtonKind::Primary => button_widget::Style {
-            background: Some(Background::Color(if pressed {
-                Color::from_rgb8(45, 189, 113)
+        ButtonKind::Primary => colored_primary(ACCENT, status),
+        ButtonKind::Secondary => {
+            let base = if pressed {
+                shade(SURFACE_ALT, 0.14)
             } else if hovered {
-                Color::from_rgb8(82, 238, 137)
-            } else {
-                ACCENT
-            })),
-            text_color: INK,
-            border: Border {
-                color: Color::from_rgba8(190, 255, 213, 0.32),
-                width: 1.0,
-                radius: Radius::from(6.0),
-            },
-            shadow: primary_button_shadow(status),
-            snap: true,
-        },
-        ButtonKind::Secondary => button_widget::Style {
-            background: Some(Background::Color(if pressed {
-                Color::from_rgb8(51, 55, 70)
-            } else if hovered {
-                SURFACE_HIGH
+                tint(SURFACE_HIGH, 0.06)
             } else {
                 SURFACE_ALT
-            })),
-            text_color: TEXT,
-            border: Border {
-                color: if hovered { LINE_STRONG } else { LINE },
-                width: 1.0,
-                radius: Radius::from(6.0),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        ButtonKind::Ghost => button_widget::Style {
-            background: Some(Background::Color(if hovered {
-                SURFACE_HIGH
-            } else {
-                Color::TRANSPARENT
-            })),
-            text_color: if hovered { TEXT } else { MUTED },
-            border: Border {
-                color: if hovered { LINE } else { Color::TRANSPARENT },
-                width: 1.0,
-                radius: Radius::from(5.0),
-            },
-            ..button_widget::Style::default()
-        },
-        ButtonKind::Command => button_widget::Style {
-            background: Some(Background::Color(if pressed {
-                Color::from_rgba8(103, 215, 246, 0.22)
+            };
+            button_widget::Style {
+                background: Some(raised_gradient(base)),
+                text_color: TEXT,
+                border: Border {
+                    color: if hovered {
+                        Color {
+                            a: 0.42,
+                            ..LINE_STRONG
+                        }
+                    } else {
+                        Color { a: 0.22, ..LINE }
+                    },
+                    width: 1.0,
+                    radius: Radius::from(6.0),
+                },
+                shadow: neutral_button_shadow(status, true),
+                snap: true,
+            }
+        }
+        ButtonKind::Ghost => {
+            let base = if pressed {
+                Color::from_rgba8(44, 49, 65, 0.82)
             } else if hovered {
-                Color::from_rgba8(103, 215, 246, 0.12)
+                Color::from_rgba8(55, 61, 80, 0.74)
             } else {
-                Color::TRANSPARENT
-            })),
-            text_color: TEXT,
-            border: Border {
-                color: Color::TRANSPARENT,
-                width: 0.0,
-                radius: Radius::from(5.0),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
-        ButtonKind::CommandActive => button_widget::Style {
-            background: Some(Background::Color(if pressed {
-                Color::from_rgba8(103, 215, 246, 0.24)
+                Color::from_rgba8(34, 38, 51, 0.30)
+            };
+            button_widget::Style {
+                background: Some(raised_gradient(base)),
+                text_color: if hovered { TEXT } else { MUTED },
+                border: Border {
+                    color: if hovered {
+                        Color::from_rgba8(224, 232, 255, 0.22)
+                    } else {
+                        Color::from_rgba8(214, 224, 255, 0.07)
+                    },
+                    width: 1.0,
+                    radius: Radius::from(5.0),
+                },
+                shadow: neutral_button_shadow(status, hovered),
+                snap: true,
+            }
+        }
+        ButtonKind::Command => {
+            let base = if pressed {
+                Color::from_rgba8(58, 116, 137, 0.34)
             } else if hovered {
-                Color::from_rgba8(103, 215, 246, 0.20)
+                Color::from_rgba8(46, 86, 108, 0.30)
             } else {
-                Color::from_rgba8(103, 215, 246, 0.13)
-            })),
-            text_color: CYAN,
-            border: Border {
-                color: Color::from_rgba8(103, 215, 246, 0.30),
-                width: 1.0,
-                radius: Radius::from(5.0),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        },
+                Color::from_rgba8(34, 38, 51, 0.18)
+            };
+            button_widget::Style {
+                background: Some(raised_gradient(base)),
+                text_color: TEXT,
+                border: Border {
+                    color: if hovered {
+                        Color::from_rgba8(103, 215, 246, 0.22)
+                    } else {
+                        Color::from_rgba8(214, 224, 255, 0.05)
+                    },
+                    width: 1.0,
+                    radius: Radius::from(5.0),
+                },
+                shadow: neutral_button_shadow(status, hovered),
+                snap: true,
+            }
+        }
+        ButtonKind::CommandActive => {
+            let base = if pressed {
+                Color::from_rgba8(50, 132, 158, 0.46)
+            } else if hovered {
+                Color::from_rgba8(51, 119, 145, 0.42)
+            } else {
+                Color::from_rgba8(43, 91, 113, 0.38)
+            };
+            button_widget::Style {
+                background: Some(raised_gradient(base)),
+                text_color: CYAN,
+                border: Border {
+                    color: Color::from_rgba8(103, 215, 246, 0.38),
+                    width: 1.0,
+                    radius: Radius::from(5.0),
+                },
+                shadow: neutral_button_shadow(status, true),
+                snap: true,
+            }
+        }
     }
 }
 
-pub fn consolidation_button(pulse: f32, status: button_widget::Status) -> button_widget::Style {
+pub fn consolidation_button(status: button_widget::Status) -> button_widget::Style {
     if matches!(status, button_widget::Status::Disabled) {
         return button(ButtonKind::Secondary, status);
     }
 
-    let pulse = pulse.clamp(0.0, 1.0);
     let hovered = matches!(
         status,
         button_widget::Status::Hovered | button_widget::Status::Pressed
     );
     let pressed = matches!(status, button_widget::Status::Pressed);
 
+    let base = if pressed {
+        Color {
+            a: 0.36,
+            ..ADVISORY
+        }
+    } else if hovered {
+        Color {
+            a: 0.29,
+            ..ADVISORY
+        }
+    } else {
+        Color {
+            a: 0.20,
+            ..ADVISORY
+        }
+    };
+
     button_widget::Style {
-        background: Some(Background::Color(if pressed {
-            Color {
-                a: 0.24,
-                ..ADVISORY
-            }
-        } else if hovered {
-            Color {
-                a: 0.18,
-                ..ADVISORY
-            }
-        } else {
-            Color {
-                a: 0.06 + 0.08 * pulse,
-                ..ADVISORY
-            }
-        })),
+        background: Some(raised_gradient(base)),
         text_color: ADVISORY,
         border: Border {
             color: Color {
-                a: if hovered { 0.95 } else { 0.48 + 0.42 * pulse },
+                a: if hovered { 0.95 } else { 0.72 },
                 ..ADVISORY
             },
-            width: 1.0 + 0.5 * pulse,
+            width: if hovered { 1.5 } else { 1.25 },
             radius: Radius::from(6.0),
         },
-        shadow: Shadow::default(),
+        shadow: neutral_button_shadow(status, true),
         snap: true,
     }
 }

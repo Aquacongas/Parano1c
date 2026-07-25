@@ -16,12 +16,12 @@ use crate::app::{Action, App, Message, SecretDialog, WalletSetupMode, NODE_LOG_L
 use crate::i18n::{navigation_label, text, text_input, translate};
 use crate::model::{Language, SecretImportMode, Section, SettingsTab};
 use crate::theme::{self, ButtonKind};
-use crate::widgets::{LanguageForge, PhotoScanner, ProofForge, SecretArrow};
+use crate::widgets::{InterfaceBackdrop, LanguageForge, PhotoScanner, ProofForge, SecretArrow};
 
 const SECRET_DESKTOP_WORKSPACE_HEIGHT: f32 = 360.0;
 
 pub fn root(app: &App) -> Element<'_, Message> {
-    let body = responsive(|size| {
+    let body: Element<'_, Message> = responsive(|size| {
         if app.language_selection_required {
             language_setup(app, size.width, size.height, size.width < 1_040.0)
         } else if app.wallet_setup_required {
@@ -29,9 +29,22 @@ pub fn root(app: &App) -> Element<'_, Message> {
         } else {
             application(app, size.width < 1_040.0)
         }
-    });
+    })
+    .into();
 
-    let wallet: Element<'_, Message> = container(body)
+    let content: Element<'_, Message> = if app.language_selection_required {
+        body
+    } else {
+        let backdrop: Element<'_, Message> = canvas(InterfaceBackdrop)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
+        stack([backdrop, body])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    };
+    let wallet: Element<'_, Message> = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(theme::root)
@@ -117,7 +130,7 @@ fn language_setup(
     container(scene)
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(theme::chrome_background)
+        .style(theme::language_background)
         .into()
 }
 
@@ -714,7 +727,7 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         span::<(), iced::Font>("O(1)").color(theme::ACCENT),
         span::<(), iced::Font>("d").color(theme::TEXT),
     ])
-    .size(19)
+    .size(18)
     .line_height(1.0)
     .font(theme::BRAND_REGULAR_FONT);
     let brand = container(wordmark).padding(Padding::ZERO.top(4));

@@ -24,10 +24,11 @@ pub const BLOCK_DETAILS_SCROLL_ID: &str = "block-details-scroll";
 pub const TRANSACTION_DETAILS_SCROLL_ID: &str = "transaction-details-scroll";
 pub const NODE_LOG_LINE_LIMIT: usize = 80;
 
-const PHOTO_SCAN_FRAME: Duration = Duration::from_millis(16);
-const PROOF_FORGE_FRAME: Duration = Duration::from_millis(16);
-const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(16);
-const LANGUAGE_FORGE_FRAME: Duration = Duration::from_millis(16);
+const PHOTO_SCAN_FRAME: Duration = Duration::from_millis(33);
+const PROOF_FORGE_FRAME: Duration = Duration::from_millis(33);
+const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(33);
+const LANGUAGE_FORGE_FRAME: Duration = Duration::from_millis(33);
+const CONSOLIDATION_HINT_CLOSE_FRAME: Duration = Duration::from_millis(80);
 const NODE_LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NODE_LOG_BYTE_LIMIT: u64 = 64 * 1024;
 const PHOTO_SCAN_COMPLETE_HOLD: Duration = Duration::from_millis(160);
@@ -144,7 +145,6 @@ pub struct App {
     consolidation_badge_hovered: bool,
     consolidation_card_hovered: bool,
     consolidation_hint_close_ticks: u8,
-    consolidation_pulse_phase: f32,
     backend: Backend,
     refresh_in_flight: bool,
     ensure_in_flight: bool,
@@ -219,7 +219,7 @@ pub enum Message {
     LeaveConsolidationBadge,
     EnterConsolidationCard,
     LeaveConsolidationCard,
-    PulseConsolidationHint,
+    ConsolidationHintCloseTick,
     EnsureNodeFinished(Result<(), String>),
     RefreshTick,
     SnapshotLoaded(Result<Box<BackendSnapshot>, String>),
@@ -438,7 +438,6 @@ impl App {
             consolidation_badge_hovered: false,
             consolidation_card_hovered: false,
             consolidation_hint_close_ticks: 0,
-            consolidation_pulse_phase: 0.0,
             backend: backend.clone(),
             refresh_in_flight: false,
             ensure_in_flight: !mock && !wallet_setup_required,
@@ -827,10 +826,7 @@ impl App {
                     self.consolidation_hint_close_ticks = 4;
                 }
             }
-            Message::PulseConsolidationHint => {
-                self.consolidation_pulse_phase =
-                    (self.consolidation_pulse_phase + 0.15) % std::f32::consts::TAU;
-
+            Message::ConsolidationHintCloseTick => {
                 if !self.consolidation_badge_hovered
                     && !self.consolidation_card_hovered
                     && self.consolidation_hint_close_ticks > 0
@@ -859,14 +855,7 @@ impl App {
                 }
             }
             Message::RefreshTick => {
-                let refresh_snapshot = !self.backend.is_mock()
-                    && !self.wallet_setup_required
-                    && !self.refresh_in_flight
-                    && !self.ensure_in_flight
-                    && !self.node_action_in_flight
-                    && !self.wallet_action_in_flight()
-                    && self.address_operation.is_none()
-                    && !self.shutting_down;
+                let refresh_snapshot = self.snapshot_refresh_available();
                 let refresh_node_log = self.node_log_refresh_due();
                 return Task::batch([
                     if refresh_snapshot {
@@ -1000,8 +989,8 @@ impl App {
                 self.address_discovery_in_flight = false;
                 self.address_discovery_pending = false;
                 match result {
-                    Ok(output) => {
-                        self.settings_notice = Some(output);
+                    Ok(_) => {
+                        self.settings_notice = None;
                         return self.refresh_snapshot();
                     }
                     Err(error) => {
@@ -1977,7 +1966,7 @@ impl App {
                     self.secret_dialog == Some(SecretDialog::Import)
                 };
                 match result {
-                    Ok(output) => {
+                    Ok(_) => {
                         self.secret_dialog = None;
                         self.imported_master_secret.clear();
                         self.address_discovery_pending = discover_addresses;
@@ -1993,14 +1982,7 @@ impl App {
                         self.wallet_setup_required = false;
                         self.wallet_setup_mode = WalletSetupMode::Choose;
                         self.reset_wallet_views();
-                        self.settings_notice = Some(if discover_addresses {
-                            "Wallet restored. Funded addresses will be discovered after synchronization."
-                                .into()
-                        } else if output.is_empty() {
-                            "Master secret ready.".into()
-                        } else {
-                            output
-                        });
+                        self.settings_notice = None;
                         self.backend_state = BackendState::Online;
                         return Task::batch([
                             self.refresh_snapshot(),
@@ -2146,29 +2128,26 @@ impl App {
                 _ => None,
             }),
         ];
-        if !self.backend.is_mock() && !self.wallet_setup_required {
+        if self.refresh_timer_needed() {
             subscriptions
                 .push(iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshTick));
-        }
-        if self.photo_scan_active {
-            subscriptions.push(iced::time::every(PHOTO_SCAN_FRAME).map(|_| Message::PhotoScanTick));
-        }
-        if self.language_selection_required {
-            subscriptions
-                .push(iced::time::every(LANGUAGE_FORGE_FRAME).map(|_| Message::LanguageForgeTick));
-        }
-        if self.send_in_flight || self.consolidation_in_flight {
-            subscriptions
-                .push(iced::time::every(PROOF_FORGE_FRAME).map(|_| Message::ProofForgeTick));
         }
         if self.shutting_down {
             subscriptions
                 .push(iced::time::every(SHUTDOWN_FORGE_FRAME).map(|_| Message::ShutdownForgeTick));
+        } else if self.language_selection_required {
+            subscriptions
+                .push(iced::time::every(LANGUAGE_FORGE_FRAME).map(|_| Message::LanguageForgeTick));
+        } else if self.photo_scan_active {
+            subscriptions.push(iced::time::every(PHOTO_SCAN_FRAME).map(|_| Message::PhotoScanTick));
+        } else if self.send_in_flight || self.consolidation_in_flight {
+            subscriptions
+                .push(iced::time::every(PROOF_FORGE_FRAME).map(|_| Message::ProofForgeTick));
         }
-        if self.section == Section::Present && self.consolidation_recommended() {
+        if self.consolidation_hint_close_ticks > 0 {
             subscriptions.push(
-                iced::time::every(Duration::from_millis(80))
-                    .map(|_| Message::PulseConsolidationHint),
+                iced::time::every(CONSOLIDATION_HINT_CLOSE_FRAME)
+                    .map(|_| Message::ConsolidationHintCloseTick),
             );
         }
         Subscription::batch(subscriptions)
@@ -2191,10 +2170,6 @@ impl App {
 
     pub fn utxo_page_count(&self) -> usize {
         utxo_page_count_for(self.visible_utxo_count())
-    }
-
-    pub fn consolidation_pulse(&self) -> f32 {
-        0.5 + 0.5 * self.consolidation_pulse_phase.sin()
     }
 
     pub fn proof_forge_elapsed_seconds(&self) -> f32 {
@@ -2325,6 +2300,25 @@ impl App {
         !self.wallet_setup_required
             && self.section == Section::Settings
             && self.settings_tab == SettingsTab::Node
+    }
+
+    fn snapshot_refresh_available(&self) -> bool {
+        !self.backend.is_mock()
+            && !self.wallet_setup_required
+            && !self.refresh_in_flight
+            && !self.ensure_in_flight
+            && !self.node_action_in_flight
+            && !self.wallet_action_in_flight()
+            && self.address_operation.is_none()
+            && !self.shutting_down
+    }
+
+    fn refresh_timer_needed(&self) -> bool {
+        self.snapshot_refresh_available()
+            || (!self.backend.is_mock()
+                && self.node_log_visible()
+                && !self.node_log_loading
+                && !self.shutting_down)
     }
 
     fn resume_node_log(&mut self) {

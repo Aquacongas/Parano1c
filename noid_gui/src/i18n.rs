@@ -1061,10 +1061,6 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
             "Мастер-ключ должен содержать ровно 64 шестнадцатеричных символа.",
             "主密钥必须正好包含 64 个十六进制字符。",
         ),
-        "Wallet restored. Funded addresses will be discovered after synchronization." => (
-            "Кошелёк восстановлен. Адреса с балансом будут найдены после синхронизации.",
-            "钱包已恢复。同步完成后将自动发现有余额的地址。",
-        ),
         "Master secret ready." => ("Мастер-ключ готов.", "主密钥已就绪。"),
         "Enter an amount." => ("Введите сумму.", "请输入金额。"),
         "Amount must be a positive NOID value." => (

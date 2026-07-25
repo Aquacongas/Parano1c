@@ -355,10 +355,6 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
         .padding([6, 9])
         .style(theme::title_bar_accent);
 
-    let title = row![owner_tab, iced::widget::Space::new().width(Length::Fill)]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
     let address_line = container(
         row![
             container(
@@ -441,7 +437,6 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
             metric_label_size,
             metric_value_size,
             app.consolidation_recommended(),
-            app.consolidation_pulse(),
         ),
         account_separator(),
         amount_stat(
@@ -472,11 +467,10 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Length::Shrink);
 
-    let pulse = app.consolidation_pulse();
     let consolidate =
         button(text("CONSOLIDATE").size(13)).padding([9, if compact { 10 } else { 13 }]);
     let consolidate = if app.consolidation_recommended() {
-        consolidate.style(move |_, status| theme::consolidation_button(pulse, status))
+        consolidate.style(|_, status| theme::consolidation_button(status))
     } else {
         consolidate.style(|_, status| theme::button(ButtonKind::Secondary, status))
     };
@@ -504,20 +498,24 @@ fn active_owner(app: &App, compact: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .into();
 
-    container(
-        column![
-            container(title).style(theme::surface_alt),
-            address_line,
-            container(iced::widget::Space::new())
-                .width(Length::Fill)
-                .height(1)
-                .style(theme::divider),
-            container(summary).padding([10, 12])
-        ]
-        .spacing(0),
-    )
+    column![
+        owner_tab,
+        container(
+            column![
+                address_line,
+                container(iced::widget::Space::new())
+                    .width(Length::Fill)
+                    .height(1)
+                    .style(theme::divider),
+                container(summary).padding([10, 12])
+            ]
+            .spacing(0)
+        )
+        .width(Length::Fill)
+        .style(theme::surface)
+    ]
+    .spacing(0)
     .width(Length::Fill)
-    .style(theme::surface)
     .into()
 }
 
@@ -540,7 +538,6 @@ fn spendable_stat(
     label_size: f32,
     value_size: f32,
     recommended: bool,
-    pulse: f32,
 ) -> Element<'static, Message> {
     let mut value_row = row![text(value).size(value_size).color(theme::TEXT)]
         .spacing(7)
@@ -552,7 +549,7 @@ fn spendable_stat(
             .height(19)
             .align_x(Alignment::Center)
             .align_y(Alignment::Center)
-            .style(theme::advisory_badge(pulse));
+            .style(theme::advisory_badge);
         value_row = value_row.push(
             mouse_area(badge)
                 .on_enter(Message::EnterConsolidationBadge)
@@ -596,7 +593,7 @@ fn consolidation_hint(compact: bool) -> Element<'static, Message> {
                 button(text("CONSOLIDATE").size(13))
                     .on_press(Message::OpenAction(Action::Consolidate))
                     .padding([7, 12])
-                    .style(|_, status| theme::consolidation_button(1.0, status)),
+                    .style(|_, status| theme::consolidation_button(status)),
             ]
             .spacing(9),
         )

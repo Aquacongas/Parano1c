@@ -14,6 +14,9 @@ const DESIGN_HEIGHT: f32 = 350.0;
 const BUTTON_CENTER_X: f32 = 350.0;
 const BUTTON_DESIGN_WIDTH: f32 = 238.0;
 const FLOOR_Y: f32 = 329.0;
+const BRAND_CENTER_X: f32 = DESIGN_WIDTH * 0.5;
+const BRAND_Y: f32 = -200.0;
+const BLOCK_SOURCE_Y: f32 = -94.0;
 const CHARACTER_SCALE: f32 = 1.35;
 const CHARACTER_SCALE_ANCHOR_X: f32 = BUTTON_CENTER_X;
 const HAMMER_READY_ANGLE: f32 = 4.48;
@@ -31,6 +34,14 @@ const DROP_END: f32 = 5.15;
 pub struct LanguageForge {
     elapsed_seconds: f32,
     compact: bool,
+}
+
+#[derive(Debug, Default)]
+pub struct LanguageForgeState {
+    grid: canvas::Cache,
+    shadows: canvas::Cache,
+    floor_light: canvas::Cache,
+    button_lights: [canvas::Cache; 3],
 }
 
 impl LanguageForge {
@@ -66,32 +77,81 @@ impl LanguageForge {
 }
 
 impl canvas::Program<Message> for LanguageForge {
-    type State = ();
+    type State = LanguageForgeState;
 
     fn draw(
         &self,
-        _state: &Self::State,
+        program_state: &Self::State,
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
         _cursor: iced::mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
         let layout = SceneLayout::new(bounds.width, bounds.height, self.compact);
         let entry_x = CHARACTER_SCALE_ANCHOR_X
             + (layout.right_edge_design + 35.0 - CHARACTER_SCALE_ANCHOR_X) / CHARACTER_SCALE;
         let state = forge_state_with_entry(self.elapsed_seconds, entry_x);
+        let grid = program_state.grid.draw(renderer, bounds.size(), |frame| {
+            with_scene_layout(frame, layout, draw_stage_grid_base);
+        });
+        let mut rings = canvas::Frame::new(renderer, bounds.size());
+        with_scene_layout(&mut rings, layout, |frame| {
+            draw_stage_rings(frame, state);
+        });
+        let shadows = program_state
+            .shadows
+            .draw(renderer, bounds.size(), |frame| {
+                with_scene_layout(frame, layout, draw_selector_shadows);
+            });
+        let impact = selector_impact(state);
+        let floor_light = if impact <= 0.0 {
+            program_state
+                .floor_light
+                .draw(renderer, bounds.size(), |frame| {
+                    with_scene_layout(frame, layout, draw_selector_floor_light_base);
+                })
+        } else {
+            let mut floor_light = canvas::Frame::new(renderer, bounds.size());
+            with_scene_layout(&mut floor_light, layout, |frame| {
+                draw_selector_floor_light(frame, state);
+            });
+            floor_light.into_geometry()
+        };
+        let mut geometries = Vec::with_capacity(11);
+        geometries.push(grid);
+        geometries.push(rings.into_geometry());
+        geometries.push(shadows);
+        geometries.push(floor_light);
 
-        frame.with_save(|frame| {
-            frame.translate(layout.origin);
-            frame.scale(layout.scale);
-            draw_stage_grid(frame, state);
+        for (index, (center_y, color)) in selector_button_lights().into_iter().enumerate() {
+            let button_light =
+                program_state.button_lights[index].draw(renderer, bounds.size(), |frame| {
+                    with_scene_layout(frame, layout, |frame| {
+                        draw_selector_button_light(frame, center_y, color);
+                    });
+                });
+            geometries.push(button_light);
+
+            if impact > 0.0 {
+                let mut overlay = canvas::Frame::new(renderer, bounds.size());
+                with_scene_layout(&mut overlay, layout, |frame| {
+                    draw_selector_button_light_overlay(frame, state, center_y, color);
+                });
+                geometries.push(overlay.into_geometry());
+            }
+        }
+
+        let mut scene = canvas::Frame::new(renderer, bounds.size());
+
+        with_scene_layout(&mut scene, layout, |frame| {
+            draw_selector_impact_light(frame, state);
 
             let strength = state.shake_strength();
             let shake = Vector::new(
                 (state.t * 181.0).sin() * 2.8 * strength,
                 (state.t * 233.0).sin() * 1.7 * strength,
             );
+            draw_language_brand(frame);
             frame.with_save(|frame| {
                 frame.translate(shake);
                 draw_blocks(frame, state);
@@ -109,8 +169,21 @@ impl canvas::Program<Message> for LanguageForge {
             });
         });
 
-        vec![frame.into_geometry()]
+        geometries.push(scene.into_geometry());
+        geometries
     }
+}
+
+fn with_scene_layout(
+    frame: &mut canvas::Frame,
+    layout: SceneLayout,
+    draw: impl FnOnce(&mut canvas::Frame),
+) {
+    frame.with_save(|frame| {
+        frame.translate(layout.origin);
+        frame.scale(layout.scale);
+        draw(frame);
+    });
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -127,7 +200,7 @@ impl SceneLayout {
         } else {
             180.0 / BUTTON_DESIGN_WIDTH
         };
-        let vertical_offset = if compact { 45.0 } else { 55.0 };
+        let vertical_offset = if compact { 61.0 } else { 73.0 };
         let origin = Vector::new(
             (width - DESIGN_WIDTH * scale) * 0.5,
             (height - DESIGN_HEIGHT * scale) * 0.5 + vertical_offset,
@@ -364,30 +437,206 @@ fn surprise_eye_openness(cycle: f32) -> f32 {
     1.0 - blink(5.30).max(blink(5.67)) * 0.94
 }
 
-fn draw_stage_grid(frame: &mut canvas::Frame, state: ForgeState) {
-    for y in (52..=304).step_by(42) {
+fn selector_impact(state: ForgeState) -> f32 {
+    state.impact.max(state.landing * 0.56)
+}
+
+fn draw_selector_shadows(frame: &mut canvas::Frame) {
+    soft_ellipse_glow(
+        frame,
+        Point::new(BUTTON_CENTER_X + 3.0, FLOOR_Y + 8.0),
+        Vector::new(142.0, 13.0),
+        Color::from_rgb8(2, 3, 8),
+        0.72,
+    );
+    soft_ellipse_glow(
+        frame,
+        Point::new(535.0, FLOOR_Y + 8.0),
+        Vector::new(86.0, 10.0),
+        Color::from_rgb8(2, 3, 8),
+        0.62,
+    );
+}
+
+fn draw_selector_floor_light_base(frame: &mut canvas::Frame) {
+    soft_ellipse_glow(
+        frame,
+        Point::new(BUTTON_CENTER_X, FLOOR_Y + 5.0),
+        Vector::new(112.0, 7.0),
+        theme::DANGER,
+        0.030,
+    );
+}
+
+fn draw_selector_floor_light(frame: &mut canvas::Frame, state: ForgeState) {
+    let impact = selector_impact(state);
+    soft_ellipse_glow(
+        frame,
+        Point::new(BUTTON_CENTER_X, FLOOR_Y + 5.0),
+        Vector::new(112.0 + impact * 18.0, 7.0 + impact * 2.0),
+        theme::DANGER,
+        0.030 + impact * 0.048,
+    );
+}
+
+fn selector_button_lights() -> [(f32, Color); 3] {
+    [
+        (180.0, theme::ACCENT),
+        (242.0, theme::CYAN),
+        (304.0, theme::DANGER),
+    ]
+}
+
+fn draw_selector_button_light(frame: &mut canvas::Frame, center_y: f32, color: Color) {
+    soft_ellipse_glow(
+        frame,
+        Point::new(BUTTON_CENTER_X, center_y + 5.0),
+        Vector::new(132.0, 39.0),
+        color,
+        0.032,
+    );
+}
+
+fn draw_selector_button_light_overlay(
+    frame: &mut canvas::Frame,
+    state: ForgeState,
+    center_y: f32,
+    color: Color,
+) {
+    let impact = selector_impact(state);
+    soft_ellipse_glow_overlay(
+        frame,
+        Point::new(BUTTON_CENTER_X, center_y + 5.0),
+        Vector::new(132.0, 39.0),
+        color,
+        0.032,
+        0.032 + impact * 0.014,
+    );
+}
+
+fn draw_selector_impact_light(frame: &mut canvas::Frame, state: ForgeState) {
+    let impact = selector_impact(state);
+    if impact <= 0.0 {
+        return;
+    }
+
+    soft_ellipse_glow(
+        frame,
+        Point::new(BUTTON_CENTER_X, 157.0),
+        Vector::new(120.0 + impact * 28.0, 45.0 + impact * 10.0),
+        theme::CYAN,
+        impact * 0.072,
+    );
+}
+
+fn draw_language_brand(frame: &mut canvas::Frame) {
+    draw_brand_wordmark(
+        frame,
+        Point::new(BRAND_CENTER_X, BRAND_Y + 1.5),
+        Color::from_rgba8(2, 3, 8, 0.72),
+        1.5,
+    );
+    draw_brand_wordmark(frame, Point::new(BRAND_CENTER_X, BRAND_Y), theme::TEXT, 0.0);
+}
+
+fn active_block_generation(state: ForgeState) -> u64 {
+    if state.t < INTRO_END {
+        return 0;
+    }
+
+    let elapsed = state.t - INTRO_END;
+    let cycle_number = (elapsed / FORGE_CYCLE).floor() as u64;
+    let cycle = elapsed.rem_euclid(FORGE_CYCLE);
+    cycle_number + u64::from(cycle >= DROP_START)
+}
+
+fn block_color_palette(generation: u64) -> [Color; 3] {
+    const PERMUTATIONS: [[usize; 3]; 6] = [
+        [2, 0, 1],
+        [0, 2, 1],
+        [1, 0, 2],
+        [2, 1, 0],
+        [0, 1, 2],
+        [1, 2, 0],
+    ];
+    let palette = [theme::ACCENT, theme::CYAN, theme::DANGER];
+    let order = PERMUTATIONS[(generation as usize).wrapping_mul(5).wrapping_add(2) % 6];
+    [palette[order[0]], palette[order[1]], palette[order[2]]]
+}
+
+fn draw_brand_wordmark(
+    frame: &mut canvas::Frame,
+    center: Point,
+    text_color: Color,
+    shadow_offset: f32,
+) {
+    let center = Point::new(center.x + shadow_offset, center.y + shadow_offset);
+    let accent = if shadow_offset == 0.0 {
+        theme::ACCENT
+    } else {
+        text_color
+    };
+    let size = iced::Pixels(29.0);
+
+    frame.fill_text(canvas::Text {
+        content: "Paran".into(),
+        position: Point::new(center.x - 2.0, center.y),
+        color: text_color,
+        size,
+        font: theme::BRAND_REGULAR_FONT,
+        align_x: alignment::Horizontal::Right.into(),
+        align_y: alignment::Vertical::Center,
+        ..canvas::Text::default()
+    });
+    frame.fill_text(canvas::Text {
+        content: "O(1)".into(),
+        position: Point::new(center.x - 2.0, center.y),
+        color: accent,
+        size,
+        font: theme::BRAND_REGULAR_FONT,
+        align_x: alignment::Horizontal::Left.into(),
+        align_y: alignment::Vertical::Center,
+        ..canvas::Text::default()
+    });
+    frame.fill_text(canvas::Text {
+        content: "d".into(),
+        position: Point::new(center.x + 53.0, center.y),
+        color: text_color,
+        size,
+        font: theme::BRAND_REGULAR_FONT,
+        align_x: alignment::Horizontal::Left.into(),
+        align_y: alignment::Vertical::Center,
+        ..canvas::Text::default()
+    });
+}
+
+fn draw_stage_grid_base(frame: &mut canvas::Frame) {
+    for y in (-32..=304).step_by(42) {
         let line = canvas::Path::line(Point::new(84.0, y as f32), Point::new(616.0, y as f32));
         frame.stroke(
             &line,
             canvas::Stroke::default()
                 .with_width(1.0)
-                .with_color(with_alpha(theme::CYAN, 0.032)),
+                .with_color(with_alpha(theme::CYAN, 0.040)),
         );
     }
     for x in (110..=590).step_by(60) {
-        let line = canvas::Path::line(Point::new(x as f32, 58.0), Point::new(x as f32, 340.0));
+        let line = canvas::Path::line(Point::new(x as f32, -38.0), Point::new(x as f32, 340.0));
         frame.stroke(
             &line,
             canvas::Stroke::default()
                 .with_width(1.0)
-                .with_color(with_alpha(theme::PROOF, 0.026)),
+                .with_color(with_alpha(theme::PROOF, 0.032)),
         );
     }
+}
 
+fn draw_stage_rings(frame: &mut canvas::Frame, state: ForgeState) {
     let pulse = 0.5 + 0.5 * (state.t * 2.1).sin();
     for (radius, color, alpha) in [
-        (94.0 + pulse * 3.0, theme::PROOF, 0.07),
-        (126.0 + pulse * 2.0, theme::CYAN, 0.034),
+        (94.0 + pulse * 3.0, theme::PROOF, 0.046),
+        (126.0 + pulse * 2.0, theme::CYAN, 0.026),
+        (168.0 + pulse, theme::ACCENT, 0.012),
     ] {
         let ring = canvas::Path::circle(Point::new(BUTTON_CENTER_X, 174.0), radius);
         frame.stroke(
@@ -400,12 +649,20 @@ fn draw_stage_grid(frame: &mut canvas::Frame, state: ForgeState) {
 }
 
 fn draw_blocks(frame: &mut canvas::Frame, state: ForgeState) {
+    let generation = active_block_generation(state);
     if let Some(progress) = state.drop_progress {
         let old_alpha = 1.0 - smoothstep(progress / 0.76);
-        draw_block_pile(frame, 3.0, state, old_alpha, None);
-        draw_block_pile(frame, 0.0, state, 1.0, Some(progress));
+        draw_block_pile(
+            frame,
+            3.0,
+            state,
+            generation.saturating_sub(1),
+            old_alpha,
+            None,
+        );
+        draw_block_pile(frame, 0.0, state, generation, 1.0, Some(progress));
     } else {
-        draw_block_pile(frame, state.compression, state, 1.0, None);
+        draw_block_pile(frame, state.compression, state, generation, 1.0, None);
     }
 }
 
@@ -413,203 +670,281 @@ fn draw_block_pile(
     frame: &mut canvas::Frame,
     compression: f32,
     state: ForgeState,
+    generation: u64,
     alpha: f32,
     fall_progress: Option<f32>,
 ) {
-    const STAGE_ZERO: [(f32, f32, f32, f32); 3] = [
-        (290.0, 119.0, 36.0, 36.0),
-        (334.0, 119.0, 36.0, 36.0),
-        (378.0, 119.0, 36.0, 36.0),
+    const STAGE_ZERO: [[(f32, f32, f32, f32, f32); 3]; 3] = [
+        [
+            (301.0, 114.0, 36.0, 36.0, -0.58),
+            (365.0, 119.0, 36.0, 36.0, 0.0),
+            (332.0, 84.0, 36.0, 36.0, 0.14),
+        ],
+        [
+            (303.0, 119.0, 36.0, 36.0, 0.0),
+            (360.0, 114.0, 36.0, 36.0, 0.58),
+            (330.0, 84.0, 36.0, 36.0, -0.17),
+        ],
+        [
+            (308.0, 113.0, 36.0, 36.0, -0.70),
+            (359.0, 119.0, 36.0, 36.0, 0.0),
+            (334.0, 83.0, 36.0, 36.0, 0.24),
+        ],
     ];
-    const STAGE_ONE: [(f32, f32, f32, f32); 3] = [
-        (290.0, 130.0, 36.0, 25.0),
-        (334.0, 130.0, 36.0, 25.0),
-        (378.0, 130.0, 36.0, 25.0),
+    const STAGE_ONE: [[(f32, f32, f32, f32, f32); 3]; 3] = [
+        [
+            (304.0, 126.0, 36.0, 28.0, -0.30),
+            (364.0, 130.0, 36.0, 25.0, 0.0),
+            (333.0, 105.0, 36.0, 25.0, 0.08),
+        ],
+        [
+            (304.0, 130.0, 36.0, 25.0, 0.0),
+            (361.0, 126.0, 36.0, 28.0, 0.30),
+            (332.0, 105.0, 36.0, 25.0, -0.08),
+        ],
+        [
+            (309.0, 125.0, 36.0, 29.0, -0.34),
+            (360.0, 130.0, 36.0, 25.0, 0.0),
+            (334.0, 104.0, 36.0, 25.0, 0.12),
+        ],
     ];
-    const STAGE_TWO: [(f32, f32, f32, f32); 3] = [
-        (302.0, 141.0, 34.0, 14.0),
-        (337.0, 141.0, 34.0, 14.0),
-        (372.0, 141.0, 34.0, 14.0),
+    const STAGE_TWO: [(f32, f32, f32, f32, f32); 3] = [
+        (302.0, 141.0, 34.0, 14.0, -0.04),
+        (337.0, 141.0, 34.0, 14.0, 0.0),
+        (372.0, 141.0, 34.0, 14.0, 0.04),
+    ];
+    const DROP_ORDERS: [[usize; 3]; 3] = [[2, 0, 1], [1, 2, 0], [0, 2, 1]];
+    const SPAWN_X: [[f32; 3]; 3] = [
+        [284.0, 397.0, 344.0],
+        [397.0, 294.0, 351.0],
+        [315.0, 405.0, 276.0],
     ];
 
     let compression = compression.clamp(0.0, 3.0);
     let merge = smoothstep(compression - 2.0);
     let jitter = state.impact * (state.t * 95.0).sin() * 1.15 * 1.65;
+    let colors = block_color_palette(generation);
+    let variant = generation as usize % STAGE_ZERO.len();
 
     frame.with_save(|frame| {
         frame.translate(Vector::new(jitter, 0.0));
-        let mut modules = [(0.0, 0.0, 0.0, 0.0); 3];
+        let mut modules = [(0.0, 0.0, 0.0, 0.0, 0.0); 3];
         let mut falling = [0.0; 3];
         for index in 0..3 {
             let (from, to, amount) = if compression < 1.0 {
-                (STAGE_ZERO[index], STAGE_ONE[index], smoothstep(compression))
+                (
+                    STAGE_ZERO[variant][index],
+                    STAGE_ONE[variant][index],
+                    smoothstep(compression),
+                )
             } else if compression < 2.0 {
                 (
-                    STAGE_ONE[index],
+                    STAGE_ONE[variant][index],
                     STAGE_TWO[index],
                     smoothstep(compression - 1.0),
                 )
             } else {
                 (STAGE_TWO[index], STAGE_TWO[index], 0.0)
             };
-            let x = lerp(from.0, to.0, amount);
+            let mut x = lerp(from.0, to.0, amount);
             let mut y = lerp(from.1, to.1, amount);
             let width = lerp(from.2, to.2, amount);
             let height = lerp(from.3, to.3, amount);
+            let mut angle = lerp(from.4, to.4, amount);
 
             if let Some(progress) = fall_progress {
-                let delay = index as f32 * 0.075;
+                let rank = DROP_ORDERS[variant]
+                    .iter()
+                    .position(|candidate| *candidate == index)
+                    .unwrap_or(index);
+                let delay = rank as f32 * 0.095;
                 let fall = ease_out(((progress - delay) / (0.78 - delay)).clamp(0.0, 1.0));
-                y -= 220.0 * (1.0 - fall);
+                let arc = (fall * std::f32::consts::PI).sin();
+                let lateral = (rank as f32 - 1.0) * 13.0;
+                x = lerp(SPAWN_X[variant][index], x, fall) + arc * lateral;
+                y = lerp(BLOCK_SOURCE_Y - rank as f32 * 13.0, y, fall);
+                let spin = [2.7, -2.3, 3.1][(index + variant) % 3];
+                angle += (1.0 - smoothstep(fall)) * spin;
                 falling[index] = 1.0 - fall;
             }
 
-            modules[index] = (x, y, width, height);
-        }
-
-        let connector_alpha = alpha * (1.0 - merge) * 0.82;
-        for index in 0..2 {
-            let left = modules[index];
-            let right = modules[index + 1];
-            let start = Point::new(left.0 + left.2 + 1.5, left.1 + left.3 * 0.56);
-            let end = Point::new(right.0 - 1.5, right.1 + right.3 * 0.56);
-            stroke_line(
-                frame,
-                start,
-                end,
-                with_alpha(
-                    if index == 0 {
-                        theme::CYAN
-                    } else {
-                        theme::PROOF
-                    },
-                    connector_alpha,
-                ),
-                1.8,
-            );
-            for point in [start, end] {
-                let link = canvas::Path::circle(point, 2.5);
-                frame.fill(&link, with_alpha(theme::SURFACE_HIGH, connector_alpha));
-                frame.stroke(
-                    &link,
-                    canvas::Stroke::default()
-                        .with_width(1.0)
-                        .with_color(with_alpha(theme::TEXT, connector_alpha * 0.72)),
-                );
-            }
+            modules[index] = (x, y, width, height, angle);
         }
 
         for index in 0..3 {
-            let (x, y, width, height) = modules[index];
-            let accent = if index == 1 {
-                theme::PROOF
-            } else {
-                theme::CYAN
-            };
-            if falling[index] > 0.02 {
-                let trail = canvas::Path::line(
-                    Point::new(x + width * 0.5, y - 32.0 * falling[index]),
-                    Point::new(x + width * 0.5, y - 6.0),
-                );
-                frame.stroke(
-                    &trail,
-                    canvas::Stroke::default()
-                        .with_width(1.2)
-                        .with_color(with_alpha(accent, alpha * falling[index] * 0.42)),
-                );
-            }
-
-            let top_depth = (4.0 * (height / 29.0)).clamp(1.5, 4.0);
-            let top_face = polygon(&[
-                (x, y),
-                (x + top_depth, y - top_depth),
-                (x + width + top_depth, y - top_depth),
-                (x + width, y),
-            ]);
-            frame.fill(
-                &top_face,
-                with_alpha(theme::MUTED, alpha * 0.30 * (1.0 - merge)),
+            let (x, y, width, height, angle) = modules[index];
+            draw_forge_block(
+                frame,
+                x,
+                y,
+                width,
+                height,
+                angle,
+                index,
+                colors[index],
+                alpha,
+                merge,
+                falling[index],
             );
-            frame.stroke(
-                &top_face,
-                canvas::Stroke::default()
-                    .with_width(0.9)
-                    .with_color(with_alpha(accent, alpha * 0.58 * (1.0 - merge))),
-            );
-            let side_face = polygon(&[
-                (x + width, y),
-                (x + width + top_depth, y - top_depth),
-                (x + width + top_depth, y + height - top_depth),
-                (x + width, y + height),
-            ]);
-            frame.fill(
-                &side_face,
-                with_alpha(theme::INK, alpha * 0.46 * (1.0 - merge)),
-            );
-            frame.stroke(
-                &side_face,
-                canvas::Stroke::default()
-                    .with_width(0.9)
-                    .with_color(with_alpha(accent, alpha * 0.42 * (1.0 - merge))),
-            );
-
-            let block = canvas::Path::rounded_rectangle(
-                Point::new(x, y),
-                Size::new(width, height),
-                Radius::from(1.6),
-            );
-            frame.fill(
-                &block,
-                with_alpha(
-                    theme::SURFACE_HIGH,
-                    alpha * (0.92 - index as f32 * 0.04) * (1.0 - merge * 0.72),
-                ),
-            );
-            frame.stroke(
-                &block,
-                canvas::Stroke::default()
-                    .with_width(1.0)
-                    .with_color(with_alpha(accent, alpha * 0.72 * (1.0 - merge))),
-            );
-            if width >= 16.0 && height >= 10.0 {
-                let glyph_alpha = alpha * 0.46 * (1.0 - merge);
-                for y_ratio in [0.42, 0.62] {
-                    stroke_line(
-                        frame,
-                        Point::new(x + width * 0.27, y + height * y_ratio),
-                        Point::new(x + width * 0.73, y + height * y_ratio),
-                        with_alpha(accent, glyph_alpha),
-                        0.9,
-                    );
-                }
-                for x_ratio in [0.43, 0.57] {
-                    stroke_line(
-                        frame,
-                        Point::new(x + width * x_ratio, y + height * 0.28),
-                        Point::new(x + width * x_ratio, y + height * 0.76),
-                        with_alpha(theme::TEXT, glyph_alpha * 0.84),
-                        0.9,
-                    );
-                }
-            }
         }
 
         if merge > 0.0 {
-            let ingot = canvas::Path::rounded_rectangle(
-                Point::new(290.0, 146.0),
-                Size::new(124.0, 9.0),
-                Radius::from(2.0),
+            draw_forge_block(
+                frame,
+                326.0,
+                141.0,
+                52.0,
+                14.0,
+                0.0,
+                0,
+                theme::ACCENT,
+                alpha * merge,
+                0.0,
+                0.0,
+            );
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_forge_block(
+    frame: &mut canvas::Frame,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    angle: f32,
+    index: usize,
+    accent: Color,
+    alpha: f32,
+    merge: f32,
+    falling: f32,
+) {
+    if falling > 0.02 {
+        let direction = if index % 2 == 0 { -1.0 } else { 1.0 };
+        let trail = canvas::Path::new(|path| {
+            path.move_to(Point::new(
+                x + width * 0.5 + direction * 7.0,
+                y - 25.0 * falling,
+            ));
+            path.line_to(Point::new(x + width * 0.5 + direction * 2.0, y - 10.0));
+        });
+        frame.stroke(
+            &trail,
+            canvas::Stroke::default()
+                .with_width(1.0)
+                .with_color(with_alpha(accent, alpha * falling * 0.24))
+                .with_line_cap(canvas::LineCap::Round),
+        );
+    }
+
+    let solid_alpha = alpha * (1.0 - merge);
+    let edge_alpha = alpha * (1.0 - merge);
+    if solid_alpha <= 0.001 {
+        return;
+    }
+
+    let center = Point::new(x + width * 0.5, y + height * 0.5);
+    let radius = (width.min(height) * 0.16).clamp(1.6, 5.5);
+    let depth = (height * 0.10).clamp(1.4, 3.8);
+
+    frame.with_save(|frame| {
+        frame.translate(Vector::new(center.x, center.y));
+        frame.rotate(angle);
+        frame.translate(Vector::new(-center.x, -center.y));
+
+        let broad_shadow = canvas::Path::rounded_rectangle(
+            Point::new(x + 1.8, y + depth + 4.2),
+            Size::new(width, height),
+            Radius::from(radius),
+        );
+        frame.fill(
+            &broad_shadow,
+            Color::from_rgba8(1, 2, 7, solid_alpha * 0.32),
+        );
+
+        for layer in (1..=3).rev() {
+            let offset = depth * layer as f32 / 3.0;
+            let edge = canvas::Path::rounded_rectangle(
+                Point::new(x + 0.5, y + offset),
+                Size::new(width, height),
+                Radius::from(radius),
             );
             frame.fill(
-                &ingot,
-                with_alpha(theme::PROOF, alpha * (0.72 + merge * 0.20)),
+                &edge,
+                with_alpha(
+                    mix_color(accent, Color::BLACK, 0.38 + layer as f32 * 0.035),
+                    solid_alpha,
+                ),
             );
-            frame.stroke(
-                &ingot,
-                canvas::Stroke::default()
-                    .with_width(1.0)
-                    .with_color(with_alpha(theme::ACCENT, alpha * (0.54 + merge * 0.40))),
-            );
+        }
+
+        let face = canvas::Path::rounded_rectangle(
+            Point::new(x, y),
+            Size::new(width, height),
+            Radius::from(radius),
+        );
+        let gradient = canvas::gradient::Linear::new(
+            Point::new(center.x, y + height),
+            Point::new(center.x, y),
+        )
+        .add_stop(
+            0.0,
+            with_alpha(mix_color(accent, Color::BLACK, 0.17), solid_alpha),
+        )
+        .add_stop(0.48, with_alpha(accent, solid_alpha))
+        .add_stop(
+            1.0,
+            with_alpha(mix_color(accent, Color::WHITE, 0.18), solid_alpha),
+        );
+        frame.fill(&face, gradient);
+        frame.stroke(
+            &face,
+            canvas::Stroke::default()
+                .with_width(1.05)
+                .with_color(with_alpha(
+                    mix_color(accent, Color::WHITE, 0.54),
+                    edge_alpha * 0.68,
+                )),
+        );
+
+        let top_glint = canvas::Path::new(|path| {
+            path.move_to(Point::new(x + radius + 1.5, y + 2.2));
+            path.line_to(Point::new(
+                x + width - radius - 1.5,
+                y + 2.2 + index as f32 * 0.12,
+            ));
+        });
+        frame.stroke(
+            &top_glint,
+            canvas::Stroke::default()
+                .with_width(0.9)
+                .with_color(with_alpha(Color::WHITE, edge_alpha * 0.34))
+                .with_line_cap(canvas::LineCap::Round),
+        );
+
+        if width >= 19.0 && height >= 13.0 {
+            let symbol_size = iced::Pixels((height * 0.48).clamp(7.0, 16.0));
+            frame.fill_text(canvas::Text {
+                content: "①".into(),
+                position: Point::new(center.x + 0.9, center.y + 1.2),
+                color: with_alpha(mix_color(accent, Color::BLACK, 0.72), edge_alpha * 0.48),
+                size: symbol_size,
+                font: theme::SYMBOL_FONT,
+                align_x: alignment::Horizontal::Center.into(),
+                align_y: alignment::Vertical::Center,
+                ..canvas::Text::default()
+            });
+            frame.fill_text(canvas::Text {
+                content: "①".into(),
+                position: Point::new(center.x - 0.25, center.y - 0.45),
+                color: with_alpha(mix_color(accent, Color::WHITE, 0.88), edge_alpha * 0.98),
+                size: symbol_size,
+                font: theme::SYMBOL_FONT,
+                align_x: alignment::Horizontal::Center.into(),
+                align_y: alignment::Vertical::Center,
+                ..canvas::Text::default()
+            });
         }
     });
 }
@@ -896,7 +1231,11 @@ fn draw_traveler(frame: &mut canvas::Frame, state: ForgeState) {
     ] {
         draw_joint(frame, point, color);
     }
-    draw_coin_head(frame, head, 0.0, 1.0);
+    frame.with_save(|frame| {
+        frame.translate(Vector::new(head.x, head.y));
+        frame.rotate(lerp(-0.16 - state.sigh_amount * 0.06, 0.0, transition));
+        draw_coin_head(frame, Point::ORIGIN, 0.0, 1.0);
+    });
 
     if state.moving && transition < 0.18 {
         let pulse = 0.35
@@ -952,15 +1291,42 @@ fn draw_traveler(frame: &mut canvas::Frame, state: ForgeState) {
 }
 
 fn draw_coin_head(frame: &mut canvas::Frame, center: Point, surprise: f32, eye_open: f32) {
-    let radius = 20.0 + surprise * 2.0;
-    let halo = canvas::Path::circle(center, radius + 9.0);
-    frame.fill(&halo, with_alpha(theme::ACCENT, 0.05 + surprise * 0.08));
-    let shadow = canvas::Path::circle(Point::new(center.x + 1.5, center.y + 2.0), radius + 2.0);
-    frame.fill(&shadow, Color::from_rgba8(5, 7, 13, 0.58));
-    let coin = canvas::Path::circle(center, radius);
-    frame.fill(&coin, Color::from_rgb8(48, 52, 67));
-    frame.stroke(
-        &coin,
+    let radius_x = lerp(18.0, 23.0, surprise);
+    let radius_y = 23.0;
+    fill_ellipse(
+        frame,
+        center,
+        Vector::new(radius_x + 12.0, radius_y + 12.0),
+        with_alpha(theme::ACCENT, 0.045 + surprise * 0.075),
+    );
+    fill_ellipse(
+        frame,
+        Point::new(center.x + 1.5, center.y + 2.0),
+        Vector::new(radius_x + 2.5, radius_y + 2.5),
+        Color::from_rgba8(3, 5, 10, 0.64),
+    );
+    fill_ellipse(
+        frame,
+        center,
+        Vector::new(radius_x, radius_y),
+        Color::from_rgb8(44, 48, 62),
+    );
+    fill_ellipse(
+        frame,
+        Point::new(center.x - 2.5, center.y - 4.0),
+        Vector::new(radius_x - 2.8, radius_y - 3.8),
+        with_alpha(theme::MUTED, 0.095),
+    );
+    fill_ellipse(
+        frame,
+        Point::new(center.x + 3.0, center.y + 5.0),
+        Vector::new(radius_x - 3.0, radius_y - 4.0),
+        with_alpha(theme::INK, 0.20),
+    );
+    stroke_ellipse(
+        frame,
+        center,
+        Vector::new(radius_x, radius_y),
         canvas::Stroke::default()
             .with_width(1.5)
             .with_color(with_alpha(
@@ -972,9 +1338,10 @@ fn draw_coin_head(frame: &mut canvas::Frame, center: Point, surprise: f32, eye_o
                 0.78,
             )),
     );
-    let inner = canvas::Path::circle(center, radius - 7.0);
-    frame.stroke(
-        &inner,
+    stroke_ellipse(
+        frame,
+        center,
+        Vector::new((radius_x - 7.0).max(8.0), radius_y - 7.0),
         canvas::Stroke::default()
             .with_width(1.0)
             .with_color(with_alpha(theme::PROOF, 0.46 + surprise * 0.22)),
@@ -1019,14 +1386,14 @@ fn draw_hammer(frame: &mut canvas::Frame, base_grip: Point, head: Point, impact:
         frame,
         base_grip,
         head,
-        with_alpha(theme::ADVISORY, 0.58),
+        Color::from_rgba8(142, 130, 112, 0.92),
         9.0,
     );
     stroke_line(
         frame,
         base_grip,
         head,
-        with_alpha(theme::WARNING, 0.78),
+        with_alpha(theme::ADVISORY, 0.62),
         1.7,
     );
 
@@ -1082,33 +1449,43 @@ fn draw_impact(frame: &mut canvas::Frame, state: ForgeState) {
     };
 
     let origin = Point::new(370.0, state.impact_y);
+    let power = 1.65;
+    let burst = 1.0 + (power - 1.0) * 0.82;
     let fade = (1.0 - progress).powi(2);
-    let ring = canvas::Path::circle(origin, 8.0 + progress * 56.0);
-    frame.stroke(
-        &ring,
-        canvas::Stroke::default()
-            .with_width(1.5)
-            .with_color(with_alpha(theme::CYAN, 0.45 * fade)),
-    );
     if state.impact > 0.0 {
-        for (radius, alpha) in [(24.0, 0.05), (13.0, 0.14), (5.0, 0.55)] {
+        let flash = state.impact * (power * 0.72_f32).min(1.0);
+        for (radius, color, alpha) in [
+            (24.0 * power, theme::CYAN, flash * 0.050),
+            (17.0 * power, theme::PROOF, flash * 0.105),
+            (9.0 * power, theme::TEXT, flash * 0.18),
+            (3.2 * power, theme::TEXT, flash * 0.64),
+        ] {
             let glow = canvas::Path::circle(origin, radius);
-            frame.fill(&glow, with_alpha(theme::PROOF, alpha * state.impact));
+            frame.fill(&glow, with_alpha(color, alpha));
         }
     }
 
-    for index in 0..22 {
-        let angle = (188.0 + index as f32 * 8.5).to_radians();
+    let ring = canvas::Path::circle(origin, 8.0 + progress * 46.0 * burst);
+    frame.stroke(
+        &ring,
+        canvas::Stroke::default()
+            .with_width(1.2 + (power - 1.0) * 0.7)
+            .with_color(with_alpha(theme::CYAN, 0.38 * fade * power.min(1.35))),
+    );
+
+    for index in 0..24 {
+        let angle = (188.0 + index as f32 * 8.0).to_radians();
         let speed = 36.0 + ((index * 29) % 54) as f32;
-        let distance = speed * progress * 1.5;
-        let gravity = 42.0 * progress * progress;
+        let distance = speed * progress * burst;
+        let gravity = 38.0 * progress * progress * (1.0 + (power - 1.0) * 0.25);
+        let tail = 9.0 * burst;
         let point = Point::new(
             origin.x + angle.cos() * distance,
             origin.y + angle.sin() * distance + gravity,
         );
         let previous = Point::new(
-            origin.x + angle.cos() * (distance - 10.0).max(0.0),
-            origin.y + angle.sin() * (distance - 10.0).max(0.0) + gravity * 0.78,
+            origin.x + angle.cos() * (distance - tail).max(0.0),
+            origin.y + angle.sin() * (distance - tail).max(0.0) + gravity * 0.78,
         );
         let color = match index % 3 {
             0 => theme::PROOF,
@@ -1120,11 +1497,111 @@ fn draw_impact(frame: &mut canvas::Frame, state: ForgeState) {
             previous,
             point,
             with_alpha(color, fade * 0.96),
-            if index % 6 == 0 { 2.2 } else { 1.3 },
+            (if index % 6 == 0 { 2.2 } else { 1.3 }) * power.min(1.25),
         );
-        let spark = canvas::Path::circle(point, if index % 6 == 0 { 2.0 } else { 1.1 });
+        let spark = canvas::Path::circle(
+            point,
+            (if index % 6 == 0 { 2.0 } else { 1.1 }) * power.min(1.2),
+        );
         frame.fill(&spark, with_alpha(color, fade));
     }
+}
+
+fn fill_ellipse(frame: &mut canvas::Frame, center: Point, radii: Vector, color: Color) {
+    frame.fill(&ellipse_path(center, radii), color);
+}
+
+fn soft_ellipse_glow(
+    frame: &mut canvas::Frame,
+    center: Point,
+    radii: Vector,
+    color: Color,
+    intensity: f32,
+) {
+    const LAYERS: usize = 20;
+    for layer in 0..LAYERS {
+        let progress = layer as f32 / (LAYERS - 1) as f32;
+        let scale = 1.0 - progress * 0.84;
+        let alpha = intensity * (0.012 + progress * 0.038);
+        fill_ellipse(
+            frame,
+            center,
+            Vector::new(radii.x * scale, radii.y * scale),
+            with_alpha(color, alpha),
+        );
+    }
+}
+
+fn soft_ellipse_glow_overlay(
+    frame: &mut canvas::Frame,
+    center: Point,
+    radii: Vector,
+    color: Color,
+    base_intensity: f32,
+    total_intensity: f32,
+) {
+    const LAYERS: usize = 20;
+    for layer in 0..LAYERS {
+        let progress = layer as f32 / (LAYERS - 1) as f32;
+        let scale = 1.0 - progress * 0.84;
+        let alpha_factor = 0.012 + progress * 0.038;
+        let base_alpha = (base_intensity * alpha_factor).clamp(0.0, 1.0);
+        let total_alpha = (total_intensity * alpha_factor).clamp(0.0, 1.0);
+        // Preserve the original source-over result after moving the base glow
+        // into a cache: base + this overlay must equal the former total alpha.
+        let overlay_alpha = if base_alpha >= 1.0 {
+            0.0
+        } else {
+            ((total_alpha - base_alpha) / (1.0 - base_alpha)).clamp(0.0, 1.0)
+        };
+        fill_ellipse(
+            frame,
+            center,
+            Vector::new(radii.x * scale, radii.y * scale),
+            with_alpha(color, overlay_alpha),
+        );
+    }
+}
+
+fn stroke_ellipse(
+    frame: &mut canvas::Frame,
+    center: Point,
+    radii: Vector,
+    stroke: canvas::Stroke<'_>,
+) {
+    frame.stroke(&ellipse_path(center, radii), stroke);
+}
+
+fn ellipse_path(center: Point, radii: Vector) -> canvas::Path {
+    let radius_x = radii.x.max(0.1);
+    let radius_y = radii.y.max(0.1);
+    let control_x = radius_x * 0.552_284_8;
+    let control_y = radius_y * 0.552_284_8;
+
+    canvas::Path::new(|path| {
+        path.move_to(Point::new(center.x + radius_x, center.y));
+        path.bezier_curve_to(
+            Point::new(center.x + radius_x, center.y + control_y),
+            Point::new(center.x + control_x, center.y + radius_y),
+            Point::new(center.x, center.y + radius_y),
+        );
+        path.bezier_curve_to(
+            Point::new(center.x - control_x, center.y + radius_y),
+            Point::new(center.x - radius_x, center.y + control_y),
+            Point::new(center.x - radius_x, center.y),
+        );
+        path.bezier_curve_to(
+            Point::new(center.x - radius_x, center.y - control_y),
+            Point::new(center.x - control_x, center.y - radius_y),
+            Point::new(center.x, center.y - radius_y),
+        );
+        path.bezier_curve_to(
+            Point::new(center.x + control_x, center.y - radius_y),
+            Point::new(center.x + radius_x, center.y - control_y),
+            Point::new(center.x + radius_x, center.y),
+        );
+        path.close();
+    })
 }
 
 fn stroke_limb(
@@ -1236,6 +1713,16 @@ fn with_alpha(color: Color, alpha: f32) -> Color {
     }
 }
 
+fn mix_color(from: Color, to: Color, amount: f32) -> Color {
+    let amount = amount.clamp(0.0, 1.0);
+    Color {
+        r: lerp(from.r, to.r, amount),
+        g: lerp(from.g, to.g, amount),
+        b: lerp(from.b, to.b, amount),
+        a: lerp(from.a, to.a, amount),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,5 +1748,16 @@ mod tests {
 
         let repeated = forge_state(INTRO_END + FORGE_CYCLE + STRIKE_DURATION * 0.55);
         assert!(repeated.impact > 0.95);
+    }
+
+    #[test]
+    fn each_block_generation_uses_a_new_complete_color_order() {
+        for generation in 0..6 {
+            let colors = block_color_palette(generation);
+            assert!(colors.contains(&theme::CYAN));
+            assert!(colors.contains(&theme::ACCENT));
+            assert!(colors.contains(&theme::DANGER));
+            assert_ne!(colors, block_color_palette(generation + 1));
+        }
     }
 }

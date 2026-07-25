@@ -41,62 +41,64 @@ impl canvas::Program<Message> for PhotoScanner {
         let background = state.background.draw(renderer, bounds.size(), |frame| {
             draw_background(frame, bounds.size());
         });
+
+        if !self.active || bounds.width < 4.0 || bounds.height < 5.0 {
+            return vec![background];
+        }
+
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-
-        if self.active {
-            let y = 8.0 + (bounds.height - 16.0).max(0.0) * self.progress;
-            for (half_height, alpha) in [(24.0, 0.025), (12.0, 0.045), (5.0, 0.075)] {
-                let top = (y - half_height).max(0.0);
-                let bottom = (y + half_height).min(bounds.height);
-                let band = canvas::Path::rectangle(
-                    Point::new(0.0, top),
-                    Size::new(bounds.width, bottom - top),
-                );
-                frame.fill(&band, Color::from_rgba8(103, 215, 246, alpha));
-            }
-
-            for (offset, width, alpha) in [
-                (-4.0, 5.0, 0.06),
-                (4.0, 5.0, 0.06),
-                (-1.5, 3.0, 0.13),
-                (1.5, 3.0, 0.13),
-            ] {
-                let glow = canvas::Path::line(
-                    Point::new(0.0, (y + offset).clamp(0.0, bounds.height)),
-                    Point::new(bounds.width, (y + offset).clamp(0.0, bounds.height)),
-                );
-                frame.stroke(
-                    &glow,
-                    canvas::Stroke::default()
-                        .with_width(width)
-                        .with_color(Color::from_rgba8(103, 215, 246, alpha)),
-                );
-            }
-            let core = canvas::Path::line(Point::new(0.0, y), Point::new(bounds.width, y));
-            frame.stroke(
-                &core,
-                canvas::Stroke::default()
-                    .with_width(1.25)
-                    .with_color(theme::CYAN),
+        let y = 8.0 + (bounds.height - 16.0).max(0.0) * self.progress;
+        for (half_height, alpha) in [(24.0, 0.025), (12.0, 0.045), (5.0, 0.075)] {
+            let top = (y - half_height).max(0.0);
+            let bottom = (y + half_height).min(bounds.height);
+            let band = canvas::Path::rectangle(
+                Point::new(0.0, top),
+                Size::new(bounds.width, bottom - top),
             );
+            frame.fill(&band, Color::from_rgba8(103, 215, 246, alpha));
+        }
 
-            for index in 0..14 {
-                let x = ((index * 47 + 19) % 193) as f32 / 193.0 * bounds.width;
-                let offset = (((index * 29 + 7) % 17) as f32 - 8.0) * 1.25;
-                let size = if index % 5 == 0 { 2.5 } else { 1.5 };
-                let pixel = canvas::Path::rectangle(
-                    Point::new(x, (y + offset).clamp(1.0, bounds.height - size - 1.0)),
-                    Size::new(size, size),
-                );
-                frame.fill(
-                    &pixel,
-                    if index % 3 == 0 {
-                        theme::PROOF
-                    } else {
-                        theme::ACCENT
-                    },
-                );
-            }
+        for (offset, width, alpha) in [
+            (-4.0, 5.0, 0.06),
+            (4.0, 5.0, 0.06),
+            (-1.5, 3.0, 0.13),
+            (1.5, 3.0, 0.13),
+        ] {
+            let glow = canvas::Path::line(
+                Point::new(0.0, (y + offset).clamp(0.0, bounds.height)),
+                Point::new(bounds.width, (y + offset).clamp(0.0, bounds.height)),
+            );
+            frame.stroke(
+                &glow,
+                canvas::Stroke::default()
+                    .with_width(width)
+                    .with_color(Color::from_rgba8(103, 215, 246, alpha)),
+            );
+        }
+        let core = canvas::Path::line(Point::new(0.0, y), Point::new(bounds.width, y));
+        frame.stroke(
+            &core,
+            canvas::Stroke::default()
+                .with_width(1.25)
+                .with_color(theme::CYAN),
+        );
+
+        for index in 0..14 {
+            let x = ((index * 47 + 19) % 193) as f32 / 193.0 * bounds.width;
+            let offset = (((index * 29 + 7) % 17) as f32 - 8.0) * 1.25;
+            let size = if index % 5 == 0 { 2.5 } else { 1.5 };
+            let pixel = canvas::Path::rectangle(
+                Point::new(x, (y + offset).clamp(1.0, bounds.height - size - 1.0)),
+                Size::new(size, size),
+            );
+            frame.fill(
+                &pixel,
+                if index % 3 == 0 {
+                    theme::PROOF
+                } else {
+                    theme::ACCENT
+                },
+            );
         }
 
         vec![background, frame.into_geometry()]
