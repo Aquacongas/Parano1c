@@ -14,8 +14,6 @@ const DESIGN_HEIGHT: f32 = 350.0;
 const BUTTON_CENTER_X: f32 = 350.0;
 const BUTTON_DESIGN_WIDTH: f32 = 238.0;
 const FLOOR_Y: f32 = 329.0;
-const BRAND_CENTER_X: f32 = DESIGN_WIDTH * 0.5;
-const BRAND_Y: f32 = -200.0;
 const BLOCK_SOURCE_Y: f32 = -94.0;
 const CHARACTER_SCALE: f32 = 1.35;
 const CHARACTER_SCALE_ANCHOR_X: f32 = BUTTON_CENTER_X;
@@ -151,7 +149,6 @@ impl canvas::Program<Message> for LanguageForge {
                 (state.t * 181.0).sin() * 2.8 * strength,
                 (state.t * 233.0).sin() * 1.7 * strength,
             );
-            draw_language_brand(frame);
             frame.with_save(|frame| {
                 frame.translate(shake);
                 draw_blocks(frame, state);
@@ -200,7 +197,7 @@ impl SceneLayout {
         } else {
             180.0 / BUTTON_DESIGN_WIDTH
         };
-        let vertical_offset = if compact { 61.0 } else { 73.0 };
+        let vertical_offset = if compact { 18.0 } else { 20.0 };
         let origin = Vector::new(
             (width - DESIGN_WIDTH * scale) * 0.5,
             (height - DESIGN_HEIGHT * scale) * 0.5 + vertical_offset,
@@ -529,16 +526,6 @@ fn draw_selector_impact_light(frame: &mut canvas::Frame, state: ForgeState) {
     );
 }
 
-fn draw_language_brand(frame: &mut canvas::Frame) {
-    draw_brand_wordmark(
-        frame,
-        Point::new(BRAND_CENTER_X, BRAND_Y + 1.5),
-        Color::from_rgba8(2, 3, 8, 0.72),
-        1.5,
-    );
-    draw_brand_wordmark(frame, Point::new(BRAND_CENTER_X, BRAND_Y), theme::TEXT, 0.0);
-}
-
 fn active_block_generation(state: ForgeState) -> u64 {
     if state.t < INTRO_END {
         return 0;
@@ -562,52 +549,6 @@ fn block_color_palette(generation: u64) -> [Color; 3] {
     let palette = [theme::ACCENT, theme::CYAN, theme::DANGER];
     let order = PERMUTATIONS[(generation as usize).wrapping_mul(5).wrapping_add(2) % 6];
     [palette[order[0]], palette[order[1]], palette[order[2]]]
-}
-
-fn draw_brand_wordmark(
-    frame: &mut canvas::Frame,
-    center: Point,
-    text_color: Color,
-    shadow_offset: f32,
-) {
-    let center = Point::new(center.x + shadow_offset, center.y + shadow_offset);
-    let accent = if shadow_offset == 0.0 {
-        theme::ACCENT
-    } else {
-        text_color
-    };
-    let size = iced::Pixels(29.0);
-
-    frame.fill_text(canvas::Text {
-        content: "Paran".into(),
-        position: Point::new(center.x - 2.0, center.y),
-        color: text_color,
-        size,
-        font: theme::BRAND_REGULAR_FONT,
-        align_x: alignment::Horizontal::Right.into(),
-        align_y: alignment::Vertical::Center,
-        ..canvas::Text::default()
-    });
-    frame.fill_text(canvas::Text {
-        content: "O(1)".into(),
-        position: Point::new(center.x - 2.0, center.y),
-        color: accent,
-        size,
-        font: theme::BRAND_REGULAR_FONT,
-        align_x: alignment::Horizontal::Left.into(),
-        align_y: alignment::Vertical::Center,
-        ..canvas::Text::default()
-    });
-    frame.fill_text(canvas::Text {
-        content: "d".into(),
-        position: Point::new(center.x + 53.0, center.y),
-        color: text_color,
-        size,
-        font: theme::BRAND_REGULAR_FONT,
-        align_x: alignment::Horizontal::Left.into(),
-        align_y: alignment::Vertical::Center,
-        ..canvas::Text::default()
-    });
 }
 
 fn draw_stage_grid_base(frame: &mut canvas::Frame) {

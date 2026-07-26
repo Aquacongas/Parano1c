@@ -20,6 +20,10 @@ on:
         options:
           - prerelease
           - stable
+      platform_ci_run_id:
+        description: Successful Platform CI run for the tagged commit
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -37,6 +41,7 @@ env:
   RELEASE_TAG: ${{ inputs.tag }}
   PACK_SHA256: ${{ inputs.pack_sha256 }}
   RELEASE_CHANNEL: ${{ inputs.release_channel }}
+  PLATFORM_CI_RUN_ID: ${{ inputs.platform_ci_run_id }}
 
 jobs:
   preflight:
@@ -59,6 +64,7 @@ jobs:
           set -Eeuo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
           [[ "$PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$PLATFORM_CI_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$RELEASE_CHANNEL" == prerelease || "$RELEASE_CHANNEL" == stable ]]
           version_without_build="${RELEASE_TAG%%+*}"
           if [[ "$RELEASE_CHANNEL" == stable && "$version_without_build" == *-* ]]; then
@@ -70,6 +76,13 @@ jobs:
           release_workspace_version
           test "v$RELEASE_VERSION" = "$RELEASE_TAG"
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          platform_ci="$(gh run view "$PLATFORM_CI_RUN_ID" \
+            --json conclusion,event,headSha,status,workflowName)"
+          test "$(jq -r .status <<<"$platform_ci")" = completed
+          test "$(jq -r .conclusion <<<"$platform_ci")" = success
+          test "$(jq -r .event <<<"$platform_ci")" = workflow_dispatch
+          test "$(jq -r .workflowName <<<"$platform_ci")" = "Platform CI"
+          test "$(jq -r .headSha <<<"$platform_ci")" = "$GITHUB_SHA"
 
   build:
     name: ${{ matrix.name }}
@@ -79,25 +92,31 @@ jobs:
       matrix:
         include:
           - name: Linux x86-64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
             artifact: paranoid-${{ inputs.tag }}-linux-x86_64.tar.gz
+            gui_artifact: paranoid-gui-${{ inputs.tag }}-linux-x86_64.deb
           - name: Linux ARM64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             artifact: paranoid-${{ inputs.tag }}-linux-aarch64.tar.gz
+            gui_artifact: paranoid-gui-${{ inputs.tag }}-linux-aarch64.deb
           - name: Windows x86-64
             runner: windows-2025
             artifact: paranoid-${{ inputs.tag }}-windows-x86_64.zip
+            gui_artifact: paranoid-gui-${{ inputs.tag }}-windows-x86_64-setup.exe
           - name: macOS Apple Silicon
             runner: macos-15
             artifact: paranoid-${{ inputs.tag }}-macos-aarch64.tar.gz
+            gui_artifact: paranoid-gui-${{ inputs.tag }}-macos-aarch64.dmg
           - name: macOS Intel
             runner: macos-15-intel
             artifact: paranoid-${{ inputs.tag }}-macos-x86_64.tar.gz
+            gui_artifact: paranoid-gui-${{ inputs.tag }}-macos-x86_64.dmg
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
       ARTIFACT_NAME: ${{ matrix.artifact }}
+      GUI_ARTIFACT_NAME: ${{ matrix.gui_artifact }}
 
     steps:
       - name: Check out the tagged source
@@ -109,7 +128,12 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config
+          sudo apt-get install --no-install-recommends -y appstream clang libclang-dev cmake dpkg-dev pkg-config
+
+      - name: Install pinned Windows installer compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --version 6.7.1 --yes --no-progress
 
       - name: Locate libclang on macOS
         if: runner.os == 'macOS'
@@ -166,13 +190,15 @@ jobs:
             --output .release-ci/build \
             --skip-tests
           test -s ".release-ci/build/$ARTIFACT_NAME"
+          test -s ".release-ci/build/$GUI_ARTIFACT_NAME"
 
-      - name: Upload native bundle to draft release
+      - name: Upload native deliverables to draft release
         shell: bash
-        run: >-
-          gh release upload "$RELEASE_TAG"
-          ".release-ci/build/$ARTIFACT_NAME"
-          --clobber
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            ".release-ci/build/$ARTIFACT_NAME" \
+            ".release-ci/build/$GUI_ARTIFACT_NAME" \
+            --clobber
 
   publish:
     name: Publish verified release
@@ -194,6 +220,11 @@ jobs:
             "paranoid-$RELEASE_TAG-windows-x86_64.zip" \
             "paranoid-$RELEASE_TAG-macos-aarch64.tar.gz" \
             "paranoid-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "paranoid-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "paranoid-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "paranoid-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "paranoid-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "paranoid-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz
           do
             gh release download "$RELEASE_TAG" \
@@ -215,6 +246,11 @@ jobs:
             "paranoid-$RELEASE_TAG-windows-x86_64.zip" \
             "paranoid-$RELEASE_TAG-macos-aarch64.tar.gz" \
             "paranoid-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "paranoid-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "paranoid-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "paranoid-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "paranoid-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "paranoid-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
             > SHA256SUMS
           gh release upload "$RELEASE_TAG" SHA256SUMS --clobber

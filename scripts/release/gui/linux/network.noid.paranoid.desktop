@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=ParanO(1)d
+Comment=Private proof-native wallet
+Exec=/usr/lib/paranoid/paranoid-gui
+Icon=network.noid.paranoid
+Terminal=false
+Categories=Finance;Network;
+StartupNotify=true
+StartupWMClass=network.noid.paranoid

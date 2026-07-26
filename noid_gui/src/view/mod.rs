@@ -19,6 +19,7 @@ use crate::theme::{self, ButtonKind};
 use crate::widgets::{InterfaceBackdrop, LanguageForge, PhotoScanner, ProofForge, SecretArrow};
 
 const SECRET_DESKTOP_WORKSPACE_HEIGHT: f32 = 360.0;
+const HEADER_WORDMARK_SIZE: u32 = 17;
 
 pub fn root(app: &App) -> Element<'_, Message> {
     let body: Element<'_, Message> = responsive(|size| {
@@ -172,21 +173,14 @@ fn shutdown_forge_overlay(app: &App) -> Element<'_, Message> {
 }
 
 fn wallet_setup(app: &App, compact: bool, narrow: bool) -> Element<'_, Message> {
-    let brand = row![
-        text("Paran")
-            .size(22)
-            .font(theme::BRAND_REGULAR_FONT)
-            .color(theme::TEXT),
-        text("O(1)")
-            .size(22)
-            .font(theme::BRAND_REGULAR_FONT)
-            .color(theme::ACCENT),
-        text("d")
-            .size(22)
-            .font(theme::BRAND_REGULAR_FONT)
-            .color(theme::TEXT),
-    ]
-    .spacing(0);
+    let brand = rich_text([
+        span::<(), iced::Font>("Paran").color(theme::TEXT),
+        span::<(), iced::Font>("O(1)").color(theme::ACCENT),
+        span::<(), iced::Font>("d").color(theme::TEXT),
+    ])
+    .size(HEADER_WORDMARK_SIZE)
+    .line_height(1.0)
+    .font(theme::BRAND_REGULAR_FONT);
     let header = container(
         row![
             brand,
@@ -727,10 +721,9 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         span::<(), iced::Font>("O(1)").color(theme::ACCENT),
         span::<(), iced::Font>("d").color(theme::TEXT),
     ])
-    .size(18)
+    .size(HEADER_WORDMARK_SIZE)
     .line_height(1.0)
     .font(theme::BRAND_REGULAR_FONT);
-    let brand = container(wordmark).padding(Padding::ZERO.top(4));
 
     let network_status = container(
         row![
@@ -760,12 +753,13 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
 
     container(
         row![
-            brand,
+            wordmark,
             iced::widget::Space::new().width(Length::Fill),
             network_status,
             mining_status,
         ]
-        .spacing(8),
+        .spacing(8)
+        .align_y(Alignment::Center),
     )
     .height(56)
     .padding([0, 18])

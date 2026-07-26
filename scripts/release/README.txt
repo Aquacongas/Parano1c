@@ -1,11 +1,24 @@
 ParanO(1)d Native Release
 =========================
 
-This archive contains the full node, command-line client, and external miner:
+Each GitHub release contains two independent product lines.
+
+GUI Wallet packages (ordinary users):
+
+  Linux:   paranoid-gui-vVERSION-linux-ARCH.deb
+  Windows: paranoid-gui-vVERSION-windows-x86_64-setup.exe
+  macOS:   paranoid-gui-vVERSION-macos-ARCH.dmg
+
+The GUI package exposes only the ParanO(1)d wallet application. Its full node
+is bundled as a private application component and is supervised by the wallet.
+The user does not need to start a daemon or use a terminal.
+
+Core archives (node operators and miners):
 
   paranoid        full node and built-in miner
   noid-cli        wallet and node command-line client
   noid-extminer   external proof-of-work miner
+  LICENSE/NOTICE  Apache-2.0 distribution terms and project notices
 
 Verify the download
 -------------------
@@ -31,8 +44,40 @@ Windows PowerShell:
 
 Never run an archive whose digest does not match.
 
-Linux
------
+GUI Wallet — Linux
+------------------
+
+Open the downloaded .deb in the system Software application, or install it
+from a terminal:
+
+  sudo apt install ./paranoid-gui-vVERSION-linux-ARCH.deb
+
+Launch ParanO(1)d from the desktop application menu. Removing the package does
+not remove wallet data from the user's home directory.
+
+GUI Wallet — Windows
+--------------------
+
+Run the downloaded setup.exe and launch ParanO(1)d from the Start menu. The
+installer is per-user and does not require administrator privileges by
+default.
+
+Until the project uses an Authenticode certificate, Microsoft Defender
+SmartScreen may display a warning. After verifying SHA256SUMS, select
+"More info" and then "Run anyway".
+
+GUI Wallet — macOS
+------------------
+
+Open the downloaded DMG and drag ParanO1d.app to Applications. Launch it from
+Applications like any other app.
+
+Until the project uses an Apple Developer ID certificate, macOS may block the
+first launch. After verifying SHA256SUMS, Control-click ParanO1d, choose Open,
+and confirm. If necessary, use Privacy & Security -> Open Anyway.
+
+Core archive — Linux
+--------------------
 
 Open a terminal in the extracted directory:
 
@@ -40,8 +85,8 @@ Open a terminal in the extracted directory:
   ./noid-cli --help
   ./noid-extminer --help
 
-macOS
------
+Core archive — macOS
+--------------------
 
 If Gatekeeper blocks a verified download, remove only the quarantine
 attributes from the three extracted binaries:
@@ -55,12 +100,10 @@ Then run:
 
   ./paranoid --help
 
-Windows
--------
+Core archive — Windows
+----------------------
 
-If Microsoft Defender SmartScreen warns about a verified download, select
-"More info" and then "Run anyway". PowerShell can also unblock all three
-extracted executables at once:
+PowerShell can unblock all three verified extracted executables at once:
 
   Get-ChildItem .\*.exe | Unblock-File
 

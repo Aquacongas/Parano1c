@@ -20,8 +20,10 @@ usage() {
 Usage: ./scripts/build_release.sh --pack PACK_DIR [--output RELEASE_DIR] [--skip-tests]
 
 Authenticate one existing canonical HistoryStep pack, embed it into the node,
-run the release gates, and package the node, CLI, and external miner for the
-current host. This command never regenerates matrices.
+run the release gates, and build two native deliverables for the current host:
+the operator bundle (node, CLI, external miner) and the independently
+installable GUI wallet (GUI plus its private node). This command never
+regenerates matrices.
 
 Options:
   --pack DIR       Canonical HistoryStep pack root (required).
@@ -33,7 +35,12 @@ Options:
 Environment:
   NOID_RELEASE_SKIP_TESTS=1       Equivalent to --skip-tests.
   NOID_RELEASE_TOOL_TARGET_DIR    Override the pack-tool Cargo target directory.
+  NOID_MACOS_SIGN_IDENTITY        Optional Developer ID identity; defaults to
+                                  an ad-hoc macOS application signature.
   SOURCE_DATE_EPOCH               Archive timestamp on GNU tar hosts (default 0).
+
+Native GUI packaging requires appstreamcli and dpkg-deb on Linux, Inno Setup 6
+on Windows, and the standard codesign/iconutil/hdiutil toolchain on macOS.
 EOF
 }
 
@@ -87,6 +94,7 @@ release_require_command sed
 release_require_command tar
 release_require_command tr
 
+release_workspace_version
 HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')
 case "$HOST_TRIPLE" in
   x86_64-unknown-linux-gnu)
@@ -95,6 +103,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ / AVX-512)'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
+    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-linux-x86_64.deb"
     ;;
   aarch64-unknown-linux-gnu)
     PLATFORM=linux-aarch64
@@ -102,6 +111,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='AArch64 NEON + PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
+    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-linux-aarch64.deb"
     ;;
   x86_64-pc-windows-msvc)
     PLATFORM=windows-x86_64
@@ -109,6 +119,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ / AVX-512)'
     BINARY_SUFFIX=.exe
     ARCHIVE_KIND=zip
+    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
     ;;
   aarch64-apple-darwin)
     PLATFORM=macos-aarch64
@@ -116,6 +127,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='Apple Silicon NEON + PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
+    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-macos-aarch64.dmg"
     ;;
   x86_64-apple-darwin)
     PLATFORM=macos-x86_64
@@ -123,11 +135,15 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='Intel macOS x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ)'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
+    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
     ;;
   *) release_die "unsupported release host: $HOST_TRIPLE" ;;
 esac
 
-release_workspace_version
+if [[ $PLATFORM == macos-* ]]; then
+  export MACOSX_DEPLOYMENT_TARGET=11.0
+fi
+
 if [[ $ARCHIVE_KIND == zip ]]; then
   ARCHIVE_NAME="paranoid-v$RELEASE_VERSION-$PLATFORM.zip"
   release_require_command 7z
@@ -142,15 +158,23 @@ mkdir -p -- "$RELEASE_PARENT"
 mkdir -- "$RELEASE_DIR"
 RELEASE_DIR=$(release_canonical_directory "$RELEASE_DIR")
 BIN_DIR="$RELEASE_DIR/bin"
+GUI_BIN_DIR="$RELEASE_DIR/gui-bin"
 ARCHIVE="$RELEASE_DIR/$ARCHIVE_NAME"
+GUI_ARTIFACT="$RELEASE_DIR/$GUI_ARTIFACT_NAME"
 LOG_FILE="$RELEASE_DIR/build.log"
 USER_GUIDE_SOURCE="$RELEASE_ROOT_DIR/scripts/release/README.txt"
+LICENSE_SOURCE="$RELEASE_ROOT_DIR/LICENSE"
+NOTICE_SOURCE="$RELEASE_ROOT_DIR/NOTICE"
 LOCK_DIR="$RELEASE_ROOT_DIR/target/.build_release.lock"
 LOCK_HELD=0
 CURRENT_STAGE=initialization
 
 [[ -f $USER_GUIDE_SOURCE && -s $USER_GUIDE_SOURCE && ! -L $USER_GUIDE_SOURCE ]] || \
   release_die "release user guide is missing, empty, or a symlink: $USER_GUIDE_SOURCE"
+for legal_source in "$LICENSE_SOURCE" "$NOTICE_SOURCE"; do
+  [[ -f $legal_source && -s $legal_source && ! -L $legal_source ]] || \
+    release_die "release legal file is missing, empty, or a symlink: $legal_source"
+done
 
 on_exit() {
   local status=$?
@@ -187,6 +211,8 @@ printf '  release dir:  %s\n' "$RELEASE_DIR"
 printf '  version:      %s\n' "$RELEASE_VERSION"
 printf '  target:       %s\n' "$HOST_TRIPLE"
 printf '  ISA profile:  %s\n' "$ISA_PROFILE"
+printf '  core bundle:  %s\n' "$ARCHIVE_NAME"
+printf '  GUI package:  %s\n' "$GUI_ARTIFACT_NAME"
 printf '  rustc:        %s\n' "$(rustc --version)"
 printf '  cargo:        %s\n' "$(cargo --version)"
 
@@ -216,6 +242,8 @@ printf '\n==> Building matrix-embedded native binaries\n'
 cargo build --locked --release --target "$HOST_TRIPLE" -p noid_node --bins
 cargo build --locked --release --target "$HOST_TRIPLE" \
   -p noid-extminer --bin noid-extminer
+cargo build --locked --release --target "$HOST_TRIPLE" \
+  -p noid_gui --bin paranoid-gui
 
 if [[ $SKIP_TESTS == 1 ]]; then
   printf '\n==> Skipping repeated release tests; source gates must already be green\n'
@@ -237,12 +265,15 @@ for binary in paranoid noid-cli noid-extminer; do
   [[ -f $TARGET_BIN_DIR/$binary$BINARY_SUFFIX ]] || \
     release_die "release binary is missing: $TARGET_BIN_DIR/$binary$BINARY_SUFFIX"
 done
+[[ -f $TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX ]] || \
+  release_die "release GUI is missing: $TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX"
 
 CURRENT_STAGE='native smoke test'
 printf '\n==> Smoke-testing native executables\n'
 "$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/noid-cli$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/noid-extminer$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX" --release-self-check >/dev/null
 
 CURRENT_STAGE='binary packaging'
 printf '\n==> Packaging %s\n' "$ARCHIVE_NAME"
@@ -251,11 +282,47 @@ for binary in paranoid noid-cli noid-extminer; do
   cp -- "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX" "$BIN_DIR/$binary$BINARY_SUFFIX"
   chmod 0755 "$BIN_DIR/$binary$BINARY_SUFFIX" 2>/dev/null || true
 done
+
+CURRENT_STAGE='GUI wallet packaging'
+printf '\n==> Packaging %s\n' "$GUI_ARTIFACT_NAME"
+mkdir -- "$GUI_BIN_DIR"
+cp -- "$TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX" \
+  "$GUI_BIN_DIR/paranoid-gui$BINARY_SUFFIX"
+cp -- "$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" \
+  "$GUI_BIN_DIR/paranoid$BINARY_SUFFIX"
+chmod 0755 "$GUI_BIN_DIR/paranoid-gui$BINARY_SUFFIX" 2>/dev/null || true
+chmod 0755 "$GUI_BIN_DIR/paranoid$BINARY_SUFFIX" 2>/dev/null || true
+case "$PLATFORM" in
+  linux-*)
+    "$RELEASE_ROOT_DIR/scripts/release/package_linux_gui.sh" \
+      "$GUI_BIN_DIR" "$RELEASE_DIR" "$RELEASE_VERSION" "$PLATFORM" >/dev/null
+    ;;
+  windows-*)
+    release_require_command pwsh
+    pwsh -NoLogo -NoProfile -NonInteractive \
+      -File "$RELEASE_ROOT_DIR/scripts/release/package_windows_gui.ps1" \
+      -BinDir "$GUI_BIN_DIR" \
+      -OutputDir "$RELEASE_DIR" \
+      -Version "$RELEASE_VERSION" \
+      -Platform "$PLATFORM" >/dev/null
+    ;;
+  macos-*)
+    "$RELEASE_ROOT_DIR/scripts/release/package_macos_gui.sh" \
+      "$GUI_BIN_DIR" "$RELEASE_DIR" "$RELEASE_VERSION" "$PLATFORM" >/dev/null
+    ;;
+esac
+[[ -f $GUI_ARTIFACT && -s $GUI_ARTIFACT ]] || \
+  release_die "GUI package is missing or empty: $GUI_ARTIFACT"
 cp -- "$USER_GUIDE_SOURCE" "$BIN_DIR/README.txt"
+cp -- "$LICENSE_SOURCE" "$BIN_DIR/LICENSE"
+cp -- "$NOTICE_SOURCE" "$BIN_DIR/NOTICE"
 chmod 0644 "$BIN_DIR/README.txt" 2>/dev/null || true
+chmod 0644 "$BIN_DIR/LICENSE" "$BIN_DIR/NOTICE" 2>/dev/null || true
 
 archive_entries=(
   README.txt
+  LICENSE
+  NOTICE
   "paranoid$BINARY_SUFFIX"
   "noid-cli$BINARY_SUFFIX"
   "noid-extminer$BINARY_SUFFIX"
@@ -310,7 +377,9 @@ for expected in "${archive_entries[@]}"; do
 done
 
 ARCHIVE_DIGEST=$(release_sha256_file "$ARCHIVE")
+GUI_ARTIFACT_DIGEST=$(release_sha256_file "$GUI_ARTIFACT")
 printf '%s  %s\n' "$ARCHIVE_DIGEST" "$ARCHIVE_NAME" > "$RELEASE_DIR/SHA256SUMS"
+printf '%s  %s\n' "$GUI_ARTIFACT_DIGEST" "$GUI_ARTIFACT_NAME" >> "$RELEASE_DIR/SHA256SUMS"
 
 mkdir -p -- "$(dirname -- "$LAST_RELEASE_FILE")"
 LAST_RELEASE_TMP="$LAST_RELEASE_FILE.tmp.$$"
@@ -322,6 +391,8 @@ printf '\nSUCCESS\n'
 printf '  binaries:     %s\n' "$BIN_DIR"
 printf '  archive:      %s\n' "$ARCHIVE"
 printf '  SHA-256:      %s\n' "$ARCHIVE_DIGEST"
+printf '  GUI package:  %s\n' "$GUI_ARTIFACT"
+printf '  GUI SHA-256:  %s\n' "$GUI_ARTIFACT_DIGEST"
 printf '  checksums:    %s\n' "$RELEASE_DIR/SHA256SUMS"
 printf '  build log:    %s\n' "$LOG_FILE"
 printf '  last release: %s\n' "$LAST_RELEASE_FILE"

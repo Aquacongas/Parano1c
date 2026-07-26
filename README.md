@@ -290,8 +290,11 @@ mkdir -p ../paranoid-artifacts
 Generation is expensive but only needs to be performed once.
 
 Build for the current machine. The script authenticates the pack, embeds it
-into the node and produces a self-contained archive containing `paranoid`,
-`noid-cli` and `noid-extminer`:
+into the node and produces two independent deliverables:
+
+- a Core archive containing `paranoid`, `noid-cli` and `noid-extminer`;
+- a native GUI Wallet package containing `paranoid-gui` and its private,
+  locally supervised `paranoid` node.
 
 ```sh
 ./scripts/build_release.sh \

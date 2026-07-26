@@ -285,14 +285,10 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
         }
         #[cfg(not(feature = "dev-genesis"))]
         {
-            column![
-                text("NETWORK READINESS").size(12).color(theme::DIM),
-                text("Mining requires two authenticated peers.")
-                    .size(13)
-                    .color(theme::MUTED),
-            ]
-            .spacing(5)
-            .into()
+            text("Mining requires two authenticated peers.")
+                .size(12)
+                .color(theme::MUTED)
+                .into()
         }
     };
 
@@ -315,6 +311,7 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
             .align_x(Alignment::Center),
     )
     .width(Length::Fill)
+    .height(Length::Fixed(35.0))
     .padding([9, 12])
     .style(move |_, status| {
         theme::button(

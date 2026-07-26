@@ -19,7 +19,7 @@ env:
 jobs:
   linux-x86-64:
     name: Linux x86-64
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     timeout-minutes: 120
 
     steps:
@@ -61,13 +61,23 @@ jobs:
           cargo check --locked --workspace --all-targets
           --target x86_64-unknown-linux-gnu
 
-      - name: Link the official node tools
+      - name: Link the official node tools and GUI wallet
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
             -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
         run: >-
           cargo build --locked --target x86_64-unknown-linux-gnu
-          -p noid_node -p noid-extminer --bins
+          -p noid_node -p noid-extminer -p noid_gui --bins
+
+      - name: Smoke-test native executables
+        run: |
+          target/x86_64-unknown-linux-gnu/debug/paranoid --help
+          target/x86_64-unknown-linux-gnu/debug/noid-cli --help
+          target/x86_64-unknown-linux-gnu/debug/noid-extminer --help
+          target/x86_64-unknown-linux-gnu/debug/paranoid-gui --release-self-check
+
+      - name: Test GUI wallet logic
+        run: cargo test --locked -p noid_gui
 
       - name: Test proof kernels with runtime dispatch
         run: >-
@@ -96,7 +106,7 @@ jobs:
       matrix:
         include:
           - name: Linux ARM64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             release_flags: -C target-feature=+aes
             test_flags: -C target-feature=+aes
@@ -183,7 +193,7 @@ jobs:
           cargo check --locked --workspace --all-targets
           --target ${{ matrix.target }}
 
-      - name: Link the official node tools
+      - name: Link the official node tools and GUI wallet
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && matrix.release_flags || '' }}
           CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && matrix.release_flags || '' }}
@@ -191,15 +201,17 @@ jobs:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && matrix.release_flags || '' }}
         run: >-
           cargo build --locked --target ${{ matrix.target }}
-          -p noid_node -p noid-extminer --bins
+          -p noid_node -p noid-extminer -p noid_gui --bins
 
       - name: Smoke-test native executables
-        if: runner.arch == 'ARM64' || runner.os == 'macOS'
         shell: bash
         run: |
-          target/${{ matrix.target }}/debug/paranoid --help
-          target/${{ matrix.target }}/debug/noid-cli --help
-          target/${{ matrix.target }}/debug/noid-extminer --help
+          suffix=
+          if [[ "${{ runner.os }}" == Windows ]]; then suffix=.exe; fi
+          target/${{ matrix.target }}/debug/paranoid$suffix --help
+          target/${{ matrix.target }}/debug/noid-cli$suffix --help
+          target/${{ matrix.target }}/debug/noid-extminer$suffix --help
+          target/${{ matrix.target }}/debug/paranoid-gui$suffix --release-self-check
 
       - name: Test native proof kernels
         env:
