@@ -919,7 +919,7 @@ async fn cmd_state(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         .collect();
     if is_tty() {
         println!(
-            "  {CYN}{:<14}{RST} [{bar}] {fill_pct:.2}%  {DIM}(| = expand at {trigger_pct}%){RST}",
+            "  {CYN}{:<14}{RST} [{bar}] {fill_pct:.2}%  {DIM}(| = sample at {trigger_pct}%){RST}",
             "Fill",
             CYN = "\x1b[36m",
             RST = "\x1b[0m",
@@ -927,7 +927,7 @@ async fn cmd_state(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         );
     } else {
         println!(
-            "  {:<14} [{bar}] {fill_pct:.2}%  (| = expand at {trigger_pct}%)",
+            "  {:<14} [{bar}] {fill_pct:.2}%  (| = sample at {trigger_pct}%)",
             "Fill"
         );
     }
@@ -944,7 +944,10 @@ async fn cmd_state(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     } else {
         kv(
             "Until expand",
-            &c!(YLW, "EXPANSION PENDING (trigger has fired)"),
+            &c!(
+                YLW,
+                "ABOVE SAMPLE THRESHOLD (awaiting finalized-window majority)"
+            ),
         );
     }
     kv("State storage", size_human);

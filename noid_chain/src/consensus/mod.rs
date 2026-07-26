@@ -96,7 +96,7 @@ pub use receipt::{
     ReceiptVerifyResult, TxSummary,
 };
 pub use reorg::ReorgResult;
-pub use slot_expansion::expected_child_log_slots;
+pub use slot_expansion::{expected_child_log_slots, finalized_expansion_window};
 pub use template::{build_block_template, BlockTemplate, TemplateBuildError};
 pub use timestamps::{
     median_time_past, median_u64, validate_future_drift, validate_median_time_past,

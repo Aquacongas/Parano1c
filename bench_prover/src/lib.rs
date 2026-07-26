@@ -474,7 +474,7 @@ struct HistoryStepFixtureCheckpoint {
     parent_state: noid_chain::state::ChainState,
     start_accumulator: noid_recursive::ChainAccumulator,
     previous_timestamps: Vec<u64>,
-    previous_active_counts: Vec<u64>,
+    finalized_active_counts: Vec<u64>,
     asert_anchor: noid_chain::consensus::AnchorInfo,
     spendables: Vec<TrackedSpendable>,
     output_slot_cursor: u32,
@@ -736,7 +736,7 @@ impl HonestHistoryStepFixtureProvider {
         let template = noid_chain::consensus::build_block_template(
             &checkpoint.parent_header,
             &checkpoint.parent_state,
-            &checkpoint.previous_active_counts,
+            &checkpoint.finalized_active_counts,
             candidates,
             derive_address(&mk_secret(miner_seed)),
             timestamp,
@@ -806,7 +806,7 @@ impl HonestHistoryStepFixtureProvider {
             parent_state: &checkpoint.parent_state,
             start_accumulator: &checkpoint.start_accumulator,
             previous_timestamps: &checkpoint.previous_timestamps,
-            previous_active_counts: &checkpoint.previous_active_counts,
+            finalized_active_counts: &checkpoint.finalized_active_counts,
             asert_anchor: &checkpoint.asert_anchor,
             local_time: timestamp,
         };
@@ -916,7 +916,7 @@ macro_rules! impl_advance_honest_backbone {
                     &sealed_block,
                     &live.parent_header,
                     &live.previous_timestamps,
-                    &live.previous_active_counts,
+                    &live.finalized_active_counts,
                     sealed_block.header.timestamp,
                     &live.asert_anchor,
                 )
@@ -929,8 +929,6 @@ macro_rules! impl_advance_honest_backbone {
                     return Err(format!("honest B{} state root did not materialize", $tier));
                 }
                 live.previous_timestamps.push(sealed_block.header.timestamp);
-                live.previous_active_counts
-                    .push(sealed_block.header.active_slot_count);
                 live.start_accumulator = prepared.end_accumulator.clone();
                 live.parent_header = sealed_block.header;
                 live.spendables = next_spendables;
@@ -954,7 +952,9 @@ fn genesis_fixture_checkpoint() -> HistoryStepFixtureCheckpoint {
         parent_state: state,
         start_accumulator: noid_recursive::genesis_accumulator(),
         previous_timestamps: vec![genesis.timestamp],
-        previous_active_counts: vec![genesis.active_slot_count],
+        // This short release fixture never reaches the first complete
+        // hard-finalized expansion window.
+        finalized_active_counts: Vec::new(),
         asert_anchor: noid_chain::consensus::AnchorInfo {
             anchor_height: genesis.height,
             anchor_timestamp: genesis.timestamp,

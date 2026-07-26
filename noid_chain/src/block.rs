@@ -155,10 +155,10 @@ pub(crate) fn apply_block(
 
     let mut snap = state.clone();
 
-    // Slot-space expansion: if the block declares a larger log_slots, expand BEFORE
-    // applying transactions. The expansion is triggered by the block producer when
-    // active_slot_count/2^log_slots ≥ 75% (SPEC §15.3.6). Both builder and validator
-    // must expand at the same point so state_root is deterministic.
+    // Slot-space expansion: if consensus validation accepted a one-level
+    // increase in log_slots from the strict-majority hard-finalized occupancy
+    // window, expand BEFORE applying transactions. Builder and validator must
+    // expand at the same point so state_root is deterministic.
     //
     // We loop defensively (spec allows only +1 per block, but be safe).
     while block.header.log_slots as usize > snap.state.log_slots() {

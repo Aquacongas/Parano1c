@@ -26,21 +26,21 @@ use crate::consensus::{
 /// 3. `difficulty_target` == ASERT-computed target
 /// 4. Timestamp rules (MTP + future drift)
 /// 5. Poseidon2b PoW satisfies difficulty_target
-/// 6. `log_slots` equals the exact median-window expansion result
+/// 6. `log_slots` equals the exact hard-finalized expansion result
 ///
 /// Detached validation witness presence is checked by the block acceptance
 /// path, not by semantic header validation.
 ///
 /// `prev_timestamps`: timestamps of the last ≤11 ancestors, oldest-first.
-/// `prev_active_counts`: active-slot counts of the last expansion-window
-/// ancestors ending at the parent, oldest-first.
+/// `finalized_active_counts`: the complete hard-finalized expansion window,
+/// oldest-first, or empty while the chain is too short to provide it.
 /// `local_time`: current wall-clock seconds (for future drift check).
 /// `anchor_*`: epoch anchor values for ASERT.
 pub fn validate_header(
     header: &BlockHeader,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     local_time: u64,
     anchor_height: u64,
     anchor_timestamp: u64,
@@ -50,7 +50,7 @@ pub fn validate_header(
         header,
         parent,
         prev_timestamps,
-        prev_active_counts,
+        finalized_active_counts,
         Some(local_time),
         anchor_height,
         anchor_timestamp,
@@ -70,7 +70,7 @@ pub fn validate_header_template(
     header: &BlockHeader,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     local_time: u64,
     anchor_height: u64,
     anchor_timestamp: u64,
@@ -80,7 +80,7 @@ pub fn validate_header_template(
         header,
         parent,
         prev_timestamps,
-        prev_active_counts,
+        finalized_active_counts,
         Some(local_time),
         anchor_height,
         anchor_timestamp,
@@ -97,7 +97,7 @@ pub fn validate_header_timeless(
     header: &BlockHeader,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     anchor_height: u64,
     anchor_timestamp: u64,
     anchor_target: &[u8; 32],
@@ -106,7 +106,7 @@ pub fn validate_header_timeless(
         header,
         parent,
         prev_timestamps,
-        prev_active_counts,
+        finalized_active_counts,
         None,
         anchor_height,
         anchor_timestamp,
@@ -120,7 +120,7 @@ fn validate_header_inner(
     header: &BlockHeader,
     parent: &BlockHeader,
     prev_timestamps: &[u64],
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     local_time: Option<u64>,
     anchor_height: u64,
     anchor_timestamp: u64,
@@ -166,11 +166,8 @@ fn validate_header_inner(
     }
 
     // 6. Exact slot-space expansion.
-    let expected_log_slots = expected_child_log_slots(
-        parent.log_slots,
-        parent.active_slot_count,
-        prev_active_counts,
-    );
+    let expected_log_slots =
+        expected_child_log_slots(parent.height, parent.log_slots, finalized_active_counts);
     if header.log_slots != expected_log_slots {
         return Err(ConsensusError::BadLogSlotsExpansion);
     }
@@ -228,12 +225,11 @@ mod tests {
         let mut h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
         mine(&mut h1);
         let prev_ts = vec![genesis.timestamp];
-        let prev_active = vec![genesis.active_slot_count];
         let result = validate_header(
             &h1,
             &genesis,
             &prev_ts,
-            &prev_active,
+            &[],
             h1.timestamp + 1,
             0,
             genesis.timestamp,
@@ -248,14 +244,13 @@ mod tests {
         let mut h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
         mine(&mut h1);
         let prev_ts = vec![genesis.timestamp];
-        let prev_active = vec![genesis.active_slot_count];
 
         assert_eq!(
             validate_header(
                 &h1,
                 &genesis,
                 &prev_ts,
-                &prev_active,
+                &[],
                 1,
                 0,
                 genesis.timestamp,
@@ -267,7 +262,7 @@ mod tests {
             &h1,
             &genesis,
             &prev_ts,
-            &prev_active,
+            &[],
             0,
             genesis.timestamp,
             &genesis.difficulty_target,
@@ -285,7 +280,7 @@ mod tests {
             &h1,
             &genesis,
             &[genesis.timestamp],
-            &[genesis.active_slot_count],
+            &[],
             h1.timestamp + 1,
             0,
             genesis.timestamp,
@@ -304,7 +299,7 @@ mod tests {
             &h1,
             &genesis,
             &[genesis.timestamp],
-            &[genesis.active_slot_count],
+            &[],
             h1.timestamp + 1,
             0,
             genesis.timestamp,
@@ -323,7 +318,7 @@ mod tests {
             &h1,
             &genesis,
             &[genesis.timestamp],
-            &[genesis.active_slot_count],
+            &[],
             h1.timestamp + 1,
             0,
             genesis.timestamp,

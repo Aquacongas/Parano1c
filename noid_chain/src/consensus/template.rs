@@ -421,7 +421,7 @@ fn select_coinbase_slot(
 pub fn build_block_template(
     parent: &BlockHeader,
     state: &ChainState,
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     candidate_txs: Vec<Transaction>,
     miner_address: Address,
     timestamp: u64,
@@ -430,7 +430,7 @@ pub fn build_block_template(
     build_block_template_with_post_state(
         parent,
         state,
-        prev_active_counts,
+        finalized_active_counts,
         candidate_txs,
         miner_address,
         timestamp,
@@ -448,7 +448,7 @@ pub fn build_block_template(
 pub fn build_node_owned_block_template(
     parent: &BlockHeader,
     state: &ChainState,
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     candidate_txs: Vec<Transaction>,
     miner_address: Address,
     timestamp: u64,
@@ -457,7 +457,7 @@ pub fn build_node_owned_block_template(
     let (template, post_state) = build_block_template_with_post_state(
         parent,
         state,
-        prev_active_counts,
+        finalized_active_counts,
         candidate_txs,
         miner_address,
         timestamp,
@@ -480,7 +480,7 @@ pub fn build_node_owned_block_template(
 fn build_block_template_with_post_state(
     parent: &BlockHeader,
     state: &ChainState,
-    prev_active_counts: &[u64],
+    finalized_active_counts: &[u64],
     candidate_txs: Vec<Transaction>,
     miner_address: Address,
     timestamp: u64,
@@ -522,14 +522,11 @@ fn build_block_template_with_post_state(
             .then_with(|| left.spend.logical_txid.0.cmp(&right.spend.logical_txid.0))
     });
 
-    // 2. Determine expansion trigger using median over prev_active_counts window.
-    //    Must match validate_block_consensus exactly so the block we produce passes
-    //    consensus validation.
-    let new_log_slots = expected_child_log_slots(
-        parent.log_slots,
-        parent.active_slot_count,
-        prev_active_counts,
-    );
+    // 2. Determine expansion from the strict-majority hard-finalized window.
+    //    Must match validate_block_consensus exactly so the block we produce
+    //    passes consensus validation.
+    let new_log_slots =
+        expected_child_log_slots(parent.height, parent.log_slots, finalized_active_counts);
     let should_expand = new_log_slots != parent.log_slots;
 
     // 3. Apply non-coinbase txs to scratch state.
@@ -831,7 +828,8 @@ mod tests {
         state.state.apply_delta_unrooted(&occupied).unwrap();
         state.active_slot_count = occupied.len() as u64;
         state.alloc_counter = occupied.len() as u64;
-        let parent = parent(&mut state);
+        let mut parent = parent(&mut state);
+        parent.height = 35;
         let candidate = user(0, 220, 100_000_000, owner, &parent);
 
         let template = build_block_template(
@@ -874,7 +872,8 @@ mod tests {
         state.state.apply_delta_unrooted(&occupied).unwrap();
         state.active_slot_count = occupied.len() as u64;
         state.alloc_counter = occupied.len() as u64;
-        let parent = parent(&mut state);
+        let mut parent = parent(&mut state);
+        parent.height = 35;
 
         let pending = user(0, 220, 100_000_000, owner, &parent);
 

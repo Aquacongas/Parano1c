@@ -107,7 +107,8 @@ reference.
 
 State is divided into `2^16`-slot segments. Empty segments are virtual and a
 segment disappears again when its last UTXO is spent. The slot domain begins
-at `2^24` and expands automatically at 75% occupancy by attaching a canonical
+at `2^24`. It expands after a strict majority of the complete 18-header
+hard-finalized window records at least 75% occupancy, attaching a canonical
 empty half to the existing root. No state copy, migration or network pause is
 required.
 

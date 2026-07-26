@@ -97,7 +97,7 @@ impl PreparedBlockAttempt {
             parent,
             authorization_bytes,
             parent_state,
-            previous_active_counts,
+            finalized_active_counts,
             previous_timestamps,
             asert_anchor,
             parent_tx_epoch_anchor_header,
@@ -143,7 +143,7 @@ impl PreparedBlockAttempt {
             parent_state: &parent_state,
             start_accumulator: &start_accumulator,
             previous_timestamps: &previous_timestamps,
-            previous_active_counts: &previous_active_counts,
+            finalized_active_counts: &finalized_active_counts,
             asert_anchor: &asert_anchor,
             local_time,
         };

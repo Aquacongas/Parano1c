@@ -72,9 +72,7 @@ pub fn median_time_past(prev_timestamps: &[u64]) -> u64 {
 
 /// Compute the median of a slice of `u64` values.
 ///
-/// Used for the slot-space expansion trigger: taking the median of
-/// `active_slot_count` over the last `EXPANSION_WINDOW` finalised headers
-/// makes the trigger immune to a single block-spam spike.
+/// Used by bounded rolling policies that need an integer upper median.
 ///
 /// Returns `0` for an empty slice (matches the behaviour of `median_time_past`).
 pub fn median_u64(values: &[u64]) -> u64 {

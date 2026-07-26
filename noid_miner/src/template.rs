@@ -67,7 +67,7 @@ pub struct BlockTemplate {
     pub authorization_bytes: Vec<Option<Vec<u8>>>,
     /// Hydrated exact parent state reused directly by HistoryStep preparation.
     pub parent_state: ChainState,
-    pub previous_active_counts: Vec<u64>,
+    pub finalized_active_counts: Vec<u64>,
     pub previous_timestamps: Vec<u64>,
     pub asert_anchor: AnchorInfo,
     /// Canonical anchor carried by the parent terminal. This is deliberately
@@ -111,7 +111,7 @@ impl BlockTemplate {
 /// handle for the chosen block.
 pub struct TemplateChainSnapshot {
     pub parent: BlockHeader,
-    pub prev_active_counts: Vec<u64>,
+    pub finalized_active_counts: Vec<u64>,
     pub prev_timestamps: Vec<u64>,
     pub anchor: AnchorInfo,
     pub state: ChainState,
@@ -170,7 +170,7 @@ impl TemplateChainSnapshot {
         };
         Ok(Self {
             parent,
-            prev_active_counts: ctx.prev_active_counts(),
+            finalized_active_counts: ctx.finalized_active_counts()?,
             prev_timestamps: ctx.prev_timestamps(),
             anchor: ctx.anchor_info(),
             state: ctx
@@ -308,7 +308,7 @@ impl TemplateBuilder {
         use noid_chain::consensus::median_time_past;
 
         let parent = snapshot.parent;
-        let prev_active_counts = &snapshot.prev_active_counts;
+        let finalized_active_counts = &snapshot.finalized_active_counts;
         let prev_timestamps = &snapshot.prev_timestamps;
 
         // Compute the minimum valid timestamp for the new block:
@@ -388,7 +388,7 @@ impl TemplateBuilder {
             match noid_chain::consensus::template::build_node_owned_block_template(
                 &parent,
                 &state,
-                prev_active_counts,
+                finalized_active_counts,
                 txs,
                 miner_address,
                 timestamp,
@@ -430,7 +430,7 @@ impl TemplateBuilder {
             parent,
             authorization_bytes,
             parent_state: state,
-            previous_active_counts: snapshot.prev_active_counts,
+            finalized_active_counts: snapshot.finalized_active_counts,
             previous_timestamps: snapshot.prev_timestamps,
             asert_anchor: snapshot.anchor,
             parent_tx_epoch_anchor_header: snapshot.parent_tx_epoch_anchor_header,

@@ -56,8 +56,9 @@ pub struct BlockHeader {
     /// reduced domains. Replicated in every Fiat-Shamir
     pub log_slots: u32,
     /// Number of live (non-empty) slots after all transactions in this block
-    /// are applied. Drives the §15.3.6 expansion trigger. MUST equal
-    /// `ChainState::active_slot_count` after `apply_block`.
+    /// are applied. Each hard-finalized value is an input to the state-depth
+    /// expansion rule. MUST equal `ChainState::active_slot_count` after
+    /// `apply_block`.
     pub active_slot_count: u64,
     /// Monotonic PRNG seed: incremented on every successful mint.
     /// MUST equal `ChainState::alloc_counter` after `apply_block`.

@@ -566,8 +566,9 @@ pub struct StateInfo {
     pub active_slots: u64,
     /// Fill percentage (active / capacity × 100), rounded to 2 decimal places.
     pub fill_pct: f64,
-    /// Slots remaining before the 75% expansion trigger fires.
-    /// Negative means the trigger has already fired (expansion pending).
+    /// Slots remaining before current occupancy reaches the 75% sample
+    /// threshold. Negative means the current header is above that threshold;
+    /// expansion still requires the consensus finalized-window majority.
     pub slots_until_expand: i64,
     /// Expansion trigger threshold in percent (always 75).
     pub expand_trigger_pct: u8,

@@ -8,7 +8,7 @@
 //! natively validated, it travels with the verified HistoryStep terminal and
 //! is streamed into the same MDBX transaction as snapshot state and rewarded
 //! tip. The file uses fixed-size records, so validation and restart
-//! recovery retain only the consensus windows (currently at most 18 headers)
+//! recovery retain only the consensus windows (currently at most 36 headers)
 //! in memory regardless of candidate chain length.
 
 use std::collections::VecDeque;
@@ -19,9 +19,11 @@ use std::path::{Path, PathBuf};
 use noid_chain::block_header::BlockHeader;
 use noid_chain::consensus::header::validate_header_timeless;
 use noid_chain::consensus::params::{
-    EPOCH_LENGTH, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
+    EPOCH_LENGTH, EXPANSION_HEADER_LOOKBACK, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
 };
-use noid_chain::consensus::{add_work, asert_anchor_height, block_work};
+use noid_chain::consensus::{
+    add_work, asert_anchor_height, block_work, finalized_expansion_window,
+};
 use noid_chain::storage::{MdbxStore, SnapshotHeaderInstallSource, VerifiedHeaderBatchRecord};
 use noid_chain::wire::BLOCK_HEADER_WIRE_SIZE;
 use noid_chain::{hash_block_header, HeaderChainAnchor};
@@ -803,17 +805,8 @@ fn validate_next_header(
     {
         *slot = ancestor.timestamp;
     }
-    let expansion_len = usize::try_from(EXPANSION_WINDOW)
-        .unwrap_or(usize::MAX)
-        .min(window.len());
-    let active_start = window.len() - expansion_len;
-    let mut prev_active_counts = [0u64; EXPANSION_WINDOW as usize];
-    for (slot, ancestor) in prev_active_counts
-        .iter_mut()
-        .zip(window.iter().skip(active_start))
-    {
-        *slot = ancestor.active_slot_count;
-    }
+    let (finalized_active_counts, expansion_len) =
+        finalized_active_counts_for_parent(parent.height, window)?;
     let anchor_height = asert_anchor_height(parent.height);
     let anchor = window
         .iter()
@@ -826,7 +819,7 @@ fn validate_next_header(
         header,
         parent,
         &prev_timestamps[..timestamp_len],
-        &prev_active_counts[..expansion_len],
+        &finalized_active_counts[..expansion_len],
         anchor_height,
         anchor.timestamp,
         &anchor.difficulty_target,
@@ -837,8 +830,46 @@ fn validate_next_header(
     })
 }
 
+fn finalized_active_counts_for_parent(
+    parent_height: u64,
+    window: &VecDeque<BlockHeader>,
+) -> Result<([u64; EXPANSION_WINDOW as usize], usize)> {
+    let mut counts = [0u64; EXPANSION_WINDOW as usize];
+    let Some((start, end)) = finalized_expansion_window(parent_height) else {
+        return Ok((counts, 0));
+    };
+    let first_height = window
+        .front()
+        .ok_or(SnapshotHeaderStagingError::Format("empty consensus window"))?
+        .height;
+    let offset = start
+        .checked_sub(first_height)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(SnapshotHeaderStagingError::InvalidCandidate {
+            height: parent_height.saturating_add(1),
+            reason: "hard-finalized expansion window is outside the validated suffix".into(),
+        })?;
+    for (index, height) in (start..=end).enumerate() {
+        let ancestor =
+            window
+                .get(offset + index)
+                .ok_or(SnapshotHeaderStagingError::InvalidCandidate {
+                    height: parent_height.saturating_add(1),
+                    reason: "hard-finalized expansion window is incomplete".into(),
+                })?;
+        if ancestor.height != height {
+            return Err(SnapshotHeaderStagingError::InvalidCandidate {
+                height: parent_height.saturating_add(1),
+                reason: "hard-finalized expansion window is not contiguous".into(),
+            });
+        }
+        counts[index] = ancestor.active_slot_count;
+    }
+    Ok((counts, EXPANSION_WINDOW as usize))
+}
+
 fn consensus_window_len() -> usize {
-    usize::try_from(EXPANSION_WINDOW)
+    usize::try_from(EXPANSION_HEADER_LOOKBACK.saturating_add(1))
         .unwrap_or(usize::MAX)
         .max(MEDIAN_TIME_BLOCKS)
         .max(usize::try_from(EPOCH_LENGTH).unwrap_or(usize::MAX))
@@ -1015,6 +1046,44 @@ mod tests {
     use noid_chain::consensus::params::BLOCK_TIME;
     use std::sync::OnceLock;
 
+    fn occupancy_header(height: u64, active_slot_count: u64) -> BlockHeader {
+        let mut header = genesis_header();
+        header.height = height;
+        header.active_slot_count = active_slot_count;
+        header.alloc_counter = active_slot_count;
+        header
+    }
+
+    #[test]
+    fn snapshot_validation_uses_only_the_depth_finalized_window() {
+        assert_eq!(consensus_window_len(), 36);
+        let window = (65..=100)
+            .map(|height| occupancy_header(height, if height <= 82 { height } else { u64::MAX }))
+            .collect::<VecDeque<_>>();
+
+        let (counts, len) = finalized_active_counts_for_parent(100, &window).unwrap();
+        assert_eq!(len, EXPANSION_WINDOW as usize);
+        assert_eq!(&counts[..len], &(65..=82).collect::<Vec<_>>());
+        assert!(
+            !counts[..len].contains(&u64::MAX),
+            "unfinalized tip values must not enter the expansion decision"
+        );
+    }
+
+    #[test]
+    fn snapshot_validation_requires_the_complete_finalized_window() {
+        let early = (0..=34)
+            .map(|height| occupancy_header(height, u64::MAX))
+            .collect::<VecDeque<_>>();
+        let (_, len) = finalized_active_counts_for_parent(34, &early).unwrap();
+        assert_eq!(len, 0);
+
+        let incomplete = (66..=100)
+            .map(|height| occupancy_header(height, height))
+            .collect::<VecDeque<_>>();
+        assert!(finalized_active_counts_for_parent(100, &incomplete).is_err());
+    }
+
     fn fixture_chain() -> &'static [BlockHeader] {
         static HEADERS: OnceLock<Vec<BlockHeader>> = OnceLock::new();
         HEADERS.get_or_init(|| {
@@ -1085,7 +1154,7 @@ mod tests {
         noid_chain::consensus::build_block_template(
             &parent,
             &chain.state,
-            &chain.prev_active_counts(),
+            &chain.finalized_active_counts().unwrap(),
             Vec::new(),
             parent.miner_address,
             timestamp,

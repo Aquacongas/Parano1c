@@ -143,10 +143,21 @@ pub const UNDO_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH * 2;
 /// headers remain permanent.
 pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
 
-/// Number of finalised block headers used for the expansion trigger median.
-/// Using median over this window makes the trigger immune to single-block spam.
-/// Must be ≤ available recent-header retention.
+/// Number of hard-finalized block headers used for the state-expansion trigger.
+///
+/// Expansion requires a strict majority of this complete window to be at or
+/// above 75% occupancy. With the current even window, a 9/9 tie does not
+/// expand; at least 10 of 18 finalized headers must meet the threshold.
 pub const EXPANSION_WINDOW: u64 = CONSENSUS_FINALITY_DEPTH;
+
+/// Oldest parent-relative header depth needed to validate state expansion.
+///
+/// For parent height `H`, the finalized window ends at
+/// `H - CONSENSUS_FINALITY_DEPTH` and contains `EXPANSION_WINDOW` headers, so
+/// its oldest member is `H - EXPANSION_HEADER_LOOKBACK`.
+pub const EXPANSION_HEADER_LOOKBACK: u64 = CONSENSUS_FINALITY_DEPTH + EXPANSION_WINDOW - 1;
+
+const _: () = assert!(EXPANSION_WINDOW > 0, "expansion window must be non-zero");
 
 // ---------------------------------------------------------------------------
 // Slot state

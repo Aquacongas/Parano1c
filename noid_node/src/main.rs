@@ -2586,19 +2586,32 @@ async fn handle_p2p_events(
                         let ctx = chain.read().await;
                         let parent = *ctx.tip_header();
                         let prev_timestamps = ctx.prev_timestamps();
-                        let prev_active_counts = ctx.prev_active_counts();
                         let anchor = ctx.anchor_info();
                         let local_time = unix_now();
-                        noid_chain::consensus::validate_header(
-                            &announced_header,
-                            &parent,
-                            &prev_timestamps,
-                            &prev_active_counts,
-                            local_time,
-                            anchor.anchor_height,
-                            anchor.anchor_timestamp,
-                            &anchor.anchor_target,
-                        )
+                        match ctx.finalized_active_counts() {
+                            Ok(finalized_active_counts) => {
+                                Some(noid_chain::consensus::validate_header(
+                                    &announced_header,
+                                    &parent,
+                                    &prev_timestamps,
+                                    &finalized_active_counts,
+                                    local_time,
+                                    anchor.anchor_height,
+                                    anchor.anchor_timestamp,
+                                    &anchor.anchor_target,
+                                ))
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    err = %error,
+                                    "canonical finalized expansion window is unavailable"
+                                );
+                                None
+                            }
+                        }
+                    };
+                    let Some(precheck) = precheck else {
+                        continue;
                     };
                     if let Err(e) = precheck {
                         if e == noid_chain::consensus::ConsensusError::BadParentHash {
@@ -5972,7 +5985,8 @@ fn print_startup_banner(
     // If state is near expansion threshold, warn the operator
     if fill_pct >= 70.0 {
         println!(
-            "  {} state is {fill_pct:.1}% full \u{2014} expansion at 75%",
+            "  {} state is {fill_pct:.1}% full \u{2014} expansion requires 10/18 \
+             hard-finalized headers at or above 75%",
             ylw("WARN")
         );
         println!();

@@ -51,10 +51,11 @@ use crate::consensus::{
     genesis::genesis_header,
     header::asert_anchor_height,
     params::{
-        BLOCK_MAX_DISTINCT_SEGMENTS, CONSENSUS_FINALITY_DEPTH, EXPANSION_WINDOW, GENESIS_TARGET,
-        LOG_SEGMENT_SIZE, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
+        BLOCK_MAX_DISTINCT_SEGMENTS, CONSENSUS_FINALITY_DEPTH, EXPANSION_HEADER_LOOKBACK,
+        EXPANSION_WINDOW, GENESIS_TARGET, LOG_SEGMENT_SIZE, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
     },
     pow::{block_id, validate_pow},
+    slot_expansion::finalized_expansion_window,
     template::LocallyProvedBlockCommit,
     validation::{validate_block_checks, AnchorInfo},
     ConsensusError,
@@ -73,6 +74,10 @@ fn canonical_genesis_parts() -> (ChainState, HashMap<u64, BlockHeader>, [u8; 32]
     let mut headers = HashMap::new();
     headers.insert(0, header);
     (ChainState::new(), headers, hash)
+}
+
+fn recent_header_lookback() -> u64 {
+    (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_HEADER_LOOKBACK)
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +185,7 @@ pub struct MdbxChainContext {
     /// atomically with each block commit.
     pub state: ChainState,
 
-    /// Recent headers needed for MTP, ASERT and the expansion median.
+    /// Recent headers needed for MTP, ASERT and finalized state expansion.
     pub recent_headers: HashMap<u64, BlockHeader>,
 
     /// Current tip height.
@@ -612,7 +617,7 @@ impl MdbxChainContext {
         )?;
 
         // 5. Rebuild the bounded header window used by native header checks.
-        let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
+        let window = recent_header_lookback();
         let start_height = tip_height.saturating_sub(window);
         let mut recent_headers = HashMap::new();
         for h in start_height..=tip_height {
@@ -705,7 +710,7 @@ impl MdbxChainContext {
             tip_header.state_root,
         )?;
 
-        let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
+        let window = recent_header_lookback();
         let start_height = meta.tip_height.saturating_sub(window);
         let mut recent_headers = HashMap::new();
         for height in start_height..=meta.tip_height {
@@ -966,7 +971,7 @@ impl MdbxChainContext {
             self.state.state.evict_all_persisted_segments();
         }
 
-        let window = (MEDIAN_TIME_BLOCKS as u64).max(EXPANSION_WINDOW);
+        let window = recent_header_lookback();
         if self.tip_height > window {
             self.recent_headers.remove(&(self.tip_height - window - 1));
         }
@@ -1120,7 +1125,7 @@ impl MdbxChainContext {
         let history_step_terminal_bytes = accepted_bundle.history_step_terminal_bytes();
         let parent = *self.tip_header();
         let prev_timestamps = self.prev_timestamps();
-        let prev_active_counts = self.prev_active_counts();
+        let finalized_active_counts = self.finalized_active_counts()?;
         let anchor = self.anchor_info();
         let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
         let tx_anchor_header =
@@ -1137,7 +1142,7 @@ impl MdbxChainContext {
             block,
             &parent,
             &prev_timestamps,
-            &prev_active_counts,
+            &finalized_active_counts,
             local_time,
             &anchor,
         )?;
@@ -1914,15 +1919,31 @@ impl MdbxChainContext {
             .collect()
     }
 
-    /// Collect the last `EXPANSION_WINDOW` `active_slot_count` values for the
-    /// median expansion trigger. Always available: `recent_headers` covers
-    /// the bounded recent window (≥ EXPANSION_WINDOW).
-    pub fn prev_active_counts(&self) -> Vec<u64> {
-        let tip = self.tip_height;
-        let start = tip.saturating_sub(EXPANSION_WINDOW.saturating_sub(1));
-        (start..=tip)
-            .filter_map(|h| self.recent_headers.get(&h).map(|hdr| hdr.active_slot_count))
-            .collect()
+    /// Collect the complete oldest-first hard-finalized occupancy window that
+    /// decides the next child state depth.
+    ///
+    /// The range is derived from `tip_height`, never from the local persisted
+    /// finality checkpoint: snapshot-installed and fully replayed nodes must
+    /// validate the same child header at the same chain height.
+    pub fn finalized_active_counts(&self) -> Result<Vec<u64>, MdbxContextError> {
+        let Some((start, end)) = finalized_expansion_window(self.tip_height) else {
+            return Ok(Vec::new());
+        };
+        let mut counts = Vec::with_capacity(EXPANSION_WINDOW as usize);
+        for height in start..=end {
+            let header = self
+                .get_header_from_store(height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "hard-finalized expansion header is missing",
+                ))?;
+            counts.push(header.active_slot_count);
+        }
+        if counts.len() != EXPANSION_WINDOW as usize {
+            return Err(MdbxContextError::Corrupt(
+                "hard-finalized expansion window has the wrong length",
+            ));
+        }
+        Ok(counts)
     }
 
     pub fn anchor_info(&self) -> AnchorInfo {
@@ -2048,6 +2069,94 @@ mod tests {
                 .seal_after_trusted_history_step_proof_unchecked(block, terminal)
                 .unwrap()
         }
+    }
+
+    fn occupancy_header(height: u64, active_slot_count: u64) -> BlockHeader {
+        BlockHeader {
+            prev_block_hash: [height.saturating_sub(1) as u8; 32],
+            state_root: [height as u8; 32],
+            tx_root: [0x33; 32],
+            timestamp: 1_000 + height,
+            height,
+            miner_address: noid_poseidon2b::primitives::Address([0x44; 32]),
+            nonce: 0,
+            difficulty_target: [0xff; 32],
+            log_slots: 8,
+            active_slot_count,
+            alloc_counter: active_slot_count,
+        }
+    }
+
+    #[test]
+    fn expansion_ignores_unfinalized_tip_pressure_and_requires_strict_majority() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        let threshold = (1u64 << 8) * crate::consensus::params::EXPAND_NUM
+            / crate::consensus::params::EXPAND_DENOM;
+        context.recent_headers.clear();
+        for height in 0..=62 {
+            let active = if height >= 35 {
+                threshold
+            } else {
+                threshold - 1
+            };
+            context
+                .recent_headers
+                .insert(height, occupancy_header(height, active));
+        }
+
+        // At parent 52, headers 35..52 are all under unfinalized pressure,
+        // while the deciding finalized window is 17..34 and remains below.
+        context.tip_height = 52;
+        let counts = context.finalized_active_counts().unwrap();
+        assert_eq!(counts, vec![threshold - 1; EXPANSION_WINDOW as usize]);
+        assert_eq!(
+            crate::consensus::expected_child_log_slots(context.tip_height, 8, &counts),
+            8
+        );
+
+        // Parent 61 sees only nine finalized threshold headers (35..43): tie,
+        // therefore no irreversible expansion.
+        context.tip_height = 61;
+        let counts = context.finalized_active_counts().unwrap();
+        assert_eq!(
+            counts.iter().filter(|&&active| active >= threshold).count(),
+            9
+        );
+        assert_eq!(
+            crate::consensus::expected_child_log_slots(context.tip_height, 8, &counts),
+            8
+        );
+
+        // Parent 62 finalizes header 44, producing the required ten of 18.
+        context.tip_height = 62;
+        let counts = context.finalized_active_counts().unwrap();
+        assert_eq!(
+            counts.iter().filter(|&&active| active >= threshold).count(),
+            10
+        );
+        assert_eq!(
+            crate::consensus::expected_child_log_slots(context.tip_height, 8, &counts),
+            9
+        );
+    }
+
+    #[test]
+    fn missing_finalized_expansion_header_fails_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        context.recent_headers = (0..=35)
+            .map(|height| (height, occupancy_header(height, 0)))
+            .collect();
+        context.tip_height = 35;
+        context.recent_headers.remove(&7);
+
+        assert!(matches!(
+            context.finalized_active_counts(),
+            Err(MdbxContextError::Corrupt(
+                "hard-finalized expansion header is missing"
+            ))
+        ));
     }
 
     #[test]
