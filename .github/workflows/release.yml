@@ -26,7 +26,8 @@ on:
         type: string
 
 permissions:
-  contents: write
+  actions: read
+  contents: read
 
 concurrency:
   group: native-release-${{ inputs.tag }}
@@ -36,7 +37,6 @@ env:
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
-  GH_TOKEN: ${{ github.token }}
   GH_REPO: ${{ github.repository }}
   RELEASE_TAG: ${{ inputs.tag }}
   PACK_SHA256: ${{ inputs.pack_sha256 }}
@@ -48,18 +48,24 @@ jobs:
     name: Release preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
 
     steps:
       - name: Check out the tagged source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
+          persist-credentials: false
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal
 
       - name: Validate tag, version, and draft release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]
@@ -87,6 +93,8 @@ jobs:
   build:
     name: ${{ matrix.name }}
     needs: preflight
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -120,9 +128,10 @@ jobs:
 
     steps:
       - name: Check out the tagged source
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.tag }}
+          persist-credentials: false
 
       - name: Install Linux native build dependencies
         if: runner.os == 'Linux'
@@ -157,7 +166,7 @@ jobs:
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
 
       - name: Cache Cargo downloads
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -168,6 +177,8 @@ jobs:
 
       - name: Download and authenticate canonical matrix pack
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           test ! -e .release-ci
@@ -194,6 +205,8 @@ jobs:
 
       - name: Upload native deliverables to draft release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "$RELEASE_TAG" \
             ".release-ci/build/$ARTIFACT_NAME" \
@@ -207,10 +220,14 @@ jobs:
       - build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: write
 
     steps:
       - name: Download the complete draft release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           mkdir release-assets
@@ -237,6 +254,8 @@ jobs:
 
       - name: Publish checksums and open the release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -Eeuo pipefail
           cd release-assets

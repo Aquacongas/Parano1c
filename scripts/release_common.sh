@@ -7,7 +7,7 @@ if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
   exit 2
 fi
 
-RELEASE_ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+RELEASE_ROOT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 readonly RELEASE_ROOT_DIR
 
 release_die() {
@@ -31,7 +31,7 @@ release_absolute_from_root() {
 release_canonical_directory() {
   local path=$1
   [[ -d $path && ! -L $path ]] || release_die "not a regular directory: $path"
-  (CDPATH= cd -- "$path" && pwd -P)
+  (CDPATH='' cd -- "$path" && pwd -P)
 }
 
 release_sha256_file() {
@@ -234,7 +234,7 @@ release_build_pack_tools() {
     unset NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
     export CARGO_TARGET_DIR="$RELEASE_TOOL_TARGET_DIR"
     export RUSTFLAGS='-C target-cpu=native'
-    cd "$RELEASE_ROOT_DIR"
+    cd "$RELEASE_ROOT_DIR" || exit 1
     cargo build --locked --release -p bench_prover "${build_args[@]}"
   )
 
@@ -312,5 +312,6 @@ release_workspace_version() {
     release_die "cannot determine noid_node version from: $node_pkg"
   [[ $node_version == "$extminer_version" ]] || \
     release_die "node version $node_version differs from external miner version $extminer_version"
+  # shellcheck disable=SC2034 # Read by scripts that source this helper.
   RELEASE_VERSION=$node_version
 }

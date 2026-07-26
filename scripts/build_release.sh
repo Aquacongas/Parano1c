@@ -4,7 +4,7 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=release_common.sh
 source "$SCRIPT_DIR/release_common.sh"
 
@@ -202,6 +202,7 @@ unset NOID_HISTORY_STEP_PACK_DIR
 unset NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
 unset NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
 unset TAR_OPTIONS GZIP GZIP_OPT
+# shellcheck disable=SC2031 # The pack-tool helper uses an intentional subshell.
 export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
 printf 'ParanO(1)d self-contained release build\n'
@@ -223,6 +224,7 @@ CURRENT_STAGE='pack authentication'
 printf '\n==> Authenticating the canonical HistoryStep pack\n'
 release_authenticate_pack "$PACK_DIR" 0
 
+# shellcheck disable=SC2031 # The pack-tool helper uses an intentional subshell.
 export RUSTFLAGS="$RELEASE_RUSTFLAGS"
 
 CURRENT_STAGE='format check'

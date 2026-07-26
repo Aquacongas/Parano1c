@@ -4,8 +4,8 @@ set -Eeuo pipefail
 IFS=$'\n\t'
 umask 022
 
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-RELEASE_ROOT_DIR="$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd -P)"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+RELEASE_ROOT_DIR="$(CDPATH='' cd -- "$SCRIPT_DIR/../.." && pwd -P)"
 
 usage() {
   cat <<'EOF'
@@ -44,9 +44,9 @@ for command in codesign hdiutil iconutil install mktemp plutil sed; do
   }
 done
 
-BIN_DIR="$(CDPATH= cd -- "$BIN_DIR" && pwd -P)"
+BIN_DIR="$(CDPATH='' cd -- "$BIN_DIR" && pwd -P)"
 mkdir -p -- "$OUTPUT_DIR"
-OUTPUT_DIR="$(CDPATH= cd -- "$OUTPUT_DIR" && pwd -P)"
+OUTPUT_DIR="$(CDPATH='' cd -- "$OUTPUT_DIR" && pwd -P)"
 for binary in paranoid-gui paranoid; do
   [[ -f $BIN_DIR/$binary && -x $BIN_DIR/$binary ]] || {
     echo "release binary is missing or not executable: $BIN_DIR/$binary" >&2
