@@ -6,10 +6,11 @@
 //! A process selects the widest safe implementation embedded in its
 //! architecture's binary. `NOID_CPU_BACKEND` is a diagnostic/test hook which
 //! may restrict that selection to `scalar`, `pclmul`, `avx2`, `avx512`,
-//! `neon`, or `neon-pmull`. Official x86-64 artifacts have an x86-64-v3 and
-//! PCLMUL baseline, then upgrade at runtime when wider kernels are available.
-//! The scalar implementation remains a test oracle and a source-build
-//! fallback, not a separately distributed binary.
+//! `neon`, or `neon-pmull`. Official artifacts keep their process-wide
+//! baseline portable enough to inspect the host before proof code runs, then
+//! dispatch the hot kernels at runtime. Production requires SSE4.1 and
+//! PCLMULQDQ on x86-64, or NEON and PMULL on AArch64. The scalar
+//! implementation remains a test oracle, never a production backend.
 
 use std::fmt;
 use std::sync::OnceLock;
@@ -48,6 +49,143 @@ impl fmt::Display for CpuBackend {
             Self::NeonPmull => "neon+pmull",
         })
     }
+}
+
+impl CpuBackend {
+    /// Whether this backend has the carry-less multiplication required by a
+    /// production node or miner.
+    pub const fn production_ready(self) -> bool {
+        matches!(
+            self,
+            Self::Pclmul | Self::Avx2 | Self::Avx512 | Self::NeonPmull
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProductionHardwareReport {
+    pub architecture: &'static str,
+    pub backend: CpuBackend,
+    pub capabilities: CpuCapabilities,
+}
+
+impl ProductionHardwareReport {
+    pub fn detect() -> Self {
+        Self {
+            architecture: std::env::consts::ARCH,
+            backend: selected_backend(),
+            capabilities: *capabilities(),
+        }
+    }
+
+    pub const fn ready(self) -> bool {
+        self.backend.production_ready()
+    }
+
+    pub const fn requirement(self) -> &'static str {
+        production_hardware_requirement()
+    }
+}
+
+impl fmt::Display for ProductionHardwareReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "ParanO(1)d hardware check")?;
+        writeln!(formatter, "ARCHITECTURE {}", self.architecture)?;
+        writeln!(formatter, "BACKEND {}", self.backend)?;
+        #[cfg(target_arch = "x86_64")]
+        writeln!(
+            formatter,
+            "FEATURES SSE4.1={} PCLMUL={} AVX2={} VPCLMUL={} AVX512F={} AVX512BW={}",
+            yes_no(self.capabilities.sse4_1),
+            yes_no(self.capabilities.pclmulqdq),
+            yes_no(self.capabilities.avx2),
+            yes_no(self.capabilities.vpclmulqdq),
+            yes_no(self.capabilities.avx512f),
+            yes_no(self.capabilities.avx512bw),
+        )?;
+        #[cfg(target_arch = "aarch64")]
+        writeln!(
+            formatter,
+            "FEATURES NEON={} PMULL={}",
+            yes_no(self.capabilities.neon),
+            yes_no(self.capabilities.pmull),
+        )?;
+        if self.ready() {
+            writeln!(formatter, "NODE READY")?;
+            writeln!(formatter, "MINING CAPACITY CALIBRATED AT RUNTIME")
+        } else {
+            write_unsupported_cpu(formatter, self.requirement())
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnsupportedProductionCpu {
+    report: ProductionHardwareReport,
+}
+
+impl UnsupportedProductionCpu {
+    pub const fn report(self) -> ProductionHardwareReport {
+        self.report
+    }
+}
+
+impl fmt::Display for UnsupportedProductionCpu {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_unsupported_cpu(formatter, self.report.requirement())
+    }
+}
+
+impl std::error::Error for UnsupportedProductionCpu {}
+
+/// Detect the selected runtime backend and reject the scalar/reference paths
+/// before a production process opens configuration, wallet, or chain state.
+pub fn ensure_production_hardware() -> Result<ProductionHardwareReport, UnsupportedProductionCpu> {
+    let report = ProductionHardwareReport::detect();
+    if report.ready() {
+        Ok(report)
+    } else {
+        Err(UnsupportedProductionCpu { report })
+    }
+}
+
+pub const fn production_hardware_requirement() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        return "x86-64: SSE4.1 + PCLMULQDQ";
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        return "AArch64: NEON + PMULL";
+    }
+    #[allow(unreachable_code)]
+    "an accelerated x86-64 or AArch64 proof backend"
+}
+
+const fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
+}
+
+fn write_unsupported_cpu(formatter: &mut fmt::Formatter<'_>, requirement: &str) -> fmt::Result {
+    writeln!(formatter, "CPU UNSUPPORTED")?;
+    writeln!(
+        formatter,
+        "This CPU is too old or does not expose the required instruction set."
+    )?;
+    writeln!(formatter, "MINIMUM {requirement}")?;
+    #[cfg(target_arch = "x86_64")]
+    {
+        return write!(
+            formatter,
+            "Most Intel and AMD desktop and server CPUs released since 2012 support both."
+        );
+    }
+    #[allow(unreachable_code)]
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,11 +278,12 @@ fn parse_backend_request(value: &str) -> Option<BackendRequest> {
 fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend {
     #[cfg(target_arch = "x86_64")]
     {
-        let available = if caps.avx512f && caps.avx512bw && caps.vpclmulqdq {
+        let production_floor = caps.sse4_1 && caps.pclmulqdq;
+        let available = if production_floor && caps.avx512f && caps.avx512bw && caps.vpclmulqdq {
             CpuBackend::Avx512
-        } else if caps.avx2 && caps.vpclmulqdq {
+        } else if production_floor && caps.avx2 && caps.vpclmulqdq {
             CpuBackend::Avx2
-        } else if caps.sse4_1 && caps.pclmulqdq {
+        } else if production_floor {
             CpuBackend::Pclmul
         } else {
             CpuBackend::Scalar
@@ -153,8 +292,12 @@ fn select_backend(caps: CpuCapabilities, request: BackendRequest) -> CpuBackend 
             BackendRequest::Auto => available,
             BackendRequest::Scalar => CpuBackend::Scalar,
             BackendRequest::Pclmul if caps.sse4_1 && caps.pclmulqdq => CpuBackend::Pclmul,
-            BackendRequest::Avx2 if caps.avx2 && caps.vpclmulqdq => CpuBackend::Avx2,
-            BackendRequest::Avx512 if caps.avx512f && caps.avx512bw && caps.vpclmulqdq => {
+            BackendRequest::Avx2 if production_floor && caps.avx2 && caps.vpclmulqdq => {
+                CpuBackend::Avx2
+            }
+            BackendRequest::Avx512
+                if production_floor && caps.avx512f && caps.avx512bw && caps.vpclmulqdq =>
+            {
                 CpuBackend::Avx512
             }
             BackendRequest::Neon | BackendRequest::NeonPmull => {
@@ -255,5 +398,64 @@ mod tests {
             CpuBackend::Neon => assert!(caps.neon),
             CpuBackend::NeonPmull => assert!(caps.neon && caps.pmull),
         }
+    }
+
+    #[test]
+    fn production_never_accepts_reference_backends() {
+        assert!(!CpuBackend::Scalar.production_ready());
+        assert!(!CpuBackend::Neon.production_ready());
+        assert!(CpuBackend::Pclmul.production_ready());
+        assert!(CpuBackend::Avx2.production_ready());
+        assert!(CpuBackend::Avx512.production_ready());
+        assert!(CpuBackend::NeonPmull.production_ready());
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn wider_x86_features_do_not_bypass_the_production_floor() {
+        let caps = CpuCapabilities {
+            avx2: true,
+            vpclmulqdq: true,
+            avx512f: true,
+            avx512bw: true,
+            ..CpuCapabilities::default()
+        };
+        assert_eq!(
+            select_backend(caps, BackendRequest::Auto),
+            CpuBackend::Scalar
+        );
+    }
+
+    #[test]
+    fn hardware_report_matches_the_selected_backend() {
+        let report = ProductionHardwareReport::detect();
+        assert_eq!(report.backend, selected_backend());
+        assert_eq!(report.capabilities, *capabilities());
+        assert_eq!(report.ready(), report.backend.production_ready());
+        assert!(!report.requirement().is_empty());
+        let rendered = report.to_string();
+        assert!(rendered.contains("ParanO(1)d hardware check"));
+        assert!(rendered.contains("ARCHITECTURE"));
+        assert!(rendered.contains("BACKEND"));
+    }
+
+    #[test]
+    fn unsupported_report_states_the_exact_minimum() {
+        let report = ProductionHardwareReport {
+            architecture: std::env::consts::ARCH,
+            backend: CpuBackend::Scalar,
+            capabilities: CpuCapabilities::default(),
+        };
+        let rendered = report.to_string();
+        assert!(rendered.contains("CPU UNSUPPORTED"));
+        assert!(rendered
+            .contains("This CPU is too old or does not expose the required instruction set."));
+        assert!(rendered.contains(&format!("MINIMUM {}", production_hardware_requirement())));
+        #[cfg(target_arch = "x86_64")]
+        assert!(rendered.contains(
+            "Most Intel and AMD desktop and server CPUs released since 2012 support both."
+        ));
+        #[cfg(target_arch = "aarch64")]
+        assert!(!rendered.contains("Intel and AMD"));
     }
 }

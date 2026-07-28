@@ -1,5 +1,5 @@
-# Developer builds keep rustc's baseline so forced-backend differential tests
-# can exercise the scalar oracle. Official artifacts set one modern profile
-# per platform in CI: x86-64-v3 + PCLMULQDQ, or AArch64 + PMULL. Wider
-# AVX2+VPCLMULQDQ/AVX-512 kernels remain runtime-selected whenever the host
-# exceeds its artifact's baseline.
+# Every build keeps a portable process-wide baseline so the executable can
+# inspect CPU capabilities before proof code runs. Production then requires
+# SSE4.1 + PCLMULQDQ on x86-64 or NEON + PMULL on AArch64 and selects wider
+# AVX2+VPCLMULQDQ/AVX-512 kernels at runtime. The scalar path remains available
+# only to differential tests.

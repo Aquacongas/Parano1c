@@ -61,6 +61,10 @@ use serde::{Deserialize, Serialize};
                   --allow-custom-coinbase and the worker supplies --coinbase."
 )]
 struct Cli {
+    /// Check production CPU support and exit without connecting to a node.
+    #[arg(long, exclusive = true)]
+    check_hardware: bool,
+
     /// JSON-RPC endpoint of the paranoid node or pool.
     #[arg(long, default_value = "http://127.0.0.1:9401", value_name = "URL")]
     rpc: String,
@@ -428,6 +432,19 @@ fn mine(cli: &Cli) -> Result<()> {
 
 fn main() {
     let cli = Cli::parse();
+    if cli.check_hardware {
+        let report = noid_core::cpu::ProductionHardwareReport::detect();
+        print!("{report}");
+        if report.ready() {
+            return;
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(1);
+    }
+    if let Err(error) = noid_core::cpu::ensure_production_hardware() {
+        eprintln!("fatal: {error}");
+        std::process::exit(1);
+    }
     if let Err(e) = mine(&cli) {
         eprintln!("fatal: {e}");
         std::process::exit(1);

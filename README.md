@@ -288,9 +288,13 @@ macOS Apple Silicon, macOS Intel and Windows x86-64. A build requires the
 pinned Rust toolchain, a native C/C++ toolchain, CMake, libclang and
 `pkg-config` where the platform provides it.
 
-Official x86-64 builds use an x86-64-v3 and PCLMULQDQ baseline. Each binary
-selects wider AVX2+VPCLMULQDQ or AVX-512 kernels at runtime when available.
-ARM64 builds use NEON and PMULL. There is no separate legacy x86-64 release.
+Official binaries keep a portable process-wide baseline so they can inspect
+the host before entering proof code. Production requires SSE4.1 and
+PCLMULQDQ on x86-64, or NEON and PMULL on ARM64. Each binary then selects
+PCLMULQDQ, AVX2+VPCLMULQDQ, AVX-512 or NEON+PMULL kernels at runtime. The
+scalar implementation is a differential-test oracle and is never used by a
+production node. Run `paranoid --check-hardware` before installation to see
+the selected backend without creating configuration, wallet or chain data.
 
 To reproduce a published release, check out the tag shown on its GitHub release
 page. Then generate the HistoryStep matrices locally. This is the trustless

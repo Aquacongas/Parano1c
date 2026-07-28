@@ -20,6 +20,18 @@ Core archives (node operators and miners):
   noid-extminer   external proof-of-work miner
   LICENSE/NOTICE  Apache-2.0 distribution terms and project notices
 
+Hardware check
+--------------
+
+Before creating node or wallet data, run:
+
+  paranoid --check-hardware
+
+Production requires SSE4.1 and PCLMULQDQ on x86-64, or NEON and PMULL on
+ARM64. The executable selects wider AVX2+VPCLMULQDQ or AVX-512 kernels
+automatically. Unsupported hardware exits with a readable diagnostic; the
+scalar reference backend is not used for production.
+
 Verify the download
 -------------------
 

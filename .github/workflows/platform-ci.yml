@@ -31,7 +31,7 @@ jobs:
       - name: Install native build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config
+          sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config qemu-user
 
       - name: Install pinned Rust toolchain
         run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
@@ -55,10 +55,10 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Check the complete x86-64 release profile
+      - name: Check the portable x86-64 release profile
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+            -C target-cpu=x86-64
         run: >-
           cargo check --locked --workspace --all-targets
           --target x86_64-unknown-linux-gnu
@@ -66,17 +66,34 @@ jobs:
       - name: Link the official node tools and GUI wallet
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+            -C target-cpu=x86-64
         run: >-
           cargo build --locked --target x86_64-unknown-linux-gnu
           -p noid_node -p noid-extminer -p noid_gui --bins
 
       - name: Smoke-test native executables
         run: |
+          target/x86_64-unknown-linux-gnu/debug/paranoid --check-hardware
           target/x86_64-unknown-linux-gnu/debug/paranoid --help
           target/x86_64-unknown-linux-gnu/debug/noid-cli --help
+          target/x86_64-unknown-linux-gnu/debug/noid-extminer --check-hardware
           target/x86_64-unknown-linux-gnu/debug/noid-extminer --help
           target/x86_64-unknown-linux-gnu/debug/paranoid-gui --release-self-check
+
+      - name: Reject a legacy virtual CPU without illegal instructions
+        shell: bash
+        run: |
+          set +e
+          legacy_output="$(
+            qemu-x86_64 -cpu qemu64 \
+              target/x86_64-unknown-linux-gnu/debug/paranoid \
+              --check-hardware 2>&1
+          )"
+          legacy_status=$?
+          set -e
+          test "$legacy_status" -ne 0
+          test "$legacy_status" -ne 132
+          grep -q "CPU UNSUPPORTED" <<<"$legacy_output"
 
       - name: Test GUI wallet logic
         run: cargo test --locked -p noid_gui
@@ -86,10 +103,9 @@ jobs:
           cargo test --locked --release
           -p noid_core -p noid_poseidon2b -p noid-ivc-core
 
-      - name: Test the x86-64-v3 PCLMUL baseline
+      - name: Test the runtime PCLMUL production floor
         env:
           NOID_CPU_BACKEND: pclmul
-          RUSTFLAGS: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
         run: >-
           cargo test --locked --release
           -p noid_core -p noid_poseidon2b -p noid-ivc-core
@@ -110,25 +126,25 @@ jobs:
           - name: Linux ARM64
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            release_flags: -C target-feature=+aes
-            test_flags: -C target-feature=+aes
+            release_flags: ""
+            test_flags: ""
             backend: neon-pmull
           - name: macOS Apple Silicon
             runner: macos-15
             target: aarch64-apple-darwin
-            release_flags: -C target-feature=+aes
-            test_flags: -C target-feature=+aes
+            release_flags: ""
+            test_flags: ""
             backend: neon-pmull
           - name: macOS Intel
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            release_flags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+            release_flags: -C target-cpu=x86-64
             test_flags: ""
             backend: pclmul
           - name: Windows x86-64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
-            release_flags: -C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq
+            release_flags: -C target-cpu=x86-64
             test_flags: ""
             backend: auto
 
@@ -212,8 +228,10 @@ jobs:
         run: |
           suffix=
           if [[ "${{ runner.os }}" == Windows ]]; then suffix=.exe; fi
+          target/${{ matrix.target }}/debug/paranoid$suffix --check-hardware
           target/${{ matrix.target }}/debug/paranoid$suffix --help
           target/${{ matrix.target }}/debug/noid-cli$suffix --help
+          target/${{ matrix.target }}/debug/noid-extminer$suffix --check-hardware
           target/${{ matrix.target }}/debug/noid-extminer$suffix --help
           target/${{ matrix.target }}/debug/paranoid-gui$suffix --release-self-check
 

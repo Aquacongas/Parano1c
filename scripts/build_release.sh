@@ -99,40 +99,40 @@ HOST_TRIPLE=$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')
 case "$HOST_TRIPLE" in
   x86_64-unknown-linux-gnu)
     PLATFORM=linux-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
-    ISA_PROFILE='x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ / AVX-512)'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64'
+    ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-linux-x86_64.deb"
     ;;
   aarch64-unknown-linux-gnu)
     PLATFORM=linux-aarch64
-    RELEASE_RUSTFLAGS='-C target-feature=+aes'
-    ISA_PROFILE='AArch64 NEON + PMULL'
+    RELEASE_RUSTFLAGS=
+    ISA_PROFILE='portable AArch64 control path; runtime NEON+PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-linux-aarch64.deb"
     ;;
   x86_64-pc-windows-msvc)
     PLATFORM=windows-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
-    ISA_PROFILE='x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ / AVX-512)'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64'
+    ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=.exe
     ARCHIVE_KIND=zip
     GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
     ;;
   aarch64-apple-darwin)
     PLATFORM=macos-aarch64
-    RELEASE_RUSTFLAGS='-C target-feature=+aes'
-    ISA_PROFILE='Apple Silicon NEON + PMULL'
+    RELEASE_RUSTFLAGS=
+    ISA_PROFILE='portable Apple Silicon control path; runtime NEON+PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-macos-aarch64.dmg"
     ;;
   x86_64-apple-darwin)
     PLATFORM=macos-x86_64
-    RELEASE_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+pclmulqdq'
-    ISA_PROFILE='Intel macOS x86-64-v3 + PCLMULQDQ (runtime AVX2+VPCLMULQDQ)'
+    RELEASE_RUSTFLAGS='-C target-cpu=x86-64'
+    ISA_PROFILE='portable Intel x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
     GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
@@ -272,8 +272,10 @@ done
 
 CURRENT_STAGE='native smoke test'
 printf '\n==> Smoke-testing native executables\n'
+"$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" --check-hardware >/dev/null
 "$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/noid-cli$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/noid-extminer$BINARY_SUFFIX" --check-hardware >/dev/null
 "$TARGET_BIN_DIR/noid-extminer$BINARY_SUFFIX" --help >/dev/null
 "$TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX" --release-self-check >/dev/null
 

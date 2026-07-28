@@ -503,6 +503,10 @@ struct Cli {
     #[arg(long)]
     purge_state: bool,
 
+    /// Check production CPU support and exit without touching node data.
+    #[arg(long, exclusive = true)]
+    check_hardware: bool,
+
     /// Print the generated master secret as 64 hexadecimal characters, then exit.
     #[arg(long, hide = true, conflicts_with = "import_wallet_secret")]
     export_wallet_secret: bool,
@@ -615,6 +619,17 @@ fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut cli = Cli::parse();
+    if cli.check_hardware {
+        let report = noid_core::cpu::ProductionHardwareReport::detect();
+        print!("{report}");
+        if report.ready() {
+            return Ok(());
+        }
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::process::exit(1);
+    }
+    let production_hardware = noid_core::cpu::ensure_production_hardware()?;
+
     // Shorthand role flags override the default mode; clap already rejects
     // combining them with each other.
     if cli.miner {
@@ -760,7 +775,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("configure process CPU budget")?;
     tracing::info!(
-        backend = %noid_core::cpu::selected_backend(),
+        backend = %production_hardware.backend,
         threads = cpu_plan.shared_pool_threads,
         "CPU proof and mining backend selected"
     );

@@ -1285,6 +1285,7 @@ impl Backend {
 
     fn spawn(&self, mode: NodeMode, selected_threads: usize, genesis: bool) -> Result<(), String> {
         let config = self.config_snapshot()?;
+        ensure_node_hardware(&config.node_binary)?;
         std::fs::create_dir_all(&config.data_dir).map_err(|error| {
             format!(
                 "create GUI node data directory {}: {error}",
@@ -1539,6 +1540,46 @@ fn parse_log_level(value: &str) -> Option<LogLevel> {
         "info" => Some(LogLevel::Info),
         "debug" => Some(LogLevel::Debug),
         _ => None,
+    }
+}
+
+fn ensure_node_hardware(node_binary: &Path) -> Result<(), String> {
+    let mut command = Command::new(node_binary);
+    command
+        .arg("--check-hardware")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().map_err(|error| {
+        format!(
+            "check production hardware with {}: {error}",
+            node_binary.display()
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if detail.is_empty() {
+        Err(format!(
+            "this computer does not satisfy the ParanO(1)d production CPU requirements ({})",
+            output.status
+        ))
+    } else {
+        Err(detail)
     }
 }
 
