@@ -1976,6 +1976,8 @@ struct RpcRecentTransaction {
     live_outputs: u16,
     fee_micronoid: u64,
     coinbase: bool,
+    #[serde(default)]
+    development_payout: bool,
     address_spent_micronoid: Option<String>,
     address_received_micronoid: Option<String>,
 }
@@ -1991,6 +1993,7 @@ impl RpcRecentTransaction {
             live_outputs: self.live_outputs,
             fee_micronoid: self.fee_micronoid,
             coinbase: self.coinbase,
+            development_payout: self.development_payout,
             address_spent_micronoid: self.address_spent_micronoid,
             address_received_micronoid: self.address_received_micronoid,
         }
@@ -2307,6 +2310,7 @@ impl RpcRetainedBlock {
                     live_outputs: transaction.live_outputs,
                     fee_micronoid: transaction.fee_micronoid,
                     coinbase: transaction.coinbase,
+                    development_payout: transaction.development_payout,
                     epoch_anchor: transaction.epoch_anchor,
                     input_owner: transaction.input_owner,
                     input_sum_micronoid: transaction.input_sum_micronoid,
@@ -2350,6 +2354,8 @@ struct RpcBlockTransaction {
     live_outputs: u16,
     fee_micronoid: u64,
     coinbase: bool,
+    #[serde(default)]
+    development_payout: bool,
     epoch_anchor: String,
     input_owner: Option<String>,
     input_sum_micronoid: String,
@@ -2420,6 +2426,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                     live_outputs: 1,
                     fee_micronoid: 0,
                     coinbase: true,
+                    development_payout: false,
                     epoch_anchor: format!("{:064x}", 0),
                     input_owner: None,
                     input_sum_micronoid: "0".into(),
@@ -2443,6 +2450,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
                     live_outputs: 4,
                     fee_micronoid: 12_000,
                     coinbase: false,
+                    development_payout: false,
                     epoch_anchor: format!("{:064x}", height.saturating_sub(1)),
                     input_owner: Some(miner.into()),
                     input_sum_micronoid: "9000000".into(),
@@ -2519,6 +2527,7 @@ fn mock_recent_transactions(page: u32, address: Option<&str>) -> RecentTransacti
                 live_outputs: transaction.live_outputs,
                 fee_micronoid: transaction.fee_micronoid,
                 coinbase: transaction.coinbase,
+                development_payout: transaction.development_payout,
                 address_spent_micronoid: spent,
                 address_received_micronoid: received,
             });

@@ -35,9 +35,10 @@ pub const BLOCK_MAX_TXS: usize = crate::consensus::params::BLOCK_MAX_TXS;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
     pub header: BlockHeader,
-    /// Fixed public records: coinbase at index zero followed by an ordered
-    /// physical PagedSpend page stream. The legacy field name is retained to
-    /// avoid copying the block body through every exact-state consumer.
+    /// Fixed public records: coinbase at index zero, the optional mandatory
+    /// development payout at index one, then the ordered physical PagedSpend
+    /// page stream. The legacy field name is retained to avoid copying the
+    /// block body through every exact-state consumer.
     pub transactions: Vec<Transaction>,
 }
 
@@ -46,6 +47,8 @@ pub enum BlockPageStreamError {
     MissingCoinbase,
     CoinbaseNotFirst,
     MultipleCoinbase,
+    InvalidPrimaryCoinbase,
+    InvalidDevelopmentPayout,
     PagedSpend(crate::consensus::paged_spend::PagedSpendStreamError),
 }
 
@@ -56,6 +59,55 @@ impl std::fmt::Display for BlockPageStreamError {
 }
 
 impl std::error::Error for BlockPageStreamError {}
+
+/// Canonical block-body layout facts.
+///
+/// The primary coinbase is body zero. A mandatory development payout, when
+/// present, is body one. The remaining suffix is the ordinary PagedSpend page
+/// stream. Proof-class selection counts the optional payout against the same
+/// fixed body capacity as one physical user page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockPageStreamFacts {
+    pub proof_class: crate::consensus::paged_spend::BlockProofClass,
+    pub groups: Vec<crate::consensus::paged_spend::PagedSpendGroupFacts>,
+    pub page_count: u16,
+    pub logical_count: u16,
+    pub live_inputs: u16,
+    pub live_outputs: u16,
+    pub has_development_payout: bool,
+    pub user_start_index: usize,
+}
+
+impl BlockPageStreamFacts {
+    #[inline]
+    pub const fn system_record_count(&self) -> usize {
+        if self.has_development_payout {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[inline]
+    pub const fn effective_page_count(&self) -> usize {
+        self.page_count as usize + self.system_record_count()
+    }
+
+    #[inline]
+    pub const fn logical_tx_count_including_system(&self) -> usize {
+        1 + self.system_record_count() + self.logical_count as usize
+    }
+
+    #[inline]
+    pub const fn user_logical_index(&self, group_index: usize) -> usize {
+        1 + self.system_record_count() + group_index
+    }
+
+    #[inline]
+    pub const fn user_body_start(&self, user_page_index: usize) -> usize {
+        self.user_start_index + user_page_index
+    }
+}
 
 /// Errors surfaced by [`apply_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +134,7 @@ pub enum BlockApplyError {
     HeaderAllocCounterMismatch,
     /// `header.log_slots` disagrees with the chain's current slot depth.
     HeaderLogSlotsMismatch,
-    /// Block contains more than one coinbase transaction.
+    /// Block contains an unexpected or misplaced additional system mint.
     MultipleCoinbase,
     /// Coinbase transaction is not the first transaction in the block.
     CoinbaseNotFirst,
@@ -118,38 +170,15 @@ pub(crate) fn apply_block(
     if block.transactions.len() > BLOCK_MAX_TXS {
         return Err(BlockApplyError::TooManyTransactions);
     }
-    validate_block_page_stream(&block.transactions)
+    let stream = validate_block_page_stream(&block.transactions)
         .map_err(|_| BlockApplyError::InvalidPagedSpend)?;
     crate::consensus::checks::validate_block_slot_conflicts(&block.transactions)
         .map_err(|_| BlockApplyError::SlotConflict)?;
-    // Coinbase structure: at most one, must be first, zero inputs.
-    // Coinbase VALUE validation (≤ block_reward + claimable fees) is in consensus checks.
-    let coinbase_count = block
-        .transactions
-        .iter()
-        .filter(|tx| tx.body.is_coinbase)
-        .count();
-    if coinbase_count > 1 {
-        return Err(BlockApplyError::MultipleCoinbase);
-    }
-    if let Some(first_non_coinbase_pos) = block
-        .transactions
-        .iter()
-        .position(|tx| !tx.body.is_coinbase)
-    {
-        if block.transactions[first_non_coinbase_pos..]
-            .iter()
-            .any(|tx| tx.body.is_coinbase)
-        {
-            return Err(BlockApplyError::CoinbaseNotFirst);
-        }
-    }
-    // Coinbase tx (if present) must have zero inputs.
-    if let Some(cb) = block.transactions.first() {
-        if cb.body.is_coinbase {
-            if cb.body.live_input_count() != 0 {
-                return Err(BlockApplyError::CoinbaseHasInputs);
-            }
+    // The stream validator fixes primary coinbase and optional development
+    // payout placement. Both system mints have zero inputs.
+    for system in &block.transactions[..stream.user_start_index] {
+        if system.body.live_input_count() != 0 {
+            return Err(BlockApplyError::CoinbaseHasInputs);
         }
     }
 
@@ -166,7 +195,7 @@ pub(crate) fn apply_block(
     }
 
     for (index, tx) in block.transactions.iter().enumerate() {
-        if index == 0 {
+        if index < stream.user_start_index {
             tx.body
                 .validate_canonical()
                 .map_err(|_| BlockApplyError::InvalidTxBody)?;
@@ -279,7 +308,7 @@ pub(crate) fn apply_state_delta(
                     crate::state::ApplyError::AllocCounterOverflow,
                 ));
             }
-            let creation_id = if tx.body.is_coinbase {
+            let creation_id = if tx.body.is_primary_coinbase_shape() {
                 crate::consensus::params::coinbase_creation_id(block.header.height)
             } else {
                 next_alloc
@@ -375,25 +404,59 @@ pub fn apply_genesis_block(
 /// Validate coinbase placement and the complete physical user-page stream.
 pub fn validate_block_page_stream(
     txs: &[Transaction],
-) -> Result<crate::consensus::paged_spend::PagedSpendStreamFacts, BlockPageStreamError> {
+) -> Result<BlockPageStreamFacts, BlockPageStreamError> {
     let Some(coinbase) = txs.first() else {
         return Err(BlockPageStreamError::MissingCoinbase);
     };
     if !coinbase.body.is_coinbase {
         return Err(BlockPageStreamError::CoinbaseNotFirst);
     }
-    if txs[1..].iter().any(|tx| tx.body.is_coinbase) {
+    if !coinbase.body.is_primary_coinbase_shape() {
+        return Err(BlockPageStreamError::InvalidPrimaryCoinbase);
+    }
+    let has_development_payout = txs
+        .get(1)
+        .is_some_and(|tx| tx.body.is_development_payout_shape());
+    let user_start_index = 1 + usize::from(has_development_payout);
+    if txs[user_start_index..].iter().any(|tx| tx.body.is_coinbase) {
         return Err(BlockPageStreamError::MultipleCoinbase);
     }
-    crate::consensus::paged_spend::validate_paged_spend_transaction_stream(&txs[1..])
-        .map_err(BlockPageStreamError::PagedSpend)
+    if txs
+        .get(1)
+        .is_some_and(|tx| tx.body.is_coinbase && !tx.body.is_development_payout_shape())
+    {
+        return Err(BlockPageStreamError::InvalidDevelopmentPayout);
+    }
+    let user = crate::consensus::paged_spend::validate_paged_spend_transaction_stream(
+        &txs[user_start_index..],
+    )
+    .map_err(BlockPageStreamError::PagedSpend)?;
+    let effective_page_count = usize::from(user.page_count) + usize::from(has_development_payout);
+    let proof_class =
+        crate::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)
+            .ok_or(BlockPageStreamError::PagedSpend(
+                crate::consensus::paged_spend::PagedSpendStreamError::BlockPageLimit {
+                    actual: effective_page_count,
+                    capacity: crate::consensus::params::BLOCK_MAX_USER_PAGES,
+                },
+            ))?;
+    Ok(BlockPageStreamFacts {
+        proof_class,
+        groups: user.groups,
+        page_count: user.page_count,
+        logical_count: user.logical_count,
+        live_inputs: user.live_inputs,
+        live_outputs: user.live_outputs,
+        has_development_payout,
+        user_start_index,
+    })
 }
 
 /// Return the exact transaction-tree leaf identities.
 ///
-/// Coinbase occupies position zero. Complete PagedSpend groups occupy the
-/// following positions; continuation pages never get independent identities.
-/// Genesis has no leaves.
+/// Coinbase occupies position zero, followed by the optional development
+/// payout and complete PagedSpend groups. Continuation pages never get
+/// independent identities. Genesis has no leaves.
 pub fn try_compute_logical_txids(
     txs: &[Transaction],
 ) -> Result<Vec<noid_poseidon2b::primitives::TxBodyHash>, BlockPageStreamError> {
@@ -402,6 +465,7 @@ pub fn try_compute_logical_txids(
     }
     let stream = validate_block_page_stream(txs)?;
     Ok(std::iter::once(txs[0].txid())
+        .chain(stream.has_development_payout.then(|| txs[1].txid()))
         .chain(stream.groups.iter().map(|group| group.spend.logical_txid))
         .collect())
 }
@@ -415,7 +479,8 @@ pub fn try_compute_tx_root(txs: &[Transaction]) -> Result<Digest, BlockPageStrea
 
 /// Infallible builder helper for an already-canonical block page stream.
 pub fn compute_tx_root(txs: &[Transaction]) -> Digest {
-    try_compute_tx_root(txs).expect("compute_tx_root requires coinbase plus canonical PagedSpend")
+    try_compute_tx_root(txs)
+        .expect("compute_tx_root requires canonical system records and PagedSpend")
 }
 
 // ---------------------------------------------------------------------------
@@ -502,11 +567,15 @@ impl Block {
             coinbase.encode(buf);
         }
         for tx in self.transactions.iter().skip(1) {
-            TxPage {
-                body: tx.body.clone(),
+            if tx.body.is_coinbase {
+                tx.encode(buf);
+            } else {
+                TxPage {
+                    body: tx.body.clone(),
+                }
+                .encode(buf)
+                .expect("validated block page stream has canonical page bodies");
             }
-            .encode(buf)
-            .expect("validated block page stream has canonical page bodies");
         }
     }
 
@@ -535,8 +604,21 @@ impl Block {
             transactions.push(coinbase);
         }
         for _ in 1..n {
-            let page = TxPage::decode(src).map_err(page_wire_error)?;
-            transactions.push(Transaction::new(page.body));
+            // Probe the fixed record as a canonical system mint without
+            // consuming the real cursor. Ordinary PagedSpend pages may be
+            // group-balanced rather than body-balanced and therefore retain
+            // their dedicated decoder.
+            let mut probe = *src;
+            match Transaction::decode(&mut probe) {
+                Ok(system) if system.body.is_coinbase => {
+                    *src = probe;
+                    transactions.push(system);
+                }
+                _ => {
+                    let page = TxPage::decode(src).map_err(page_wire_error)?;
+                    transactions.push(Transaction::new(page.body));
+                }
+            }
         }
         if n > 0 {
             validate_block_page_stream(&transactions).map_err(|_| WireError::NonCanonicalBody)?;
@@ -615,6 +697,29 @@ mod tests {
             inputs: [TxInput::dummy(); TX_INPUTS],
             outputs,
             validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        })
+    }
+
+    fn development_payout() -> Transaction {
+        Transaction::new(TxBody {
+            epoch_anchor: [7u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index: 201,
+                    amount: 17,
+                    owner: crate::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS,
+                },
+                TxOutput {
+                    slot_index: 202,
+                    amount: 17,
+                    owner: crate::consensus::development_allocation::O1_LAB_ADDRESS,
+                },
+            ],
+            validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
             is_coinbase: true,
         })
     }
@@ -705,6 +810,49 @@ mod tests {
     }
 
     #[test]
+    fn direct_interpreters_assign_identical_development_payout_creation_ids() {
+        let initial = state();
+        let transactions = vec![coinbase(), development_payout(), user_tx()];
+        let height = crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
+        let mut expected = initial.clone();
+        for transaction in &transactions {
+            apply_tx_at(&mut expected, &transaction.body, height).unwrap();
+        }
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: expected.state_root(),
+                tx_root: compute_tx_root(&transactions),
+                timestamp: height,
+                height,
+                miner_address: Address([9u8; 32]),
+                nonce: 0,
+                difficulty_target: [0xff; 32],
+                log_slots: 8,
+                active_slot_count: expected.active_slot_count,
+                alloc_counter: expected.alloc_counter,
+            },
+            transactions,
+        };
+
+        let mut interpreted = initial.clone();
+        apply_block(&mut interpreted, &block).unwrap();
+        let mut delta = initial;
+        apply_state_delta(&mut delta, &block).unwrap();
+        assert_eq!(delta.state_root(), interpreted.state_root());
+        assert_eq!(delta.active_slot_count, interpreted.active_slot_count);
+        assert_eq!(delta.alloc_counter, interpreted.alloc_counter);
+        assert_eq!(delta.state.slot(201).creation_id(), 3);
+        assert_eq!(delta.state.slot(202).creation_id(), 4);
+        assert!(!crate::consensus::params::is_coinbase_creation_id(
+            delta.state.slot(201).creation_id()
+        ));
+        assert!(!crate::consensus::params::is_coinbase_creation_id(
+            delta.state.slot(202).creation_id()
+        ));
+    }
+
+    #[test]
     fn block_wire_uses_one_fixed_marker_and_no_cached_txid() {
         let state = state();
         let block = block_for(&state, vec![user_tx()]);
@@ -751,6 +899,66 @@ mod tests {
             canonical_block_wire_len(BLOCK_MAX_TXS + 1),
             Err(WireError::LengthOverflow)
         );
+    }
+
+    #[test]
+    fn development_payout_consumes_one_page_class_position_and_roundtrips() {
+        let with_users = |count: usize| {
+            let mut txs = vec![coinbase(), development_payout()];
+            txs.extend((0..count).map(|index| {
+                let mut tx = user_tx_at(1_000 + index as u32, 2_000 + index as u32);
+                tx.body.inputs[0].creation_id = index as u64 + 1;
+                tx
+            }));
+            txs
+        };
+
+        let b64 = with_users(63);
+        let facts = validate_block_page_stream(&b64).unwrap();
+        assert!(facts.has_development_payout);
+        assert_eq!(facts.page_count, 63);
+        assert_eq!(facts.effective_page_count(), 64);
+        assert_eq!(
+            facts.proof_class,
+            crate::consensus::paged_spend::BlockProofClass::B64
+        );
+
+        let mut ordinary_b64 = with_users(64);
+        ordinary_b64.remove(1);
+        let ordinary_facts = validate_block_page_stream(&ordinary_b64).unwrap();
+        assert!(!ordinary_facts.has_development_payout);
+        assert_eq!(ordinary_facts.page_count, 64);
+        assert_eq!(ordinary_facts.effective_page_count(), 64);
+        assert_eq!(
+            ordinary_facts.proof_class,
+            crate::consensus::paged_spend::BlockProofClass::B64
+        );
+
+        let b255 = with_users(64);
+        assert_eq!(
+            validate_block_page_stream(&b255).unwrap().proof_class,
+            crate::consensus::paged_spend::BlockProofClass::B255
+        );
+        assert!(validate_block_page_stream(&with_users(255)).is_err());
+
+        let transactions = with_users(1);
+        let block = Block {
+            header: BlockHeader {
+                prev_block_hash: [0u8; 32],
+                state_root: [0u8; 32],
+                tx_root: compute_tx_root(&transactions),
+                timestamp: 1,
+                height: crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY,
+                miner_address: Address([9u8; 32]),
+                nonce: 0,
+                difficulty_target: [0xff; 32],
+                log_slots: 24,
+                active_slot_count: 0,
+                alloc_counter: 0,
+            },
+            transactions,
+        };
+        assert_eq!(Block::from_bytes(&block.to_bytes()), Ok(block));
     }
 
     #[test]

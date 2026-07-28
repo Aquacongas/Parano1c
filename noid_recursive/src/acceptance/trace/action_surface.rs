@@ -14,7 +14,7 @@ use super::tx_body_spine::SpineInputsTrace;
 use super::{
     const_block, mul, pin_eq, pin_zero, range_check_bits, FieldR1csBuilder, LinExpr, Wire, F128,
 };
-use noid_core::Block128;
+use noid_core::{Block128, TowerField};
 pub use noid_tx::body_hash::{
     TX8X2_LEAF_EPOCH_ANCHOR as LEAF_EPOCH_ANCHOR, TX8X2_LEAF_FEE as LEAF_FEE,
     TX8X2_LEAF_FLAGS as LEAF_FLAGS, TX8X2_LEAF_INPUT_BASE as LEAF_INPUT_BASE,
@@ -55,6 +55,14 @@ pub struct CoinbaseActionTrace {
     pub action: ActionRowTrace,
     pub amount: LinExpr,
     pub amount_bits: [Wire; 64],
+}
+
+/// Optional two-output system payout selected by the deterministic height
+/// schedule. The physical spine slot is always present in the fixed circuit:
+/// it is the complete canonical ghost body when `live == 0`.
+pub struct DevelopmentPayoutActionTrace {
+    pub actions: [ActionRowTrace; 2],
+    pub amount_each: LinExpr,
 }
 
 /// Selector surface of one Tx8x2 user body.
@@ -258,6 +266,89 @@ pub fn bind_coinbase_action(b: &mut FieldR1csBuilder, spine: &SpineInputsTrace) 
     bind_coinbase_action_with_amount(b, spine).action
 }
 
+/// Bind the fixed development-payout spine slot.
+///
+/// `live` is derived from the constrained child height, not supplied by the
+/// prover. When live, the body is the exact two-output system-mint shape and
+/// pays the two consensus recipients in fixed order. When dead, every raw leaf
+/// equals the canonical protocol ghost body.
+pub fn bind_development_payout_action(
+    b: &mut FieldR1csBuilder,
+    spine: &SpineInputsTrace,
+    live: &LinExpr,
+) -> DevelopmentPayoutActionTrace {
+    let live_sq = mul(b, live, live);
+    pin_eq(b, &live_sq, live);
+    let dead = live.add_const(F128::ONE);
+    let ghost =
+        noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+    for leaf in 0..super::tx_body_spine::TX_BODY_RAW_LEAVES {
+        for lane in 0..2 {
+            let difference = spine.leaves[leaf][lane].add(&const_block(ghost.leaves[leaf][lane]));
+            let gated = mul(b, &dead, &difference);
+            pin_zero(b, &gated);
+        }
+    }
+
+    let gate_expected = |b: &mut FieldR1csBuilder, actual: &LinExpr, expected: Block128| {
+        let difference = actual.add(&const_block(expected));
+        let gated = mul(b, live, &difference);
+        pin_zero(b, &gated);
+    };
+    for lane in &spine.leaves[LEAF_FEE] {
+        gate_expected(b, lane, Block128::ZERO);
+    }
+    for lane in &spine.leaves[LEAF_INPUT_OWNER] {
+        gate_expected(b, lane, Block128::ZERO);
+    }
+    for input in 0..INPUT_SELECTORS {
+        for lane in &spine.leaves[LEAF_INPUT_BASE + input] {
+            gate_expected(b, lane, Block128::ZERO);
+        }
+    }
+    gate_expected(
+        b,
+        &spine.leaves[LEAF_FLAGS][0],
+        Block128::from((noid_tx::output_bitmap_bit(0) | noid_tx::output_bitmap_bit(1)) as u128),
+    );
+    gate_expected(b, &spine.leaves[LEAF_FLAGS][1], Block128::from(1u128));
+
+    let recipients = [
+        noid_chain::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS,
+        noid_chain::consensus::development_allocation::O1_LAB_ADDRESS,
+    ];
+    for (index, recipient) in recipients.iter().enumerate() {
+        let owner_leaf = LEAF_OUTPUT0_OWNER + 2 * index;
+        for (lane, expected) in recipient.as_fields().into_iter().enumerate() {
+            gate_expected(b, &spine.leaves[owner_leaf][lane], expected);
+        }
+    }
+
+    let first_amount = spine.leaves[LEAF_OUTPUT0_DATA][1].clone();
+    let second_amount = spine.leaves[LEAF_OUTPUT1_DATA][1].clone();
+    let amount_difference = first_amount.add(&second_amount);
+    let gated_amount_difference = mul(b, live, &amount_difference);
+    pin_zero(b, &gated_amount_difference);
+    let _ = range_check_bits(b, &first_amount, 64);
+    let _ = range_check_bits(b, &second_amount, 64);
+    let amount_each = mul(b, live, &first_amount);
+
+    let actions = std::array::from_fn(|index| {
+        let data_leaf = LEAF_OUTPUT0_DATA + 2 * index;
+        selected_row(
+            b,
+            live,
+            &spine.leaves[data_leaf],
+            &spine.leaves[data_leaf + 1],
+            true,
+        )
+    });
+    DevelopmentPayoutActionTrace {
+        actions,
+        amount_each,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +425,29 @@ mod tests {
         }
     }
 
+    fn development_payout_body(amount: u64) -> TxBody {
+        TxBody {
+            epoch_anchor: [0x72; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index: 24,
+                    amount,
+                    owner: noid_chain::consensus::O1_NETWORK_FUND_ADDRESS,
+                },
+                TxOutput {
+                    slot_index: 25,
+                    amount,
+                    owner: noid_chain::consensus::O1_LAB_ADDRESS,
+                },
+            ],
+            validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
+            is_coinbase: true,
+        }
+    }
+
     fn relation_satisfies(native: &SpineInputs, tx_live: Block128) -> bool {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut b = FieldR1csBuilder::new();
@@ -351,6 +465,18 @@ mod tests {
             let mut b = FieldR1csBuilder::new();
             let spine = SpineInputsTrace::alloc(&mut b, native);
             let _ = bind_coinbase_action(&mut b, &spine);
+            let (r1cs, z) = b.build();
+            r1cs.satisfies(&z)
+        }))
+        .unwrap_or(false)
+    }
+
+    fn development_payout_relation_satisfies(native: &SpineInputs, live: Block128) -> bool {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut b = FieldR1csBuilder::new();
+            let spine = SpineInputsTrace::alloc(&mut b, native);
+            let live = alloc_block(&mut b, live);
+            let _ = bind_development_payout_action(&mut b, &spine, &live);
             let (r1cs, z) = b.build();
             r1cs.satisfies(&z)
         }))
@@ -513,6 +639,74 @@ mod tests {
         assert!(
             !coinbase_relation_satisfies(&oversized_amount),
             "coinbase amount above u64 bypassed the source range proof"
+        );
+    }
+
+    #[test]
+    fn development_payout_is_exact_when_live_and_canonical_ghost_when_dead() {
+        let native = spine_inputs_from_body(&development_payout_body(123));
+        let mut b = FieldR1csBuilder::new();
+        let spine = SpineInputsTrace::alloc(&mut b, &native);
+        let live = const_block(Block128::ONE);
+        let payout = bind_development_payout_action(&mut b, &spine, &live);
+        let (r1cs, z) = b.build();
+        assert!(r1cs.satisfies(&z));
+        assert_eq!(
+            payout.amount_each.eval(&z),
+            crate::acceptance::trace::flat_of(Block128::from(123u128))
+        );
+        assert!(payout.actions.iter().all(
+            |action| action.live.eval(&z) == F128::ONE && action.is_mint.eval(&z) == F128::ONE
+        ));
+
+        let ghost = spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+        assert!(development_payout_relation_satisfies(
+            &ghost,
+            Block128::ZERO
+        ));
+        assert!(!development_payout_relation_satisfies(
+            &native,
+            Block128::ZERO
+        ));
+        assert!(!development_payout_relation_satisfies(
+            &native,
+            Block128::from(2u128)
+        ));
+    }
+
+    #[test]
+    fn development_payout_rejects_any_shape_recipient_or_amount_tampering() {
+        let native = spine_inputs_from_body(&development_payout_body(123));
+        for (leaf, lane) in [
+            (LEAF_FEE, 0usize),
+            (LEAF_INPUT_OWNER, 1),
+            (LEAF_INPUT_BASE, 1),
+            (LEAF_FLAGS, 0),
+            (LEAF_FLAGS, 1),
+            (LEAF_OUTPUT0_OWNER, 0),
+            (LEAF_OUTPUT1_OWNER, 1),
+        ] {
+            let mut bad = native.clone();
+            bad.leaves[leaf][lane] += Block128::ONE;
+            assert!(
+                !development_payout_relation_satisfies(&bad, Block128::ONE),
+                "development payout L{leaf}[{lane}] tamper accepted"
+            );
+        }
+
+        let mut unequal_amounts = native.clone();
+        unequal_amounts.leaves[LEAF_OUTPUT1_DATA][1] += Block128::ONE;
+        assert!(!development_payout_relation_satisfies(
+            &unequal_amounts,
+            Block128::ONE
+        ));
+
+        let mut oversized_amount = native;
+        oversized_amount.leaves[LEAF_OUTPUT0_DATA][1] = Block128::from(1u128 << 64);
+        oversized_amount.leaves[LEAF_OUTPUT1_DATA][1] = Block128::from(1u128 << 64);
+        assert!(
+            !development_payout_relation_satisfies(&oversized_amount, Block128::ONE),
+            "development payout amount above u64 bypassed the source range proof"
         );
     }
 }

@@ -87,8 +87,11 @@ pub fn validate_body_semantics_no_hash(body: &TxBody) -> Result<(), PublicLogicE
         if body.input_owner != Address([0u8; 32]) {
             return Err(PublicLogicError::CoinbaseInputOwner);
         }
-        let expected = output_bitmap_bit(0);
-        if body.validity_bitmap != expected || body.fee != 0 {
+        let primary = output_bitmap_bit(0);
+        let development = output_bitmap_bit(0) | output_bitmap_bit(1);
+        if !matches!(body.validity_bitmap, bitmap if bitmap == primary || bitmap == development)
+            || body.fee != 0
+        {
             return Err(PublicLogicError::CoinbaseBitmap {
                 bitmap: body.validity_bitmap,
             });
@@ -275,10 +278,36 @@ mod tests {
         };
         assert_eq!(validate_body_semantics_no_hash(&body), Ok(()));
         let mut bad = body;
-        bad.validity_bitmap |= output_bitmap_bit(1);
+        bad.validity_bitmap |= 1;
         assert!(matches!(
             validate_body_semantics_no_hash(&bad),
             Err(PublicLogicError::CoinbaseBitmap { .. })
         ));
+    }
+
+    #[test]
+    fn canonical_development_payout_has_two_outputs() {
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 5,
+            amount: 50,
+            owner: Address([8u8; 32]),
+        };
+        outputs[1] = TxOutput {
+            slot_index: 6,
+            amount: 50,
+            owner: Address([9u8; 32]),
+        };
+        let body = TxBody {
+            epoch_anchor: [3u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs,
+            validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
+            is_coinbase: true,
+        };
+        assert!(body.is_development_payout_shape());
+        assert_eq!(validate_body_semantics_no_hash(&body), Ok(()));
     }
 }

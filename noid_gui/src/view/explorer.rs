@@ -509,7 +509,9 @@ fn transaction_row<'a>(
     alternate: bool,
     address_mode: bool,
 ) -> Element<'a, Message> {
-    let kind = if transaction.coinbase {
+    let kind = if transaction.development_payout {
+        ("DEVELOPMENT", theme::PROOF)
+    } else if transaction.coinbase {
         ("COINBASE", theme::ACCENT)
     } else {
         ("TRANSFER", theme::TEXT)
@@ -580,7 +582,9 @@ fn compact_transaction<'a>(
     transaction: &'a RecentTransactionSnapshot,
     address_mode: bool,
 ) -> Element<'a, Message> {
-    let kind = if transaction.coinbase {
+    let kind = if transaction.development_payout {
+        ("DEVELOPMENT", theme::PROOF)
+    } else if transaction.coinbase {
         ("COINBASE", theme::ACCENT)
     } else {
         ("TRANSFER", theme::TEXT)

@@ -143,7 +143,11 @@ impl<const TIER: usize> PreparedHistoryStepWitness<TIER> {
     }
 
     pub fn user_page_count(&self) -> usize {
-        self.template.transactions.len().saturating_sub(1)
+        usize::from(
+            noid_chain::validate_block_page_stream(&self.template.transactions)
+                .expect("prepared HistoryStep template has a canonical block body")
+                .page_count,
+        )
     }
 
     pub fn retained_witness_bytes(&self) -> usize {
@@ -287,19 +291,19 @@ fn prepare_native_history_step<const TIER: usize>(
     validate_nonce_independent_block(&template, &context)?;
 
     let components = build_history_step_components(&template, context.parent_state)?;
-    let user_pages = components.tx_body_inputs.len().saturating_sub(1);
+    let effective_pages = components.effective_page_count();
     let actual_tier =
-        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_pages)
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_pages)
             .map(|class| class.page_capacity());
     if actual_tier != Some(TIER) {
         return Err(HistoryStepWitnessError::WrongTier {
             expected: TIER,
             actual: actual_tier,
-            user_pages,
+            user_pages: effective_pages,
         });
     }
     let authorizations = prepare_history_step_authorizations::<TIER>(
-        user_pages,
+        effective_pages,
         &components.authorization_inputs,
         live_authorization_proofs,
         ghost_authorization,
@@ -380,27 +384,35 @@ fn build_history_step_components(
     block: &Block,
     parent_state: &ChainState,
 ) -> Result<HistoryStepBlockComponents, HistoryStepWitnessError> {
+    let stream = validate_block_page_stream(&block.transactions)
+        .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
+    let normalized_bodies = block
+        .transactions
+        .iter()
+        .map(|transaction| transaction.body.clone())
+        .collect::<Vec<_>>();
+    let tx_body_inputs = normalized_bodies
+        .iter()
+        .map(spine_inputs_from_body)
+        .collect::<Vec<_>>();
+    let tx_body_hashes = normalized_bodies
+        .iter()
+        .map(|body| digest_to_fields(body.txid().0))
+        .collect::<Vec<_>>();
     let body_hashes = block
         .transactions
         .iter()
         .map(|transaction| transaction.txid().0)
         .collect::<Vec<_>>();
-    let tx_body_inputs = block
-        .transactions
-        .iter()
-        .map(|transaction| spine_inputs_from_body(&transaction.body))
-        .collect();
-    let tx_body_hashes = body_hashes.iter().copied().map(digest_to_fields).collect();
-    let stream = validate_block_page_stream(&block.transactions)
-        .map_err(|error| ConsensusError::InvalidPagedSpend(error.to_string()))?;
     let logical_hashes = std::iter::once(body_hashes[0])
+        .chain(stream.has_development_payout.then(|| body_hashes[1]))
         .chain(stream.groups.iter().map(|group| group.spend.logical_txid.0))
         .collect::<Vec<_>>();
     let tx_root_inputs = tx_root_merkle_inputs(block, &logical_hashes)?;
 
     let mut authorization_inputs = Vec::with_capacity(stream.groups.len());
     for (group_index, group) in stream.groups.iter().enumerate() {
-        let tx_index = group_index + 1;
+        let tx_index = stream.user_logical_index(group_index);
         let tx_body_hash = group.spend.logical_txid.as_fields();
         let public =
             noid_gkr::OwnerAuthPublicInputs::new(tx_body_hash, group.spend.input_owner.as_fields());
@@ -413,6 +425,8 @@ fn build_history_step_components(
     }
 
     Ok(HistoryStepBlockComponents {
+        user_page_count: usize::from(stream.page_count),
+        has_development_payout: stream.has_development_payout,
         tx_body_inputs,
         tx_body_hashes,
         tx_root_inputs,

@@ -622,13 +622,17 @@ fn block_details<'a>(
                     row![
                         table_cell(transaction.position.to_string(), 2, theme::CYAN),
                         table_cell(
-                            if transaction.coinbase {
+                            if transaction.development_payout {
+                                "DEVELOPMENT".into()
+                            } else if transaction.coinbase {
                                 "COINBASE".into()
                             } else {
                                 "SPEND".into()
                             },
                             3,
-                            if transaction.coinbase {
+                            if transaction.development_payout {
+                                theme::PROOF
+                            } else if transaction.coinbase {
                                 theme::ACCENT
                             } else {
                                 theme::TEXT
@@ -729,7 +733,9 @@ fn transaction_details<'a>(
     transaction: &'a BlockTransactionSnapshot,
     compact: bool,
 ) -> Element<'a, Message> {
-    let kind = if transaction.coinbase {
+    let kind = if transaction.development_payout {
+        "DEVELOPMENT"
+    } else if transaction.coinbase {
         "COINBASE"
     } else {
         "TRANSFER"
@@ -799,7 +805,9 @@ fn transaction_details<'a>(
         metric(
             "TYPE",
             kind.into(),
-            if transaction.coinbase {
+            if transaction.development_payout {
+                theme::PROOF
+            } else if transaction.coinbase {
                 theme::ACCENT
             } else {
                 theme::TEXT
@@ -823,11 +831,19 @@ fn transaction_details<'a>(
     ]
     .spacing(8);
 
-    let flow = if transaction.coinbase {
+    let flow = if transaction.development_payout {
         column![
-            text("PROTOCOL ISSUANCE").size(12).color(theme::DIM),
+            text("REWARD SHARE").size(12).color(theme::DIM),
+            text("Block-reward shares paid to O(1) Network Fund and O(1) Lab. This protocol payout has no spend inputs.")
+                .size(13)
+                .color(theme::PROOF),
+        ]
+        .spacing(4)
+    } else if transaction.coinbase {
+        column![
+            text("BLOCK REWARD").size(12).color(theme::DIM),
             text(format!(
-                "{} ① minted to the block miner. Coinbase has no spend inputs.",
+                "{} ① paid to the block miner. Coinbase has no spend inputs.",
                 format_micronoid_string(&transaction.output_sum_micronoid)
             ))
             .size(13)
@@ -940,7 +956,7 @@ fn transaction_inputs(
                 )
                 .padding([7, 9]),
                 container(
-                    text("NO INPUTS · PROTOCOL ISSUANCE")
+                    text("NO INPUTS · BLOCK REWARD PAYOUT")
                         .size(13)
                         .color(theme::DIM)
                 )

@@ -380,7 +380,7 @@ fn translate_localized(language: Language, source: &str) -> String {
         }
     }
     if let Some(value) =
-        source.strip_suffix(" minted to the block miner. Coinbase has no spend inputs.")
+        source.strip_suffix(" paid to the block miner. Coinbase has no spend inputs.")
     {
         return match language {
             Language::Russian => {
@@ -928,13 +928,19 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "TYPE" => ("ТИП", "类型"),
         "TRANSFER" => ("ПЕРЕВОД", "转账"),
         "COINBASE" => ("COINBASE", "COINBASE"),
+        "DEVELOPMENT" => ("РАЗВИТИЕ", "开发资金"),
         "INPUT TOTAL" => ("СУММА ВХОДОВ", "输入总额"),
         "INPUT OWNER" => ("ВЛАДЕЛЕЦ ВХОДОВ", "输入所有者"),
         "OUTPUT TOTAL" => ("СУММА ВЫХОДОВ", "输出总额"),
-        "PROTOCOL ISSUANCE" => ("ПРОТОКОЛЬНАЯ ЭМИССИЯ", "协议发行"),
+        "BLOCK REWARD" => ("ВОЗНАГРАЖДЕНИЕ ЗА БЛОК", "区块奖励"),
+        "REWARD SHARE" => ("ДОЛЯ НАГРАДЫ", "奖励份额"),
+        "Block-reward shares paid to O(1) Network Fund and O(1) Lab. This protocol payout has no spend inputs." => (
+            "Доли вознаграждения за блок выплачены O(1) Network Fund и O(1) Lab. У этой протокольной выплаты нет расходуемых входов.",
+            "区块奖励份额支付给 O(1) Network Fund 和 O(1) Lab。该协议付款不消耗任何输入。",
+        ),
         "INPUT UTXOS" => ("ВХОДНЫЕ UTXO", "输入 UTXO"),
         "OUTPUT UTXOS" => ("ВЫХОДНЫЕ UTXO", "输出 UTXO"),
-        "NO INPUTS · PROTOCOL ISSUANCE" => ("БЕЗ ВХОДОВ · ПРОТОКОЛЬНАЯ ЭМИССИЯ", "无输入 · 协议发行"),
+        "NO INPUTS · BLOCK REWARD PAYOUT" => ("БЕЗ ВХОДОВ · ВЫПЛАТА ВОЗНАГРАЖДЕНИЯ", "无输入 · 区块奖励支付"),
         "REF" => ("ССЫЛКА", "引用"),
         "OWNED" => ("МОИ", "本钱包所有"),
         "RESERVED" => ("ЗАРЕЗЕРВИРОВАНО", "已预留"),

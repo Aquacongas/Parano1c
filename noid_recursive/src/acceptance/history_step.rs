@@ -128,11 +128,29 @@ pub struct ExactStateStructuralFrontierInputs {
 /// body/root/state regions in its own post-commit sidecar.
 #[derive(Debug, Clone)]
 pub struct HistoryStepBlockComponents {
+    /// Physical user PagedSpend pages in the canonical block suffix.
+    pub user_page_count: usize,
+    /// Whether the first body-suffix position is a development payout.
+    pub has_development_payout: bool,
+    /// Canonical block-order body spines: coinbase, optional payout, then
+    /// physical user pages. The fixed recursive suffix multiplexes the
+    /// payout against one user-capacity position.
     pub tx_body_inputs: Vec<noid_gkr::SpineInputs>,
     pub tx_body_hashes: Vec<[noid_core::Block128; 2]>,
     pub tx_root_inputs: Vec<noid_gkr::MerklePathInputs>,
     pub authorization_inputs: Vec<AuthorizationComponentInput>,
     pub exact_state: ExactStateStructuralFrontierInputs,
+}
+
+impl HistoryStepBlockComponents {
+    /// Page count that selects the recursive block class.
+    ///
+    /// A scheduled payout consumes one physical block-capacity position.
+    #[inline]
+    pub const fn effective_page_count(&self) -> usize {
+        self.user_page_count
+            .saturating_add(self.has_development_payout as usize)
+    }
 }
 
 /// Runtime-cached canonical ghost authorization, verified exactly once.
@@ -183,13 +201,13 @@ pub fn prepare_history_step_ghost_authorization(
 }
 
 pub fn prepare_history_step_authorizations<const TIER: usize>(
-    user_page_count: usize,
+    effective_page_count: usize,
     inputs: &[AuthorizationComponentInput],
     proofs: Vec<noid_gkr::zk_authorization::ZkAuthorizationProof>,
     ghost: &PreparedHistoryStepGhostAuthorization,
 ) -> Result<PreparedHistoryStepAuthorizations, HistoryStepAuthorizationError> {
     let actual_tier =
-        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_page_count)
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)
             .map(|class| class.page_capacity());
     if crate::region_sidecar::selected_zk_block_geometry(TIER).is_none()
         || actual_tier != Some(TIER)
@@ -250,10 +268,12 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
                 actual: authorizations.inner.live_count(),
             });
         }
-        let user_page_count = components.tx_body_inputs.len().saturating_sub(1);
-        let actual_tier =
-            noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_page_count)
-                .map(|class| class.page_capacity());
+        let user_page_count = components.user_page_count;
+        let effective_page_count = components.effective_page_count();
+        let actual_tier = noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(
+            effective_page_count,
+        )
+        .map(|class| class.page_capacity());
         if actual_tier != Some(TIER) {
             return Err(HistoryStepInputError::WrongTier {
                 expected_tier: TIER,
@@ -262,7 +282,10 @@ impl<const TIER: usize> HistoryStepBlockInput<TIER> {
             });
         }
         if components.tx_body_inputs.len() != components.tx_body_hashes.len()
-            || components.tx_body_inputs.is_empty()
+            || components.tx_body_inputs.len()
+                != user_page_count
+                    .saturating_add(1)
+                    .saturating_add(components.has_development_payout as usize)
             || live_authorizations > user_page_count
             || components.tx_root_inputs.is_empty()
         {

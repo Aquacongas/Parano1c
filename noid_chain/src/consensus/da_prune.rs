@@ -24,8 +24,8 @@ use noid_poseidon2b::primitives::TxBodyHash;
 /// Per-block undo log. Records the pre-image value of every UTXO slot
 /// mutated by the block, enabling reversion without the full block data.
 ///
-/// Maximum size is bounded by the consensus semantic action budget plus the
-/// single coinbase output, not by the raw decoded transaction cap.
+/// Maximum size is bounded by the complete consensus semantic action budget,
+/// not by the raw decoded transaction cap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockUndoLog {
     /// Height of the block this undo log was produced for.
@@ -41,8 +41,8 @@ pub struct BlockUndoLog {
     /// this block, recorded once at the slot's first occurrence in application
     /// order. Replaying these restores the pre-block UTXO state.
     pub slot_changes: Vec<(u32, SlotValue)>,
-    /// Canonical transaction-tree leaves for this block (coinbase first,
-    /// followed by one logical txid per complete PagedSpend group).
+    /// Canonical transaction-tree leaves for this block: coinbase, optional
+    /// development payout, then one logical txid per complete PagedSpend group.
     /// Used to restore the mempool after a reorg: txs that are no longer
     /// on the canonical chain can be re-admitted.
     pub tx_hashes: Vec<TxBodyHash>,
@@ -204,6 +204,61 @@ mod tests {
         assert_eq!(undo.slot_changes, vec![(7, SlotValue::EMPTY)]);
         assert_eq!(undo.active_slot_count_before, 0);
         assert_eq!(undo.alloc_counter_before, 0);
+    }
+
+    #[test]
+    fn scheduled_payout_reverts_cleanly_before_replacement_branch() {
+        use crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
+
+        let mut state = ChainState::with_log_slots(8);
+        let parent_root = state.state_root();
+        let parent = BlockHeader {
+            prev_block_hash: [0u8; 32],
+            state_root: parent_root,
+            tx_root: [0u8; 32],
+            timestamp: 1,
+            height: TARGET_BLOCKS_PER_DAY - 1,
+            miner_address: Address([1u8; 32]),
+            nonce: 0,
+            difficulty_target: GENESIS_TARGET,
+            log_slots: 8,
+            active_slot_count: 0,
+            alloc_counter: 0,
+        };
+        let build = |state: &ChainState, miner_address, timestamp| {
+            crate::consensus::build_block_template(
+                &parent,
+                state,
+                &[0; 18],
+                Vec::new(),
+                miner_address,
+                timestamp,
+                GENESIS_TARGET,
+            )
+            .unwrap()
+            .into_block(0)
+        };
+
+        let orphaned = build(&state, Address([2u8; 32]), 2);
+        let undo = build_undo_log(&state, &orphaned).unwrap();
+        assert_eq!(undo.tx_hashes.len(), 2);
+        assert_eq!(undo.slot_changes.len(), 3);
+        crate::block::apply_block(&mut state, &orphaned).unwrap();
+        assert_eq!(state.active_slot_count, 3);
+        assert_eq!(state.alloc_counter, 3);
+
+        revert_block(&mut state.state, &undo);
+        state.active_slot_count = undo.active_slot_count_before;
+        state.alloc_counter = undo.alloc_counter_before;
+        assert_eq!(state.state_root(), parent_root);
+        assert_eq!(state.active_slot_count, 0);
+        assert_eq!(state.alloc_counter, 0);
+
+        let replacement = build(&state, Address([3u8; 32]), 3);
+        crate::block::apply_block(&mut state, &replacement).unwrap();
+        assert_eq!(state.active_slot_count, 3);
+        assert_eq!(state.alloc_counter, 3);
+        assert_ne!(orphaned.header.state_root, replacement.header.state_root);
     }
 
     #[test]

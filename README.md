@@ -194,6 +194,25 @@ reference 12-thread Intel Core i7-1365U, saturated B64 preparation measures
 hardware may qualify B255; every node verifies both classes. Full measurements
 are in the [two-class benchmark](research/two_class/results/2026-07-17-history-step-lto-20-sample.md).
 
+### Development Allocation
+
+ParanO(1)d has no premine. For blocks 1 through 6,307,200 — exactly three
+365-day target-time years — each block reward is divided by consensus:
+
+- 90% to the miner;
+- 5% to the O(1) Network Fund;
+- 5% to O(1) Lab.
+
+Transaction fees remain entirely miner-claimable after the existing
+state-growth burn. Beginning with block 6,307,201, the development allocation
+ends and 100% of every new block reward goes to miners.
+
+The O(1) Network Fund finances operation, maintenance, security and adoption
+of the live network. O(1) Lab supports the founders, core developers,
+researchers and contributors advancing the protocol. Both will publish
+periodic reports covering funds received, major expenditures, completed work
+and current priorities.
+
 ## Network
 
 ParanO(1)d uses libp2p GossipSub for blocks and transaction intents, typed

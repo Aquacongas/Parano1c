@@ -67,6 +67,7 @@ pub fn total_fees(txs: &[TxBody]) -> u128 {
 /// Only miner-claimable fees are included. The deterministic state-growth
 /// component is burned and can never be recovered through coinbase.
 pub fn max_coinbase_value(
+    child_height: u64,
     child_log_slots: u32,
     parent_active_slot_count: u64,
     parent_log_slots: u32,
@@ -83,7 +84,7 @@ pub fn max_coinbase_value(
             ))
         })
         .sum();
-    max_coinbase_value_from_claimable_fee_sum(child_log_slots, claimable_fee_sum)
+    max_coinbase_value_from_claimable_fee_sum(child_height, child_log_slots, claimable_fee_sum)
 }
 
 /// Same as [`max_coinbase_value`] but accepts an already checked sum of
@@ -93,10 +94,14 @@ pub fn max_coinbase_value(
 /// bodies just to repeat fee accounting.
 #[inline]
 pub fn max_coinbase_value_from_claimable_fee_sum(
+    child_height: u64,
     child_log_slots: u32,
     claimable_fee_sum: u128,
 ) -> u128 {
-    u128::from(block_reward(child_log_slots)) + claimable_fee_sum
+    u128::from(crate::consensus::development_allocation::miner_subsidy(
+        child_height,
+        child_log_slots,
+    )) + claimable_fee_sum
 }
 
 /// Format a μNOID amount as a human-readable string (not consensus-critical).
@@ -156,11 +161,17 @@ mod tests {
         tx.outputs[0].slot_index = 2;
         tx.outputs[1].slot_index = 3;
         tx.validity_bitmap = 1 | output_bitmap_bit(0) | output_bitmap_bit(1);
-        let ceiling = max_coinbase_value(LOG_SLOTS_GENESIS, 0, LOG_SLOTS_GENESIS, &[tx]);
-        assert_eq!(ceiling, u128::from(block_reward(LOG_SLOTS_GENESIS) + 6_500));
+        let ceiling = max_coinbase_value(1, LOG_SLOTS_GENESIS, 0, LOG_SLOTS_GENESIS, &[tx]);
         assert_eq!(
             ceiling,
-            max_coinbase_value_from_claimable_fee_sum(LOG_SLOTS_GENESIS, 6_500)
+            u128::from(
+                crate::consensus::development_allocation::miner_subsidy(1, LOG_SLOTS_GENESIS,)
+                    + 6_500,
+            )
+        );
+        assert_eq!(
+            ceiling,
+            max_coinbase_value_from_claimable_fee_sum(1, LOG_SLOTS_GENESIS, 6_500)
         );
     }
 }

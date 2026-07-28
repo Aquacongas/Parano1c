@@ -45,7 +45,7 @@ pub struct ParanoidReceipt {
     pub paged_spend: Vec<u8>,
     /// Logical position in the universal namespace. Directions derive from it.
     pub tx_index: u16,
-    /// Real block transaction count, including the mandatory coinbase.
+    /// Real logical count, including coinbase and any development payout.
     pub tx_count: u16,
     /// Sibling hashes along the Merkle path (leaf → root), always depth 8.
     pub merkle_path: [[u8; 32]; tx_tree::TX_TREE_DEPTH],

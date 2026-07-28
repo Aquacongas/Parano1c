@@ -3,12 +3,12 @@
 
 //! Fixed-shape action compaction and slot uniqueness.
 //!
-//! Candidates enter in canonical body order: the coinbase mint, then every
-//! user input and output bitmap position. Semantic lanes are selected to zero
-//! when dead. The allocator first packs each mint's body-order creation id
-//! into its value lane. One witness-routed Beneš network then permutes the
-//! six-lane physical source directly into a `(live first, slot ascending)`
-//! target. Output constraints,
+//! Candidates enter in canonical body order: the primary coinbase mint, two
+//! schedule-gated development-payout mints, then every user input and output
+//! bitmap position. Semantic lanes are selected to zero when dead. The
+//! allocator first packs each mint's body-order creation id into its value
+//! lane. One witness-routed Beneš network then permutes the six-lane physical
+//! source directly into a `(live first, slot ascending)` target. Output constraints,
 //! not the host routing witness, prove the ordering and strict slot uniqueness.
 //! This avoids materializing two `O(N log^2 N)` sorting networks.
 

@@ -183,10 +183,10 @@ fn recover_outgoing_receipts_from_block(
     let mut recovered = 0usize;
     let mut history_changed = false;
     for (group_index, group) in stream.groups.iter().enumerate() {
-        let tx_index = group_index + 1;
+        let tx_index = stream.user_logical_index(group_index);
         let tx_hash = group.spend.logical_txid.0;
-        let start = 1 + usize::from(group.start_page);
-        let end = 1 + group.end_page_exclusive();
+        let start = stream.user_body_start(usize::from(group.start_page));
+        let end = stream.user_body_start(group.end_page_exclusive());
         let pages = &block.transactions[start..end];
         let has_distinct_recipient = pages
             .iter()
@@ -1393,7 +1393,7 @@ mod tests {
             input_owner: Address([0; 32]),
             inputs: [TxInput::dummy(); TX_INPUTS],
             outputs: [TxOutput::dummy(); TX_OUTPUTS],
-            validity_bitmap: 0,
+            validity_bitmap: output_bitmap_bit(0),
             is_coinbase: true,
         });
         let transactions = vec![coinbase, transaction];

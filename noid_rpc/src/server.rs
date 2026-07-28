@@ -146,12 +146,50 @@ fn retained_transaction_summaries(
             live_outputs: coinbase_outputs,
             fee_micronoid: 0,
             coinbase: true,
+            development_payout: false,
             input_owner: None,
             input_sum_micronoid: "0".into(),
             output_sum_micronoid: coinbase_output_sum.to_string(),
             address_spent_micronoid: address.map(|_| "0".into()),
             address_received_micronoid: coinbase_received.map(|value| value.to_string()),
         });
+    }
+
+    if stream.has_development_payout {
+        let payout = &block.transactions[1];
+        let payout_output_sum = payout
+            .body
+            .live_outputs()
+            .map(|(_, output)| u128::from(output.amount))
+            .sum::<u128>();
+        let payout_received = address.map(|owner| {
+            payout
+                .body
+                .live_outputs()
+                .filter(|(_, output)| &output.owner == owner)
+                .map(|(_, output)| u128::from(output.amount))
+                .sum::<u128>()
+        });
+        if payout_received.is_none_or(|received| received > 0) {
+            transactions.push(RecentTransactionInfo {
+                height: header.height,
+                block_hash: block_hash.clone(),
+                timestamp: header.timestamp,
+                position: 1,
+                txid: hex::encode(logical_txids[1].0),
+                page_count: 1,
+                live_inputs: 0,
+                live_outputs: 2,
+                fee_micronoid: 0,
+                coinbase: true,
+                development_payout: true,
+                input_owner: None,
+                input_sum_micronoid: "0".into(),
+                output_sum_micronoid: payout_output_sum.to_string(),
+                address_spent_micronoid: address.map(|_| "0".into()),
+                address_received_micronoid: payout_received.map(|value| value.to_string()),
+            });
+        }
     }
 
     for (index, group) in stream.groups.iter().enumerate() {
@@ -161,9 +199,7 @@ fn retained_transaction_summaries(
             } else {
                 0
             };
-            let start = 1usize
-                .checked_add(usize::from(group.start_page))
-                .ok_or_else(|| "retained transaction page offset overflow".to_string())?;
+            let start = stream.user_body_start(usize::from(group.start_page));
             let end = start
                 .checked_add(usize::from(group.page_count))
                 .ok_or_else(|| "retained transaction page range overflow".to_string())?;
@@ -189,7 +225,7 @@ fn retained_transaction_summaries(
             height: header.height,
             block_hash: block_hash.clone(),
             timestamp: header.timestamp,
-            position: u16::try_from(index + 1)
+            position: u16::try_from(stream.user_logical_index(index))
                 .map_err(|_| "logical transaction position does not fit u16".to_string())?,
             txid: hex::encode(group.spend.logical_txid.0),
             page_count: group.page_count,
@@ -197,6 +233,7 @@ fn retained_transaction_summaries(
             live_outputs: group.spend.live_outputs,
             fee_micronoid: group.spend.fee,
             coinbase: false,
+            development_payout: false,
             input_owner: Some(group.spend.input_owner.to_bech32()),
             input_sum_micronoid: group.spend.input_sum.to_string(),
             output_sum_micronoid: group.spend.output_sum.to_string(),
@@ -1736,8 +1773,15 @@ impl ParanoidApiServer for RpcHandler {
             .fold(0u64, u64::saturating_add);
         let coinbase_outputs = u16::try_from(coinbase.body.live_outputs().count())
             .map_err(|_| rpc_err("coinbase output count does not fit u16"))?;
+        let development_outputs = if stream.has_development_payout {
+            u16::try_from(block.transactions[1].body.live_outputs().count())
+                .map_err(|_| rpc_err("development payout output count does not fit u16"))?
+        } else {
+            0
+        };
         let minted_outputs = u64::from(stream.live_outputs)
             .checked_add(u64::from(coinbase_outputs))
+            .and_then(|count| count.checked_add(u64::from(development_outputs)))
             .ok_or_else(|| rpc_err("retained block output count overflow"))?;
         let mut alloc_cursor = header
             .alloc_counter
@@ -1768,6 +1812,7 @@ impl ParanoidApiServer for RpcHandler {
             live_outputs: coinbase_outputs,
             fee_micronoid: 0,
             coinbase: true,
+            development_payout: false,
             epoch_anchor: hex::encode(coinbase.body.epoch_anchor),
             input_owner: None,
             input_sum_micronoid: "0".into(),
@@ -1777,10 +1822,48 @@ impl ParanoidApiServer for RpcHandler {
             outputs: coinbase_output_details,
         });
 
+        if stream.has_development_payout {
+            let payout = &block.transactions[1];
+            let mut payout_outputs = Vec::with_capacity(usize::from(development_outputs));
+            let mut payout_output_sum = 0u128;
+            for (lane, output) in payout.body.live_outputs() {
+                alloc_cursor = alloc_cursor
+                    .checked_add(1)
+                    .ok_or_else(|| rpc_err("retained block allocator counter overflow"))?;
+                payout_output_sum = payout_output_sum
+                    .checked_add(u128::from(output.amount))
+                    .ok_or_else(|| rpc_err("development payout sum overflow"))?;
+                payout_outputs.push(BlockTransactionOutputInfo {
+                    page: 0,
+                    lane: lane as u8,
+                    slot_index: output.slot_index,
+                    amount_micronoid: output.amount,
+                    owner: output.owner.to_bech32(),
+                    creation_id: alloc_cursor,
+                });
+            }
+            let payout_txid = hex::encode(logical_txids[1].0);
+            transactions.push(BlockTransactionInfo {
+                position: 1,
+                txid: payout_txid.clone(),
+                page_count: 1,
+                live_inputs: 0,
+                live_outputs: development_outputs,
+                fee_micronoid: 0,
+                coinbase: true,
+                development_payout: true,
+                epoch_anchor: hex::encode(payout.body.epoch_anchor),
+                input_owner: None,
+                input_sum_micronoid: "0".into(),
+                output_sum_micronoid: payout_output_sum.to_string(),
+                page_hashes: vec![payout_txid],
+                inputs: Vec::new(),
+                outputs: payout_outputs,
+            });
+        }
+
         for (index, group) in stream.groups.iter().enumerate() {
-            let start = 1usize
-                .checked_add(usize::from(group.start_page))
-                .ok_or_else(|| rpc_err("retained transaction page offset overflow"))?;
+            let start = stream.user_body_start(usize::from(group.start_page));
             let end = start
                 .checked_add(usize::from(group.page_count))
                 .ok_or_else(|| rpc_err("retained transaction page range overflow"))?;
@@ -1819,13 +1902,14 @@ impl ParanoidApiServer for RpcHandler {
             }
 
             transactions.push(BlockTransactionInfo {
-                position: (index + 1) as u16,
+                position: stream.user_logical_index(index) as u16,
                 txid: hex::encode(group.spend.logical_txid.0),
                 page_count: group.page_count,
                 live_inputs: group.spend.live_inputs,
                 live_outputs: group.spend.live_outputs,
                 fee_micronoid: group.spend.fee,
                 coinbase: false,
+                development_payout: false,
                 epoch_anchor: hex::encode(group.spend.epoch_anchor),
                 input_owner: Some(group.spend.input_owner.to_bech32()),
                 input_sum_micronoid: group.spend.input_sum.to_string(),
@@ -1856,7 +1940,10 @@ impl ParanoidApiServer for RpcHandler {
             logical_transactions: logical_txids.len() as u16,
             user_pages: stream.page_count,
             live_inputs: stream.live_inputs,
-            live_outputs: stream.live_outputs.saturating_add(coinbase_outputs),
+            live_outputs: stream
+                .live_outputs
+                .saturating_add(coinbase_outputs)
+                .saturating_add(development_outputs),
             reward_micronoid,
             reward_noid: crate::types::micronoid_to_noid(reward_micronoid),
             total_fees_micronoid,

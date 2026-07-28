@@ -37,8 +37,9 @@ impl ShapeClass {
         self.tier.next_power_of_two()
     }
 
-    /// Exact-state touched capacity: spends, at most two creations per user
-    /// transaction, and the mandatory coinbase creation.
+    /// Exact-state touched capacity. On payout heights the two development
+    /// creations replace one physical user-page position, so the existing
+    /// class maximum remains unchanged.
     pub fn touched_capacity(self) -> usize {
         self.spend_capacity() + self.tier * noid_tx::TX_OUTPUTS + 1
     }
@@ -52,10 +53,11 @@ impl ShapeClass {
     }
 
     /// Physical bitmap-selected rows scanned by the stable compactor: ten
-    /// positions per user body plus the already-canonical sole coinbase mint.
+    /// positions per user body, the primary coinbase mint, and two
+    /// fixed-position development-payout candidates gated by the schedule.
     /// The B255 authorization PAD slot is deliberately not an action slot.
     pub fn action_candidate_capacity(self) -> usize {
-        self.tier * noid_tx::TX_ACTIONS + 1
+        self.tier * noid_tx::TX_ACTIONS + 3
     }
 
     /// Power-of-two Beneš routing width for the action candidates.
@@ -114,7 +116,7 @@ pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
         .map(|tier| ShapeClass { tier })
 }
 
-const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-TX8X2-SHAPE-CLASS-V3";
+const SHAPE_CLASS_DOMAIN: &[u8] = b"NOID-TX8X2-SHAPE-CLASS-V4";
 
 #[cfg(test)]
 mod tests {
@@ -155,7 +157,7 @@ mod tests {
             ShapeClass::for_page_count(255)
                 .unwrap()
                 .action_candidate_capacity(),
-            2_551
+            2_553
         );
         assert_eq!(
             ShapeClass::for_page_count(255)
@@ -197,7 +199,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(table, [(64, 641, 1_024, 641), (255, 2_551, 4_096, 1_531)]);
+        assert_eq!(table, [(64, 643, 1_024, 641), (255, 2_553, 4_096, 1_531)]);
     }
 
     #[test]

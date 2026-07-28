@@ -291,7 +291,7 @@ fn build_state_delta_action_surface_in_domain<'a>(
                     output_index: j,
                 });
             }
-            let creation_id = if body.is_coinbase {
+            let creation_id = if body.is_primary_coinbase_shape() {
                 crate::consensus::params::coinbase_creation_id(block_height)
             } else {
                 next_alloc

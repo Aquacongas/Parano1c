@@ -1714,8 +1714,8 @@ fn prepare_history_step_assembly<const TIER: usize>(
         io,
     } = prepared;
     let envelope = envelopes[selected_parent_class.current_slot()].proof();
-    let user_pages = current.components.tx_body_inputs.len().saturating_sub(1);
-    if noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_pages)
+    let effective_pages = current.components.effective_page_count();
+    if noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_pages)
         .map(|class| class.page_capacity())
         != Some(TIER)
     {

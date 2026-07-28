@@ -55,6 +55,7 @@ pub struct BlockFeeArithmeticTrace {
     pub groups: Vec<LogicalGroupFeeArithmeticTrace>,
     pub claimable_fee_sum: LinExpr,
     pub block_reward: LinExpr,
+    pub coinbase_subsidy: LinExpr,
     pub max_coinbase_value: LinExpr,
 }
 
@@ -330,6 +331,7 @@ pub fn bind_block_fee_arithmetic(
     parent_active_count: &LinExpr,
     parent_depth: &StateDepthTrace,
     child_depth: &StateDepthTrace,
+    coinbase_subsidy: &LinExpr,
     coinbase_amount: &LinExpr,
     coinbase_amount_bits: &[Wire; U64_BITS],
 ) -> BlockFeeArithmeticTrace {
@@ -366,7 +368,12 @@ pub fn bind_block_fee_arithmetic(
         .collect();
     let reward_bits = selected_constant_bits(&child_depth.one_hot, &rewards, MONEY_SUM_BITS);
     let block_reward = reconstruct_bits(&reward_bits);
-    let max_bits = checked_add_bits(b, &aggregate_bits, &reward_bits);
+    let mut subsidy_bits: Vec<LinExpr> = range_check_bits(b, coinbase_subsidy, U64_BITS)
+        .into_iter()
+        .map(LinExpr::from_wire)
+        .collect();
+    subsidy_bits.resize(MONEY_SUM_BITS, LinExpr::zero());
+    let max_bits = checked_add_bits(b, &aggregate_bits, &subsidy_bits);
     let max_coinbase_value = reconstruct_bits(&max_bits);
 
     let mut coinbase_bits: Vec<LinExpr> = coinbase_amount_bits
@@ -384,6 +391,7 @@ pub fn bind_block_fee_arithmetic(
         groups,
         claimable_fee_sum,
         block_reward,
+        coinbase_subsidy: coinbase_subsidy.clone(),
         max_coinbase_value,
     }
 }
@@ -470,6 +478,7 @@ mod tests {
         coinbase: u64,
     ) -> (FieldR1cs, Vec<F128>, BlockFeeArithmeticTrace) {
         assert_eq!(bodies.len(), liveness.len());
+        let child_depth_native = child_depth;
         let mut b = FieldR1csBuilder::new();
         let parent_active = alloc_block(&mut b, Block128::from(parent_active as u128));
         let parent_depth_value = alloc_block(&mut b, Block128::from(parent_depth as u128));
@@ -510,6 +519,12 @@ mod tests {
             })
             .collect();
         let coinbase = alloc_block(&mut b, Block128::from(coinbase as u128));
+        let subsidy = alloc_block(
+            &mut b,
+            Block128::from(
+                noid_chain::consensus::emission::block_reward(child_depth_native) as u128,
+            ),
+        );
         let coinbase_bits: [Wire; U64_BITS] = range_check_bits(&mut b, &coinbase, U64_BITS)
             .try_into()
             .expect("u64 bits");
@@ -519,6 +534,7 @@ mod tests {
             &parent_active,
             &parent_depth,
             &child_depth,
+            &subsidy,
             &coinbase,
             &coinbase_bits,
         );

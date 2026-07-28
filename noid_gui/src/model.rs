@@ -449,6 +449,7 @@ pub struct BlockTransactionSnapshot {
     pub live_outputs: u16,
     pub fee_micronoid: u64,
     pub coinbase: bool,
+    pub development_payout: bool,
     pub epoch_anchor: String,
     pub input_owner: Option<String>,
     pub input_sum_micronoid: String,
@@ -538,6 +539,7 @@ pub struct RecentTransactionSnapshot {
     pub live_outputs: u16,
     pub fee_micronoid: u64,
     pub coinbase: bool,
+    pub development_payout: bool,
     pub address_spent_micronoid: Option<String>,
     pub address_received_micronoid: Option<String>,
 }

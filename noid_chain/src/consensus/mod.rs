@@ -42,6 +42,7 @@ pub mod validation;
 pub mod wire_limits;
 
 pub mod allocator;
+pub mod development_allocation;
 pub mod difficulty;
 pub mod emission;
 pub mod epoch_anchor;
@@ -62,6 +63,12 @@ pub use allocator::{
 pub use checks::{validate_block_slot_conflicts, validate_tx_consensus};
 pub use conflict::resolve_slot_conflicts;
 pub use da_prune::{build_undo_log, prune_undo_logs, revert_block, BlockUndoLog};
+pub use development_allocation::{
+    development_allocation, development_allocation_active, development_payout_due,
+    development_share_each, miner_subsidy, DevelopmentAllocation, DevelopmentAllocationError,
+    DEVELOPMENT_ALLOCATION_END_HEIGHT, DEVELOPMENT_ALLOCATION_PAYOUTS,
+    DEVELOPMENT_SHARE_DENOMINATOR, O1_LAB_ADDRESS, O1_NETWORK_FUND_ADDRESS, TARGET_BLOCKS_PER_DAY,
+};
 pub use difficulty::{add_work, block_work, le256_lt, next_target, work_gt};
 pub use emission::{
     block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_claimable_fee_sum,
@@ -151,6 +158,12 @@ pub enum ConsensusError {
     InflatedCoinbase,
     /// Coinbase `epoch_anchor` must equal the parent block hash.
     BadCoinbaseAnchor,
+    /// A scheduled development payout record is missing.
+    MissingDevelopmentPayout,
+    /// A development payout record appears outside its scheduled height.
+    UnexpectedDevelopmentPayout,
+    /// The mandatory development payout has a wrong anchor, owner, or amount.
+    BadDevelopmentPayout,
     /// The block's mandatory current-height history terminal is missing, does
     /// not natively verify, or does not bind the exact candidate header.
     /// Nodes without the pinned verifier artifacts fail closed here.

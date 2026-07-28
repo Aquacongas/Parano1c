@@ -44,7 +44,9 @@ use crate::state::{apply_tx_checked_deferred_root, ChainState};
 pub struct BlockTemplate {
     /// Coinbase transaction (always first in the block).
     pub coinbase: Transaction,
-    /// Non-coinbase transactions in canonical order (coinbase excluded here).
+    /// Mandatory batched development payout, present only on scheduled heights.
+    pub development_payout: Option<Transaction>,
+    /// User PagedSpend pages in canonical order (system mints excluded here).
     pub txs: Vec<Transaction>,
     /// Post-apply state root (computed from applying all txs to prev state).
     pub state_root: Digest,
@@ -73,6 +75,7 @@ impl BlockTemplate {
     pub fn into_block(self, nonce: u128) -> crate::block::Block {
         let Self {
             coinbase,
+            development_payout,
             txs,
             state_root,
             tx_root,
@@ -85,8 +88,10 @@ impl BlockTemplate {
             difficulty_target,
             prev_block_hash,
         } = self;
-        let mut transactions = Vec::with_capacity(1 + txs.len());
+        let mut transactions =
+            Vec::with_capacity(1 + usize::from(development_payout.is_some()) + txs.len());
         transactions.push(coinbase);
+        transactions.extend(development_payout);
         transactions.extend(txs);
         crate::block::Block {
             header: BlockHeader {
@@ -141,16 +146,17 @@ impl BlockTemplate {
         }
     }
 
-    /// All transactions in block order: coinbase first, then txs.
+    /// All bodies in block order: coinbase, optional payout, then user pages.
     pub fn all_txs(&self) -> Vec<Transaction> {
         let mut all = vec![self.coinbase.clone()];
+        all.extend(self.development_payout.iter().cloned());
         all.extend(self.txs.iter().cloned());
         all
     }
 
     /// Total tx count (coinbase + non-coinbase).
     pub fn n_txs(&self) -> usize {
-        1 + self.txs.len()
+        1 + usize::from(self.development_payout.is_some()) + self.txs.len()
     }
 }
 
@@ -268,6 +274,8 @@ pub enum TemplateBuildError {
 
 #[derive(Clone, Default)]
 struct TemplateResourceSelection {
+    system_record_count: usize,
+    system_output_count: usize,
     user_page_count: usize,
     logical_count: usize,
     live_input_count: usize,
@@ -277,8 +285,16 @@ struct TemplateResourceSelection {
 }
 
 impl TemplateResourceSelection {
-    /// Return the next bounded selection, reserving one possible new segment
-    /// for the mandatory coinbase output.
+    fn with_system_outputs(system_record_count: usize, system_output_count: usize) -> Self {
+        Self {
+            system_record_count,
+            system_output_count,
+            ..Self::default()
+        }
+    }
+
+    /// Return the next bounded selection, reserving possible new segments for
+    /// every mandatory system output.
     fn with_group(&self, pages: &[Transaction], spend: &PagedSpendFacts) -> Option<Self> {
         let user_page_count = self.user_page_count.checked_add(pages.len())?;
         let logical_count = self.logical_count.checked_add(1)?;
@@ -288,12 +304,16 @@ impl TemplateResourceSelection {
         let live_output_count = self
             .live_output_count
             .checked_add(usize::from(spend.live_outputs))?;
-        if user_page_count > crate::consensus::params::BLOCK_MAX_USER_PAGES
+        if user_page_count.checked_add(self.system_record_count)?
+            > crate::consensus::params::BLOCK_MAX_USER_PAGES
             || logical_count > crate::consensus::params::BLOCK_MAX_USER_PAGES
             || live_input_count > crate::consensus::params::BLOCK_MAX_LIVE_INPUTS
-            || live_output_count > crate::consensus::params::BLOCK_MAX_USER_OUTPUTS
-            || live_input_count + live_output_count
-                > crate::consensus::params::BLOCK_MAX_USER_ACTIONS
+            || live_output_count.checked_add(self.system_output_count)?
+                > crate::consensus::params::BLOCK_MAX_USER_OUTPUTS + 1
+            || live_input_count
+                .checked_add(live_output_count)?
+                .checked_add(self.system_output_count)?
+                > crate::consensus::params::BLOCK_MAX_ACTIONS
         {
             return None;
         }
@@ -317,11 +337,17 @@ impl TemplateResourceSelection {
                 touched_segments.insert(slot >> crate::consensus::params::LOG_SEGMENT_SIZE);
             }
         }
-        if touched_segments.len() >= crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS {
+        if touched_segments
+            .len()
+            .checked_add(self.system_output_count)?
+            > crate::consensus::params::BLOCK_MAX_DISTINCT_SEGMENTS
+        {
             return None;
         }
 
         Some(Self {
+            system_record_count: self.system_record_count,
+            system_output_count: self.system_output_count,
             user_page_count,
             logical_count,
             live_input_count,
@@ -345,7 +371,7 @@ struct CandidatePagedSpend {
 /// duplicate-free segment probe skips full zones and opens one virtual-zero
 /// segment. Evicted live segments remain fail-closed; the miner snapshot must
 /// authenticate and hydrate one before calling the pure builder.
-fn select_coinbase_slot(
+fn select_system_mint_slot(
     state: &ChainState,
     reuse_seed: u64,
     reserved: &HashSet<u32>,
@@ -486,7 +512,9 @@ fn build_block_template_with_post_state(
     timestamp: u64,
     difficulty_target: Digest,
 ) -> Result<(BlockTemplate, ChainState), TemplateBuildError> {
-    use crate::consensus::emission::block_reward;
+    use crate::consensus::development_allocation::{
+        development_allocation, O1_LAB_ADDRESS, O1_NETWORK_FUND_ADDRESS,
+    };
     use crate::consensus::expected_child_log_slots;
     use crate::consensus::fees::fee_breakdown;
     use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS};
@@ -528,6 +556,11 @@ fn build_block_template_with_post_state(
     let new_log_slots =
         expected_child_log_slots(parent.height, parent.log_slots, finalized_active_counts);
     let should_expand = new_log_slots != parent.log_slots;
+    let allocation = development_allocation(child_height, new_log_slots).map_err(|error| {
+        TemplateBuildError::StateApplyError(format!("development allocation: {error}"))
+    })?;
+    let system_record_count = usize::from(allocation.payout_due);
+    let system_output_count = 1 + 2 * system_record_count;
 
     // 3. Apply non-coinbase txs to scratch state.
     // PagedSpend authorization binds (logical_txid, owner), not the state
@@ -538,23 +571,23 @@ fn build_block_template_with_post_state(
         selection_scratch.expand_one();
     }
     // Selection executes users before their fee-dependent coinbase is known.
-    // Reserve the coinbase's canonical first creation ID so user outputs get
-    // exactly the same IDs here as in the final coinbase -> users replay.
-    selection_scratch.alloc_counter =
-        selection_scratch
-            .alloc_counter
-            .checked_add(1)
-            .ok_or_else(|| {
-                TemplateBuildError::StateApplyError(
-                    "alloc_counter exhausted while reserving coinbase creation ID".into(),
-                )
-            })?;
+    // Reserve every system mint's canonical creation IDs so user outputs get
+    // exactly the same IDs here as in the final system -> users replay.
+    selection_scratch.alloc_counter = selection_scratch
+        .alloc_counter
+        .checked_add(system_output_count as u64)
+        .ok_or_else(|| {
+            TemplateBuildError::StateApplyError(
+                "alloc_counter exhausted while reserving system mint creation IDs".into(),
+            )
+        })?;
 
     let mut applied_winners: Vec<CandidatePagedSpend> = Vec::new();
     // Reserve one segment for coinbase. Typical templates place coinbase in
     // an already-populated segment, but this conservative reservation makes
     // the final 256-segment consensus bound unconditional.
-    let mut resources = TemplateResourceSelection::default();
+    let mut resources =
+        TemplateResourceSelection::with_system_outputs(system_record_count, system_output_count);
     for group in candidates {
         let Some(next_resources) = resources.with_group(&group.pages, &group.spend) else {
             continue;
@@ -587,7 +620,7 @@ fn build_block_template_with_post_state(
 
     // Rebuild the final scratch state in semantic block order. Selection runs
     // users first because coinbase value depends on the selected fee set, but
-    // the actual block and exact action stream are coinbase -> users.
+    // the actual block and exact action stream are system mints -> users.
     let mut scratch = state.clone();
     if should_expand {
         scratch.expand_one();
@@ -596,8 +629,8 @@ fn build_block_template_with_post_state(
     // 4. Build coinbase transaction.
     // Find an empty slot for coinbase output using the allocator.
     // Use the scratch state's actual capacity so hints are always in range.
-    let coinbase_slot = {
-        let reserved: HashSet<u32> = ordered_winners
+    let (coinbase_slot, development_slots) = {
+        let mut reserved: HashSet<u32> = ordered_winners
             .iter()
             .flat_map(|group| {
                 group.pages.iter().flat_map(|page| {
@@ -615,7 +648,20 @@ fn build_block_template_with_post_state(
         let seed =
             scratch.alloc_counter ^ u64::from_le_bytes(parent.state_root[..8].try_into().unwrap());
 
-        select_coinbase_slot(&scratch, seed, &reserved).ok_or(TemplateBuildError::NoCoinbaseSlot)?
+        let coinbase = select_system_mint_slot(&scratch, seed, &reserved)
+            .ok_or(TemplateBuildError::NoCoinbaseSlot)?;
+        reserved.insert(coinbase);
+        let development = if allocation.payout_due {
+            let first = select_system_mint_slot(&scratch, seed, &reserved)
+                .ok_or(TemplateBuildError::NoCoinbaseSlot)?;
+            reserved.insert(first);
+            let second = select_system_mint_slot(&scratch, seed, &reserved)
+                .ok_or(TemplateBuildError::NoCoinbaseSlot)?;
+            Some([first, second])
+        } else {
+            None
+        };
+        (coinbase, development)
     };
 
     // Sum only claimable fees. The deterministic state-growth component is burned.
@@ -634,8 +680,8 @@ fn build_block_template_with_post_state(
         .sum();
     // The mathematical ceiling may exceed the body amount lane. Claiming less
     // is canonical, so the miner selects the largest representable amount.
-    let coinbase_value = (u128::from(block_reward(new_log_slots)) + claimable_fee_sum)
-        .min(u128::from(u64::MAX)) as u64;
+    let coinbase_value =
+        (u128::from(allocation.miner_subsidy) + claimable_fee_sum).min(u128::from(u64::MAX)) as u64;
 
     let prev_block_hash = block_id(parent);
     let cb_body = TxBody {
@@ -655,10 +701,38 @@ fn build_block_template_with_post_state(
         is_coinbase: true,
     };
     let coinbase = Transaction::new(cb_body);
+    let development_payout = allocation.payout_each.map(|amount| {
+        let [network_slot, lab_slot] =
+            development_slots.expect("scheduled payout has two selected slots");
+        Transaction::new(TxBody {
+            epoch_anchor: prev_block_hash,
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index: network_slot,
+                    amount,
+                    owner: O1_NETWORK_FUND_ADDRESS,
+                },
+                TxOutput {
+                    slot_index: lab_slot,
+                    amount,
+                    owner: O1_LAB_ADDRESS,
+                },
+            ],
+            validity_bitmap: noid_tx::output_bitmap_bit(0) | noid_tx::output_bitmap_bit(1),
+            is_coinbase: true,
+        })
+    });
 
     // Apply the complete block to scratch in its real semantic order.
     apply_tx_checked_deferred_root(&mut scratch, &coinbase.body, Some(child_height))
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    if let Some(payout) = &development_payout {
+        apply_tx_checked_deferred_root(&mut scratch, &payout.body, Some(child_height))
+            .map_err(|e| TemplateBuildError::StateApplyError(format!("{:?}", e)))?;
+    }
     for group in &ordered_winners {
         for page in &group.pages {
             apply_tx_checked_deferred_root(&mut scratch, &page.body, None)
@@ -671,6 +745,7 @@ fn build_block_template_with_post_state(
         .try_state_root()
         .map_err(|e| TemplateBuildError::StateApplyError(format!("{e:?}")))?;
     let tx_hashes_for_root: Vec<[u8; 32]> = std::iter::once(coinbase.txid().0)
+        .chain(development_payout.iter().map(|payout| payout.txid().0))
         .chain(
             ordered_winners
                 .iter()
@@ -686,6 +761,7 @@ fn build_block_template_with_post_state(
 
     let template = BlockTemplate {
         coinbase,
+        development_payout,
         txs: ordered_pages,
         state_root,
         tx_root,
@@ -789,6 +865,153 @@ mod tests {
     }
 
     #[test]
+    fn due_template_builds_the_mandatory_two_recipient_payout() {
+        use crate::consensus::development_allocation::{
+            development_share_each, miner_subsidy, O1_LAB_ADDRESS, O1_NETWORK_FUND_ADDRESS,
+            TARGET_BLOCKS_PER_DAY,
+        };
+        use crate::consensus::emission::block_reward;
+
+        let mut state = ChainState::with_log_slots(8);
+        let mut parent = parent(&mut state);
+        parent.height = TARGET_BLOCKS_PER_DAY - 1;
+        let share = development_share_each(block_reward(parent.log_slots)).unwrap();
+
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[0; 18],
+            vec![],
+            Address([9u8; 32]),
+            1,
+            [0xff; 32],
+        )
+        .unwrap();
+        let payout = template
+            .development_payout
+            .as_ref()
+            .expect("daily payout is mandatory");
+        assert_eq!(payout.body.outputs[0].owner, O1_NETWORK_FUND_ADDRESS);
+        assert_eq!(payout.body.outputs[1].owner, O1_LAB_ADDRESS);
+        assert_eq!(payout.body.outputs[0].amount, share * TARGET_BLOCKS_PER_DAY);
+        assert_eq!(payout.body.outputs[1].amount, share * TARGET_BLOCKS_PER_DAY);
+        assert_eq!(
+            template.coinbase.body.outputs[0].amount,
+            miner_subsidy(TARGET_BLOCKS_PER_DAY, template.log_slots)
+        );
+        assert_eq!(template.active_slot_count, 3);
+        assert_eq!(template.alloc_counter, 3);
+
+        let block = template.into_block(0);
+        assert_eq!(
+            crate::consensus::validation::validate_mandatory_coinbase(&block, &parent),
+            Ok(())
+        );
+        assert_eq!(
+            block.header.tx_root,
+            crate::block::compute_tx_root(&block.transactions)
+        );
+    }
+
+    #[test]
+    fn scheduled_payout_and_state_expansion_use_the_child_reward_tier() {
+        use crate::consensus::development_allocation::{
+            development_share_each, miner_subsidy, TARGET_BLOCKS_PER_DAY,
+        };
+        use crate::consensus::emission::block_reward;
+
+        // 5,760 is simultaneously the first payout height and an exact
+        // 144-block transaction-epoch boundary. The system mint still anchors
+        // directly to the selected parent, while its current share uses the
+        // newly expanded child depth.
+        let mut state = ChainState::with_log_slots(24);
+        let mut parent = parent(&mut state);
+        parent.height = TARGET_BLOCKS_PER_DAY - 1;
+        let new_share = development_share_each(block_reward(25)).unwrap();
+        let expansion_threshold = (1u64 << 24) * 3 / 4;
+
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[expansion_threshold; 18],
+            vec![],
+            Address([9u8; 32]),
+            1,
+            [0xff; 32],
+        )
+        .unwrap();
+
+        assert_eq!(template.log_slots, 25);
+        assert_eq!(
+            template.coinbase.body.outputs[0].amount,
+            miner_subsidy(TARGET_BLOCKS_PER_DAY, 25)
+        );
+        let payout = template
+            .development_payout
+            .as_ref()
+            .expect("payout remains mandatory on an expansion block");
+        let expected_each = new_share * TARGET_BLOCKS_PER_DAY;
+        assert_eq!(payout.body.outputs[0].amount, expected_each);
+        assert_eq!(payout.body.outputs[1].amount, expected_each);
+        assert_eq!(payout.body.epoch_anchor, block_id(&parent));
+
+        let block = template.into_block(0);
+        assert_eq!(
+            crate::consensus::validation::validate_mandatory_coinbase(&block, &parent),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn payout_and_user_keep_distinct_anchors_at_epoch_boundary() {
+        use crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
+        use crate::consensus::validate_block_epoch_anchors;
+        use crate::fri_state::SlotValue;
+
+        assert!(TARGET_BLOCKS_PER_DAY.is_multiple_of(crate::consensus::params::TX_EPOCH_BLOCKS));
+        let owner = Address([4u8; 32]);
+        let mut state = ChainState::with_log_slots(8);
+        state
+            .state
+            .set_slot(
+                7,
+                SlotValue::with_owner_fields(1_000_000, 1, owner.as_fields()),
+            )
+            .unwrap();
+        state.active_slot_count = 1;
+        state.alloc_counter = 1;
+        let mut parent = parent(&mut state);
+        parent.height = TARGET_BLOCKS_PER_DAY - 1;
+
+        // Boundary block 5,760 still consumes the previous 144-block user
+        // anchor, while both system mints bind the immediate parent.
+        let user_epoch_anchor = [0x44u8; 32];
+        let mut candidate = user(7, 8, 1_000_000, owner, &parent);
+        candidate.body.epoch_anchor = user_epoch_anchor;
+        let template = build_block_template(
+            &parent,
+            &state,
+            &[1; 18],
+            vec![candidate],
+            Address([9u8; 32]),
+            2,
+            [0xff; 32],
+        )
+        .unwrap();
+        let block = template.into_block(0);
+        let parent_id = block_id(&parent);
+
+        assert_eq!(block.transactions.len(), 3);
+        assert_eq!(block.transactions[0].body.epoch_anchor, parent_id);
+        assert_eq!(block.transactions[1].body.epoch_anchor, parent_id);
+        assert_eq!(block.transactions[2].body.epoch_anchor, user_epoch_anchor);
+        assert_eq!(
+            validate_block_epoch_anchors(&block, user_epoch_anchor, parent_id),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn coinbase_segment_probe_escapes_a_full_current_zone() {
         use crate::consensus::allocator::generate_zone_segment_hints;
 
@@ -801,7 +1024,7 @@ mod tests {
         state.state.finish_evicted_exact_summaries();
         state.active_slot_count = 1u64 << 16;
 
-        let slot = select_coinbase_slot(&state, 7, &HashSet::new())
+        let slot = select_system_mint_slot(&state, 7, &HashSet::new())
             .expect("the other production-size segment is virtual zero");
         assert_ne!((slot >> 16) as u16, primary);
         assert_eq!(state.state.slot(slot), crate::fri_state::SlotValue::EMPTY);

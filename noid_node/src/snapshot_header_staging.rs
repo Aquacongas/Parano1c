@@ -1162,7 +1162,7 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        .into_block(136_504)
+        .into_block(1_288_230)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a

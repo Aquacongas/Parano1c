@@ -911,10 +911,12 @@ pub fn apply_tx(state: &mut ChainState, body: &TxBody) -> Result<StateTransition
     apply_tx_inner(state, body, None)
 }
 
-/// Apply a `TxBody` (coinbase or user) minted inside the block at
-/// `block_height`. The unique live coinbase output receives the tagged
-/// `creation_id = COINBASE_CREATION_TAG | block_height`; user outputs receive
-/// fresh monotone allocator ids exactly as [`apply_tx`].
+/// Apply a `TxBody` minted inside the block at `block_height`.
+///
+/// The primary coinbase output receives the tagged
+/// `creation_id = COINBASE_CREATION_TAG | block_height`; development-payout
+/// and user outputs receive fresh monotone allocator ids exactly as
+/// [`apply_tx`].
 pub fn apply_tx_at(
     state: &mut ChainState,
     body: &TxBody,
@@ -945,8 +947,9 @@ fn apply_tx_inner(
 /// acceptance API; callers must compute/bind the final root before publishing or
 /// accepting a header.
 ///
-/// `coinbase_mint_height` supplies the block height for the coinbase's tagged
-/// `creation_id`; it MUST be `Some` when `body.is_coinbase`.
+/// `coinbase_mint_height` supplies block context for system-mint bodies and the
+/// tagged primary-coinbase `creation_id`; it MUST be `Some` when
+/// `body.is_coinbase`.
 pub(crate) fn apply_tx_checked_deferred_root(
     state: &mut ChainState,
     body: &TxBody,
@@ -1026,15 +1029,15 @@ pub(crate) fn apply_tx_checked_deferred_root(
         if state.state.slot(output.slot_index) != SlotValue::EMPTY {
             return Err(ApplyError::OutputSlotNotEmpty);
         }
-        // Every mint (including coinbase) consumes one allocator increment,
-        // keeping `alloc_counter` = "number of mints ever" and the wallet
-        // slot-hint seed unchanged. The STORED id diverges only for coinbase:
-        // its unique live output is tagged with the mint height so spends can
-        // be gated on an accepted HistoryStep boundary.
+        // Every mint consumes one allocator increment, keeping
+        // `alloc_counter` = "number of mints ever" and the wallet slot-hint
+        // seed unchanged. The STORED id diverges only for the primary
+        // coinbase: its live output is tagged with the mint height so spends
+        // can be gated on an accepted HistoryStep boundary.
         alloc_cursor = alloc_cursor
             .checked_add(1)
             .ok_or(ApplyError::AllocCounterOverflow)?;
-        let creation_id = if body.is_coinbase {
+        let creation_id = if body.is_primary_coinbase_shape() {
             crate::consensus::params::coinbase_creation_id(
                 coinbase_mint_height.ok_or(ApplyError::CoinbaseMintHeightMissing)?,
             )
@@ -1204,6 +1207,58 @@ mod tests {
         apply_tx(&mut state, &spend(coinbase_creation_id(42))).unwrap();
         // The user mint after the coinbase continues the untagged namespace.
         assert_eq!(state.state.slot(6).creation_id(), 2);
+    }
+
+    #[test]
+    fn development_payout_uses_the_normal_allocator_namespace() {
+        use crate::consensus::params::is_coinbase_creation_id;
+
+        let mut state = ChainState::with_log_slots(8);
+        let mut miner_outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        miner_outputs[0] = TxOutput {
+            slot_index: 4,
+            amount: 45,
+            owner: Address([5u8; 32]),
+        };
+        let miner = TxBody {
+            epoch_anchor: [9u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: miner_outputs,
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        };
+        apply_tx_at(&mut state, &miner, 5_760).unwrap();
+
+        let payout = TxBody {
+            epoch_anchor: [9u8; 32],
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index: 5,
+                    amount: 10,
+                    owner: crate::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS,
+                },
+                TxOutput {
+                    slot_index: 6,
+                    amount: 10,
+                    owner: crate::consensus::development_allocation::O1_LAB_ADDRESS,
+                },
+            ],
+            validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
+            is_coinbase: true,
+        };
+        apply_tx_at(&mut state, &payout, 5_760).unwrap();
+
+        assert_eq!(state.state.slot(5).creation_id(), 2);
+        assert_eq!(state.state.slot(6).creation_id(), 3);
+        assert!(!is_coinbase_creation_id(state.state.slot(5).creation_id()));
+        assert!(!is_coinbase_creation_id(state.state.slot(6).creation_id()));
+        assert_eq!(state.alloc_counter, 3);
+        assert_eq!(state.active_slot_count, 3);
     }
 
     #[test]

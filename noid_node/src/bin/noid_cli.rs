@@ -188,7 +188,7 @@ enum Command {
         height: u64,
     },
 
-    /// Raw 276-byte block header hex (for developers).
+    /// Raw 212-byte block header hex (for developers).
     Header {
         /// Block height to query.
         height: u64,

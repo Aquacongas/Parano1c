@@ -439,8 +439,8 @@ fn history_step_terminal_metadata(bytes: &[u8]) -> Option<(u64, [u8; 32], usize)
     ))
 }
 
-fn history_step_class_slot(user_page_count: usize) -> Option<usize> {
-    match crate::consensus::paged_spend::BlockProofClass::for_page_count(user_page_count)? {
+fn history_step_class_slot(effective_page_count: usize) -> Option<usize> {
+    match crate::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)? {
         crate::consensus::paged_spend::BlockProofClass::B64 => Some(0),
         crate::consensus::paged_spend::BlockProofClass::B255 => Some(1),
     }
@@ -2055,7 +2055,7 @@ impl MdbxStore {
                     "accepted logical txids do not bind the committed block",
                 ));
             }
-            let user_page_count =
+            let effective_page_count =
                 block
                     .transactions
                     .len()
@@ -2063,7 +2063,7 @@ impl MdbxStore {
                     .ok_or(StoreError::Decode(
                         "accepted block is missing its coinbase record",
                     ))?;
-            let expected_class = history_step_class_slot(user_page_count).ok_or(
+            let expected_class = history_step_class_slot(effective_page_count).ok_or(
                 StoreError::Decode("accepted block page count has no canonical HistoryStep tier"),
             )?;
             if !history_step_terminal_matches_class(

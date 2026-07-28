@@ -1631,8 +1631,8 @@ impl MdbxChainContext {
             for (_, out) in tx.body.live_outputs() {
                 needed.push((out.slot_index >> eff_log) as u16);
             }
-            // Coinbase slot (splitmix64 assigned): include all recently-checked
-            // slots from the allocator hints by checking coinbase outputs too.
+            // System-mint slots are allocator-assigned: include their outputs
+            // alongside user actions when selecting segments to hydrate.
         }
         needed.sort_unstable();
         needed.dedup();

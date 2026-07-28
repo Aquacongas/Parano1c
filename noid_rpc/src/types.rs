@@ -402,6 +402,9 @@ pub struct BlockTransactionInfo {
     pub live_outputs: u16,
     pub fee_micronoid: u64,
     pub coinbase: bool,
+    /// Deterministic batched payout of the two development-reward shares.
+    #[serde(default)]
+    pub development_payout: bool,
     /// Shared anti-replay anchor carried by every physical page.
     pub epoch_anchor: String,
     /// One owner shared by every live input. Coinbase has no input owner.
@@ -441,11 +444,11 @@ pub struct BlockTransactionOutputInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetainedBlockInfo {
     pub proof_class: String,
-    /// Coinbase plus logical PagedSpend groups.
+    /// Coinbase, optional development payout, and logical PagedSpend groups.
     pub logical_transactions: u16,
     pub user_pages: u16,
     pub live_inputs: u16,
-    /// Includes the mandatory coinbase output.
+    /// Includes all system-mint outputs.
     pub live_outputs: u16,
     pub reward_micronoid: u64,
     pub reward_noid: f64,
@@ -479,6 +482,9 @@ pub struct RecentTransactionInfo {
     pub live_outputs: u16,
     pub fee_micronoid: u64,
     pub coinbase: bool,
+    /// Deterministic batched payout of the two development-reward shares.
+    #[serde(default)]
+    pub development_payout: bool,
     pub input_owner: Option<String>,
     /// Decimal u128 strings preserve exact aggregates in JSON.
     pub input_sum_micronoid: String,

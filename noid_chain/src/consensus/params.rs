@@ -26,11 +26,12 @@ pub const MEDIAN_TIME_BLOCKS: usize = 11;
 // Block limits
 // ---------------------------------------------------------------------------
 
-/// Maximum transactions decoded in one block, including coinbase.
+/// Maximum fixed bodies decoded in one block, including system records.
 ///
 /// This is a hard decoder/DoS cap. The consensus throughput budget is the
-/// semantic block budget below: 255 fixed-shape user transactions plus one
-/// mandatory coinbase.
+/// semantic block budget below: one mandatory coinbase plus 255 effective
+/// page positions. A scheduled development payout consumes one of those
+/// positions, leaving at most 254 physical user pages in that block.
 pub const BLOCK_MAX_TXS: usize = 256;
 
 /// Fixed input capacity of every transaction body.
@@ -51,7 +52,7 @@ pub const BLOCK_MAX_USER_OUTPUTS: usize = 510;
 /// Maximum bitmap-live user action capacity accepted by consensus.
 pub const BLOCK_MAX_USER_ACTIONS: usize = BLOCK_MAX_LIVE_INPUTS + BLOCK_MAX_USER_OUTPUTS;
 
-/// Maximum accepted live action count including the mandatory coinbase output.
+/// Maximum accepted live action count across system and user bodies.
 pub const BLOCK_MAX_ACTIONS: usize = BLOCK_MAX_USER_ACTIONS + 1;
 
 /// Maximum number of distinct dense state segments a block may make resident.
@@ -62,9 +63,10 @@ pub const BLOCK_MAX_DISTINCT_SEGMENTS: usize = 256;
 // HistoryStep classes
 // ---------------------------------------------------------------------------
 
-/// The two launch proof classes, indexed by physical PagedSpend pages.
-/// Coinbase-only through 64-page blocks use B64; 65 through 255 pages use
-/// B255. Logical groups/capsules never select the physical proof class.
+/// The two launch proof classes, indexed by effective page positions.
+/// Physical user pages count one each and a live development payout counts
+/// one; the primary coinbase is excluded. Counts through 64 use B64 and
+/// 65 through 255 use B255. Logical groups/capsules never select the class.
 pub const BLOCK_PAGE_CLASS_TIERS: [usize; 2] = [64, 255];
 
 /// Smallest tier in `tiers` holding `count`, or None past the top tier.
@@ -73,7 +75,7 @@ fn class_tier_for(tiers: &[usize], count: usize) -> Option<usize> {
     tiers.iter().copied().find(|&tier| tier >= count)
 }
 
-/// Proof class tier for a block's physical user-page count.
+/// Proof class tier for a block's effective page-position count.
 #[inline]
 pub fn block_page_class_tier(page_count: usize) -> Option<usize> {
     class_tier_for(&BLOCK_PAGE_CLASS_TIERS, page_count)
@@ -94,7 +96,7 @@ pub fn block_class_output_capacity(user_tier: usize) -> usize {
     (user_tier * MAX_OUTPUTS).min(BLOCK_MAX_USER_OUTPUTS)
 }
 
-/// Maximum exact-state touched surface, including the mandatory coinbase.
+/// Maximum exact-state touched surface across system and user bodies.
 #[inline]
 pub fn block_class_touched_capacity(user_tier: usize) -> usize {
     block_class_spend_capacity(user_tier) + block_class_output_capacity(user_tier) + 1

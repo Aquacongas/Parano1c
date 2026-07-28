@@ -16,12 +16,12 @@
 //!   transcript embeds `AcceptedBlockHeaderClaim::from_header(header)`);
 //! - the claim's parent-section block id is the header's `prev_block_hash`,
 //!   its parent state root / height are the start accumulator's;
-//! - the direct eleven-lane accumulator transition shares the header block-id,
+//! - the direct ten-lane accumulator transition shares the header block-id,
 //!   parent-tip, state/depth/counter and height wires; transaction epoch is
 //!   selected by a constrained `height mod 144` relation;
 //! - every tx-root Merkle path pins its root to the underlying universal
-//!   256-leaf Merkle root `M`, its leaf to coinbase or a complete PagedSpend
-//!   logical hash, its
+//!   256-leaf Merkle root `M`, its leaf to coinbase, the optional development
+//!   payout, or a complete PagedSpend logical hash, its
 //!   direction bits to the
 //!   CONSTANT bits of its tx position, and the last real path pins its
 //!   right-hand siblings to the canonical zero-subtree digests (the padding
@@ -36,8 +36,8 @@
 //!   header-bound dynamic depth.
 //! - page-selected amounts accumulate into one checked group conservation
 //!   equation; those same group counts drive minimum fee and deterministic
-//!   burn, and the mandatory coinbase is bounded by child-depth reward plus
-//!   the checked 72-bit claimable-fee aggregate.
+//!   burn, and the mandatory coinbase is bounded by the scheduled miner
+//!   subsidy plus the checked 72-bit claimable-fee aggregate.
 //!
 //! NOT bound here (audited residue, each correctly scoped to another
 //! layer, none a hole in what this file claims):
@@ -73,8 +73,10 @@ use super::trace::action_compaction::{
     bind_mint_packed_values_body_order, compact_action_rows, CompactedActionTrace,
 };
 use super::trace::action_surface::{
-    bind_coinbase_action_with_amount, bind_user_action_surface, ActionRowTrace, ActionSurfaceTrace,
+    bind_coinbase_action_with_amount, bind_development_payout_action, bind_user_action_surface,
+    ActionRowTrace, ActionSurfaceTrace,
 };
+use super::trace::development_allocation::bind_development_allocation;
 use super::trace::exact_state::{
     bind_actions_to_exact_state_leaves, bind_exact_state_header_roots_dynamic,
     build_exact_state_structural_region_slot, select_upper_paired_roots, ExactStateSlotWires,
@@ -259,6 +261,45 @@ const DIRECT_BLOCK_TAIL_ROWS: usize = 4_042;
 fn pin_eq2(b: &mut FieldR1csBuilder, a: &[LinExpr; 2], c: &[LinExpr; 2]) {
     pin_eq(b, &a[0], &c[0]);
     pin_eq(b, &a[1], &c[1]);
+}
+
+/// Boolean select over the characteristic-two field:
+/// `when_zero + selector * (when_one + when_zero)`.
+fn select_expr(
+    b: &mut FieldR1csBuilder,
+    selector: &LinExpr,
+    when_one: &LinExpr,
+    when_zero: &LinExpr,
+) -> LinExpr {
+    when_zero.add(&mul(b, selector, &when_one.add(when_zero)))
+}
+
+fn constant_spine_inputs_trace(native: &SpineInputs) -> SpineInputsTrace {
+    SpineInputsTrace {
+        leaves: std::array::from_fn(|leaf| {
+            std::array::from_fn(|lane| const_block(native.leaves[leaf][lane]))
+        }),
+    }
+}
+
+fn select_spine_inputs_trace(
+    b: &mut FieldR1csBuilder,
+    selector: &LinExpr,
+    when_one: &SpineInputsTrace,
+    when_zero: &SpineInputsTrace,
+) -> SpineInputsTrace {
+    SpineInputsTrace {
+        leaves: std::array::from_fn(|leaf| {
+            std::array::from_fn(|lane| {
+                select_expr(
+                    b,
+                    selector,
+                    &when_one.leaves[leaf][lane],
+                    &when_zero.leaves[leaf][lane],
+                )
+            })
+        }),
+    }
 }
 
 /// Pin `child == parent + 1` as u64 INTEGERS (not field/XOR): a
@@ -474,7 +515,6 @@ fn tx_root_region_capacity_handoff(
     real_hashes: &[[Block128; 2]],
     tx_hashes: &[[LinExpr; 2]],
     live_bits: &[LinExpr],
-    tx_delta: usize,
 ) -> TxRootRegionData {
     let root_native = tx_root_inputs[0].expected_root;
     let root_w = [
@@ -488,7 +528,6 @@ fn tx_root_region_capacity_handoff(
         root_w,
         tx_hashes,
         live_bits,
-        tx_delta,
     )
 }
 
@@ -502,7 +541,6 @@ fn tx_root_region_capacity_data_from_wires(
     root_w: [LinExpr; 2],
     tx_hashes: &[[LinExpr; 2]],
     live_bits: &[LinExpr],
-    tx_delta: usize,
 ) -> TxRootRegionData {
     assert!(
         !tx_root_inputs.is_empty(),
@@ -514,6 +552,11 @@ fn tx_root_region_capacity_data_from_wires(
     assert!(n_real >= 1 && n_real <= n_leaves);
     assert_eq!(depth, noid_chain::tx_tree::TX_TREE_DEPTH);
     assert!(tx_hashes.len() <= n_leaves);
+    assert_eq!(
+        tx_hashes.len(),
+        live_bits.len(),
+        "one logical tx-root liveness selector per hash wire"
+    );
     let root_native = tx_root_inputs[0].expected_root;
     let root_flat = [flat_of(root_native[0]), flat_of(root_native[1])];
     for lane in 0..2 {
@@ -533,18 +576,13 @@ fn tx_root_region_capacity_data_from_wires(
 
     let paths: Vec<TxRootPathRegion> = (0..n_leaves)
         .map(|j| {
-            // Leaf liveness: coinbase (when present) is leaf 0 and always
-            // live; user leaf u = j - tx_delta takes its authorization
-            // liveness bit; leaves past the capacity are dead constants.
-            let live: LinExpr = if tx_delta == 1 && j == 0 {
-                LinExpr::constant(F128::ONE)
+            // The caller has already compacted the optional system payout
+            // into the logical order. Every capacity position therefore has
+            // one exact liveness selector; leaves past that capacity are zero.
+            let live: LinExpr = if j < live_bits.len() {
+                live_bits[j].clone()
             } else {
-                let u = j - tx_delta;
-                if u < live_bits.len() {
-                    live_bits[u].clone()
-                } else {
-                    LinExpr::zero()
-                }
+                LinExpr::zero()
             };
             let entry_w: [LinExpr; 2] = if j < tx_hashes.len() {
                 std::array::from_fn(|lane| mul(b, &live, &tx_hashes[j][lane]))
@@ -698,59 +736,43 @@ fn spine_region_data_from_wires(
     SpineRegionData { instances }
 }
 
-/// Bind the Tx8x2 L0 domain anchor for every real body and fix every padded
-/// body to the complete canonical ghost statement.
+/// Bind the Tx8x2 L0 domain anchor for the coinbase, selected payout view and
+/// fixed user-capacity views. Dead user views are complete protocol ghosts.
 fn bind_tx_epoch_anchors(
     b: &mut FieldR1csBuilder,
     parent_block_id: &[LinExpr; 2],
     user_anchor: &[LinExpr; 2],
-    spine_inputs: &[SpineInputsTrace],
-    n_real_txs: usize,
-    tx_delta: usize,
-    capacity_live_bits: Option<&[LinExpr]>,
+    coinbase: &SpineInputsTrace,
+    payout: &SpineInputsTrace,
+    user_spines: &[SpineInputsTrace],
+    payout_live: &LinExpr,
+    user_live_bits: &[LinExpr],
 ) {
-    assert!(tx_delta <= 1);
-    assert!(n_real_txs <= spine_inputs.len());
-    assert!(tx_delta <= n_real_txs);
+    assert_eq!(user_spines.len(), user_live_bits.len());
     const L0: usize = noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR;
 
-    if tx_delta == 1 {
-        for lane in 0..2 {
-            pin_eq(b, &spine_inputs[0].leaves[L0][lane], &parent_block_id[lane]);
-        }
+    for lane in 0..2 {
+        pin_eq(b, &coinbase.leaves[L0][lane], &parent_block_id[lane]);
+        let difference = payout.leaves[L0][lane].add(&parent_block_id[lane]);
+        let gated = mul(b, payout_live, &difference);
+        pin_zero(b, &gated);
     }
-    match capacity_live_bits {
-        None => {
-            assert_eq!(n_real_txs, spine_inputs.len());
-            for spine in &spine_inputs[tx_delta..] {
-                for lane in 0..2 {
-                    pin_eq(b, &spine.leaves[L0][lane], &user_anchor[lane]);
-                }
-            }
+
+    let ghost =
+        noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+    for (spine, live) in user_spines.iter().zip(user_live_bits) {
+        for lane in 0..2 {
+            let epoch_diff = spine.leaves[L0][lane].add(&user_anchor[lane]);
+            let gated = mul(b, live, &epoch_diff);
+            pin_zero(b, &gated);
         }
-        Some(live_bits) => {
-            assert_eq!(spine_inputs.len(), tx_delta + live_bits.len());
-            let ghost = noid_gkr::spine_statement::spine_inputs_from_body(
-                &noid_gkr::ghost_tx::ghost_tx_body(),
-            );
-            // Every capacity slot gets the exact same rows. `live` selects a
-            // real user epoch anchor; `1+live` selects the complete canonical
-            // ghost body. No branch depends on the block's real tx count.
-            for (spine, live) in spine_inputs[tx_delta..].iter().zip(live_bits) {
-                for lane in 0..2 {
-                    let epoch_diff = spine.leaves[L0][lane].add(&user_anchor[lane]);
-                    let gated = mul(b, live, &epoch_diff);
-                    pin_zero(b, &gated);
-                }
-                let dead = live.add_const(F128::ONE);
-                for leaf in 0..noid_tx::body_hash::BODY_HASH_LEAVES {
-                    for lane in 0..2 {
-                        let ghost_diff =
-                            spine.leaves[leaf][lane].add(&const_block(ghost.leaves[leaf][lane]));
-                        let gated = mul(b, &dead, &ghost_diff);
-                        pin_zero(b, &gated);
-                    }
-                }
+        let dead = live.add_const(F128::ONE);
+        for leaf in 0..noid_tx::body_hash::BODY_HASH_LEAVES {
+            for lane in 0..2 {
+                let ghost_diff =
+                    spine.leaves[leaf][lane].add(&const_block(ghost.leaves[leaf][lane]));
+                let gated = mul(b, &dead, &ghost_diff);
+                pin_zero(b, &gated);
             }
         }
     }
@@ -1313,9 +1335,10 @@ fn build_selected_zk_block_slots_core(
         components.tx_body_inputs.len(),
         components.tx_body_hashes.len()
     );
-    let n_real_pages = components.tx_body_inputs.len().saturating_sub(1);
+    let n_real_pages = components.user_page_count;
+    let effective_page_count = components.effective_page_count();
     assert_eq!(
-        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(n_real_pages)
+        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)
             .map(|class| class.page_capacity()),
         Some(tier),
         "selected Block capacity must match its physical page class"
@@ -1356,17 +1379,22 @@ fn build_selected_zk_block_slots_core(
     // untouched — and the handoff carries them into the plural discharge.
     // The inline killshot proof is not consumed in-trace (nodes still verify
     // it natively; π proves the statement directly).
-    // Tier capacity: the block carries capacity-many tx slots — the real
-    // transactions followed by canonical GHOST-body slots (the protocol
-    // ghost tx), so `tx_hashes`/`spine_inputs` are capacity-length and every
-    // per-tx-slot structure below is class-fixed. `delta` = non-user txs
-    // (the coinbase when present) — a class constant within a tier.
+    // Tier capacity: one coinbase plus exactly `tier` body-suffix slots. The
+    // real block-order bodies are followed by canonical protocol ghosts. On a
+    // payout height suffix slot zero is the payout and at most `tier - 1`
+    // physical user pages follow; otherwise all `tier` suffix slots are
+    // available to users. The relation selects one fixed user view below.
     let n_real_txs = components.tx_body_inputs.len();
     let tx_delta = 1;
     let cap_txs = tier + tx_delta;
     assert!(
         !components.tx_body_inputs.is_empty(),
         "selected Block carries a body"
+    );
+    assert_eq!(
+        n_real_txs,
+        n_real_pages + tx_delta + usize::from(components.has_development_payout),
+        "body components contain coinbase, optional payout, and user pages"
     );
     let mut spine_natives: Vec<SpineInputs> = components.tx_body_inputs.clone();
     let mut hash_natives: Vec<[Block128; 2]> = components.tx_body_hashes.clone();
@@ -1416,28 +1444,14 @@ fn build_selected_zk_block_slots_core(
     }
     let body_user_slots = tier;
 
-    // Coinbase L0 = parent tip. In a capacity class every user slot gets the
-    // same live/ghost gated relation; the non-capacity path pins all real L0s
-    // directly.
-    bind_tx_epoch_anchors(
-        b,
-        parent_block_id,
-        &end_acc.epoch_anchor_id,
-        &spine_inputs,
-        n_real_txs,
-        tx_delta,
-        Some(&page_live_bits),
-    );
-
     // Canonical body-order action candidates. Coinbase has exactly one live
-    // mint; each user tier slot contributes its eight input and two output
-    // bitmap positions. The extra B255 authorization PAD has no body/action
-    // slot and is excluded below by the tx-hash/spine bound.
+    // mint, the selected payout view contributes two schedule-gated mints,
+    // and each fixed user view contributes its eight input and two output
+    // bitmap positions. The extra B255 authorization PAD has no action slot.
     let user_action_slots = tier.saturating_mul(noid_tx::TX_ACTIONS);
-    let mut action_candidates = Vec::with_capacity(user_action_slots + tx_delta);
+    let mut action_candidates = Vec::with_capacity(user_action_slots + 3);
     let mut selected_input_bits = Vec::with_capacity(tier.saturating_mul(noid_tx::TX_INPUTS));
-    let mut selected_output_bits =
-        Vec::with_capacity(tier.saturating_mul(noid_tx::TX_OUTPUTS) + tx_delta);
+    let mut selected_output_bits = Vec::with_capacity(tier.saturating_mul(noid_tx::TX_OUTPUTS) + 3);
     let coinbase = bind_coinbase_action_with_amount(b, &spine_inputs[0]);
     for lane in 0..2 {
         pin_eq(
@@ -1480,6 +1494,84 @@ fn build_selected_zk_block_slots_core(
         &header.fields[hf::LOG_SLOTS],
     );
 
+    let allocation = bind_development_allocation(
+        b,
+        &header.fields[hf::HEIGHT],
+        &exact_state_depth.child,
+        &spine_inputs[1].leaves[noid_tx::body_hash::TX8X2_LEAF_OUTPUT0_DATA][1],
+    );
+    let ghost_spine_native =
+        noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+    let ghost_spine = constant_spine_inputs_trace(&ghost_spine_native);
+    let payout_spine =
+        select_spine_inputs_trace(b, &allocation.payout_due, &spine_inputs[1], &ghost_spine);
+    let payout = bind_development_payout_action(b, &payout_spine, &allocation.payout_due);
+    pin_eq(b, &payout.amount_each, &allocation.payout_each);
+    for action in payout.actions {
+        selected_output_bits.push(action.live.clone());
+        action_candidates.push(action);
+    }
+
+    // Select one class-fixed user view from the shared suffix. On payout
+    // heights user i is raw suffix i+1; otherwise it is raw suffix i. The
+    // final payout-height user position selects the protocol ghost, preserving
+    // the original B255 Meta geometry instead of allocating a 257th spine.
+    let user_spine_inputs = (0..tier)
+        .map(|index| {
+            let payout_position = spine_inputs.get(index + 2).unwrap_or(&ghost_spine);
+            select_spine_inputs_trace(
+                b,
+                &allocation.payout_due,
+                payout_position,
+                &spine_inputs[index + 1],
+            )
+        })
+        .collect::<Vec<_>>();
+    let ghost_hash_native = noid_gkr::ghost_tx::ghost_tx_body_hash();
+    let ghost_hash = [
+        const_block(ghost_hash_native[0]),
+        const_block(ghost_hash_native[1]),
+    ];
+    let user_tx_hashes = (0..tier)
+        .map(|index| {
+            let payout_position = tx_hashes.get(index + 2).unwrap_or(&ghost_hash);
+            std::array::from_fn(|lane| {
+                select_expr(
+                    b,
+                    &allocation.payout_due,
+                    &payout_position[lane],
+                    &tx_hashes[index + 1][lane],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Coinbase and a live payout anchor to the direct parent. Every selected
+    // user view anchors to the epoch selected by the accumulator; dead views
+    // are complete canonical ghosts.
+    bind_tx_epoch_anchors(
+        b,
+        parent_block_id,
+        &end_acc.epoch_anchor_id,
+        &spine_inputs[0],
+        &payout_spine,
+        &user_spine_inputs,
+        &allocation.payout_due,
+        &page_live_bits,
+    );
+
+    // A payout consumes one position in the effective proof class. This
+    // circuit constraint is the proof-side twin of template/resource
+    // selection and prevents a due block from hiding a tier-sized user suffix.
+    let payout_over_capacity = mul(
+        b,
+        &allocation.payout_due,
+        page_live_bits
+            .last()
+            .expect("canonical block tiers are non-empty"),
+    );
+    pin_zero(b, &payout_over_capacity);
+
     crate::acceptance::row_ledger_mark(b, &mut ledger, "slots: exact-state");
     // ---- Physical page arithmetic followed by the fixed PagedSpend scan.
     // Pages keep the existing action/exact-state surface; only complete END
@@ -1489,7 +1581,10 @@ fn build_selected_zk_block_slots_core(
     assert_eq!(body_user_slots, geometry.tier);
     let n_auth_slots = geometry.auth_tiles;
     assert_eq!(n_auth_slots, geometry.auth_tiles);
-    assert_eq!(tx_delta, 1, "selected body aliases begin after coinbase");
+    assert_eq!(
+        tx_delta, 1,
+        "selected raw body suffix begins after coinbase"
+    );
     assert_eq!(
         spine_inputs.len(),
         body_user_slots + tx_delta,
@@ -1499,10 +1594,9 @@ fn build_selected_zk_block_slots_core(
     let mut page_surfaces = Vec::with_capacity(body_user_slots);
     let mut user_public_arithmetic = Vec::with_capacity(body_user_slots);
     for index in 0..body_user_slots {
-        let body_index = index + tx_delta;
         let (surface, arithmetic) = append_page_action_surface(
             b,
-            &spine_inputs[body_index],
+            &user_spine_inputs[index],
             &page_live_bits[index],
             &mut action_candidates,
             &mut selected_input_bits,
@@ -1513,8 +1607,8 @@ fn build_selected_zk_block_slots_core(
     }
     let paged_spend = bind_paged_spend_stream(
         b,
-        &spine_inputs[tx_delta..],
-        &tx_hashes[tx_delta..],
+        &user_spine_inputs,
+        &user_tx_hashes,
         &page_live_bits,
         &page_surfaces,
         &user_public_arithmetic,
@@ -1530,13 +1624,27 @@ fn build_selected_zk_block_slots_core(
         .iter()
         .map(|group| group.live.clone())
         .collect::<Vec<_>>();
-    let tx_count = alloc_block(
+    let user_plus_coinbase_count = alloc_block(
         b,
         Block128::from((components.authorization_inputs.len() + 1) as u128),
     );
-    pin_u64_successor(b, &paged_spend.logical_count, &tx_count);
+    pin_u64_successor(b, &paged_spend.logical_count, &user_plus_coinbase_count);
+    let expected_tx_count =
+        integer_add_no_overflow(b, &user_plus_coinbase_count, &allocation.payout_due, 64);
+    let tx_count = alloc_block(
+        b,
+        Block128::from(
+            (components.authorization_inputs.len()
+                + 1
+                + usize::from(components.has_development_payout)) as u128,
+        ),
+    );
+    pin_eq(b, &tx_count, &expected_tx_count);
 
-    // Coinbase plus compacted logical txids form the universal tx tree.
+    // Coinbase, the optional system payout, and compacted logical user txids
+    // form the universal tx tree. The fixed circuit positions below mux the
+    // payout into index one on due heights and shift user groups by one; on
+    // ordinary heights users begin directly at index one.
     assert!(
         !components.tx_root_inputs.is_empty(),
         "selected Block carries the canonical logical transaction root"
@@ -1544,25 +1652,56 @@ fn build_selected_zk_block_slots_core(
     let logical_hash_natives = std::iter::once(components.tx_body_hashes[0])
         .chain(
             components
+                .has_development_payout
+                .then(|| components.tx_body_hashes[1]),
+        )
+        .chain(
+            components
                 .authorization_inputs
                 .iter()
                 .map(|input| input.tx_body_hash),
         )
         .collect::<Vec<_>>();
-    let mut logical_hash_wires = Vec::with_capacity(tier + tx_delta);
-    logical_hash_wires.push(tx_hashes[0].clone());
-    logical_hash_wires.extend(
-        paged_spend.groups[..tier]
-            .iter()
-            .map(|group| group.logical_txid.clone()),
+    assert_eq!(
+        logical_hash_natives.len(),
+        components.tx_root_inputs.len(),
+        "one native tx-root path per logical transaction"
     );
+    let mut logical_hash_wires = Vec::with_capacity(tier + 1);
+    let mut logical_live_bits = Vec::with_capacity(tier + 1);
+    logical_hash_wires.push(tx_hashes[0].clone());
+    logical_live_bits.push(LinExpr::constant(F128::ONE));
+    for logical_suffix_index in 0..tier {
+        let (due_hash, due_live) = if logical_suffix_index == 0 {
+            (tx_hashes[1].clone(), LinExpr::constant(F128::ONE))
+        } else {
+            let group = &paged_spend.groups[logical_suffix_index - 1];
+            (group.logical_txid.clone(), group.live.clone())
+        };
+        let ordinary_group = &paged_spend.groups[logical_suffix_index];
+        let ordinary_hash = ordinary_group.logical_txid.clone();
+        let ordinary_live = ordinary_group.live.clone();
+        logical_hash_wires.push(std::array::from_fn(|lane| {
+            select_expr(
+                b,
+                &allocation.payout_due,
+                &due_hash[lane],
+                &ordinary_hash[lane],
+            )
+        }));
+        logical_live_bits.push(select_expr(
+            b,
+            &allocation.payout_due,
+            &due_live,
+            &ordinary_live,
+        ));
+    }
     let tx_root_region_data = Some(tx_root_region_capacity_handoff(
         b,
         &components.tx_root_inputs,
         &logical_hash_natives,
         &logical_hash_wires,
-        &authorization_live_bits[..tier],
-        tx_delta,
+        &logical_live_bits,
     ));
     let merkle_root = tx_root_region_data
         .as_ref()
@@ -1590,6 +1729,7 @@ fn build_selected_zk_block_slots_core(
         &start_acc.active_slot_count,
         &exact_state_depth.parent,
         &exact_state_depth.child,
+        &allocation.miner_subsidy,
         &coinbase_amount,
         &coinbase_amount_bits,
     );
@@ -1638,7 +1778,7 @@ fn build_selected_zk_block_slots_core(
     assert_eq!(
         action_candidates.len(),
         class.action_candidate_capacity(),
-        "one coinbase action plus ten candidates per tier user slot"
+        "three fixed system candidates plus ten per tier user slot"
     );
     let count_bits = range_check_bits(b, &live_input_sum, 12);
     let cap_plus_one = const_block(Block128::from((class.spend_capacity() + 1) as u128));
@@ -1912,6 +2052,83 @@ mod tx_epoch_anchor_tests {
     }
 
     const TEST_PARENT_BLOCK_ID: [u8; 32] = [0x66; 32];
+    const MARKER_LEAF: usize = noid_tx::body_hash::TX8X2_LEAF_FEE;
+
+    fn selected_suffix_case(
+        payout_due: bool,
+    ) -> (noid_ivc_core::field_r1cs::FieldR1cs, Vec<F128>, [F128; 3]) {
+        let mut coinbase = SpineInputs {
+            leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
+        };
+        coinbase.leaves[MARKER_LEAF][0] = Block128::from(1u128);
+        let mut first = coinbase.clone();
+        let mut second = coinbase.clone();
+        if payout_due {
+            first.leaves[MARKER_LEAF][0] = Block128::from(21u128);
+            second.leaves[MARKER_LEAF][0] = Block128::from(11u128);
+        } else {
+            first.leaves[MARKER_LEAF][0] = Block128::from(11u128);
+            second.leaves[MARKER_LEAF][0] = Block128::from(12u128);
+        }
+
+        let mut builder = FieldR1csBuilder::new();
+        let raw = [coinbase, first, second]
+            .iter()
+            .map(|body| SpineInputsTrace::alloc(&mut builder, body))
+            .collect::<Vec<_>>();
+        let selector = alloc_block(&mut builder, Block128::from(u128::from(payout_due)));
+        let selector_square = mul(&mut builder, &selector, &selector);
+        pin_eq(&mut builder, &selector_square, &selector);
+        let ghost_native =
+            noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+        let ghost = constant_spine_inputs_trace(&ghost_native);
+        let payout = select_spine_inputs_trace(&mut builder, &selector, &raw[1], &ghost);
+        let users = (0..2)
+            .map(|index| {
+                let when_due = raw.get(index + 2).unwrap_or(&ghost);
+                select_spine_inputs_trace(&mut builder, &selector, when_due, &raw[index + 1])
+            })
+            .collect::<Vec<_>>();
+        let markers = [
+            payout.leaves[MARKER_LEAF][0].eval(builder.values()),
+            users[0].leaves[MARKER_LEAF][0].eval(builder.values()),
+            users[1].leaves[MARKER_LEAF][0].eval(builder.values()),
+        ];
+        let (matrix, witness) = builder.build();
+        (matrix, witness, markers)
+    }
+
+    #[test]
+    fn payout_multiplexes_one_existing_suffix_position_without_shape_growth() {
+        let (ordinary, ordinary_witness, ordinary_markers) = selected_suffix_case(false);
+        let (payout, payout_witness, payout_markers) = selected_suffix_case(true);
+        assert!(ordinary.satisfies(&ordinary_witness));
+        assert!(payout.satisfies(&payout_witness));
+        assert_eq!(
+            ordinary.structural_statement_digest(),
+            payout.structural_statement_digest()
+        );
+        assert_eq!(ordinary.useful_rows, payout.useful_rows);
+
+        let ghost =
+            noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+        assert_eq!(
+            ordinary_markers,
+            [
+                flat_of(ghost.leaves[MARKER_LEAF][0]),
+                flat_of(Block128::from(11u128)),
+                flat_of(Block128::from(12u128)),
+            ]
+        );
+        assert_eq!(
+            payout_markers,
+            [
+                flat_of(Block128::from(21u128)),
+                flat_of(Block128::from(11u128)),
+                flat_of(ghost.leaves[MARKER_LEAF][0]),
+            ]
+        );
+    }
 
     fn bodies(start: &ChainAccumulator) -> Vec<SpineInputs> {
         let mut coinbase = SpineInputs {
@@ -1950,14 +2167,18 @@ mod tx_epoch_anchor_tests {
             pin_eq(&mut b, &square, live);
         }
         let parent_id = digest_lanes(&TEST_PARENT_BLOCK_ID).map(|lane| alloc_block(&mut b, lane));
+        let ghost =
+            noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+        let payout = constant_spine_inputs_trace(&ghost);
         bind_tx_epoch_anchors(
             &mut b,
             &parent_id,
             &start.epoch_anchor_id,
-            &traces,
-            1 + real_users,
-            1,
-            Some(&live_bits),
+            &traces[0],
+            &payout,
+            &traces[1..],
+            &LinExpr::zero(),
+            &live_bits,
         );
         b.build()
     }
@@ -2010,6 +2231,53 @@ mod tx_epoch_anchor_tests {
         assert_eq!(one_r1cs.useful_rows, two_r1cs.useful_rows);
     }
 
+    fn scheduled_system_anchor_satisfies(payout_anchor: [u8; 32]) -> bool {
+        let start = start_accumulator();
+        let mut coinbase = SpineInputs {
+            leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
+        };
+        coinbase.leaves[noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] =
+            digest_lanes(&TEST_PARENT_BLOCK_ID);
+        let mut payout = SpineInputs {
+            leaves: [[Block128::ZERO; 2]; noid_tx::body_hash::BODY_HASH_LEAVES],
+        };
+        payout.leaves[noid_tx::body_hash::TX8X2_LEAF_EPOCH_ANCHOR] = digest_lanes(&payout_anchor);
+        let ghost =
+            noid_gkr::spine_statement::spine_inputs_from_body(&noid_gkr::ghost_tx::ghost_tx_body());
+
+        let mut b = FieldR1csBuilder::new();
+        let start_w = AccumulatorWires::alloc(&mut b, &start);
+        let traces = [coinbase, payout, ghost]
+            .iter()
+            .map(|body| SpineInputsTrace::alloc(&mut b, body))
+            .collect::<Vec<_>>();
+        let system_live = alloc_block(&mut b, Block128::ONE);
+        let system_live_sq = mul(&mut b, &system_live, &system_live);
+        pin_eq(&mut b, &system_live_sq, &system_live);
+        let user_live = alloc_block(&mut b, Block128::ZERO);
+        let parent_id = digest_lanes(&TEST_PARENT_BLOCK_ID).map(|lane| alloc_block(&mut b, lane));
+        bind_tx_epoch_anchors(
+            &mut b,
+            &parent_id,
+            &start_w.epoch_anchor_id,
+            &traces[0],
+            &traces[1],
+            &traces[2..],
+            &system_live,
+            &[user_live],
+        );
+        let (r1cs, witness) = b.build();
+        r1cs.satisfies(&witness)
+    }
+
+    #[test]
+    fn scheduled_system_payout_anchors_to_the_direct_parent() {
+        assert!(scheduled_system_anchor_satisfies(TEST_PARENT_BLOCK_ID));
+        let mut wrong = TEST_PARENT_BLOCK_ID;
+        wrong[0] ^= 1;
+        assert!(!scheduled_system_anchor_satisfies(wrong));
+    }
+
     #[test]
     fn b255_body_liveness_excludes_the_256th_authorization_pad() {
         let start = start_accumulator();
@@ -2038,14 +2306,16 @@ mod tx_epoch_anchor_tests {
         }
         pin_zero(&mut b, &live_bits[255]);
         let parent_id = digest_lanes(&TEST_PARENT_BLOCK_ID).map(|lane| alloc_block(&mut b, lane));
+        let payout = constant_spine_inputs_trace(&ghost);
         bind_tx_epoch_anchors(
             &mut b,
             &parent_id,
             &start_w.epoch_anchor_id,
-            &traces,
-            2,
-            1,
-            Some(&live_bits[..255]),
+            &traces[0],
+            &payout,
+            &traces[1..],
+            &LinExpr::zero(),
+            &live_bits[..255],
         );
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));

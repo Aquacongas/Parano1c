@@ -26,8 +26,7 @@ use noid_chain::consensus::receipt::generate_receipt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreationIdDerivationError {
-    MultipleCoinbase,
-    CoinbaseNotFirst,
+    InvalidSystemLayout,
     MintCountOverflow,
     HeaderCounterUnderflow { alloc_counter: u64, live_mints: u64 },
     CounterOverflow,
@@ -37,8 +36,7 @@ enum CreationIdDerivationError {
 impl std::fmt::Display for CreationIdDerivationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::MultipleCoinbase => write!(f, "multiple coinbase transactions"),
-            Self::CoinbaseNotFirst => write!(f, "coinbase transaction is not first"),
+            Self::InvalidSystemLayout => write!(f, "invalid system transaction layout"),
             Self::MintCountOverflow => write!(f, "live output count exceeds u64"),
             Self::HeaderCounterUnderflow {
                 alloc_counter,
@@ -58,8 +56,9 @@ impl std::fmt::Display for CreationIdDerivationError {
 
 /// Reconstruct each output's consensus creation id from the post-block
 /// allocator counter. IDs follow `block.transactions` and output order exactly.
-/// The helper independently rejects a late or duplicate coinbase so malformed
-/// data cannot acquire a wallet-only interpretation different from consensus.
+/// The helper independently validates the primary coinbase and optional
+/// development-payout positions so malformed data cannot acquire a
+/// wallet-only interpretation different from consensus.
 ///
 /// `TxOutput` intentionally carries no caller-chosen creation id. The wallet
 /// therefore derives the parent counter as `header.alloc_counter - live_mints`
@@ -69,19 +68,8 @@ impl std::fmt::Display for CreationIdDerivationError {
 fn derive_output_creation_ids(
     block: &Block,
 ) -> Result<Vec<Vec<Option<u64>>>, CreationIdDerivationError> {
-    let mut seen_coinbase = false;
-    for (tx_index, tx) in block.transactions.iter().enumerate() {
-        if !tx.body.is_coinbase {
-            continue;
-        }
-        if seen_coinbase {
-            return Err(CreationIdDerivationError::MultipleCoinbase);
-        }
-        if tx_index != 0 {
-            return Err(CreationIdDerivationError::CoinbaseNotFirst);
-        }
-        seen_coinbase = true;
-    }
+    noid_chain::validate_block_page_stream(&block.transactions)
+        .map_err(|_| CreationIdDerivationError::InvalidSystemLayout)?;
 
     let live_mints = block
         .transactions
@@ -113,7 +101,7 @@ fn derive_output_creation_ids(
             counter = counter
                 .checked_add(1)
                 .ok_or(CreationIdDerivationError::CounterOverflow)?;
-            ids[tx_index][output_index] = Some(if tx.body.is_coinbase {
+            ids[tx_index][output_index] = Some(if tx.body.is_primary_coinbase_shape() {
                 noid_chain::consensus::params::coinbase_creation_id(block.header.height)
             } else {
                 counter
@@ -159,10 +147,13 @@ pub fn update_wallet_artifacts_from_block(
         .map(|entry| entry.tx_hash)
         .collect();
 
-    let coinbase = &block.transactions[0];
-    let coinbase_hash = block_tx_hashes[0];
-    if !existing_confirmed.contains(&coinbase_hash) {
-        let received = coinbase
+    for system_index in 0..stream.user_start_index {
+        let system = &block.transactions[system_index];
+        let system_hash = block_tx_hashes[system_index];
+        if existing_confirmed.contains(&system_hash) {
+            continue;
+        }
+        let received = system
             .body
             .live_outputs()
             .map(|(_, output)| output)
@@ -171,10 +162,10 @@ pub fn update_wallet_artifacts_from_block(
             .fold(0u64, u64::saturating_add);
         if received > 0 {
             history.push(TxHistoryEntry {
-                tx_hash: coinbase_hash,
+                tx_hash: system_hash,
                 height: block.header.height,
                 direction: TxDirection::Received,
-                is_coinbase: true,
+                is_coinbase: system_index == 0,
                 amount_micronoid: received,
                 peer_address: None,
                 timestamp: block.header.timestamp,
@@ -185,10 +176,10 @@ pub fn update_wallet_artifacts_from_block(
     }
 
     for (group_index, group) in stream.groups.iter().enumerate() {
-        let tx_index = group_index + 1;
+        let tx_index = stream.user_logical_index(group_index);
         let tx_hash = group.spend.logical_txid.0;
-        let start = 1 + usize::from(group.start_page);
-        let end = 1 + group.end_page_exclusive();
+        let start = stream.user_body_start(usize::from(group.start_page));
+        let end = stream.user_body_start(group.end_page_exclusive());
         let pages = &block.transactions[start..end];
         let pending_send = pending_hashes.contains(&tx_hash);
         let has_distinct_recipient = pages
@@ -280,49 +271,52 @@ pub fn update_active_wallet_from_block(
         .map(|e| e.tx_hash)
         .collect();
 
-    // Coinbase is the sole non-PagedSpend leaf and remains at logical index 0.
-    let coinbase = &block.transactions[0];
-    let coinbase_hash = block_tx_hashes[0];
-    for (output_index, output) in coinbase.body.outputs.iter().enumerate() {
-        if !coinbase.body.output_is_live(output_index) {
-            continue;
-        }
-        let Some(creation_id) = output_creation_ids[0][output_index] else {
-            return Err(format!(
-                "wallet block h={height} is missing creation id for live coinbase output 0:{output_index}"
-            ));
-        };
-        if output.owner == active_address {
-            utxos.insert(
-                output.slot_index,
-                WalletUtxo {
-                    slot_index: output.slot_index,
-                    value: output.amount,
-                    creation_id,
-                    address: output.owner,
-                    key_index: active_index,
-                    confirmed_height: height,
-                },
-            );
-            history.push(TxHistoryEntry {
-                tx_hash: coinbase_hash,
-                height,
-                direction: TxDirection::Received,
-                is_coinbase: true,
-                amount_micronoid: output.amount,
-                peer_address: None,
-                timestamp,
-                own_address: Some(output.owner.to_bech32()),
-                own_key_index: Some(active_index),
-            });
+    // Primary coinbase and the optional development payout occupy the
+    // logical prefix in the same order as their physical bodies.
+    for system_index in 0..stream.user_start_index {
+        let system = &block.transactions[system_index];
+        let system_hash = block_tx_hashes[system_index];
+        for (output_index, output) in system.body.outputs.iter().enumerate() {
+            if !system.body.output_is_live(output_index) {
+                continue;
+            }
+            let Some(creation_id) = output_creation_ids[system_index][output_index] else {
+                return Err(format!(
+                    "wallet block h={height} is missing creation id for live system output {system_index}:{output_index}"
+                ));
+            };
+            if output.owner == active_address {
+                utxos.insert(
+                    output.slot_index,
+                    WalletUtxo {
+                        slot_index: output.slot_index,
+                        value: output.amount,
+                        creation_id,
+                        address: output.owner,
+                        key_index: active_index,
+                        confirmed_height: height,
+                    },
+                );
+                history.push(TxHistoryEntry {
+                    tx_hash: system_hash,
+                    height,
+                    direction: TxDirection::Received,
+                    is_coinbase: system_index == 0,
+                    amount_micronoid: output.amount,
+                    peer_address: None,
+                    timestamp,
+                    own_address: Some(output.owner.to_bech32()),
+                    own_key_index: Some(active_index),
+                });
+            }
         }
     }
 
     for (group_index, group) in stream.groups.iter().enumerate() {
-        let logical_index = group_index + 1;
+        let logical_index = stream.user_logical_index(group_index);
         let tx_hash = group.spend.logical_txid.0;
-        let start = 1 + usize::from(group.start_page);
-        let end = 1 + group.end_page_exclusive();
+        let start = stream.user_body_start(usize::from(group.start_page));
+        let end = stream.user_body_start(group.end_page_exclusive());
         let pages = &block.transactions[start..end];
         let has_distinct_recipient = pages
             .iter()
@@ -475,6 +469,29 @@ mod tests {
         })
     }
 
+    fn development_payout(slot_index: u32) -> Transaction {
+        Transaction::new(TxBody {
+            epoch_anchor: [0; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index,
+                    amount: 500,
+                    owner: noid_chain::consensus::O1_NETWORK_FUND_ADDRESS,
+                },
+                TxOutput {
+                    slot_index: slot_index + 1,
+                    amount: 500,
+                    owner: noid_chain::consensus::O1_LAB_ADDRESS,
+                },
+            ],
+            validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
+            is_coinbase: true,
+        })
+    }
+
     fn block(transactions: Vec<Transaction>, alloc_counter: u64) -> Block {
         let tx_root = noid_chain::try_compute_tx_root(&transactions).unwrap_or([0; 32]);
         Block {
@@ -542,6 +559,49 @@ mod tests {
     }
 
     #[test]
+    fn incremental_scan_assigns_normal_ids_to_development_payout_outputs() {
+        let owner = noid_chain::consensus::O1_NETWORK_FUND_ADDRESS;
+        let block = block(
+            vec![
+                transaction(true, 10, owner),
+                development_payout(30),
+                transaction(false, 20, owner),
+            ],
+            104,
+        );
+        let ids = derive_output_creation_ids(&block).unwrap();
+        assert_eq!(
+            ids[0][0],
+            Some(noid_chain::consensus::params::coinbase_creation_id(7))
+        );
+        assert_eq!(ids[1][0], Some(102));
+        assert_eq!(ids[1][1], Some(103));
+        assert_eq!(ids[2][0], Some(104));
+
+        let mut utxos = HashMap::new();
+        let mut history = vec![];
+        let mut receipts = HashMap::new();
+        let mut pending_inputs = std::collections::HashSet::new();
+        update_active_wallet_from_block(
+            &mut utxos,
+            &mut history,
+            &mut receipts,
+            owner,
+            3,
+            &mut pending_inputs,
+            &block,
+        )
+        .unwrap();
+
+        assert_eq!(utxos[&30].creation_id, 102);
+        assert_eq!(utxos[&20].creation_id, 104);
+        assert_eq!(history.len(), 3);
+        assert!(history[0].is_coinbase);
+        assert!(!history[1].is_coinbase);
+        assert!(!history[2].is_coinbase);
+    }
+
+    #[test]
     fn incremental_scan_rejects_noncanonical_coinbase_layout() {
         let owner = Address([0xA3; 32]);
         let late = block(
@@ -550,7 +610,7 @@ mod tests {
         );
         assert_eq!(
             derive_output_creation_ids(&late),
-            Err(CreationIdDerivationError::CoinbaseNotFirst)
+            Err(CreationIdDerivationError::InvalidSystemLayout)
         );
 
         let duplicate = block(
@@ -559,7 +619,7 @@ mod tests {
         );
         assert_eq!(
             derive_output_creation_ids(&duplicate),
-            Err(CreationIdDerivationError::MultipleCoinbase)
+            Err(CreationIdDerivationError::InvalidSystemLayout)
         );
     }
 

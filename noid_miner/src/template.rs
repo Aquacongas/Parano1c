@@ -97,7 +97,7 @@ impl BlockTemplate {
         }
     }
 
-    /// Number of non-coinbase transactions.
+    /// Number of selected physical user pages.
     pub fn n_user_txs(&self) -> usize {
         self.inner.txs.len()
     }

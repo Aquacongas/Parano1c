@@ -39,6 +39,7 @@ pub mod action_surface;
 pub mod batch_eval;
 pub mod block_spine;
 pub mod deep_chain;
+pub mod development_allocation;
 pub mod exact_state;
 pub mod fee_arithmetic;
 pub mod fri_pcs;

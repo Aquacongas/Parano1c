@@ -243,7 +243,7 @@ fn validate_fee_policy_and_claimable_fee_sum(
     Ok(claimable_fee_sum)
 }
 
-/// Validate the complete mandatory coinbase contract for a non-genesis block.
+/// Validate the complete mandatory system-mint contract for a non-genesis block.
 ///
 /// This is the single cheap, state-free predicate shared by every accepted
 /// block entry point. Genesis is deliberately outside this contract and is
@@ -253,20 +253,8 @@ pub fn validate_mandatory_coinbase(
     parent: &BlockHeader,
 ) -> Result<(), ConsensusError> {
     let expected_anchor = crate::consensus::pow::block_id(parent);
-    let mut coinbase_positions = block
-        .transactions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, tx)| tx.body.is_coinbase.then_some(index));
-    let coinbase_index = coinbase_positions
-        .next()
-        .ok_or(ConsensusError::MissingCoinbase)?;
-    if coinbase_positions.next().is_some() {
-        return Err(ConsensusError::MultipleCoinbase);
-    }
-    if coinbase_index != 0 {
-        return Err(ConsensusError::CoinbaseNotFirst);
-    }
+    let stream =
+        validate_block_page_stream(&block.transactions).map_err(page_stream_consensus_error)?;
 
     let coinbase = &block.transactions[0];
     // This one shared predicate owns fee/input/output counts and canonical
@@ -282,6 +270,38 @@ pub fn validate_mandatory_coinbase(
     let output = &coinbase.body.outputs[0];
     if output.owner != block.header.miner_address {
         return Err(ConsensusError::BadCoinbaseOwner);
+    }
+
+    let allocation = crate::consensus::development_allocation::development_allocation(
+        block.header.height,
+        block.header.log_slots,
+    )
+    .map_err(|_| ConsensusError::BadDevelopmentPayout)?;
+
+    match (allocation.payout_each, stream.has_development_payout) {
+        (Some(_), false) => return Err(ConsensusError::MissingDevelopmentPayout),
+        (None, true) => return Err(ConsensusError::UnexpectedDevelopmentPayout),
+        (None, false) => {}
+        (Some(expected_amount), true) => {
+            let payout = &block.transactions[1];
+            noid_tx::validate_body_semantics_no_hash(&payout.body).map_err(|_| {
+                ConsensusError::ShapeMismatch(
+                    "development payout has non-canonical body semantics".into(),
+                )
+            })?;
+            if payout.body.epoch_anchor != expected_anchor {
+                return Err(ConsensusError::BadDevelopmentPayout);
+            }
+            let first = &payout.body.outputs[0];
+            let second = &payout.body.outputs[1];
+            if first.owner != crate::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS
+                || second.owner != crate::consensus::development_allocation::O1_LAB_ADDRESS
+                || first.amount != expected_amount
+                || second.amount != expected_amount
+            {
+                return Err(ConsensusError::BadDevelopmentPayout);
+            }
+        }
     }
 
     Ok(())
@@ -419,6 +439,7 @@ fn validate_block_checks_inner(
                 .1
                 .amount;
             let max_allowed = max_coinbase_value_from_claimable_fee_sum(
+                block.header.height,
                 block.header.log_slots,
                 claimable_fee_sum,
             );
@@ -488,6 +509,7 @@ pub fn validate_block_consensus(
                 .amount;
 
             let max_allowed = max_coinbase_value_from_claimable_fee_sum(
+                block.header.height,
                 block.header.log_slots,
                 claimable_fee_sum,
             );
@@ -559,6 +581,29 @@ mod tests {
             inputs: [TxInput::dummy(); TX_INPUTS],
             outputs,
             validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        })
+    }
+
+    fn development_payout(parent: &BlockHeader, amount: u64) -> Transaction {
+        Transaction::new(TxBody {
+            epoch_anchor: block_id(parent),
+            fee: 0,
+            input_owner: Address([0u8; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index: 15_000_001,
+                    amount,
+                    owner: crate::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS,
+                },
+                TxOutput {
+                    slot_index: 15_000_002,
+                    amount,
+                    owner: crate::consensus::development_allocation::O1_LAB_ADDRESS,
+                },
+            ],
+            validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
             is_coinbase: true,
         })
     }
@@ -660,5 +705,58 @@ mod tests {
             validate_mandatory_coinbase(&block, &parent),
             Err(ConsensusError::ShapeMismatch(_))
         ));
+    }
+
+    #[test]
+    fn scheduled_development_payout_is_mandatory_and_exact() {
+        use crate::consensus::development_allocation::{
+            development_allocation, development_share_each, TARGET_BLOCKS_PER_DAY,
+        };
+        use crate::consensus::emission::block_reward;
+
+        let parent = header(TARGET_BLOCKS_PER_DAY - 1);
+        let share = development_share_each(block_reward(parent.log_slots)).unwrap();
+        let allocation = development_allocation(TARGET_BLOCKS_PER_DAY, parent.log_slots).unwrap();
+        let amount = allocation.payout_each.unwrap();
+        let block = Block {
+            header: header(TARGET_BLOCKS_PER_DAY),
+            transactions: vec![coinbase(&parent), development_payout(&parent, amount)],
+        };
+        assert_eq!(amount, share * TARGET_BLOCKS_PER_DAY);
+        assert_eq!(validate_mandatory_coinbase(&block, &parent), Ok(()));
+
+        let mut missing = block.clone();
+        missing.transactions.pop();
+        assert_eq!(
+            validate_mandatory_coinbase(&missing, &parent),
+            Err(ConsensusError::MissingDevelopmentPayout)
+        );
+
+        let mut wrong_amount = block.clone();
+        wrong_amount.transactions[1].body.outputs[0].amount += 1;
+        assert_eq!(
+            validate_mandatory_coinbase(&wrong_amount, &parent),
+            Err(ConsensusError::BadDevelopmentPayout)
+        );
+
+        let mut wrong_recipient = block.clone();
+        wrong_recipient.transactions[1].body.outputs.swap(0, 1);
+        assert_eq!(
+            validate_mandatory_coinbase(&wrong_recipient, &parent),
+            Err(ConsensusError::BadDevelopmentPayout)
+        );
+    }
+
+    #[test]
+    fn unscheduled_development_payout_is_rejected() {
+        let parent = header(0);
+        let block = Block {
+            header: header(1),
+            transactions: vec![coinbase(&parent), development_payout(&parent, 1)],
+        };
+        assert_eq!(
+            validate_mandatory_coinbase(&block, &parent),
+            Err(ConsensusError::UnexpectedDevelopmentPayout)
+        );
     }
 }

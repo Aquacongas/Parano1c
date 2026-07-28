@@ -106,6 +106,26 @@ pub struct TxBody {
 pub const TX_EPOCH_BLOCKS: u64 = 144;
 
 impl TxBody {
+    /// The canonical primary block reward shape.
+    ///
+    /// `is_coinbase` is the fixed-wire system-mint discriminator retained by
+    /// the launch protocol. Block context distinguishes the primary reward
+    /// from the two-output development-allocation payout below.
+    #[inline]
+    pub const fn is_primary_coinbase_shape(&self) -> bool {
+        self.is_coinbase && self.validity_bitmap == output_bitmap_bit(0)
+    }
+
+    /// The canonical two-output development-allocation payout shape.
+    ///
+    /// Height, owners, amounts, and placement are consensus-bound by the
+    /// block validator and HistoryStep relation; this helper deliberately
+    /// recognizes only the fixed public-body shape.
+    #[inline]
+    pub const fn is_development_payout_shape(&self) -> bool {
+        self.is_coinbase && self.validity_bitmap == (output_bitmap_bit(0) | output_bitmap_bit(1))
+    }
+
     #[inline]
     pub fn input_is_live(&self, index: usize) -> bool {
         index < TX_INPUTS && self.validity_bitmap & (1u16 << index) != 0

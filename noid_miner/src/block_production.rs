@@ -136,7 +136,9 @@ impl PreparedBlockAttempt {
             .len()
             .checked_add(authorization_weight)
             .ok_or_else(|| "prepared block byte weight overflow".to_string())?;
-        let user_pages = block.transactions.len().saturating_sub(1);
+        let stream = noid_chain::validate_block_page_stream(&block.transactions)
+            .map_err(|error| format!("prepared block body is non-canonical: {error}"))?;
+        let proof_class = stream.proof_class;
         let context = noid_block::HistoryStepPreparationContext {
             parent_header: &parent,
             tx_epoch_anchor_header: &parent_tx_epoch_anchor_header,
@@ -147,37 +149,31 @@ impl PreparedBlockAttempt {
             asert_anchor: &asert_anchor,
             local_time,
         };
-        let witness =
-            match noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(user_pages) {
-                Some(noid_chain::consensus::paged_spend::BlockProofClass::B64) => {
-                    noid_block::prepare_history_step_witness::<64>(
-                        block,
-                        context,
-                        authorization_proofs,
-                        ghost,
-                        runtime,
-                        parent_terminal.as_ref(),
-                    )
-                    .map(PreparedWitness::B64)
-                }
-                Some(noid_chain::consensus::paged_spend::BlockProofClass::B255) => {
-                    noid_block::prepare_history_step_witness::<255>(
-                        block,
-                        context,
-                        authorization_proofs,
-                        ghost,
-                        runtime,
-                        parent_terminal.as_ref(),
-                    )
-                    .map(PreparedWitness::B255)
-                }
-                None => {
-                    return Err(format!(
-                        "{user_pages} physical pages do not select a HistoryStep class"
-                    ));
-                }
+        let witness = match proof_class {
+            noid_chain::consensus::paged_spend::BlockProofClass::B64 => {
+                noid_block::prepare_history_step_witness::<64>(
+                    block,
+                    context,
+                    authorization_proofs,
+                    ghost,
+                    runtime,
+                    parent_terminal.as_ref(),
+                )
+                .map(PreparedWitness::B64)
             }
-            .map_err(|error| error.to_string())?;
+            noid_chain::consensus::paged_spend::BlockProofClass::B255 => {
+                noid_block::prepare_history_step_witness::<255>(
+                    block,
+                    context,
+                    authorization_proofs,
+                    ghost,
+                    runtime,
+                    parent_terminal.as_ref(),
+                )
+                .map(PreparedWitness::B255)
+            }
+        }
+        .map_err(|error| error.to_string())?;
 
         // The relation is nonce-free: finish the exact template (every native
         // check except PoW) and prove the complete HistoryStep before any
@@ -231,12 +227,17 @@ impl PreparedBlockAttempt {
     }
 
     pub fn user_page_count(&self) -> usize {
-        self.block.transactions.len().saturating_sub(1)
+        usize::from(
+            noid_chain::validate_block_page_stream(&self.block.transactions)
+                .expect("prepared block has a canonical body")
+                .page_count,
+        )
     }
 
     pub fn proof_class(&self) -> noid_chain::consensus::paged_spend::BlockProofClass {
-        noid_chain::consensus::paged_spend::BlockProofClass::for_page_count(self.user_page_count())
-            .expect("prepared block already selected a canonical proof class")
+        noid_chain::validate_block_page_stream(&self.block.transactions)
+            .expect("prepared block has a canonical body")
+            .proof_class
     }
 
     pub const fn expected_parent_id(&self) -> [u8; 32] {
