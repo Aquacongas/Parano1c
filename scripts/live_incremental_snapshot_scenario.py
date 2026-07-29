@@ -180,9 +180,9 @@ def main():
         export_dirs = sorted(
             path.name
             for path in (source.data_dir / "snapshot-exports").iterdir()
-            if path.is_dir() and path.name.startswith("snapshot-v4-")
+            if path.is_dir() and path.name.startswith("snapshot-v5-")
         )
-        require(len(export_dirs) >= 2, f"fewer than two V4 generations persisted: {export_dirs}")
+        require(len(export_dirs) >= 2, f"fewer than two V5 generations persisted: {export_dirs}")
 
         source_label = "02-source-frozen-restart"
         source.start(source_label)
@@ -210,7 +210,8 @@ def main():
         boundaries = [
             int(value)
             for value in re.findall(
-                r"snapshot boundary fully applied snapshot_height=(\d+)", receiver_log
+                r"snapshot boundary and disk tail fully applied snapshot_height=(\d+)",
+                receiver_log,
             )
         ]
         require(len(boundaries) == 1, f"receiver snapshot boundary count is wrong: {boundaries}")
@@ -222,10 +223,14 @@ def main():
             receiver_log.count("snapshot install completed") == 1,
             "receiver did not install exactly one snapshot",
         )
-        require(
-            receiver_log.count("applied P2P block") == RETAINED_DEPTH,
-            "receiver did not apply exactly 18 direct blocks",
-        )
+        suffix_counts = [
+            int(value)
+            for value in re.findall(
+                r'phase="retained_suffix_apply"[^\n]* count=(\d+)',
+                receiver_log,
+            )
+        ]
+        require(suffix_counts == [RETAINED_DEPTH], f"disk-tail telemetry is wrong: {suffix_counts}")
 
         for label in labels:
             assert_clean(label, read_log(label))
@@ -235,11 +240,11 @@ def main():
                 "status": "passed",
                 "source_tip": source_tip,
                 "snapshot_builds": builds,
-                "persisted_v4_generations": export_dirs,
+                "persisted_v5_generations": export_dirs,
                 "receiver_startup_s": round(receiver_startup_s, 3),
                 "receiver_sync_s": round(sync_s, 3),
                 "receiver_snapshot_boundary": boundaries[0],
-                "receiver_direct_suffix_blocks": RETAINED_DEPTH,
+                "receiver_staged_suffix_blocks": suffix_counts[0],
                 "converged_tip": converged,
                 "matched_header_count": len(headers),
                 "source_state": rpc(source.rpc_port, "getStateInfo"),

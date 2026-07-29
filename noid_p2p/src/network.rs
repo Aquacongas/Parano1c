@@ -95,6 +95,9 @@ type SnapshotExportKey = (u64, [u8; 32]);
 type SnapshotExport = Arc<SnapshotGeneration>;
 
 const MAX_SNAPSHOT_EXPORTS: usize = 2;
+const SNAPSHOT_EXPORT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
+const SNAPSHOT_BRIDGE_MAX_LIVE_GAP: u64 =
+    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH / 2;
 const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize = MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
 const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
@@ -102,6 +105,12 @@ const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
 const _: () = assert!(
     MAX_PENDING_STATE_SEGMENT_REQUESTS >= noid_chain::consensus::wire_limits::MAX_INFLIGHT_SEGMENTS
 );
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotExportLease {
+    key: SnapshotExportKey,
+    last_activity: Instant,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingRetainedBlockRequest {
@@ -312,6 +321,75 @@ fn local_history_step_boundary(ctx: &MdbxChainContext) -> Option<(u64, [u8; 32])
     Some((height, block_hash))
 }
 
+fn snapshot_bridge_has_live_headroom(live_tip: u64, bridge_tip: u64) -> bool {
+    bridge_tip <= live_tip && live_tip.saturating_sub(bridge_tip) <= SNAPSHOT_BRIDGE_MAX_LIVE_GAP
+}
+
+/// Select the freshest complete immutable generation that still has ample
+/// live-window headroom after its captured bridge. The state boundary itself
+/// may be older than the node's newest finalized checkpoint: its terminal and
+/// complete initial suffix are generation-owned and therefore cannot race
+/// pruning.
+fn select_snapshot_export(
+    ctx: &MdbxChainContext,
+    exports: &std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
+    requester_height: u64,
+) -> Option<SnapshotExport> {
+    exports
+        .values()
+        .filter(|generation| {
+            let manifest = generation.manifest();
+            if manifest.target_height == 0
+                || manifest.target_height <= requester_height
+                || manifest.target_height > ctx.finalized_checkpoint().height
+                || manifest.bridge_tip_height < manifest.target_height
+                || !snapshot_bridge_has_live_headroom(ctx.tip_height(), manifest.bridge_tip_height)
+            {
+                return false;
+            }
+            let boundary_matches = ctx
+                .store
+                .get_header(manifest.target_height)
+                .ok()
+                .flatten()
+                .is_some_and(|header| {
+                    noid_chain::hash_block_header(&header) == manifest.target_hash
+                        && header.state_root == manifest.state_root
+                        && header.log_slots == manifest.log_slots
+                        && header.active_slot_count == manifest.active_slot_count
+                        && header.alloc_counter == manifest.alloc_counter
+                });
+            let bridge_matches = ctx
+                .store
+                .get_header(manifest.bridge_tip_height)
+                .ok()
+                .flatten()
+                .is_some_and(|header| {
+                    noid_chain::hash_block_header(&header) == manifest.bridge_tip_hash
+                });
+            let work_matches = ctx
+                .store
+                .get_chain_work(manifest.target_height)
+                .ok()
+                .flatten()
+                == Some(manifest.cumulative_chainwork)
+                && ctx
+                    .store
+                    .get_chain_work(manifest.bridge_tip_height)
+                    .ok()
+                    .flatten()
+                    == Some(manifest.bridge_cumulative_chainwork);
+            boundary_matches && bridge_matches && work_matches
+        })
+        .max_by_key(|generation| {
+            (
+                generation.manifest().target_height,
+                generation.manifest().bridge_tip_height,
+            )
+        })
+        .cloned()
+}
+
 /// Load only the exact HistoryStep terminal requested for a finalized manifest.
 fn local_history_step_terminal(
     ctx: &MdbxChainContext,
@@ -482,6 +560,10 @@ pub enum NetworkEvent {
     },
     /// A requested retained full block is no longer available from this peer.
     RecentBlockUnavailable { from: PeerId, height: u64 },
+    /// Transport failed for one exact retained-block request.  Keeping the
+    /// requested height lets snapshot sync distinguish its immutable bridge
+    /// from the optional live tail without discarding unrelated peer requests.
+    RecentBlockRequestFailed { from: PeerId, height: u64 },
     /// A new TxIntent arrived from a peer.
     NewTx { from: PeerId, intent_bytes: Vec<u8> },
     /// Response to FetchHeaders: decoded headers from the peer.
@@ -920,7 +1002,9 @@ async fn run_swarm(
     let snapshot_export_root = data_dir.join("snapshot-exports");
     std::fs::create_dir_all(&snapshot_export_root)?;
     let mut snapshot_exports = load_snapshot_exports(&snapshot_export_root);
-    prune_snapshot_exports(&mut snapshot_exports);
+    let mut snapshot_export_leases: std::collections::HashMap<PeerId, SnapshotExportLease> =
+        std::collections::HashMap::new();
+    prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
     let (snapshot_export_tx, mut snapshot_export_rx) =
         mpsc::channel::<(SnapshotExportKey, Result<SnapshotGeneration, String>)>(1);
     let mut snapshot_export_inflight: Option<SnapshotExportKey> = None;
@@ -992,6 +1076,7 @@ async fn run_swarm(
                     &mempool_response_prepare_semaphore,
                     &outbound_response_budget,
                     &mut snapshot_exports,
+                    &mut snapshot_export_leases,
                     &mut reconnect,
                     &mut block_event_rate,
                     &mut tx_gossip_rate,
@@ -1070,7 +1155,8 @@ async fn run_swarm(
                         Ok(generation) if generation.key() == key => {
                             tracing::info!(height = key.0, "published bounded disk snapshot generation");
                             snapshot_exports.insert(key, Arc::new(generation));
-                            prune_snapshot_exports(&mut snapshot_exports);
+                            prune_snapshot_export_leases(&mut snapshot_export_leases);
+                            prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
                         }
                         Ok(_) => tracing::warn!(height = key.0, "snapshot generation boundary mismatch"),
                         Err(error) => tracing::warn!(height = key.0, err = %error, "snapshot generation build failed"),
@@ -1242,12 +1328,56 @@ fn load_snapshot_exports(
     exports
 }
 
+fn prune_snapshot_export_leases(
+    leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
+) {
+    let now = Instant::now();
+    leases.retain(|_, lease| now.duration_since(lease.last_activity) <= SNAPSHOT_EXPORT_LEASE_TTL);
+}
+
+fn lease_snapshot_export(
+    leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
+    peer: PeerId,
+    key: SnapshotExportKey,
+) -> bool {
+    prune_snapshot_export_leases(leases);
+    let distinct_other_keys = leases
+        .iter()
+        .filter(|(leased_peer, _)| **leased_peer != peer)
+        .map(|(_, lease)| lease.key)
+        .collect::<std::collections::HashSet<_>>();
+    if !distinct_other_keys.contains(&key) && distinct_other_keys.len() >= MAX_SNAPSHOT_EXPORTS {
+        return false;
+    }
+    leases.insert(
+        peer,
+        SnapshotExportLease {
+            key,
+            last_activity: Instant::now(),
+        },
+    );
+    true
+}
+
 fn prune_snapshot_exports(
     exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
+    leases: &std::collections::HashMap<PeerId, SnapshotExportLease>,
 ) {
+    let protected = leases
+        .values()
+        .map(|lease| lease.key)
+        .collect::<std::collections::HashSet<_>>();
     let mut keys: Vec<_> = exports.keys().copied().collect();
     keys.sort_unstable_by_key(|(height, _)| std::cmp::Reverse(*height));
-    for key in keys.into_iter().skip(MAX_SNAPSHOT_EXPORTS) {
+    let mut unprotected_kept = 0usize;
+    for key in keys {
+        if protected.contains(&key) {
+            continue;
+        }
+        unprotected_kept += 1;
+        if unprotected_kept <= MAX_SNAPSHOT_EXPORTS {
+            continue;
+        }
         let removable = exports
             .get(&key)
             .is_some_and(|generation| Arc::strong_count(generation) == 1);
@@ -1523,6 +1653,7 @@ async fn handle_swarm_event(
     mempool_response_prepare_semaphore: &Arc<Semaphore>,
     outbound_response_budget: &OutboundResponseBudget,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
+    snapshot_export_leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
     reconnect: &mut std::collections::HashMap<
         libp2p::PeerId,
         (Multiaddr, tokio::time::Instant, u32),
@@ -1843,6 +1974,7 @@ async fn handle_swarm_event(
                     request_response::Message::Request {
                         request, channel, ..
                     },
+                peer: _,
                 ..
             },
         )) => {
@@ -1938,7 +2070,7 @@ async fn handle_swarm_event(
                     request_response::Message::Request {
                         request, channel, ..
                     },
-                ..
+                peer,
             },
         )) => {
             // Reserve the consensus upper bound before the first MDBX value is
@@ -1960,6 +2092,15 @@ async fn handle_swarm_event(
             let budget = outbound_response_budget.clone();
             let completion = block_response_tx.clone();
             let height = request.height;
+            let leased_bridge = snapshot_export_leases.get_mut(&peer).and_then(|lease| {
+                let generation = snapshot_exports.get(&lease.key)?;
+                if generation.manifest().bridge_block(height).is_some() {
+                    lease.last_activity = Instant::now();
+                    Some(generation.clone())
+                } else {
+                    None
+                }
+            });
             tokio::spawn(async move {
                 let _preparation_permit = preparation_permit;
                 let Ok(Some(outbound_memory_permit)) =
@@ -1968,6 +2109,9 @@ async fn handle_swarm_event(
                     return;
                 };
                 let loaded = tokio::task::spawn_blocking(move || {
+                    if let Some(generation) = leased_bridge {
+                        return generation.read_bridge_block(height).ok();
+                    }
                     let ctx = chain.blocking_read();
                     match ctx.store.get_recent_accepted_block_bundle_bounded(height) {
                         Ok(encoded) => decode_stored_accepted_block_bundle(height, encoded),
@@ -2032,6 +2176,13 @@ async fn handle_swarm_event(
             let completion = history_step_response_tx.clone();
             let request_height = request.height;
             let request_hash = request.block_hash;
+            let leased_generation = snapshot_export_leases
+                .get_mut(&peer)
+                .filter(|lease| lease.key == (request_height, request_hash))
+                .and_then(|lease| {
+                    lease.last_activity = Instant::now();
+                    snapshot_exports.get(&lease.key).cloned()
+                });
             tokio::spawn(async move {
                 let _preparation_permit = preparation_permit;
                 let Ok(Some(outbound_memory_permit)) = budget
@@ -2041,6 +2192,9 @@ async fn handle_swarm_event(
                     return;
                 };
                 let loaded = tokio::task::spawn_blocking(move || {
+                    if let Some(generation) = leased_generation {
+                        return generation.read_boundary_terminal().ok();
+                    }
                     let ctx = chain.blocking_read();
                     local_history_step_terminal(&ctx, request_height, request_hash)
                 })
@@ -2137,42 +2291,25 @@ async fn handle_swarm_event(
                 return;
             }
             snapshot_manifest_last_request.insert(peer, now);
-            prune_snapshot_exports(snapshot_exports);
+            prune_snapshot_export_leases(snapshot_export_leases);
+            prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             let response = 'ready_manifest: {
                 let ctx = chain.read().await;
-                let Some((snapshot_height, snapshot_hash)) = local_history_step_boundary(&ctx)
+                let Some(generation) =
+                    select_snapshot_export(&ctx, snapshot_exports, request.requester_height)
                 else {
                     break 'ready_manifest GetStateManifestResponse::default();
                 };
-                if snapshot_height == 0
-                    || snapshot_height <= request.requester_height
-                    || snapshot_height > ctx.tip_height()
-                    || ctx.tip_height().saturating_sub(snapshot_height)
-                        > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
-                {
+                let key = generation.key();
+                if !lease_snapshot_export(snapshot_export_leases, peer, key) {
+                    tracing::debug!(
+                        peer = %peer,
+                        snapshot_height = key.0,
+                        "snapshot generation lease capacity is full"
+                    );
                     break 'ready_manifest GetStateManifestResponse::default();
                 }
-                let Some(snapshot_header) = ctx.store.get_header(snapshot_height).ok().flatten()
-                else {
-                    break 'ready_manifest GetStateManifestResponse::default();
-                };
-                let key = (snapshot_height, snapshot_hash);
-                if noid_chain::hash_block_header(&snapshot_header) != snapshot_hash {
-                    break 'ready_manifest GetStateManifestResponse::default();
-                }
-                let Some(generation) = snapshot_exports.get(&key) else {
-                    tracing::debug!(snapshot_height, "bounded snapshot generation is not ready");
-                    break 'ready_manifest GetStateManifestResponse::default();
-                };
                 let manifest = generation.manifest();
-                if manifest.state_root != snapshot_header.state_root
-                    || manifest.log_slots != snapshot_header.log_slots
-                    || manifest.active_slot_count != snapshot_header.active_slot_count
-                    || manifest.alloc_counter != snapshot_header.alloc_counter
-                {
-                    tracing::warn!(snapshot_height, "disk snapshot manifest/header mismatch");
-                    break 'ready_manifest GetStateManifestResponse::default();
-                }
 
                 let segment_ids = manifest
                     .segments
@@ -2191,18 +2328,23 @@ async fn handle_swarm_event(
                     .collect();
                 tracing::info!(
                     requester_height = request.requester_height,
-                    snapshot_height,
+                    snapshot_height = manifest.target_height,
+                    bridge_tip = manifest.bridge_tip_height,
+                    live_tip = ctx.tip_height(),
                     segments = manifest.segments.len(),
-                    "serving precomputed disk snapshot manifest"
+                    "serving immutable snapshot manifest and bridge"
                 );
                 GetStateManifestResponse {
-                    tip_height: snapshot_height,
+                    tip_height: manifest.target_height,
                     tip_hash: key.1,
                     cumulative_chainwork: manifest.cumulative_chainwork,
                     log_slots: manifest.log_slots,
                     active_slot_count: manifest.active_slot_count,
                     alloc_counter: manifest.alloc_counter,
                     eff_log: manifest.effective_log_segment_size,
+                    bridge_tip_height: manifest.bridge_tip_height,
+                    bridge_tip_hash: manifest.bridge_tip_hash,
+                    bridge_cumulative_chainwork: manifest.bridge_cumulative_chainwork,
                     segment_ids,
                     segment_roots,
                     segment_lengths,
@@ -2222,6 +2364,22 @@ async fn handle_swarm_event(
             },
         )) => {
             if response.tip_height > 0 {
+                if response.bridge_tip_height < response.tip_height
+                    || response
+                        .bridge_tip_height
+                        .saturating_sub(response.tip_height)
+                        > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
+                    || (response.bridge_tip_height == response.tip_height
+                        && response.bridge_tip_hash != response.tip_hash)
+                {
+                    tracing::warn!(
+                        from = %peer,
+                        snapshot = response.tip_height,
+                        bridge_tip = response.bridge_tip_height,
+                        "manifest: immutable bridge geometry is invalid"
+                    );
+                    return;
+                }
                 if response.segment_ids.len() != response.segment_roots.len()
                     || response.segment_ids.len() != response.segment_lengths.len()
                 {
@@ -2350,8 +2508,24 @@ async fn handle_swarm_event(
                 return;
             }
             entry.0 += 1;
-            prune_snapshot_exports(snapshot_exports);
+            prune_snapshot_export_leases(snapshot_export_leases);
+            prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             let key = (request.expected_tip_height, request.expected_tip_hash);
+            let lease_matches = snapshot_export_leases.get_mut(&peer).is_some_and(|lease| {
+                if lease.key == key {
+                    lease.last_activity = Instant::now();
+                    true
+                } else {
+                    false
+                }
+            });
+            if !lease_matches {
+                let _ = swarm
+                    .behaviour_mut()
+                    .state_segment_sync
+                    .send_response(channel, unavailable_state_segment_response(&request));
+                return;
+            }
             let Some(export) = snapshot_exports.get(&key).cloned() else {
                 let _ = swarm
                     .behaviour_mut()
@@ -2710,6 +2884,8 @@ async fn handle_swarm_event(
                 mempool_sync_retries.remove(&peer_id);
                 snapshot_manifest_last_request.remove(&peer_id);
                 snapshot_segment_rate.remove(&peer_id);
+                snapshot_export_leases.remove(&peer_id);
+                prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
                 clear_peer_request_correlations(
                     pending_retained_block_requests,
                     pending_state_segment_requests,
@@ -2744,16 +2920,28 @@ async fn handle_swarm_event(
             },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "block sync request failed");
-            let correlated = pending_retained_block_requests
-                .remove(&request_id)
-                .is_some_and(|pending| pending.peer == peer);
-            if !correlated {
+            let Some(pending) = pending_retained_block_requests.remove(&request_id) else {
                 tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale block-sync failure");
                 return;
+            };
+            if pending.peer != peer {
+                tracing::debug!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    requested_peer = %pending.peer,
+                    "ignoring mismatched block-sync failure"
+                );
+                return;
             }
-            // Release the logical request so the sync state machine can retry
-            // without pretending the underlying peer connection closed.
-            fail_peer!(peer);
+            // A block pull is an exact, independently correlated request.  Do
+            // not clear this peer's state-segment or other block requests when
+            // one stream fails.
+            let _ = required_event_tx
+                .send(NetworkEvent::RecentBlockRequestFailed {
+                    from: peer,
+                    height: pending.height,
+                })
+                .await;
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
@@ -2859,6 +3047,37 @@ mod tests {
         assert!(snapshot_suffix_is_retained(100, 100 - retention));
         assert!(!snapshot_suffix_is_retained(100, 100 - retention - 1));
         assert!(!snapshot_suffix_is_retained(100, 101));
+    }
+
+    #[test]
+    fn snapshot_bridge_keeps_half_window_for_the_live_tail() {
+        let allowance = SNAPSHOT_BRIDGE_MAX_LIVE_GAP;
+        assert!(snapshot_bridge_has_live_headroom(100, 100));
+        assert!(snapshot_bridge_has_live_headroom(100, 100 - allowance));
+        assert!(!snapshot_bridge_has_live_headroom(100, 100 - allowance - 1));
+        assert!(!snapshot_bridge_has_live_headroom(100, 101));
+    }
+
+    #[test]
+    fn snapshot_generation_leases_bound_distinct_pinned_generations() {
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let third = PeerId::random();
+        let key_a = (100, [1; 32]);
+        let key_b = (101, [2; 32]);
+        let key_c = (102, [3; 32]);
+        let mut leases = std::collections::HashMap::new();
+
+        assert!(lease_snapshot_export(&mut leases, first, key_a));
+        assert!(lease_snapshot_export(&mut leases, second, key_b));
+        assert!(lease_snapshot_export(&mut leases, third, key_a));
+        assert!(!lease_snapshot_export(&mut leases, third, key_c));
+
+        leases.get_mut(&first).unwrap().last_activity =
+            Instant::now() - SNAPSHOT_EXPORT_LEASE_TTL - Duration::from_secs(1);
+        prune_snapshot_export_leases(&mut leases);
+        assert!(!leases.contains_key(&first));
+        assert!(lease_snapshot_export(&mut leases, third, key_c));
     }
 
     #[test]

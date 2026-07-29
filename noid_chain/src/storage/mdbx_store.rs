@@ -215,6 +215,75 @@ impl MdbxHistoricalReadSnapshot<'_> {
         Ok(raw.and_then(|raw| decode_undo_log(&raw)))
     }
 
+    /// Read the exact canonical HistoryStep terminal from this pinned MVCC
+    /// view. Snapshot generations retain the finalized boundary terminal
+    /// alongside their immutable state and suffix, so serving does not race
+    /// the live retained-payload pruner.
+    pub(super) fn get_history_step_terminal_at(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        read_history_step_terminal(&self.txn, height, block_hash)
+    }
+
+    /// Encode one canonical accepted-block bundle from this same pinned MVCC
+    /// view. Keeping state reconstruction and suffix capture under one read
+    /// transaction makes a published snapshot generation internally
+    /// immutable even while mining advances the live database.
+    pub(super) fn get_accepted_block_bundle(
+        &self,
+        height: u64,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let key = u64_key(height);
+        let blocks = self.txn.open_table(Some(T_RECENT_BLOCKS))?;
+        let terminals = self.txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
+        let block_len: Option<ObjectLength> = self.txn.get(&blocks, &key)?;
+        let terminal_len: Option<ObjectLength> = self.txn.get(&terminals, &key)?;
+
+        let Some(ObjectLength(block_len)) = block_len else {
+            return Ok(None);
+        };
+        let ObjectLength(terminal_len) = terminal_len.ok_or(StoreError::Decode(
+            "accepted block is missing its HistoryStep terminal",
+        ))?;
+        crate::AcceptedBlockBundle::validate_declared_lengths(
+            block_len as u64,
+            terminal_len as u64,
+        )
+        .map_err(|_| StoreError::Decode("accepted block bundle length is invalid"))?;
+
+        let block_bytes: Vec<u8> = self
+            .txn
+            .get(&blocks, &key)?
+            .ok_or(StoreError::Decode("accepted block disappeared during read"))?;
+        let terminal_bytes: Vec<u8> = self.txn.get(&terminals, &key)?.ok_or(StoreError::Decode(
+            "accepted HistoryStep terminal disappeared during read",
+        ))?;
+        if block_bytes.len() != block_len || terminal_bytes.len() != terminal_len {
+            return Err(StoreError::Decode(
+                "accepted block bundle length changed during read",
+            ));
+        }
+        let bundle = crate::AcceptedBlockBundle::try_from_parts(block_bytes, terminal_bytes)
+            .map_err(|_| StoreError::Decode("accepted block bundle is malformed"))?;
+        if bundle.height() != height {
+            return Err(StoreError::Decode(
+                "accepted block bundle height differs from its key",
+            ));
+        }
+        let headers = self.txn.open_table(Some(T_HEADERS))?;
+        let header_raw: Option<Vec<u8>> = self.txn.get(&headers, &key)?;
+        if header_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(bundle.block_hash())
+        {
+            return Err(StoreError::Decode("accepted block bundle is not canonical"));
+        }
+        Ok(Some(bundle.encode()))
+    }
+
     pub(super) fn get_encoded_segment(
         &self,
         segment_id: u16,

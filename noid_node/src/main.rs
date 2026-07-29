@@ -61,6 +61,7 @@ use noid_node::snapshot_header_staging::{
     CanonicalHeaderBoundary, SnapshotHeaderBoundary, SnapshotHeaderStaging,
     ValidatedSnapshotHeaderStaging, MAX_STAGED_HEADER_BATCH,
 };
+use noid_node::snapshot_tail_staging::{FinalizedSnapshotTail, SnapshotTailStaging};
 use noid_p2p::{NetworkEvent, P2PNetwork};
 use noid_rpc::{start_rpc_server, ExternalMiningAttemptInvalidator, WalletOperationGate};
 
@@ -1594,6 +1595,9 @@ struct VerifiedHistoryStepSnapshot {
 
 struct AppliedVerifiedSnapshot {
     height: u64,
+    tail_blocks: u64,
+    tail_bytes: u64,
+    tail_apply_elapsed: std::time::Duration,
     state_install_elapsed: std::time::Duration,
 }
 
@@ -1618,6 +1622,25 @@ fn validate_snapshot_staged_header_boundary(
     }
     if boundary.cumulative_chainwork != manifest.cumulative_chainwork {
         return Err("snapshot manifest chainwork does not match staged headers".into());
+    }
+    let bridge_span = manifest
+        .bridge_tip_height
+        .checked_sub(manifest.tip_height)
+        .ok_or_else(|| "snapshot bridge precedes its boundary".to_string())?;
+    if bridge_span > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH {
+        return Err("snapshot bridge exceeds retained suffix depth".into());
+    }
+    if bridge_span == 0 {
+        if manifest.bridge_tip_hash != manifest.tip_hash
+            || manifest.bridge_cumulative_chainwork != manifest.cumulative_chainwork
+        {
+            return Err("empty snapshot bridge differs from its boundary".into());
+        }
+    } else if !noid_chain::work_gt(
+        &manifest.bridge_cumulative_chainwork,
+        &manifest.cumulative_chainwork,
+    ) {
+        return Err("snapshot bridge does not advance cumulative chainwork".into());
     }
     let expected_epoch_height = (manifest.tip_height
         / noid_chain::consensus::params::TX_EPOCH_BLOCKS)
@@ -2140,6 +2163,9 @@ mod tests {
             log_slots: h1.log_slots,
             active_slot_count: h1.active_slot_count,
             alloc_counter: h1.alloc_counter,
+            bridge_tip_height: 1,
+            bridge_tip_hash: h1_hash,
+            bridge_cumulative_chainwork: h1_work,
             ..Default::default()
         };
         let boundary = SnapshotHeaderBoundary {
@@ -2194,15 +2220,19 @@ mod tests {
     fn manifest_fork_choice_prefers_chainwork_then_height() {
         let mut low_work_high_height = noid_p2p::protocol::GetStateManifestResponse {
             tip_height: 100,
+            bridge_tip_height: 118,
             ..Default::default()
         };
         low_work_high_height.cumulative_chainwork[0] = 5;
+        low_work_high_height.bridge_cumulative_chainwork[0] = 5;
 
         let mut high_work_low_height = noid_p2p::protocol::GetStateManifestResponse {
             tip_height: 99,
+            bridge_tip_height: 117,
             ..Default::default()
         };
         high_work_low_height.cumulative_chainwork[0] = 6;
+        high_work_low_height.bridge_cumulative_chainwork[0] = 6;
 
         assert_eq!(
             compare_manifest_fork_choice(&high_work_low_height, &low_work_high_height),
@@ -2211,7 +2241,9 @@ mod tests {
 
         let equal_work_higher_height = noid_p2p::protocol::GetStateManifestResponse {
             tip_height: 101,
+            bridge_tip_height: 119,
             cumulative_chainwork: high_work_low_height.cumulative_chainwork,
+            bridge_cumulative_chainwork: high_work_low_height.bridge_cumulative_chainwork,
             ..Default::default()
         };
         assert_eq!(
@@ -2331,6 +2363,16 @@ async fn handle_p2p_events(
         },
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SnapshotTailAppendKey {
+        generation: u64,
+        from: libp2p::PeerId,
+        height: u64,
+    }
+    struct SnapshotTailAppendCompletion {
+        key: SnapshotTailAppendKey,
+        result: Result<SnapshotTailStaging, String>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct SnapshotInstallKey {
         generation: u64,
         from: libp2p::PeerId,
@@ -2357,6 +2399,15 @@ async fn handle_p2p_events(
     let (snapshot_staging_completion_tx, mut snapshot_staging_completion_rx) =
         tokio::sync::mpsc::channel::<SnapshotStagingCompletion>(1);
     let mut snapshot_staging_inflight: Option<SnapshotStagingOperationKey> = None;
+    let (snapshot_tail_append_tx, mut snapshot_tail_append_rx) =
+        tokio::sync::mpsc::channel::<SnapshotTailAppendCompletion>(1);
+    let mut snapshot_tail_staging: Option<SnapshotTailStaging> = None;
+    let mut snapshot_tail_request_inflight: Option<SnapshotTailAppendKey> = None;
+    let mut snapshot_tail_append_inflight: Option<SnapshotTailAppendKey> = None;
+    let mut snapshot_tail_state_download_started = false;
+    let mut finalized_snapshot_waiting: Option<(FinalizedSnapshotStaging, usize, libp2p::PeerId)> =
+        None;
+    let mut snapshot_tail_install_target: Option<u64> = None;
     let (snapshot_install_completion_tx, mut snapshot_install_completion_rx) =
         tokio::sync::mpsc::channel::<SnapshotInstallCompletion>(1);
     let mut snapshot_install_inflight: Option<SnapshotInstallKey> = None;
@@ -2436,6 +2487,13 @@ async fn handle_p2p_events(
             if let Some(stale_staging) = snapshot_staging.take() {
                 cleanup_snapshot_staging_session_offthread(stale_staging);
             }
+            drop(snapshot_tail_staging.take());
+            snapshot_tail_request_inflight = None;
+            snapshot_tail_state_download_started = false;
+            snapshot_tail_install_target = None;
+            if let Some((finalized, _, _)) = finalized_snapshot_waiting.take() {
+                cleanup_finalized_snapshot_staging_offthread(finalized);
+            }
             pending_segment_ids.clear();
             segment_queue.clear();
             pending_shallow_fork = None;
@@ -2445,6 +2503,7 @@ async fn handle_p2p_events(
                 );
             } else if snapshot_header_staging_inflight.is_some()
                 || snapshot_staging_inflight.is_some()
+                || snapshot_tail_append_inflight.is_some()
                 || snapshot_install_inflight.is_some()
             {
                 tracing::debug!(
@@ -2452,6 +2511,50 @@ async fn handle_p2p_events(
                 );
             } else {
                 tracing::debug!("sync state reset — ready for fresh manifest retry");
+            }
+        }};
+    }
+
+    macro_rules! selected_snapshot_peer {
+        () => {{
+            pending_manifest
+                .as_ref()
+                .map(|pending| pending.from)
+                .or_else(|| {
+                    pending_snapshot_header_sync
+                        .as_ref()
+                        .map(|pending| pending.from)
+                })
+                .or_else(|| {
+                    snapshot_header_staging_inflight
+                        .as_ref()
+                        .map(|key| match key {
+                            SnapshotHeaderStagingOperationKey::Prepare { from, .. }
+                            | SnapshotHeaderStagingOperationKey::Append { from, .. } => *from,
+                        })
+                })
+                .or_else(|| history_step_verification_inflight.map(|pending| pending.from))
+        }};
+    }
+
+    macro_rules! request_snapshot_tail_block {
+        ($from:expr, $height:expr) => {{
+            let from = $from;
+            let height = $height;
+            if snapshot_tail_request_inflight.is_none() && snapshot_tail_append_inflight.is_none() {
+                let key = SnapshotTailAppendKey {
+                    generation: snapshot_sync_generation,
+                    from,
+                    height,
+                };
+                snapshot_tail_request_inflight = Some(key);
+                if p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestBlock { peer: from, height })
+                    .await
+                    .is_err()
+                {
+                    snapshot_tail_request_inflight = None;
+                }
             }
         }};
     }
@@ -2486,6 +2589,136 @@ async fn handle_p2p_events(
                     result,
                 });
             });
+        }};
+    }
+
+    macro_rules! stage_snapshot_tail_bundle {
+        ($from:expr, $bundle:expr, $inbound_permit:expr) => {{
+            let from = $from;
+            let bundle = $bundle;
+            let height = bundle.height();
+            let Some(staging) = snapshot_tail_staging.take() else {
+                tracing::warn!(from = %from, height, "snapshot tail bundle arrived without staging");
+                drop(bundle);
+                drop($inbound_permit);
+                reset_sync_state!();
+                continue;
+            };
+            let key = SnapshotTailAppendKey {
+                generation: snapshot_sync_generation,
+                from,
+                height,
+            };
+            snapshot_tail_append_inflight = Some(key);
+            let completion = snapshot_tail_append_tx.clone();
+            let inbound_permit = $inbound_permit;
+            tokio::task::spawn_blocking(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let result = staging.append(bundle);
+                    drop(inbound_permit);
+                    result
+                }))
+                .map_err(|_| "snapshot tail append worker panicked".to_owned())
+                .and_then(|result| result);
+                let _ = completion.blocking_send(SnapshotTailAppendCompletion { key, result });
+            });
+        }};
+    }
+
+    macro_rules! start_snapshot_install {
+        ($finalized:expr, $segment_count:expr, $from:expr, $tail:expr) => {{
+            let finalized = $finalized;
+            let segment_count = $segment_count;
+            let from = $from;
+            let tail = $tail;
+            let Some(mut pending) = pending_manifest.take() else {
+                tracing::warn!(from = %from, "snapshot finalized without selected manifest");
+                cleanup_finalized_snapshot_staging_offthread(finalized);
+                drop(tail);
+                reset_sync_state!();
+                continue;
+            };
+            if pending.from != from {
+                tracing::warn!(from = %from, expected = %pending.from, "snapshot finalization peer changed");
+                cleanup_finalized_snapshot_staging_offthread(finalized);
+                drop(tail);
+                reset_sync_state!();
+                continue;
+            }
+            let Some(history_step) = pending.history_step.take() else {
+                tracing::error!(from = %from, "verified snapshot lost HistoryStep authority");
+                cleanup_finalized_snapshot_staging_offthread(finalized);
+                drop(tail);
+                reset_sync_state!();
+                continue;
+            };
+
+            let manifest = *pending.manifest;
+            if tail.boundary_height() != manifest.tip_height
+                || tail.boundary_hash() != manifest.tip_hash
+                || tail.tip_height() < manifest.bridge_tip_height
+            {
+                tracing::error!(
+                    from = %from,
+                    snapshot = manifest.tip_height,
+                    bridge_tip = manifest.bridge_tip_height,
+                    staged_tip = tail.tip_height(),
+                    "snapshot tail does not cover the immutable bridge"
+                );
+                cleanup_finalized_snapshot_staging_offthread(finalized);
+                drop_verified_history_step(history_step);
+                drop(tail);
+                reset_sync_state!();
+                continue;
+            }
+            let key = SnapshotInstallKey {
+                generation: snapshot_sync_generation,
+                from,
+                height: manifest.tip_height,
+                block_hash: manifest.tip_hash,
+            };
+            snapshot_install_inflight = Some(key);
+            let install_chain = Arc::clone(&chain);
+            let install_mempool = mempool.clone();
+            let install_wallet = Arc::clone(&wallet);
+            let install_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
+            let install_external_mining_attempts = external_mining_attempts.clone();
+            let install_history_step_runtime = history_step_runtime.clone();
+            let completion = snapshot_install_completion_tx.clone();
+            let staged_tail_blocks = tail.block_count();
+            let staged_tail_bytes = tail.payload_bytes();
+            let install_task = tokio::spawn(async move {
+                apply_verified_snapshot(
+                    &install_chain,
+                    &install_mempool,
+                    &install_wallet,
+                    manifest,
+                    finalized,
+                    history_step,
+                    tail,
+                    install_history_step_runtime,
+                    &install_wallet_operation_gate,
+                    &install_external_mining_attempts,
+                )
+                .await
+            });
+            tokio::spawn(async move {
+                let result = install_task
+                    .await
+                    .map_err(|error| format!("snapshot install task panicked: {error}"))
+                    .and_then(|result| result);
+                let _ = completion
+                    .send(SnapshotInstallCompletion { key, result })
+                    .await;
+            });
+            tracing::info!(
+                from = %from,
+                tip = key.height,
+                segments = segment_count,
+                staged_tail_blocks,
+                staged_tail_bytes,
+                "snapshot and immutable tail finalized — atomic catch-up running off event loop"
+            );
         }};
     }
 
@@ -2568,13 +2801,34 @@ async fn handle_p2p_events(
         match rx_item {
             Ok(NetworkEvent::BlockAnnouncement { from, header: announced_header }) => {
                 let height = announced_header.height;
-                let hash = noid_chain::consensus::pow::block_id(&announced_header);
-                if snapshot_install_inflight.is_some() {
-                    if height > highest_announced {
-                        highest_announced = height;
-                        sync_phase_telemetry.extend_suffix_target(height);
-                        last_announcement_peer = Some(from);
+                if selected_snapshot_peer!().is_some_and(|selected| selected != from) {
+                    continue;
+                }
+                if height > highest_announced {
+                    highest_announced = height;
+                    sync_phase_telemetry.extend_suffix_target(height);
+                    last_announcement_peer = Some(from);
+                }
+                if pending_manifest.is_some()
+                    && (snapshot_tail_staging.is_some()
+                        || snapshot_tail_append_inflight.is_some())
+                {
+                    if snapshot_tail_request_inflight.is_none()
+                        && snapshot_tail_append_inflight.is_none()
+                    {
+                        if let Some(staging) = snapshot_tail_staging.as_ref() {
+                            let expected = staging.next_height();
+                            if height >= expected {
+                                let peer = pending_manifest
+                                    .as_ref()
+                                    .map_or(from, |pending| pending.from);
+                                request_snapshot_tail_block!(peer, expected);
+                            }
+                        }
                     }
+                    continue;
+                }
+                if snapshot_install_inflight.is_some() {
                     tracing::debug!(
                         peer = %from,
                         height,
@@ -2583,11 +2837,6 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                if height > highest_announced {
-                    highest_announced = height;
-                    sync_phase_telemetry.extend_suffix_target(height);
-                    last_announcement_peer = Some(from);
-                }
                 // Compact block announcement: validate the advertised header before
                 // downloading a potentially large accepted bundle. Direct-next
                 // headers can be fully checked against the current tip; larger recent
@@ -2703,7 +2952,10 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    let fetch_key = (height, hash);
+                    let fetch_key = (
+                        height,
+                        noid_chain::consensus::pow::block_id(&announced_header),
+                    );
                     if let Some(pending) = pending_block_fetches.get(&fetch_key) {
                         if pending.requested_at.elapsed() < BLOCK_FETCH_INFLIGHT_TTL {
                             tracing::debug!(
@@ -2749,18 +3001,29 @@ async fn handle_p2p_events(
                 }
             }
             Ok(
-                NetworkEvent::IncomingBlock {
-                    from,
-                    bundle,
-                    mut inbound_memory_permit,
-                }
-                | NetworkEvent::RecentBlock {
-                    from,
-                    bundle,
-                    mut inbound_memory_permit,
-                },
+                block_event @ (NetworkEvent::IncomingBlock { .. }
+                | NetworkEvent::RecentBlock { .. }),
             ) => {
+                let pulled_response = matches!(&block_event, NetworkEvent::RecentBlock { .. });
+                let (from, bundle, mut inbound_memory_permit) = match block_event {
+                    NetworkEvent::IncomingBlock {
+                        from,
+                        bundle,
+                        inbound_memory_permit,
+                    }
+                    | NetworkEvent::RecentBlock {
+                        from,
+                        bundle,
+                        inbound_memory_permit,
+                    } => (from, bundle, inbound_memory_permit),
+                    _ => unreachable!("matched accepted-block event"),
+                };
                 let advertised_height = bundle.height();
+                if selected_snapshot_peer!().is_some_and(|selected| selected != from) {
+                    drop(bundle);
+                    drop(inbound_memory_permit.take());
+                    continue;
+                }
                 if advertised_height > highest_announced {
                     highest_announced = advertised_height;
                     sync_phase_telemetry.extend_suffix_target(advertised_height);
@@ -2797,6 +3060,64 @@ async fn handle_p2p_events(
                 if block_event_count.is_multiple_of(200) {
                     let cutoff = Instant::now() - Duration::from_secs(60);
                     peer_block_rate.retain(|_, (_, t)| *t >= cutoff);
+                }
+
+                if let Some(selected_snapshot_peer) =
+                    pending_manifest.as_ref().map(|pending| pending.from)
+                {
+                    debug_assert_eq!(from, selected_snapshot_peer);
+                    if let Some(staging) = snapshot_tail_staging.as_ref() {
+                        let expected = staging.next_height();
+                        let response_matches_request = pulled_response
+                            && snapshot_tail_request_inflight.is_some_and(|request| {
+                                request.generation == snapshot_sync_generation
+                                    && request.from == from
+                                    && request.height == advertised_height
+                            });
+                        if advertised_height == expected
+                            && snapshot_tail_append_inflight.is_none()
+                            && (snapshot_tail_request_inflight.is_none()
+                                || response_matches_request)
+                        {
+                            if response_matches_request {
+                                snapshot_tail_request_inflight = None;
+                            }
+                            stage_snapshot_tail_bundle!(
+                                from,
+                                bundle,
+                                inbound_memory_permit.take()
+                            );
+                            continue;
+                        }
+                        if advertised_height == expected {
+                            // An exact pull is already correlated at the P2P
+                            // layer.  Ignore an inline duplicate so only one
+                            // transport response can advance the disk tail.
+                            drop(bundle);
+                            drop(inbound_memory_permit.take());
+                            continue;
+                        }
+                        if advertised_height <= staging.tip_height()
+                            || advertised_height > expected
+                        {
+                            drop(bundle);
+                            drop(inbound_memory_permit.take());
+                            if advertised_height > expected
+                                && snapshot_tail_request_inflight.is_none()
+                                && snapshot_tail_append_inflight.is_none()
+                            {
+                                let peer = pending_manifest
+                                    .as_ref()
+                                    .map_or(from, |pending| pending.from);
+                                request_snapshot_tail_block!(peer, expected);
+                            }
+                            continue;
+                        }
+                    } else if snapshot_tail_append_inflight.is_some() {
+                        drop(bundle);
+                        drop(inbound_memory_permit.take());
+                        continue;
+                    }
                 }
 
                 tracing::debug!(peer = %from, "received block from P2P");
@@ -3562,7 +3883,19 @@ async fn handle_p2p_events(
                             }
                         }
             }
-            Ok(NetworkEvent::RecentBlockUnavailable { from, height }) => {
+            Ok(
+                availability_event @ (NetworkEvent::RecentBlockUnavailable { .. }
+                | NetworkEvent::RecentBlockRequestFailed { .. }),
+            ) => {
+                let request_failed = matches!(
+                    &availability_event,
+                    NetworkEvent::RecentBlockRequestFailed { .. }
+                );
+                let (from, height) = match availability_event {
+                    NetworkEvent::RecentBlockUnavailable { from, height }
+                    | NetworkEvent::RecentBlockRequestFailed { from, height } => (from, height),
+                    _ => unreachable!("matched retained-block availability event"),
+                };
                 let unavailable_shallow = pending_shallow_fork
                     .as_ref()
                     .filter(|pending| pending.peer == from)
@@ -3576,6 +3909,85 @@ async fn handle_p2p_events(
                     );
                     pending_shallow_fork = None;
                     pending_block_fetches.retain(|_, pending| pending.peer != from);
+                    continue;
+                }
+                let unavailable_snapshot_tail = snapshot_tail_request_inflight.is_some_and(|request| {
+                    request.generation == snapshot_sync_generation
+                        && request.from == from
+                        && request.height == height
+                }) && pending_manifest
+                    .as_ref()
+                    .is_some_and(|pending| pending.from == from);
+                if unavailable_snapshot_tail {
+                    snapshot_tail_request_inflight = None;
+                    let bridge_tip = pending_manifest
+                        .as_ref()
+                        .expect("selected snapshot manifest exists")
+                        .manifest
+                        .bridge_tip_height;
+                    if height <= bridge_tip {
+                        let our_tip = {
+                            let ctx = chain.read().await;
+                            ctx.tip_height()
+                        };
+                        tracing::warn!(
+                            peer = %from,
+                            height,
+                            request_failed,
+                            "immutable snapshot bridge block unavailable — selecting a fresh generation"
+                        );
+                        reset_sync_state!();
+                        manifest_requested_peers.insert(from);
+                        manifest_force_snapshot_peers.insert(from);
+                        manifest_round_started_at.get_or_insert_with(Instant::now);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer: from,
+                                requester_height: our_tip,
+                            })
+                            .await;
+                        continue;
+                    }
+
+                    // Beyond the generation's immutable bridge the pull is only
+                    // a best-effort live-tail probe.  Unavailable means that the
+                    // selected source is caught up; it does not invalidate the
+                    // already authenticated snapshot generation.
+                    let staged_tip = snapshot_tail_staging
+                        .as_ref()
+                        .map_or(bridge_tip, SnapshotTailStaging::tip_height);
+                    highest_announced = staged_tip;
+                    snapshot_tail_install_target = Some(staged_tip);
+                    tracing::debug!(
+                        peer = %from,
+                        height,
+                        staged_tip,
+                        request_failed,
+                        "optional snapshot live-tail exhausted"
+                    );
+                    if let Some((finalized, segment_count, finalized_from)) =
+                        finalized_snapshot_waiting.take()
+                    {
+                        let tail = match snapshot_tail_staging
+                            .take()
+                            .expect("finalized snapshot retains its disk tail")
+                            .finalize()
+                        {
+                            Ok(tail) => tail,
+                            Err(error) => {
+                                tracing::warn!(from = %from, err = %error, "snapshot tail finalization failed");
+                                cleanup_finalized_snapshot_staging_offthread(finalized);
+                                reset_sync_state!();
+                                continue;
+                            }
+                        };
+                        start_snapshot_install!(
+                            finalized,
+                            segment_count,
+                            finalized_from,
+                            tail
+                        );
+                    }
                     continue;
                 }
                 if snapshot_install_inflight.is_some() {
@@ -3752,10 +4164,10 @@ async fn handle_p2p_events(
                 mining_peer_quorum.connect(peer);
                 manifest_peers.insert(peer);
 
-                if snapshot_install_inflight.is_some() {
+                if snapshot_install_inflight.is_some() || selected_snapshot_peer!().is_some() {
                     tracing::debug!(
                         peer = %peer,
-                        "snapshot install active — deferring peer sync probes until new announcements"
+                        "snapshot session active — deferring peer sync probes"
                     );
                     continue;
                 }
@@ -3803,6 +4215,14 @@ async fn handle_p2p_events(
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
+                if selected_snapshot_peer!().is_some_and(|selected| selected != from) {
+                    tracing::debug!(
+                        peer = %from,
+                        headers = headers.len(),
+                        "snapshot session pinned to another peer — dropping header batch"
+                    );
+                    continue;
+                }
                 if snapshot_install_inflight.is_some() {
                     tracing::debug!(
                         peer = %from,
@@ -4919,6 +5339,204 @@ async fn handle_p2p_events(
             }
         }
 
+        completed = snapshot_tail_append_rx.recv() => {
+            let Some(completed) = completed else {
+                continue;
+            };
+            if snapshot_tail_append_inflight != Some(completed.key) {
+                tracing::debug!(
+                    key = ?completed.key,
+                    "discarding superseded snapshot tail append"
+                );
+                drop(completed.result);
+                continue;
+            }
+            snapshot_tail_append_inflight = None;
+            if completed.key.generation != snapshot_sync_generation {
+                drop(completed.result);
+                tracing::debug!(
+                    from = %completed.key.from,
+                    height = completed.key.height,
+                    "discarding snapshot tail from a reset sync generation"
+                );
+                continue;
+            }
+            let from = completed.key.from;
+            let staging = match completed.result {
+                Ok(staging) => staging,
+                Err(error) => {
+                    tracing::warn!(
+                        from = %from,
+                        height = completed.key.height,
+                        err = %error,
+                        "snapshot tail append failed"
+                    );
+                    reset_sync_state!();
+                    continue;
+                }
+            };
+            let Some(pending) = pending_manifest.as_ref() else {
+                drop(staging);
+                tracing::warn!(from = %from, "snapshot tail lost its selected manifest");
+                reset_sync_state!();
+                continue;
+            };
+            if pending.from != from {
+                drop(staging);
+                tracing::warn!(from = %from, expected = %pending.from, "snapshot tail peer changed");
+                reset_sync_state!();
+                continue;
+            }
+            let bridge_tip = pending.manifest.bridge_tip_height;
+            if staging.tip_height() == bridge_tip
+                && (staging.tip_hash() != pending.manifest.bridge_tip_hash
+                    || staging.tip_chainwork()
+                        != pending.manifest.bridge_cumulative_chainwork)
+            {
+                drop(staging);
+                tracing::warn!(
+                    from = %from,
+                    bridge_tip,
+                    "immutable snapshot bridge tip hash/work mismatch"
+                );
+                reset_sync_state!();
+                continue;
+            }
+            if staging.tip_height() > bridge_tip && !snapshot_tail_state_download_started {
+                drop(staging);
+                tracing::warn!(
+                    from = %from,
+                    height = completed.key.height,
+                    bridge_tip,
+                    "snapshot tail crossed bridge before state download started"
+                );
+                reset_sync_state!();
+                continue;
+            }
+            snapshot_tail_staging = Some(staging);
+
+            if !snapshot_tail_state_download_started
+                && snapshot_tail_staging
+                    .as_ref()
+                    .is_some_and(|tail| tail.tip_height() == bridge_tip)
+            {
+                let boundary_header = *pending_manifest
+                    .as_ref()
+                    .and_then(|pending| pending.history_step.as_ref())
+                    .expect("verified HistoryStep is retained through snapshot install")
+                    .boundary
+                    .header();
+                let manifest = pending_manifest
+                    .as_ref()
+                    .expect("selected manifest is retained")
+                    .manifest
+                    .clone();
+                let staging = begin_snapshot_state_download(
+                    &p2p_cmd,
+                    &snapshot_staging_root,
+                    from,
+                    &manifest,
+                    boundary_header,
+                    &mut pending_segment_ids,
+                    &mut segment_queue,
+                )
+                .await;
+                let staging = match staging {
+                    Ok(staging) => staging,
+                    Err(error) => {
+                        tracing::warn!(
+                            peer = %from,
+                            err = %error,
+                            "snapshot state staging initialization failed"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+                };
+                snapshot_staging = Some(staging);
+                snapshot_tail_state_download_started = true;
+                tracing::info!(
+                    from = %from,
+                    bridge_tip,
+                    blocks = snapshot_tail_staging.as_ref().map_or(0, SnapshotTailStaging::block_count),
+                    "immutable snapshot bridge sealed — downloading state"
+                );
+                if pending_segment_ids.is_empty() && segment_queue.is_empty() {
+                    let staging = snapshot_staging
+                        .take()
+                        .expect("snapshot staging exists before empty finalization");
+                    let segment_count = staging.descriptors().len();
+                    let key = SnapshotStagingOperationKey::Finalize {
+                        generation: snapshot_sync_generation,
+                        from,
+                    };
+                    snapshot_staging_inflight = Some(key);
+                    let completion = snapshot_staging_completion_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let started = Instant::now();
+                        let result = std::panic::catch_unwind(
+                            std::panic::AssertUnwindSafe(move || {
+                                staging.finalize().map_err(|error| error.to_string())
+                            }),
+                        )
+                        .map_err(|_| "snapshot finalization worker panicked".to_owned())
+                        .and_then(|result| result);
+                        let _ = completion.blocking_send(
+                            SnapshotStagingCompletion::Finalized {
+                                key,
+                                segment_count,
+                                work_elapsed: started.elapsed(),
+                                result,
+                            },
+                        );
+                    });
+                }
+            }
+
+            let install_ready = snapshot_tail_install_target.is_some_and(|target| {
+                snapshot_tail_staging
+                    .as_ref()
+                    .is_some_and(|tail| tail.tip_height() >= target)
+            }) && finalized_snapshot_waiting.is_some();
+            if install_ready {
+                let (finalized, segment_count, finalized_from) =
+                    finalized_snapshot_waiting
+                        .take()
+                        .expect("ready finalized snapshot is retained");
+                let tail = match snapshot_tail_staging
+                    .take()
+                    .expect("ready snapshot tail is retained")
+                    .finalize()
+                {
+                    Ok(tail) => tail,
+                    Err(error) => {
+                        tracing::warn!(from = %from, err = %error, "snapshot tail finalization failed");
+                        cleanup_finalized_snapshot_staging_offthread(finalized);
+                        reset_sync_state!();
+                        continue;
+                    }
+                };
+                start_snapshot_install!(finalized, segment_count, finalized_from, tail);
+                continue;
+            }
+
+            let next_target = if !snapshot_tail_state_download_started {
+                bridge_tip
+            } else {
+                snapshot_tail_install_target.unwrap_or(highest_announced)
+            };
+            if snapshot_tail_staging
+                .as_ref()
+                .is_some_and(|tail| tail.tip_height() < next_target)
+            {
+                let height = snapshot_tail_staging
+                    .as_ref()
+                    .expect("tail target comparison retained staging")
+                    .next_height();
+                request_snapshot_tail_block!(from, height);
+            }
+        }
+
         completed = snapshot_staging_completion_rx.recv() => {
             let Some(completed) = completed else {
                 continue;
@@ -5083,7 +5701,7 @@ async fn handle_p2p_events(
                         }
                     };
                     sync_phase_telemetry.record_state_work(work_elapsed);
-                    let Some(mut pending) = pending_manifest.take() else {
+                    let Some(pending) = pending_manifest.as_ref() else {
                         tracing::warn!(from = %from, "snapshot finalized without selected manifest");
                         cleanup_finalized_snapshot_staging_offthread(finalized);
                         reset_sync_state!();
@@ -5095,55 +5713,43 @@ async fn handle_p2p_events(
                         reset_sync_state!();
                         continue;
                     }
-                    let Some(history_step) = pending.history_step.take() else {
-                        tracing::error!(from = %from, "verified snapshot lost HistoryStep authority");
-                        cleanup_finalized_snapshot_staging_offthread(finalized);
-                        reset_sync_state!();
-                        continue;
-                    };
-
-                    let manifest = *pending.manifest;
-                    let key = SnapshotInstallKey {
-                        generation: snapshot_sync_generation,
-                        from,
-                        height: manifest.tip_height,
-                        block_hash: manifest.tip_hash,
-                    };
-                    snapshot_install_inflight = Some(key);
-                    let install_chain = Arc::clone(&chain);
-                    let install_mempool = mempool.clone();
-                    let install_wallet = Arc::clone(&wallet);
-                    let install_wallet_operation_gate = Arc::clone(&wallet_operation_gate);
-                    let install_external_mining_attempts = external_mining_attempts.clone();
-                    let completion = snapshot_install_completion_tx.clone();
-                    let install_task = tokio::spawn(async move {
-                        apply_verified_snapshot(
-                            &install_chain,
-                            &install_mempool,
-                            &install_wallet,
-                            manifest,
-                            finalized,
-                            history_step,
-                            &install_wallet_operation_gate,
-                            &install_external_mining_attempts,
-                        )
-                        .await
-                    });
-                    tokio::spawn(async move {
-                        let result = install_task
-                            .await
-                            .map_err(|error| format!("snapshot install task panicked: {error}"))
-                            .and_then(|result| result);
-                        let _ = completion
-                            .send(SnapshotInstallCompletion { key, result })
-                            .await;
-                    });
-                    tracing::info!(
-                        from = %from,
-                        tip = key.height,
-                        segments = segment_count,
-                        "snapshot finalized on disk — atomic install running off event loop"
-                    );
+                    let staged_tip = snapshot_tail_staging
+                        .as_ref()
+                        .map_or(pending.manifest.bridge_tip_height, SnapshotTailStaging::tip_height);
+                    let target = snapshot_tail_request_inflight
+                        .map_or(staged_tip, |request| staged_tip.max(request.height));
+                    let target = snapshot_tail_append_inflight
+                        .map_or(target, |append| target.max(append.height))
+                        .max(pending.manifest.bridge_tip_height);
+                    snapshot_tail_install_target = Some(target);
+                    if snapshot_tail_request_inflight.is_none()
+                        && snapshot_tail_append_inflight.is_none()
+                        && snapshot_tail_staging
+                            .as_ref()
+                            .is_some_and(|tail| tail.tip_height() >= target)
+                    {
+                        let tail = snapshot_tail_staging
+                            .take()
+                            .expect("ready snapshot tail is present")
+                            .finalize();
+                        let tail = match tail {
+                            Ok(tail) => tail,
+                            Err(error) => {
+                                tracing::warn!(from = %from, err = %error, "snapshot tail finalization failed");
+                                cleanup_finalized_snapshot_staging_offthread(finalized);
+                                reset_sync_state!();
+                                continue;
+                            }
+                        };
+                        start_snapshot_install!(finalized, segment_count, from, tail);
+                    } else {
+                        finalized_snapshot_waiting = Some((finalized, segment_count, from));
+                        tracing::info!(
+                            from = %from,
+                            target,
+                            "snapshot state finalized — waiting for disk live-tail"
+                        );
+                    }
                 }
             }
         }
@@ -5162,14 +5768,22 @@ async fn handle_p2p_events(
                     sync_phase_telemetry.record_state_work(applied.state_install_elapsed);
                     log_sync_phase_measurement(sync_phase_telemetry.finish_headers());
                     log_sync_phase_measurement(sync_phase_telemetry.finish_state());
+                    log_sync_phase_measurement(sync_phase_telemetry.complete_staged_tail(
+                        applied.tail_blocks,
+                        applied.tail_bytes,
+                        applied.tail_apply_elapsed,
+                    ));
 
                     let height = applied.height;
-                    tracing::info!(height, from = %completed.key.from, "snapshot install completed");
+                    tracing::info!(
+                        height,
+                        tail_blocks = applied.tail_blocks,
+                        from = %completed.key.from,
+                        "snapshot install completed"
+                    );
                     reset_sync_state!();
-                    if let Some(empty_suffix) =
-                        sync_phase_telemetry.begin_suffix(height, highest_announced)
-                    {
-                        log_sync_phase_measurement(empty_suffix);
+                    if highest_announced > height {
+                        let _ = sync_phase_telemetry.begin_suffix(height, highest_announced);
                     }
                     last_tip_advance = Instant::now();
                     mark_initial_sync_ready(&initial_sync_ready);
@@ -5264,64 +5878,58 @@ async fn handle_p2p_events(
             tracing::info!(
                 from = %from,
                 tip = completed.manifest.tip_height,
+                bridge_tip = completed.manifest.bridge_tip_height,
                 segments = completed.manifest.segment_ids.len(),
-                "snapshot manifest accepted — staging authenticated boundary"
+                "snapshot manifest accepted — staging immutable bridge before state"
             );
-            let staging = match create_snapshot_staging_session(
-                &snapshot_staging_root,
-                &completed.manifest,
-                *verified_history_step.boundary.header(),
+            let tail_root = snapshot_staging_root.join("tail");
+            let tail = match SnapshotTailStaging::create(
+                &tail_root,
+                completed.manifest.tip_height,
+                completed.manifest.tip_hash,
+                completed.manifest.cumulative_chainwork,
             ) {
-                Ok(staging) => staging,
+                Ok(tail) => tail,
                 Err(error) => {
-                    tracing::warn!(peer = %from, err = %error, "snapshot staging initialization failed");
+                    tracing::warn!(peer = %from, err = %error, "snapshot tail staging initialization failed");
                     drop_verified_history_step(verified_history_step);
                     reset_sync_state!();
                     continue;
                 }
             };
-            snapshot_staging = Some(staging);
-            queue_snapshot_segment_download(
-                &p2p_cmd,
-                from,
-                &completed.manifest,
-                &mut pending_segment_ids,
-                &mut segment_queue,
-            )
-            .await;
             // The terminal allocation and inbound permit remain owned by the
             // selected manifest until atomic snapshot installation.
+            highest_announced = if last_announcement_peer == Some(from) {
+                highest_announced.max(completed.manifest.bridge_tip_height)
+            } else {
+                completed.manifest.bridge_tip_height
+            };
+            last_announcement_peer = Some(from);
             pending_manifest = Some(PendingManifest {
                 from,
                 manifest: completed.manifest,
                 history_step: Some(verified_history_step),
             });
-            if pending_segment_ids.is_empty() && segment_queue.is_empty() {
-                // No segments (fresh network, no UTXOs yet).
-                let staging = snapshot_staging
-                    .take()
-                    .expect("snapshot staging exists before segment download");
-                let segment_count = staging.descriptors().len();
-                let key = SnapshotStagingOperationKey::Finalize {
-                    generation: snapshot_sync_generation,
-                    from,
-                };
-                snapshot_staging_inflight = Some(key);
-                let completion = snapshot_staging_completion_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let started = Instant::now();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        staging.finalize().map_err(|error| error.to_string())
-                    }))
-                    .map_err(|_| "snapshot finalization worker panicked".to_owned())
-                    .and_then(|result| result);
-                    let _ = completion.blocking_send(SnapshotStagingCompletion::Finalized {
-                        key,
-                        segment_count,
-                        work_elapsed: started.elapsed(),
-                        result,
-                    });
-                });
+            snapshot_tail_staging = Some(tail);
+            let bridge_tip = pending_manifest
+                .as_ref()
+                .expect("selected snapshot manifest is installed")
+                .manifest
+                .bridge_tip_height;
+            if bridge_tip
+                > pending_manifest
+                    .as_ref()
+                    .expect("selected snapshot manifest is installed")
+                    .manifest
+                    .tip_height
+            {
+                let height = pending_manifest
+                    .as_ref()
+                    .expect("selected snapshot manifest is installed")
+                    .manifest
+                    .tip_height
+                    .saturating_add(1);
+                request_snapshot_tail_block!(from, height);
             }
         }
 
@@ -5544,13 +6152,30 @@ fn compare_manifest_fork_choice(
     a: &noid_p2p::protocol::GetStateManifestResponse,
     b: &noid_p2p::protocol::GetStateManifestResponse,
 ) -> std::cmp::Ordering {
-    if noid_chain::work_gt(&a.cumulative_chainwork, &b.cumulative_chainwork) {
+    if noid_chain::work_gt(
+        &a.bridge_cumulative_chainwork,
+        &b.bridge_cumulative_chainwork,
+    ) {
         return std::cmp::Ordering::Greater;
     }
-    if noid_chain::work_gt(&b.cumulative_chainwork, &a.cumulative_chainwork) {
+    if noid_chain::work_gt(
+        &b.bridge_cumulative_chainwork,
+        &a.bridge_cumulative_chainwork,
+    ) {
         return std::cmp::Ordering::Less;
     }
-    a.tip_height.cmp(&b.tip_height)
+    a.bridge_tip_height
+        .cmp(&b.bridge_tip_height)
+        .then_with(|| {
+            if noid_chain::work_gt(&a.cumulative_chainwork, &b.cumulative_chainwork) {
+                std::cmp::Ordering::Greater
+            } else if noid_chain::work_gt(&b.cumulative_chainwork, &a.cumulative_chainwork) {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .then_with(|| a.tip_height.cmp(&b.tip_height))
 }
 
 fn cleanup_snapshot_staging_session_offthread(staging: SnapshotStagingSession) {
@@ -5641,6 +6266,21 @@ async fn queue_snapshot_segment_download(
         segment_queue,
     )
     .await;
+}
+
+async fn begin_snapshot_state_download(
+    p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    staging_root: &Path,
+    peer: libp2p::PeerId,
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+    header: noid_chain::BlockHeader,
+    pending_segment_ids: &mut std::collections::HashSet<u16>,
+    segment_queue: &mut std::collections::VecDeque<u16>,
+) -> Result<SnapshotStagingSession, String> {
+    let staging = create_snapshot_staging_session(staging_root, manifest, header)?;
+    queue_snapshot_segment_download(p2p_cmd, peer, manifest, pending_segment_ids, segment_queue)
+        .await;
+    Ok(staging)
 }
 
 /// Fill only the already-admitted network request window.  Snapshot payload
@@ -5779,6 +6419,8 @@ async fn apply_verified_snapshot(
     manifest: noid_p2p::protocol::GetStateManifestResponse,
     staging: FinalizedSnapshotStaging,
     history_step: VerifiedHistoryStepSnapshot,
+    tail: FinalizedSnapshotTail,
+    history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
     wallet_operation_gate: &WalletOperationGate,
     external_mining_attempts: &ExternalMiningAttemptInvalidator,
 ) -> Result<AppliedVerifiedSnapshot, String> {
@@ -5788,6 +6430,18 @@ async fn apply_verified_snapshot(
     }
     let snapshot_height = manifest.tip_height;
     let segment_count = staging.descriptors().len();
+    if tail.boundary_height() != snapshot_height
+        || tail.boundary_hash() != manifest.tip_hash
+        || tail.tip_height() < manifest.bridge_tip_height
+    {
+        drop_verified_history_step(history_step);
+        drop(tail);
+        return Err("snapshot tail does not cover the authenticated manifest bridge".into());
+    }
+    let expected_tail_tip = tail.tip_height();
+    let expected_tail_hash = tail.tip_hash();
+    let expected_tail_blocks = tail.block_count();
+    let expected_tail_bytes = tail.payload_bytes();
     let VerifiedHistoryStepSnapshot {
         boundary,
         mut headers,
@@ -5801,40 +6455,154 @@ async fn apply_verified_snapshot(
     // reload. None of those helpers may enter wallet RPC code that acquires
     // the same gate.
     let wallet_operation = wallet_operation_gate.lock().await;
-    let state_install_started = Instant::now();
     let install_chain = Arc::clone(chain);
     let result = tokio::task::spawn_blocking(move || {
         // Keep the verified terminal capability and its process-global inbound
         // charge alive through the atomic HistoryStep/snapshot commit.
         let inbound_memory_permit = inbound_memory_permit;
         let mut ctx = install_chain.blocking_write();
+        let state_install_started = Instant::now();
         if let Err(error) = ctx.apply_staged_state_snapshot(&staging, &boundary, &mut headers) {
             drop(ctx);
             let _ = headers.discard();
             return Err(format!("apply authenticated state snapshot: {error:?}"));
         }
+        let state_install_elapsed = state_install_started.elapsed();
+        // The atomic MDBX commit now owns the snapshot boundary. Replay the
+        // immutable bridge and the disk-staged live suffix through the normal
+        // block acceptance path while the chain writer excludes any competing
+        // in-process mutation. Each accepted bundle remains independently
+        // durable; if a later bundle is rejected, the caller reconciles the
+        // mempool and wallet to the last valid committed tip before retrying.
+        let tail_apply_started = Instant::now();
+        let mut tail_reader = match tail.reader() {
+            Ok(reader) => reader,
+            Err(error) => {
+                let view = ChainView::from_mdbx(&ctx);
+                let height = ctx.tip_height();
+                drop(ctx);
+                drop(staging);
+                drop(boundary);
+                drop(inbound_memory_permit);
+                drop(tail);
+                if let Err(cleanup_error) = headers.discard() {
+                    tracing::warn!(
+                        err = %cleanup_error,
+                        "committed snapshot header staging cleanup deferred"
+                    );
+                }
+                return Ok::<_, String>((
+                    height,
+                    view,
+                    Vec::new(),
+                    Some(error),
+                    0u64,
+                    state_install_elapsed,
+                    tail_apply_started.elapsed(),
+                ));
+            }
+        };
+        let mut confirmed_tx_hashes = Vec::new();
+        let mut applied_tail_blocks = 0u64;
+        let mut tail_error = None;
+        loop {
+            let bundle = match tail_reader.next_bundle() {
+                Ok(Some(bundle)) => bundle,
+                Ok(None) => break,
+                Err(error) => {
+                    tail_error = Some(error);
+                    break;
+                }
+            };
+            let block = match noid_chain::Block::from_bytes(bundle.block_bytes()) {
+                Ok(block) => block,
+                Err(error) => {
+                    tail_error = Some(format!(
+                        "decode staged tail block {}: {error:?}",
+                        bundle.height()
+                    ));
+                    break;
+                }
+            };
+            let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
+                Ok(txids) => txids,
+                Err(error) => {
+                    tail_error = Some(format!(
+                        "staged tail block {} has invalid logical transactions: {error}",
+                        bundle.height()
+                    ));
+                    break;
+                }
+            };
+            let apply_result = ctx.apply_next_block(
+                &bundle,
+                unix_now(),
+                |block, state| {
+                    noid_chain::materialize_accepted_block_state(state, block)
+                        .map_err(|error| format!("{error:?}"))
+                },
+                |claim| verify_history_step_terminal(claim, history_step_runtime.as_deref()),
+            );
+            if let Err(error) = apply_result {
+                tail_error = Some(format!(
+                    "apply staged tail block {}: {error}",
+                    bundle.height()
+                ));
+                break;
+            }
+            confirmed_tx_hashes.extend(txids);
+            applied_tail_blocks = applied_tail_blocks.saturating_add(1);
+        }
         let view = ChainView::from_mdbx(&ctx);
         let height = ctx.tip_height();
+        if tail_error.is_none()
+            && (height != expected_tail_tip
+                || view.tip_hash != expected_tail_hash
+                || applied_tail_blocks != expected_tail_blocks)
+        {
+            tail_error = Some("applied snapshot tail does not end at its sealed tip".to_string());
+        }
         drop(ctx);
-        // The atomic MDBX commit now owns the state; release temporary files
-        // before constructing consumers of the new durable view.
+        // Release temporary files only after every durable mutation and the
+        // final compact chain view have been established.
         drop(staging);
         drop(boundary);
         drop(inbound_memory_permit);
+        drop(tail);
         if let Err(error) = headers.discard() {
             tracing::warn!(err = %error, "committed snapshot header staging cleanup deferred");
         }
-        Ok::<_, String>((height, view))
+        Ok::<_, String>((
+            height,
+            view,
+            confirmed_tx_hashes,
+            tail_error,
+            applied_tail_blocks,
+            state_install_elapsed,
+            tail_apply_started.elapsed(),
+        ))
     })
     .await
     .map_err(|error| format!("snapshot install worker panicked: {error}"))?
     .map_err(|error| format!("failed to apply verified state snapshot: {error}"))?;
 
-    let (applied_height, view) = result;
+    let (
+        applied_height,
+        view,
+        confirmed_tx_hashes,
+        tail_error,
+        applied_tail_blocks,
+        state_install_elapsed,
+        tail_apply_elapsed,
+    ) = result;
     external_mining_attempts.invalidate_for_tip(applied_height, view.tip_hash);
-    mempool.on_new_block(&[], applied_height, view).await;
+    mempool
+        .on_new_block(&confirmed_tx_hashes, applied_height, view)
+        .await;
 
-    // Establish the exact active-owner cache at the installed snapshot boundary.
+    // Establish the exact active-owner cache at the final replayed tail. This
+    // deliberately replaces incremental wallet updates: the wallet sees one
+    // coherent chain state and never an intermediate snapshot boundary.
     if let Err(error) = rescan_wallet_from_chain(wallet, chain, mempool, "snapshot sync").await {
         wallet::invalidate_active_cache(wallet);
         return Err(format!(
@@ -5844,13 +6612,23 @@ async fn apply_verified_snapshot(
 
     tracing::info!(
         snapshot_height,
+        applied_height,
+        tail_blocks = applied_tail_blocks,
         segments = segment_count,
-        "snapshot boundary fully applied"
+        "snapshot boundary and disk tail fully applied"
     );
     drop(wallet_operation);
-    let state_install_elapsed = state_install_started.elapsed();
+    if let Some(error) = tail_error {
+        return Err(format!(
+            "snapshot boundary committed at {snapshot_height}, but tail replay stopped at \
+             {applied_height}: {error}"
+        ));
+    }
     Ok(AppliedVerifiedSnapshot {
-        height: snapshot_height,
+        height: applied_height,
+        tail_blocks: applied_tail_blocks,
+        tail_bytes: expected_tail_bytes,
+        tail_apply_elapsed,
         state_install_elapsed,
     })
 }

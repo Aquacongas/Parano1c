@@ -204,7 +204,7 @@ def main():
         boundaries = [
             int(value)
             for value in re.findall(
-                r"snapshot boundary fully applied snapshot_height=(\d+)",
+                r"snapshot boundary and disk tail fully applied snapshot_height=(\d+)",
                 recipient_log,
             )
         ]
@@ -224,8 +224,8 @@ def main():
             "recipient did not install exactly one snapshot",
         )
         require(
-            recipient_log.count("applied P2P block") == RETAINED_DEPTH,
-            "recipient did not apply exactly 18 retained blocks",
+            recipient_log.count("applied P2P block") == 0,
+            "snapshot tail escaped disk staging",
         )
         require(
             suffix_counts == [RETAINED_DEPTH],
@@ -262,9 +262,7 @@ def main():
                 "recipient_snapshot_installs": recipient_log.count(
                     "snapshot install completed"
                 ),
-                "recipient_applied_suffix_blocks": recipient_log.count(
-                    "applied P2P block"
-                ),
+                "recipient_applied_suffix_blocks": suffix_counts[0],
                 "recipient_suffix_counts": suffix_counts,
                 "recipient_wallet_scan_calls": 0,
             }

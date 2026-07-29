@@ -258,7 +258,10 @@ def sync_counts(text):
         "snapshot_installs": text.count("snapshot install completed"),
         "snapshot_boundaries": [
             int(value)
-            for value in re.findall(r"snapshot boundary fully applied snapshot_height=(\d+)", text)
+            for value in re.findall(
+                r"snapshot boundary and disk tail fully applied snapshot_height=(\d+)",
+                text,
+            )
         ],
         "history_step_verifications": text.count(
             'phase="history_step_terminal"'
@@ -409,9 +412,9 @@ def main():
         assert_no_sync_failures("fresh", secondary.log_text())
         require(fresh["snapshot_installs"] == 1, f"fresh snapshot count: {fresh}")
         require(fresh["snapshot_boundaries"] == [1], f"fresh boundary is not h=1: {fresh}")
-        require(fresh["applied_p2p_blocks"] == 18, f"fresh suffix is not 18 blocks: {fresh}")
+        require(fresh["applied_p2p_blocks"] == 0, f"fresh tail escaped staging: {fresh}")
         require(fresh["suffix_measurements"] == [18], f"fresh suffix telemetry is wrong: {fresh}")
-        require(fresh["post_snapshot_suffix_requests"] == 1, f"fresh suffix requested more than once: {fresh}")
+        require(fresh["post_snapshot_suffix_requests"] == 0, f"fresh tail needed a second pass: {fresh}")
         compare_hashes(primary, secondary, 0, 19)
         summary["phases"]["fresh_sync"] = {
             "source_height": 19,
@@ -460,9 +463,9 @@ def main():
         assert_no_sync_failures("gap19", secondary.log_text())
         require(gap19["snapshot_installs"] == 1, f"gap19 did not use one snapshot: {gap19}")
         require(gap19["snapshot_boundaries"] == [25], f"gap19 boundary is not h=25: {gap19}")
-        require(gap19["applied_p2p_blocks"] == 18, f"gap19 suffix is not 18 blocks: {gap19}")
+        require(gap19["applied_p2p_blocks"] == 0, f"gap19 tail escaped staging: {gap19}")
         require(gap19["suffix_measurements"] == [18], f"gap19 suffix telemetry is wrong: {gap19}")
-        require(gap19["post_snapshot_suffix_requests"] == 1, f"gap19 suffix requested more than once: {gap19}")
+        require(gap19["post_snapshot_suffix_requests"] == 0, f"gap19 tail needed a second pass: {gap19}")
         compare_hashes(primary, secondary, 0, 43)
         summary["phases"]["gap19_snapshot_sync"] = {
             "from_height": 24,

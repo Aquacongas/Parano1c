@@ -292,7 +292,7 @@ impl NodeBehaviour {
             [(
                 // v2 checks segment/header counts and snapshot geometry before
                 // allocating either manifest vector.
-                StreamProtocol::try_from_owned(format!("{}/sync/manifest/3", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest/4", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

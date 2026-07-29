@@ -140,6 +140,12 @@ pub struct GetStateManifestResponse {
     pub alloc_counter: u64,
     /// Effective log segment size (determines each segment's slot capacity).
     pub eff_log: u8,
+    /// Last immutable accepted bundle captured with this snapshot generation.
+    /// The complete range `tip_height + 1 ..= bridge_tip_height` is served
+    /// from generation-owned files and cannot be pruned by the live chain.
+    pub bridge_tip_height: u64,
+    pub bridge_tip_hash: [u8; 32],
+    pub bridge_cumulative_chainwork: [u8; 32],
     /// IDs of all non-empty state segments.  Each must be fetched individually.
     pub segment_ids: Vec<u16>,
     /// Exact Poseidon subtree roots aligned with `segment_ids`. Each sparse

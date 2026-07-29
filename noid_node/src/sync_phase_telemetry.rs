@@ -148,6 +148,21 @@ impl SnapshotSyncTelemetry {
         self.state.finish(SyncPhase::SnapshotState)
     }
 
+    /// Emit the immutable bridge plus disk live-tail replay completed as part
+    /// of snapshot installation. The replay is already complete, so it does
+    /// not need the incremental post-install suffix state machine below.
+    pub(crate) fn complete_staged_tail(
+        &mut self,
+        count: u64,
+        bytes: u64,
+        elapsed: Duration,
+    ) -> SyncPhaseMeasurement {
+        self.suffix = PhaseAccumulator::default();
+        self.suffix_active = false;
+        self.suffix_target_height = 0;
+        SyncPhaseMeasurement::new(SyncPhase::RetainedSuffix, count, bytes, elapsed, true)
+    }
+
     /// Begin the post-snapshot retained suffix.  An empty suffix is completed
     /// immediately and therefore still emits an honest zero-count sample.
     pub(crate) fn begin_suffix(
@@ -225,6 +240,18 @@ mod tests {
         assert_eq!(terminal.phase.scaling(), "O(1)");
         assert_eq!(terminal.elapsed_ms(), 42);
         assert_eq!(terminal.count, 1);
+    }
+
+    #[test]
+    fn staged_tail_is_reported_without_incremental_recounting() {
+        let mut telemetry = SnapshotSyncTelemetry::default();
+        let completed = telemetry.complete_staged_tail(18, 42_000, Duration::from_millis(90));
+        assert_eq!(completed.phase, SyncPhase::RetainedSuffix);
+        assert_eq!((completed.count, completed.bytes), (18, 42_000));
+        assert_eq!(completed.elapsed, Duration::from_millis(90));
+        assert!(telemetry
+            .record_suffix_block(19, 1, Duration::from_millis(1))
+            .is_none());
     }
 
     #[test]

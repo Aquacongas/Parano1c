@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 use noid_chain::{
+    consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
     consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS},
     storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
     LOG_SEGMENT_SIZE,
@@ -21,10 +22,10 @@ use noid_chain::{
 
 use crate::protocol::{GetStateManifestRequest, GetStateManifestResponse};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NMQ3";
-const RESPONSE_MAGIC: [u8; 4] = *b"NMF3";
+const REQUEST_MAGIC: [u8; 4] = *b"NMQ4";
+const RESPONSE_MAGIC: [u8; 4] = *b"NMF4";
 const REQUEST_BYTES: usize = 4 + 8;
-const RESPONSE_HEADER_BYTES: usize = 4 + 8 + 32 + 32 + 4 + 8 + 8 + 1 + 4;
+const RESPONSE_HEADER_BYTES: usize = 4 + 8 + 32 + 32 + 4 + 8 + 8 + 1 + 8 + 32 + 32 + 4;
 const SEGMENT_DESCRIPTOR_BYTES: usize = 2 + 32 + 4;
 
 /// Fixed-framing state-manifest request/response codec.
@@ -143,6 +144,9 @@ impl request_response::Codec for StateManifestCodec {
             active_slot_count: fields.active_slot_count,
             alloc_counter: fields.alloc_counter,
             eff_log: fields.eff_log,
+            bridge_tip_height: fields.bridge_tip_height,
+            bridge_tip_hash: fields.bridge_tip_hash,
+            bridge_cumulative_chainwork: fields.bridge_cumulative_chainwork,
             segment_ids,
             segment_roots,
             segment_lengths,
@@ -237,6 +241,9 @@ struct ResponseFields {
     active_slot_count: u64,
     alloc_counter: u64,
     eff_log: u8,
+    bridge_tip_height: u64,
+    bridge_tip_hash: [u8; 32],
+    bridge_cumulative_chainwork: [u8; 32],
     segment_count: u32,
     maximum_segments: u32,
 }
@@ -251,6 +258,9 @@ impl ResponseFields {
             active_slot_count: response.active_slot_count,
             alloc_counter: response.alloc_counter,
             eff_log: response.eff_log,
+            bridge_tip_height: response.bridge_tip_height,
+            bridge_tip_hash: response.bridge_tip_hash,
+            bridge_cumulative_chainwork: response.bridge_cumulative_chainwork,
             segment_count: u32::try_from(response.segment_ids.len())
                 .map_err(|_| invalid_data("manifest segment count does not fit u32"))?,
             maximum_segments: 0,
@@ -276,7 +286,14 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
             header[88..96].try_into().expect("fixed allocation counter"),
         ),
         eff_log: header[96],
-        segment_count: u32::from_le_bytes(header[97..101].try_into().expect("fixed segment count")),
+        bridge_tip_height: u64::from_le_bytes(
+            header[97..105].try_into().expect("fixed bridge tip height"),
+        ),
+        bridge_tip_hash: header[105..137].try_into().expect("fixed bridge tip hash"),
+        bridge_cumulative_chainwork: header[137..169].try_into().expect("fixed bridge chainwork"),
+        segment_count: u32::from_le_bytes(
+            header[169..173].try_into().expect("fixed segment count"),
+        ),
         maximum_segments: 0,
     };
     validate_response_fields(&mut fields)?;
@@ -291,6 +308,9 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
             || fields.active_slot_count != 0
             || fields.alloc_counter != 0
             || fields.eff_log != 0
+            || fields.bridge_tip_height != 0
+            || fields.bridge_tip_hash != [0; 32]
+            || fields.bridge_cumulative_chainwork != [0; 32]
             || fields.segment_count != 0
         {
             return Err(invalid_data(
@@ -315,6 +335,29 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
     if fields.active_slot_count > fields.alloc_counter {
         return Err(invalid_data(
             "manifest active slot count exceeds allocation counter",
+        ));
+    }
+    if fields.bridge_tip_height < fields.tip_height
+        || fields.bridge_tip_height.saturating_sub(fields.tip_height) > RECENT_BLOCK_RETENTION_DEPTH
+    {
+        return Err(invalid_data(
+            "manifest bridge lies outside the immutable suffix bound",
+        ));
+    }
+    if fields.bridge_tip_height == fields.tip_height {
+        if fields.bridge_tip_hash != fields.tip_hash
+            || fields.bridge_cumulative_chainwork != fields.cumulative_chainwork
+        {
+            return Err(invalid_data(
+                "empty manifest bridge differs from the snapshot boundary",
+            ));
+        }
+    } else if !noid_chain::work_gt(
+        &fields.bridge_cumulative_chainwork,
+        &fields.cumulative_chainwork,
+    ) {
+        return Err(invalid_data(
+            "manifest bridge does not advance cumulative chainwork",
         ));
     }
     let expected_eff_log = fields.log_slots.min(LOG_SEGMENT_SIZE as u32) as u8;
@@ -380,7 +423,10 @@ fn encode_response_header(fields: &ResponseFields) -> [u8; RESPONSE_HEADER_BYTES
     header[80..88].copy_from_slice(&fields.active_slot_count.to_le_bytes());
     header[88..96].copy_from_slice(&fields.alloc_counter.to_le_bytes());
     header[96] = fields.eff_log;
-    header[97..101].copy_from_slice(&fields.segment_count.to_le_bytes());
+    header[97..105].copy_from_slice(&fields.bridge_tip_height.to_le_bytes());
+    header[105..137].copy_from_slice(&fields.bridge_tip_hash);
+    header[137..169].copy_from_slice(&fields.bridge_cumulative_chainwork);
+    header[169..173].copy_from_slice(&fields.segment_count.to_le_bytes());
     header
 }
 
@@ -404,7 +450,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/manifest/3")
+        StreamProtocol::new("/noid/test/sync/manifest/4")
     }
 
     fn populated_response() -> GetStateManifestResponse {
@@ -416,6 +462,9 @@ mod tests {
             active_slot_count: 9,
             alloc_counter: 12,
             eff_log: 16,
+            bridge_tip_height: 95,
+            bridge_tip_hash: [0x23; 32],
+            bridge_cumulative_chainwork: [0x24; 32],
             segment_ids: vec![0, 1],
             segment_roots: vec![[0x33; 32], [0x44; 32]],
             segment_lengths: vec![209, 259],
@@ -436,6 +485,9 @@ mod tests {
             active_slot_count: 9,
             alloc_counter: 12,
             eff_log: 16,
+            bridge_tip_height: 95,
+            bridge_tip_hash: [0x23; 32],
+            bridge_cumulative_chainwork: [0x24; 32],
             segment_count: 2,
             maximum_segments: 0,
         }
@@ -493,6 +545,9 @@ mod tests {
         assert_eq!(decoded.tip_height, 77);
         assert_eq!(decoded.tip_hash, [0x11; 32]);
         assert_eq!(decoded.cumulative_chainwork, [0x22; 32]);
+        assert_eq!(decoded.bridge_tip_height, 95);
+        assert_eq!(decoded.bridge_tip_hash, [0x23; 32]);
+        assert_eq!(decoded.bridge_cumulative_chainwork, [0x24; 32]);
         assert_eq!(decoded.segment_ids, vec![0, 1]);
         assert_eq!(decoded.segment_roots, vec![[0x33; 32], [0x44; 32]]);
         assert_eq!(decoded.segment_lengths, vec![209, 259]);
@@ -508,6 +563,9 @@ mod tests {
             active_slot_count: 2,
             alloc_counter: 2,
             eff_log: 16,
+            bridge_tip_height: 106,
+            bridge_tip_hash: [0x55; 32],
+            bridge_cumulative_chainwork: [0x56; 32],
             segment_ids: vec![0, 511],
             segment_roots: vec![[0x53; 32], [0x54; 32]],
             segment_lengths: vec![59, 59],
@@ -576,6 +634,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("non-empty segment count"));
+
+        let mut bridge_too_deep = valid_fields();
+        bridge_too_deep.bridge_tip_height =
+            bridge_too_deep.tip_height + RECENT_BLOCK_RETENTION_DEPTH + 1;
+        let error = StateManifestCodec
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(response_header(bridge_too_deep)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("immutable suffix"));
+
+        let mut nonadvancing_bridge = valid_fields();
+        nonadvancing_bridge.bridge_cumulative_chainwork = nonadvancing_bridge.cumulative_chainwork;
+        let error = StateManifestCodec
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(response_header(nonadvancing_bridge)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("cumulative chainwork"));
     }
 
     #[tokio::test]

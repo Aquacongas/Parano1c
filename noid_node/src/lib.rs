@@ -5,3 +5,4 @@
 //! fault-injection tests.
 
 pub mod snapshot_header_staging;
+pub mod snapshot_tail_staging;
