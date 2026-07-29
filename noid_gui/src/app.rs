@@ -946,11 +946,12 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        self.backend_state = BackendState::Offline;
                         self.backend_error = Some(error);
-                        self.consecutive_refresh_failures =
-                            self.consecutive_refresh_failures.saturating_add(1);
-                        if self.consecutive_refresh_failures >= 3 {
+                        let should_probe = record_snapshot_refresh_failure(
+                            &mut self.backend_state,
+                            &mut self.consecutive_refresh_failures,
+                        );
+                        if should_probe && !self.ensure_in_flight {
                             self.ensure_in_flight = true;
                             let backend = self.backend.clone();
                             return Task::perform(
@@ -2516,9 +2517,27 @@ fn normalize_utxo_page_after_refresh(
     }
 }
 
+fn record_snapshot_refresh_failure(
+    _backend_state: &mut BackendState,
+    consecutive_failures: &mut u8,
+) -> bool {
+    *consecutive_failures = consecutive_failures.saturating_add(1);
+    if *consecutive_failures < 3 {
+        return false;
+    }
+    // A busy snapshot commit can temporarily hold the node's atomic storage
+    // writer long enough for GUI RPC refreshes to time out. That is not proof
+    // that the process is offline, so preserve the last known state while the
+    // supervisor performs the actual liveness check.
+    true
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{normalize_utxo_page_after_refresh, parse_noid_amount, utxo_page_count_for};
+    use super::{
+        normalize_utxo_page_after_refresh, parse_noid_amount, record_snapshot_refresh_failure,
+        utxo_page_count_for, BackendState,
+    };
 
     #[test]
     fn parses_noid_without_floating_point() {
@@ -2543,5 +2562,18 @@ mod tests {
         assert_eq!(normalize_utxo_page_after_refresh(2, 4, false), 2);
         assert_eq!(normalize_utxo_page_after_refresh(4, 2, false), 2);
         assert_eq!(normalize_utxo_page_after_refresh(2, 4, true), 1);
+    }
+
+    #[test]
+    fn transient_snapshot_rpc_timeouts_never_claim_the_node_is_offline() {
+        let mut state = BackendState::Online;
+        let mut failures = 0;
+        assert!(!record_snapshot_refresh_failure(&mut state, &mut failures));
+        assert_eq!(state, BackendState::Online);
+        assert!(!record_snapshot_refresh_failure(&mut state, &mut failures));
+        assert_eq!(state, BackendState::Online);
+        assert!(record_snapshot_refresh_failure(&mut state, &mut failures));
+        assert_eq!(state, BackendState::Online);
+        assert_ne!(state, BackendState::Offline);
     }
 }

@@ -60,18 +60,39 @@ pub struct GetHeadersResponse {
 // Block pull: complete accepted-block bundle
 // ---------------------------------------------------------------------------
 
-/// Request a retained full block from the bounded suffix window.
+/// Payload requested from the bounded recent-block window.
+///
+/// `BlockBody` is the snapshot fast path: the suffix's final recursive
+/// HistoryStep terminal authenticates the complete linked body sequence, so
+/// transferring the same proof-sized terminal with every body is redundant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecentBlockPayloadKind {
+    Complete,
+    BlockBody,
+}
+
+/// Request one retained block payload from the bounded suffix window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecentBlockRequest {
     pub height: u64,
+    pub payload_kind: RecentBlockPayloadKind,
 }
 
-/// Response: one structurally complete block + current-height HistoryStep
-/// terminal, or `None` when the retained block is unavailable.
+/// One bounded recent-block payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecentBlockPayload {
+    /// Canonical block plus its current-height HistoryStep terminal.
+    Complete(AcceptedBlockBundle),
+    /// Canonical block bytes only. Used exclusively by snapshot suffix sync.
+    BlockBody(Vec<u8>),
+}
+
+/// Response: the requested payload, or `None` when it is unavailable.
 #[derive(Debug, Clone)]
 pub struct GetRecentBlockResponse {
     pub height: u64,
-    pub bundle: Option<AcceptedBlockBundle>,
+    pub payload_kind: RecentBlockPayloadKind,
+    pub payload: Option<RecentBlockPayload>,
     /// Process-global inbound block-byte budget retained until the node has
     /// consumed this response. It is local flow-control state, never wire data.
     pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,

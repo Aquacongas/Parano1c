@@ -267,14 +267,14 @@ impl NodeBehaviour {
 
         let block_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/block/1", protocol_id))?,
+                // v2 can return a canonical block body without repeating its
+                // proof-sized terminal during authenticated snapshot sync.
+                StreamProtocol::try_from_owned(format!("{}/sync/block/2", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(30))
-                // Suffix advancement requests the next complete bundle only
-                // after the current bundle has been consumed.
-                .with_max_concurrent_streams(1),
+                .with_max_concurrent_streams(4),
         );
 
         let history_step_sync = request_response::Behaviour::new(

@@ -1,25 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Disk-backed accepted-bundle tail for finalized snapshot synchronization.
+//! Disk-backed compact block-body tail for finalized snapshot synchronization.
 //!
-//! A snapshot generation owns the immutable bundles immediately following its
-//! finalized state boundary. The receiver seals those bundles, then any newer
-//! live suffix, into this append-only file before downloading state segments.
-//! Snapshot installation can therefore replay the exact suffix even after the
-//! serving node's ordinary retained-block window has advanced.
+//! A snapshot generation owns the immutable blocks immediately following its
+//! finalized state boundary. The receiver stores only canonical block bodies,
+//! then fetches one recursive HistoryStep terminal for the sealed suffix tip.
+//! That terminal authenticates the complete linked sequence without repeating
+//! roughly 750 KiB of proof data at every height.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
+use noid_chain::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES};
 use noid_chain::{
-    AcceptedBlockBundle, Block, ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES, ACCEPTED_BLOCK_BUNDLE_MAGIC,
-    MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
+    Block, BlockHeader, HistoryStepTerminalMetadata, HISTORY_STEP_TERMINAL_BINDING_BYTES,
 };
 
-const FILE_MAGIC: [u8; 4] = *b"NST2";
+const FILE_MAGIC: [u8; 4] = *b"NST3";
 const FILE_HEADER_BYTES: u64 = 4 + 8 + 32 + 32;
 const RECORD_HEADER_BYTES: u64 = 4;
 static NEXT_TAIL_FILE_ID: AtomicU64 = AtomicU64::new(0);
@@ -38,6 +39,7 @@ pub struct SnapshotTailStaging {
     boundary_chainwork: [u8; 32],
     tip_height: u64,
     tip_hash: [u8; 32],
+    tip_header: Option<BlockHeader>,
     tip_chainwork: [u8; 32],
     block_count: u64,
     payload_bytes: u64,
@@ -52,8 +54,11 @@ pub struct FinalizedSnapshotTail {
     boundary_chainwork: [u8; 32],
     tip_height: u64,
     tip_hash: [u8; 32],
+    tip_header: Option<BlockHeader>,
     block_count: u64,
     payload_bytes: u64,
+    terminal_bytes: Vec<u8>,
+    _inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     armed: bool,
 }
 
@@ -102,6 +107,7 @@ impl SnapshotTailStaging {
             boundary_chainwork,
             tip_height: boundary_height,
             tip_hash: boundary_hash,
+            tip_header: None,
             tip_chainwork: boundary_chainwork,
             block_count: 0,
             payload_bytes: 0,
@@ -133,46 +139,32 @@ impl SnapshotTailStaging {
         self.payload_bytes
     }
 
-    pub fn append(mut self, bundle: AcceptedBlockBundle) -> Result<Self, String> {
-        let height = bundle.height();
+    pub fn append(mut self, block_bytes: Vec<u8>) -> Result<Self, String> {
+        if block_bytes.is_empty() || block_bytes.len() > MAX_BLOCK_BYTES {
+            return Err("tail block body length is outside bounds".to_string());
+        }
+        let block = Block::from_bytes(&block_bytes)
+            .map_err(|error| format!("decode tail block body: {error:?}"))?;
+        let height = block.header.height;
         if height != self.next_height() {
             return Err(format!(
-                "tail bundle height {height} does not follow {}",
+                "tail block height {height} does not follow {}",
                 self.tip_height
             ));
         }
-        let block = Block::from_bytes(bundle.block_bytes())
-            .map_err(|error| format!("decode tail block {height}: {error:?}"))?;
         if block.header.height != height || block.header.prev_block_hash != self.tip_hash {
             return Err(format!("tail block {height} is not linked to staged tip"));
         }
-        if bundle.block_hash() != noid_chain::hash_block_header(&block.header) {
-            return Err(format!("tail block {height} hash is inconsistent"));
-        }
-        let block_len = bundle.block_bytes().len();
-        let terminal_len = bundle.history_step_terminal_bytes().len();
-        let encoded_len = ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
-            .checked_add(block_len)
-            .and_then(|length| length.checked_add(terminal_len))
-            .ok_or_else(|| format!("tail block {height} length overflows"))?;
-        if encoded_len > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES {
-            return Err(format!(
-                "tail block {height} exceeds accepted-bundle bounds"
-            ));
-        }
-        let encoded_len_u32 = u32::try_from(encoded_len)
+        let block_hash = noid_chain::hash_block_header(&block.header);
+        let encoded_len_u32 = u32::try_from(block_bytes.len())
             .map_err(|_| format!("tail block {height} length does not fit u32"))?;
-        let block_len_u32 = u32::try_from(block_len)
-            .map_err(|_| format!("tail block {height} block length does not fit u32"))?;
-        let terminal_len_u32 = u32::try_from(terminal_len)
-            .map_err(|_| format!("tail block {height} terminal length does not fit u32"))?;
         let next_count = self
             .block_count
             .checked_add(1)
             .ok_or_else(|| "tail block counter overflow".to_string())?;
         let next_bytes = self
             .payload_bytes
-            .checked_add(encoded_len as u64)
+            .checked_add(block_bytes.len() as u64)
             .ok_or_else(|| "tail byte counter overflow".to_string())?;
         if next_count > MAX_SNAPSHOT_TAIL_BLOCKS || next_bytes > MAX_SNAPSHOT_TAIL_BYTES {
             return Err("snapshot live-tail staging limit exceeded".to_string());
@@ -185,15 +177,12 @@ impl SnapshotTailStaging {
         // The entire staging root is discarded after a process restart, so a
         // per-block fsync buys no recovery. Seal once in `finalize` instead.
         file.write_all(&encoded_len_u32.to_le_bytes())
-            .and_then(|()| file.write_all(&ACCEPTED_BLOCK_BUNDLE_MAGIC))
-            .and_then(|()| file.write_all(&block_len_u32.to_le_bytes()))
-            .and_then(|()| file.write_all(&terminal_len_u32.to_le_bytes()))
-            .and_then(|()| file.write_all(bundle.block_bytes()))
-            .and_then(|()| file.write_all(bundle.history_step_terminal_bytes()))
+            .and_then(|()| file.write_all(&block_bytes))
             .map_err(|error| format!("append tail block {height}: {error}"))?;
 
         self.tip_height = height;
-        self.tip_hash = bundle.block_hash();
+        self.tip_hash = block_hash;
+        self.tip_header = Some(block.header);
         self.tip_chainwork = noid_chain::add_work(
             &self.tip_chainwork,
             &noid_chain::block_work(&block.header.difficulty_target),
@@ -203,7 +192,26 @@ impl SnapshotTailStaging {
         Ok(self)
     }
 
-    pub fn finalize(mut self) -> Result<FinalizedSnapshotTail, String> {
+    pub fn finalize(
+        mut self,
+        terminal_bytes: Vec<u8>,
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    ) -> Result<FinalizedSnapshotTail, String> {
+        let tip_header = self
+            .tip_header
+            .ok_or_else(|| "snapshot tail cannot finalize without a block body".to_string())?;
+        if terminal_bytes.len() < HISTORY_STEP_TERMINAL_BINDING_BYTES
+            || terminal_bytes.len() > MAX_HISTORY_STEP_TERMINAL_BYTES
+        {
+            return Err("snapshot tail terminal length is outside bounds".to_string());
+        }
+        let metadata = HistoryStepTerminalMetadata::decode_prefix(&terminal_bytes)
+            .map_err(|error| format!("snapshot tail terminal metadata: {error}"))?;
+        if metadata.terminal_height() != tip_header.height
+            || metadata.terminal_hash() != noid_chain::block_header::semantic_header_id(&tip_header)
+        {
+            return Err("snapshot tail terminal does not bind its sealed tip".to_string());
+        }
         File::open(&self.path)
             .and_then(|file| file.sync_all())
             .map_err(|error| format!("finalize snapshot tail: {error}"))?;
@@ -215,8 +223,11 @@ impl SnapshotTailStaging {
             boundary_chainwork: self.boundary_chainwork,
             tip_height: self.tip_height,
             tip_hash: self.tip_hash,
+            tip_header: Some(tip_header),
             block_count: self.block_count,
             payload_bytes: self.payload_bytes,
+            terminal_bytes,
+            _inbound_memory_permit: inbound_memory_permit,
             armed: true,
         })
     }
@@ -237,6 +248,19 @@ impl FinalizedSnapshotTail {
 
     pub fn tip_hash(&self) -> [u8; 32] {
         self.tip_hash
+    }
+
+    pub fn tip_header(&self) -> Result<BlockHeader, String> {
+        self.tip_header
+            .ok_or_else(|| "finalized snapshot tail has no tip header".to_string())
+    }
+
+    pub fn terminal_bytes(&self) -> &[u8] {
+        &self.terminal_bytes
+    }
+
+    pub fn take_terminal_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.terminal_bytes)
     }
 
     pub fn block_count(&self) -> u64 {
@@ -270,10 +294,26 @@ impl FinalizedSnapshotTail {
             remaining_payload_bytes: self.payload_bytes,
         })
     }
+
+    /// Resolve a header retained inside the compact suffix.
+    pub fn header_at(&self, height: u64) -> Result<Option<BlockHeader>, String> {
+        if height <= self.boundary_height || height > self.tip_height {
+            return Ok(None);
+        }
+        let mut reader = self.reader()?;
+        while let Some(block_bytes) = reader.next_block()? {
+            let block = Block::from_bytes(&block_bytes)
+                .map_err(|error| format!("decode finalized tail block: {error:?}"))?;
+            if block.header.height == height {
+                return Ok(Some(block.header));
+            }
+        }
+        Ok(None)
+    }
 }
 
 impl SnapshotTailReader {
-    pub fn next_bundle(&mut self) -> Result<Option<AcceptedBlockBundle>, String> {
+    pub fn next_block(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self.remaining == 0 {
             if self.remaining_payload_bytes != 0 {
                 return Err("finalized tail byte accounting did not close".to_string());
@@ -304,57 +344,35 @@ impl SnapshotTailReader {
             .read_exact(&mut encoded_len)
             .map_err(|error| format!("read tail record length: {error}"))?;
         let encoded_len = u32::from_le_bytes(encoded_len) as usize;
-        if encoded_len == 0 || encoded_len > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES {
+        if encoded_len == 0 || encoded_len > MAX_BLOCK_BYTES {
             return Err("finalized tail record length is outside bounds".to_string());
         }
         if encoded_len as u64 > self.remaining_payload_bytes {
             return Err("finalized tail record exceeds byte accounting".to_string());
         }
-        let mut bundle_header = [0u8; ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES];
-        self.reader
-            .read_exact(&mut bundle_header)
-            .map_err(|error| format!("read finalized tail bundle header: {error}"))?;
-        if bundle_header[..4] != ACCEPTED_BLOCK_BUNDLE_MAGIC {
-            return Err("finalized tail bundle has invalid magic".to_string());
-        }
-        let block_len = u32::from_le_bytes(bundle_header[4..8].try_into().unwrap()) as usize;
-        let terminal_len = u32::from_le_bytes(bundle_header[8..12].try_into().unwrap()) as usize;
-        let payload_len =
-            AcceptedBlockBundle::validate_declared_lengths(block_len as u64, terminal_len as u64)
-                .map_err(|error| format!("decode finalized tail lengths: {error}"))?;
-        if ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
-            .checked_add(payload_len)
-            .is_none_or(|expected| expected != encoded_len)
-        {
-            return Err("finalized tail record length is inconsistent".to_string());
-        }
         let mut block_bytes = Vec::new();
         block_bytes
-            .try_reserve_exact(block_len)
+            .try_reserve_exact(encoded_len)
             .map_err(|_| "allocate finalized tail block".to_string())?;
-        block_bytes.resize(block_len, 0);
-        let mut terminal_bytes = Vec::new();
-        terminal_bytes
-            .try_reserve_exact(terminal_len)
-            .map_err(|_| "allocate finalized tail terminal".to_string())?;
-        terminal_bytes.resize(terminal_len, 0);
+        block_bytes.resize(encoded_len, 0);
         self.reader
             .read_exact(&mut block_bytes)
-            .and_then(|()| self.reader.read_exact(&mut terminal_bytes))
             .map_err(|error| format!("read finalized tail payload: {error}"))?;
-        let bundle = AcceptedBlockBundle::try_from_parts(block_bytes, terminal_bytes)
-            .map_err(|error| format!("decode finalized tail bundle: {error}"))?;
-        if bundle.height() != self.next_height {
+        let block = Block::from_bytes(&block_bytes)
+            .map_err(|error| format!("decode finalized tail block: {error:?}"))?;
+        if block.header.height != self.next_height
+            || block.header.prev_block_hash != self.previous_hash
+        {
             return Err(format!(
                 "finalized tail block {} is outside its staged sequence",
-                bundle.height()
+                block.header.height
             ));
         }
         self.next_height = self.next_height.saturating_add(1);
-        self.previous_hash = bundle.block_hash();
+        self.previous_hash = noid_chain::hash_block_header(&block.header);
         self.remaining -= 1;
         self.remaining_payload_bytes -= encoded_len as u64;
-        Ok(Some(bundle))
+        Ok(Some(block_bytes))
     }
 }
 
@@ -398,17 +416,20 @@ mod tests {
     use super::*;
     use noid_chain::consensus::genesis::genesis_header;
 
-    fn linked_bundle(parent: &Block, height: u64) -> AcceptedBlockBundle {
+    fn linked_block(parent: &Block, height: u64) -> Block {
         let mut header = parent.header;
         header.height = height;
         header.prev_block_hash = noid_chain::hash_block_header(&parent.header);
         header.timestamp = header.timestamp.saturating_add(15);
-        let block = Block {
+        Block {
             header,
             transactions: Vec::new(),
-        };
+        }
+    }
+
+    fn terminal_for(block: &Block) -> Vec<u8> {
         let mut terminal = noid_chain::HistoryStepTerminalMetadata::new(
-            height,
+            block.header.height,
             noid_chain::block_header::semantic_header_id(&block.header),
             0,
         )
@@ -416,25 +437,69 @@ mod tests {
         .encode_prefix()
         .to_vec();
         terminal.push(1);
-        AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
+        terminal
     }
 
     #[test]
-    fn empty_tail_round_trips_and_rejects_trailing_bytes() {
+    fn empty_tail_cannot_claim_a_recursive_suffix() {
         let root = tempfile::tempdir().unwrap();
         let boundary = genesis_header();
         let hash = noid_chain::hash_block_header(&boundary);
+        assert!(SnapshotTailStaging::create(root.path(), 0, hash, [0; 32])
+            .unwrap()
+            .finalize(vec![1], None)
+            .is_err());
+    }
+
+    #[test]
+    fn finalized_tail_rejects_trailing_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let genesis = Block {
+            header: genesis_header(),
+            transactions: Vec::new(),
+        };
+        let hash = noid_chain::hash_block_header(&genesis.header);
+        let block = linked_block(&genesis, 1);
         let finalized = SnapshotTailStaging::create(root.path(), 0, hash, [0; 32])
             .unwrap()
-            .finalize()
+            .append(block.to_bytes())
+            .unwrap()
+            .finalize(terminal_for(&block), None)
             .unwrap();
-        assert!(finalized.reader().unwrap().next_bundle().unwrap().is_none());
+        assert!(finalized.reader().unwrap().next_block().unwrap().is_some());
         let mut file = OpenOptions::new()
             .append(true)
             .open(&finalized.path)
             .unwrap();
         file.write_all(&[1]).unwrap();
-        assert!(finalized.reader().unwrap().next_bundle().is_err());
+        let mut reader = finalized.reader().unwrap();
+        assert!(reader.next_block().unwrap().is_some());
+        assert!(reader.next_block().is_err());
+    }
+
+    #[test]
+    fn tail_rejects_unlinked_bodies_and_a_terminal_for_another_tip() {
+        let root = tempfile::tempdir().unwrap();
+        let genesis = Block {
+            header: genesis_header(),
+            transactions: Vec::new(),
+        };
+        let boundary_hash = noid_chain::hash_block_header(&genesis.header);
+        let first = linked_block(&genesis, 1);
+        let mut unlinked = linked_block(&genesis, 1);
+        unlinked.header.prev_block_hash = [0x55; 32];
+        assert!(
+            SnapshotTailStaging::create(root.path(), 0, boundary_hash, [0; 32])
+                .unwrap()
+                .append(unlinked.to_bytes())
+                .is_err()
+        );
+
+        let staged = SnapshotTailStaging::create(root.path(), 0, boundary_hash, [0; 32])
+            .unwrap()
+            .append(first.to_bytes())
+            .unwrap();
+        assert!(staged.finalize(terminal_for(&genesis), None).is_err());
     }
 
     #[test]
@@ -446,36 +511,35 @@ mod tests {
         };
         let boundary_hash = noid_chain::hash_block_header(&genesis.header);
         let boundary_work = noid_chain::block_work(&genesis.header.difficulty_target);
-        let first = linked_bundle(&genesis, 1);
-        let first_block = Block::from_bytes(first.block_bytes()).unwrap();
-        let second = linked_bundle(&first_block, 2);
+        let first = linked_block(&genesis, 1);
+        let second = linked_block(&first, 2);
         let expected_work = noid_chain::add_work(
             &noid_chain::add_work(
                 &boundary_work,
-                &noid_chain::block_work(&first_block.header.difficulty_target),
+                &noid_chain::block_work(&first.header.difficulty_target),
             ),
-            &noid_chain::block_work(
-                &Block::from_bytes(second.block_bytes())
-                    .unwrap()
-                    .header
-                    .difficulty_target,
-            ),
+            &noid_chain::block_work(&second.header.difficulty_target),
         );
 
         let staged = SnapshotTailStaging::create(root.path(), 0, boundary_hash, boundary_work)
             .unwrap()
-            .append(first.clone())
+            .append(first.to_bytes())
             .unwrap()
-            .append(second.clone())
+            .append(second.to_bytes())
             .unwrap();
         assert_eq!(staged.tip_height(), 2);
-        assert_eq!(staged.tip_hash(), second.block_hash());
+        assert_eq!(
+            staged.tip_hash(),
+            noid_chain::hash_block_header(&second.header)
+        );
         assert_eq!(staged.tip_chainwork(), expected_work);
 
-        let finalized = staged.finalize().unwrap();
+        let finalized = staged.finalize(terminal_for(&second), None).unwrap();
+        assert_eq!(finalized.tip_header().unwrap(), second.header);
+        assert_eq!(finalized.header_at(1).unwrap(), Some(first.header));
         let mut reader = finalized.reader().unwrap();
-        assert_eq!(reader.next_bundle().unwrap(), Some(first));
-        assert_eq!(reader.next_bundle().unwrap(), Some(second));
-        assert_eq!(reader.next_bundle().unwrap(), None);
+        assert_eq!(reader.next_block().unwrap(), Some(first.to_bytes()));
+        assert_eq!(reader.next_block().unwrap(), Some(second.to_bytes()));
+        assert_eq!(reader.next_block().unwrap(), None);
     }
 }

@@ -62,7 +62,7 @@ use crate::consensus::{
 };
 use crate::segmented_state::SegmentedFriState;
 use crate::state::{ChainState, StreamingSparseRoot};
-use crate::storage::mdbx_store::StagedAcceptedBlockCommit;
+use crate::storage::mdbx_store::{AcceptedBlockCommit, StagedAcceptedBlockCommit};
 use crate::storage::{
     ConsensusMeta, FinalizedCheckpoint, FinalizedSnapshotStaging, MdbxStore,
     SnapshotHeaderInstallSource, StoreError, VerifiedSnapshotBoundary,
@@ -138,6 +138,41 @@ pub struct HistoryStepTerminalClaim<'a> {
     pub header: BlockHeader,
     /// Canonical transaction-epoch anchor header for height C.
     pub epoch_anchor_header: BlockHeader,
+}
+
+/// Non-cloneable authority for one exact linked snapshot suffix.
+///
+/// Construction verifies the suffix tip's recursive HistoryStep terminal and
+/// persists a crash-recovery record at the current boundary. Each successful
+/// body commit advances this capability exactly once; the final body stores
+/// the complete verified terminal and closes the temporary authority.
+#[derive(Debug)]
+pub struct VerifiedRecursiveSuffix {
+    boundary_height: u64,
+    tip_header: BlockHeader,
+    epoch_anchor_header: BlockHeader,
+    terminal_bytes: Vec<u8>,
+    next_height: u64,
+    previous_hash: [u8; 32],
+    complete: bool,
+}
+
+impl VerifiedRecursiveSuffix {
+    pub fn boundary_height(&self) -> u64 {
+        self.boundary_height
+    }
+
+    pub fn tip_height(&self) -> u64 {
+        self.tip_header.height
+    }
+
+    pub fn tip_hash(&self) -> [u8; 32] {
+        block_id(&self.tip_header)
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
 }
 
 /// A shallow in-RAM reorg may retain the union of old-branch and replacement
@@ -650,11 +685,15 @@ impl MdbxChainContext {
         if tip_header.height == 0 {
             return Ok(());
         }
-        let terminal = store
-            .get_history_step_terminal_at(tip_header.height, tip_hash)?
-            .ok_or(MdbxContextError::Corrupt(
-                "durable non-genesis tip history terminal is missing",
-            ))?;
+        let Some(terminal) = store.get_history_step_terminal_at(tip_header.height, tip_hash)?
+        else {
+            if store.durable_tip_has_verified_suffix_authority(tip_header, tip_hash)? {
+                return Ok(());
+            }
+            return Err(MdbxContextError::Corrupt(
+                "durable non-genesis tip history authorization is missing",
+            ));
+        };
         let metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(&terminal)
             .map_err(|_| {
             MdbxContextError::Corrupt("durable non-genesis tip history terminal is malformed")
@@ -878,7 +917,7 @@ impl MdbxChainContext {
 
     fn commit_applied_next_block(
         &mut self,
-        accepted_bundle: &crate::AcceptedBlockBundle,
+        accepted_block: AcceptedBlockCommit<'_>,
         block: &Block,
         undo: &crate::consensus::da_prune::BlockUndoLog,
         parent: &BlockHeader,
@@ -941,7 +980,7 @@ impl MdbxChainContext {
                     &dirty_summaries,
                     &tx_hashes,
                     &[],
-                    Some(accepted_bundle),
+                    Some(accepted_block),
                     &consensus_meta,
                     false,
                 )
@@ -1089,7 +1128,7 @@ impl MdbxChainContext {
         self.state = post_state;
         let state_root = self.state.cached_state_root();
         self.commit_applied_next_block(
-            &accepted_bundle,
+            AcceptedBlockCommit::Complete(&accepted_bundle),
             &block,
             &undo,
             &parent,
@@ -1223,12 +1262,171 @@ impl MdbxChainContext {
             ));
         }
         self.commit_applied_next_block(
-            accepted_bundle,
+            AcceptedBlockCommit::Complete(accepted_bundle),
             block,
             &undo,
             &parent,
             &parent_segment_summaries,
         )?;
+        Ok(state_root)
+    }
+
+    /// Materialize one body covered by a previously verified recursive suffix.
+    ///
+    /// This is not a proof bypass. `VerifiedRecursiveSuffix` can only be
+    /// created after the final terminal has passed the pinned verifier, and it
+    /// advances along one exact parent/hash sequence. Native header, PoW,
+    /// epoch-anchor, transaction and exact post-state checks remain identical
+    /// to ordinary block acceptance. Intermediate durable rows carry a compact
+    /// local authorization marker; the final row stores the complete terminal.
+    pub fn apply_verified_recursive_suffix_block<F, E>(
+        &mut self,
+        authority: &mut VerifiedRecursiveSuffix,
+        block_bytes: &[u8],
+        local_time: u64,
+        materialize_state: F,
+    ) -> Result<[u8; 32], MdbxContextError>
+    where
+        F: FnOnce(&Block, &mut ChainState) -> Result<[u8; 32], E>,
+        E: std::fmt::Display,
+    {
+        if self.reorg_staging.is_some() {
+            return Err(MdbxContextError::Corrupt(
+                "recursive suffix cannot apply during reorg staging",
+            ));
+        }
+        if authority.complete {
+            return Err(MdbxContextError::Corrupt(
+                "recursive suffix authority is already complete",
+            ));
+        }
+        if self.tip_height.saturating_add(1) != authority.next_height
+            || self.tip_hash != authority.previous_hash
+        {
+            return Err(MdbxContextError::Corrupt(
+                "recursive suffix authority no longer matches the canonical tip",
+            ));
+        }
+
+        let block = Block::from_bytes(block_bytes)
+            .map_err(|_| MdbxContextError::Corrupt("recursive suffix block body is malformed"))?;
+        if block.header.height != authority.next_height
+            || block.header.prev_block_hash != authority.previous_hash
+            || block.header.height > authority.tip_header.height
+        {
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+        }
+        let is_final = block.header.height == authority.tip_header.height;
+        if is_final && block.header != authority.tip_header {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix final body differs from its verified tip".to_string(),
+                ),
+            ));
+        }
+        if block.header.height == authority.epoch_anchor_header.height
+            && block.header != authority.epoch_anchor_header
+        {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix body differs from its verified epoch anchor".to_string(),
+                ),
+            ));
+        }
+
+        let parent = *self.tip_header();
+        let prev_timestamps = self.prev_timestamps();
+        let finalized_active_counts = self.finalized_active_counts()?;
+        let anchor = self.anchor_info();
+        let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
+        let tx_anchor_header =
+            self.get_header_from_store(tx_anchor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "canonical transaction epoch-anchor header missing",
+                ))?;
+        validate_block_epoch_anchors(&block, block_id(&tx_anchor_header), block_id(&parent))?;
+        validate_block_checks(
+            &block,
+            &parent,
+            &prev_timestamps,
+            &finalized_active_counts,
+            local_time,
+            &anchor,
+        )?;
+
+        let touched_segment_ids = self.segment_ids_for_block(&block);
+        let parent_segment_summaries: Vec<ParentSegmentSummary> = touched_segment_ids
+            .iter()
+            .copied()
+            .filter(|segment_id| (*segment_id as usize) < self.state.state.num_segments())
+            .map(|segment_id| (segment_id, self.state.state.cached_segment_root(segment_id)))
+            .collect();
+        self.preload_segment_ids(&touched_segment_ids)?;
+        let undo = build_undo_log(&self.state, &block).map_err(|_| {
+            MdbxContextError::Corrupt("recursive suffix block has invalid logical transactions")
+        })?;
+        let state_root = match materialize_state(&block, &mut self.state) {
+            Ok(state_root) => state_root,
+            Err(error) => {
+                let original = MdbxContextError::Consensus(ConsensusError::ShapeMismatch(format!(
+                    "public recursive suffix state materialization failed: {error}"
+                )));
+                return Err(self.reject_uncommitted_block(
+                    &undo,
+                    &parent,
+                    &parent_segment_summaries,
+                    original,
+                ));
+            }
+        };
+        if state_root != block.header.state_root {
+            return Err(self.reject_uncommitted_block(
+                &undo,
+                &parent,
+                &parent_segment_summaries,
+                MdbxContextError::Consensus(ConsensusError::BadStateRoot),
+            ));
+        }
+
+        let final_bundle = if is_final {
+            Some(
+                crate::AcceptedBlockBundle::try_from_parts(
+                    block_bytes.to_vec(),
+                    authority.terminal_bytes.clone(),
+                )
+                .map_err(|error| {
+                    self.reject_uncommitted_block(
+                        &undo,
+                        &parent,
+                        &parent_segment_summaries,
+                        MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(
+                            format!("verified recursive suffix bundle is malformed: {error}"),
+                        )),
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let commit_authorization = match final_bundle.as_ref() {
+            Some(bundle) => AcceptedBlockCommit::Complete(bundle),
+            None => AcceptedBlockCommit::RecursiveSuffix {
+                block_bytes,
+                authority_tip_height: authority.tip_header.height,
+                authority_tip_hash: block_id(&authority.tip_header),
+            },
+        };
+        self.commit_applied_next_block(
+            commit_authorization,
+            &block,
+            &undo,
+            &parent,
+            &parent_segment_summaries,
+        )?;
+
+        authority.previous_hash = block_id(&block.header);
+        authority.next_height = block.header.height.saturating_add(1);
+        authority.complete = is_final;
         Ok(state_root)
     }
 
@@ -1781,6 +1979,110 @@ impl MdbxChainContext {
         ))
     }
 
+    /// Verify one recursive terminal for an exact post-snapshot body suffix.
+    ///
+    /// The terminal proves the complete HistoryStep recursion through
+    /// `tip_header`; the caller separately supplies the linked canonical block
+    /// bodies. Those bodies still pass all native checks and exact state-root
+    /// materialization one by one, but no redundant intermediate terminal is
+    /// transferred or verified.
+    pub fn verify_recursive_suffix<A>(
+        &mut self,
+        tip_header: BlockHeader,
+        epoch_anchor_header: BlockHeader,
+        terminal_bytes: Vec<u8>,
+        verify_history_step_terminal: A,
+    ) -> Result<VerifiedRecursiveSuffix, MdbxContextError>
+    where
+        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+    {
+        if self.reorg_staging.is_some() {
+            return Err(MdbxContextError::Corrupt(
+                "recursive suffix cannot begin during reorg staging",
+            ));
+        }
+        if tip_header.height <= self.tip_height {
+            return Err(MdbxContextError::Corrupt(
+                "recursive suffix tip does not advance the canonical boundary",
+            ));
+        }
+        if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix terminal exceeds the wire cap".to_string(),
+                ),
+            ));
+        }
+        let expected_epoch_height = tx_epoch_anchor_height_for_child(tip_header.height);
+        if epoch_anchor_header.height != expected_epoch_height {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix terminal epoch anchor is invalid".to_string(),
+                ),
+            ));
+        }
+        if expected_epoch_height <= self.tip_height {
+            let canonical_epoch_anchor = self.get_header_from_store(expected_epoch_height)?.ok_or(
+                MdbxContextError::Corrupt("recursive suffix canonical epoch anchor is missing"),
+            )?;
+            if canonical_epoch_anchor != epoch_anchor_header {
+                return Err(MdbxContextError::Consensus(
+                    ConsensusError::BadHistoryStepTerminal(
+                        "recursive suffix epoch anchor is not canonical".to_string(),
+                    ),
+                ));
+            }
+        } else if expected_epoch_height >= tip_header.height {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix epoch anchor lies outside its body sequence".to_string(),
+                ),
+            ));
+        }
+        let metadata =
+            crate::history_step::HistoryStepTerminalMetadata::decode_prefix(&terminal_bytes)
+                .map_err(|error| {
+                    MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(format!(
+                        "recursive suffix terminal metadata is invalid: {error}"
+                    )))
+                })?;
+        if metadata.terminal_height() != tip_header.height
+            || metadata.terminal_hash() != crate::block_header::semantic_header_id(&tip_header)
+        {
+            return Err(MdbxContextError::Consensus(
+                ConsensusError::BadHistoryStepTerminal(
+                    "recursive suffix terminal does not bind its sealed tip".to_string(),
+                ),
+            ));
+        }
+        verify_history_step_terminal(&HistoryStepTerminalClaim {
+            terminal_bytes: &terminal_bytes,
+            header: tip_header,
+            epoch_anchor_header,
+        })
+        .map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(error))
+        })?;
+
+        let boundary_height = self.tip_height;
+        let boundary_hash = self.tip_hash;
+        self.store.begin_verified_recursive_suffix(
+            boundary_height,
+            boundary_hash,
+            &tip_header,
+            &terminal_bytes,
+        )?;
+        Ok(VerifiedRecursiveSuffix {
+            boundary_height,
+            tip_header,
+            epoch_anchor_header,
+            terminal_bytes,
+            next_height: boundary_height.saturating_add(1),
+            previous_hash: boundary_hash,
+            complete: false,
+        })
+    }
+
     /// Install a fully verified snapshot boundary in one durable state epoch.
     pub fn apply_staged_state_snapshot<S: SnapshotHeaderInstallSource>(
         &mut self,
@@ -1986,9 +2288,76 @@ impl MdbxChainContext {
 mod tests {
     use super::*;
 
-    fn small_context(path: &Path) -> MdbxChainContext {
+    fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
+        let parent = *context.tip_header();
+        let timestamp = parent.timestamp.saturating_add(1);
+        let anchor = context.anchor_info();
+        let target = crate::consensus::next_target(
+            anchor.anchor_height,
+            anchor.anchor_timestamp,
+            &anchor.anchor_target,
+            parent.height.saturating_add(1),
+            timestamp,
+        );
+        let finalized_active_counts = context.finalized_active_counts().unwrap();
+        let (template, _) = crate::consensus::template::build_node_owned_block_template(
+            &parent,
+            &context.state,
+            &finalized_active_counts,
+            Vec::new(),
+            noid_poseidon2b::primitives::Address([0x44; 32]),
+            timestamp,
+            target,
+        )
+        .unwrap();
+        let mut nonce = 0u128;
+        let block = loop {
+            let candidate = template.clone().into_block(nonce);
+            if crate::consensus::validate_pow(&candidate.header).is_ok() {
+                break candidate;
+            }
+            nonce = nonce.checked_add(1).expect("test nonce space exhausted");
+        };
+        let mut terminal = crate::history_step::HistoryStepTerminalMetadata::new(
+            block.header.height,
+            crate::block_header::semantic_header_id(&block.header),
+            0,
+        )
+        .unwrap()
+        .encode_prefix()
+        .to_vec();
+        terminal.push(0xA5);
+        crate::AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
+    }
+
+    fn accept_test_bundle(context: &mut MdbxChainContext, bundle: &crate::AcceptedBlockBundle) {
+        let block = crate::Block::from_bytes(bundle.block_bytes()).unwrap();
+        context
+            .apply_next_block(
+                bundle,
+                block.header.timestamp,
+                |block, state| {
+                    crate::materialize_accepted_block_state(state, block)
+                        .map_err(|error| format!("{error:?}"))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+    }
+
+    fn two_block_suffix() -> (crate::AcceptedBlockBundle, crate::AcceptedBlockBundle) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut producer = easy_block_context(directory.path());
+        let first = test_next_bundle(&producer);
+        accept_test_bundle(&mut producer, &first);
+        let second = test_next_bundle(&producer);
+        accept_test_bundle(&mut producer, &second);
+        (first, second)
+    }
+
+    fn test_context_with_log(path: &Path, log_slots: u32) -> MdbxChainContext {
         let store = MdbxStore::open(path).unwrap();
-        let state = ChainState::with_log_slots(8);
+        let state = ChainState::with_log_slots(log_slots as usize);
         let header = BlockHeader {
             prev_block_hash: [0u8; 32],
             state_root: state.cached_state_root(),
@@ -1998,7 +2367,7 @@ mod tests {
             miner_address: noid_poseidon2b::primitives::Address([0u8; 32]),
             nonce: 0,
             difficulty_target: [0xff; 32],
-            log_slots: 8,
+            log_slots,
             active_slot_count: 0,
             alloc_counter: 0,
         };
@@ -2035,6 +2404,14 @@ mod tests {
             defer_finality_updates: false,
             reorg_staging: None,
         }
+    }
+
+    fn small_context(path: &Path) -> MdbxChainContext {
+        test_context_with_log(path, 8)
+    }
+
+    fn easy_block_context(path: &Path) -> MdbxChainContext {
+        test_context_with_log(path, crate::consensus::params::LOG_SLOTS_GENESIS)
     }
 
     fn unsafe_claimed_coinbase_with_impossible_pow(
@@ -2193,6 +2570,186 @@ mod tests {
         assert_eq!(context.store.get_header(1).unwrap(), None);
         assert_eq!(context.store.get_chain_work(1).unwrap(), None);
         assert_eq!(context.store.get_header_anchor(1).unwrap(), None);
+    }
+
+    #[test]
+    fn recursive_suffix_verifies_once_and_commits_only_the_final_terminal() {
+        let (first, second) = two_block_suffix();
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = easy_block_context(directory.path());
+        let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+        let mut verifier_calls = 0usize;
+        let mut authority = context
+            .verify_recursive_suffix(
+                second_block.header,
+                genesis,
+                second.history_step_terminal_bytes().to_vec(),
+                |_| {
+                    verifier_calls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(verifier_calls, 1);
+
+        for bundle in [&first, &second] {
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    bundle.block_bytes(),
+                    crate::Block::from_bytes(bundle.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+        }
+
+        assert!(authority.is_complete());
+        assert_eq!(context.tip_height(), 2);
+        assert_eq!(context.tip_hash(), second.block_hash());
+        assert!(context.store.get_undo_log(1).unwrap().is_some());
+        assert!(context.store.get_undo_log(2).unwrap().is_some());
+        assert!(context.store.get_recent_block(1).unwrap().is_some());
+        assert!(context
+            .store
+            .get_recent_accepted_block_bundle_bounded(1)
+            .unwrap()
+            .is_none());
+        assert!(context
+            .store
+            .get_history_step_terminal_at(1, first.block_hash())
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            context
+                .store
+                .get_recent_accepted_block_bundle_bounded(2)
+                .unwrap(),
+            Some(second.encode())
+        );
+        assert!(!context
+            .store
+            .durable_tip_has_verified_suffix_authority(context.tip_header(), context.tip_hash())
+            .unwrap());
+    }
+
+    #[test]
+    fn interrupted_recursive_suffix_reopens_and_accepts_a_normal_successor() {
+        let (first, second) = two_block_suffix();
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let mut context = easy_block_context(directory.path());
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = context.get_header_from_store(0).unwrap().unwrap();
+            let mut authority = context
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    first.block_bytes(),
+                    crate::Block::from_bytes(first.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+            assert_eq!(context.tip_height(), 1);
+            assert!(!authority.is_complete());
+            assert!(
+                context
+                    .store
+                    .durable_tip_has_verified_suffix_authority(
+                        context.tip_header(),
+                        context.tip_hash(),
+                    )
+                    .unwrap()
+            );
+        }
+
+        let mut reopened =
+            MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap())
+                .unwrap();
+        assert_eq!(reopened.tip_height(), 1);
+        assert_eq!(reopened.tip_hash(), first.block_hash());
+        accept_test_bundle(&mut reopened, &second);
+        assert_eq!(reopened.tip_height(), 2);
+        assert!(!reopened
+            .store
+            .durable_tip_has_verified_suffix_authority(reopened.tip_header(), reopened.tip_hash(),)
+            .unwrap());
+    }
+
+    #[test]
+    fn rejected_recursive_suffix_terminal_never_authorizes_or_mutates_bodies() {
+        let (first, second) = two_block_suffix();
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = easy_block_context(directory.path());
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+        let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+        let original_tip = context.tip_hash();
+        let result = context.verify_recursive_suffix(
+            second_block.header,
+            genesis,
+            second.history_step_terminal_bytes().to_vec(),
+            |_| Err("deliberate recursive verifier rejection".to_string()),
+        );
+        assert!(result.is_err());
+        assert_eq!(context.tip_height(), 0);
+        assert_eq!(context.tip_hash(), original_tip);
+        assert!(context.store.get_recent_block(1).unwrap().is_none());
+        assert!(!context
+            .store
+            .durable_tip_has_verified_suffix_authority(context.tip_header(), original_tip)
+            .unwrap());
+
+        let mut authority = context
+            .verify_recursive_suffix(
+                second_block.header,
+                genesis,
+                second.history_step_terminal_bytes().to_vec(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        let mut tampered_first = crate::Block::from_bytes(first.block_bytes()).unwrap();
+        tampered_first.header.prev_block_hash = [0x55; 32];
+        assert!(context
+            .apply_verified_recursive_suffix_block(
+                &mut authority,
+                &tampered_first.to_bytes(),
+                tampered_first.header.timestamp,
+                |block, state| {
+                    crate::materialize_accepted_block_state(state, block)
+                        .map_err(|error| format!("{error:?}"))
+                },
+            )
+            .is_err());
+        assert_eq!(context.tip_height(), 0);
+        assert_eq!(context.tip_hash(), original_tip);
+        assert!(context.store.get_recent_block(1).unwrap().is_none());
+
+        // A normal fully proved successor supersedes the unused authority.
+        accept_test_bundle(&mut context, &first);
+        assert_eq!(context.tip_height(), 1);
+        assert!(!context
+            .store
+            .durable_tip_has_verified_suffix_authority(context.tip_header(), context.tip_hash())
+            .unwrap());
     }
 
     #[test]

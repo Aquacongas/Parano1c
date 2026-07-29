@@ -288,6 +288,10 @@ fn manifest_round_retry_due(
             .is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT)
 }
 
+fn manifest_round_gap_is_resolved(local_height: u64, highest_announced: u64) -> bool {
+    local_height >= highest_announced
+}
+
 fn history_step_cache_directory(data_dir: &Path, metadata_digest: [u8; 32]) -> PathBuf {
     let mut digest_hex = String::with_capacity(64);
     for byte in metadata_digest {
@@ -1893,8 +1897,8 @@ fn state_segment_response_matches_snapshot_boundary(
 mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
-        manifest_round_retry_due, mark_initial_sync_ready, next_block_has_competing_parent,
-        p2p_listen_to_multiaddr, snapshot_header_next_action,
+        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
+        next_block_has_competing_parent, p2p_listen_to_multiaddr, snapshot_header_next_action,
         state_segment_response_matches_snapshot_boundary, unavailable_block_requires_snapshot,
         validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
         validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
@@ -2049,6 +2053,13 @@ mod tests {
             started + STATE_MANIFEST_RESPONSE_TIMEOUT,
             1
         ));
+    }
+
+    #[test]
+    fn manifest_round_becomes_obsolete_when_announced_gap_is_closed() {
+        assert!(!manifest_round_gap_is_resolved(99, 100));
+        assert!(manifest_round_gap_is_resolved(100, 100));
+        assert!(manifest_round_gap_is_resolved(101, 100));
     }
 
     #[test]
@@ -2373,6 +2384,13 @@ async fn handle_p2p_events(
         result: Result<SnapshotTailStaging, String>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SnapshotTailTerminalKey {
+        generation: u64,
+        from: libp2p::PeerId,
+        height: u64,
+        block_hash: [u8; 32],
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct SnapshotInstallKey {
         generation: u64,
         from: libp2p::PeerId,
@@ -2404,6 +2422,7 @@ async fn handle_p2p_events(
     let mut snapshot_tail_staging: Option<SnapshotTailStaging> = None;
     let mut snapshot_tail_request_inflight: Option<SnapshotTailAppendKey> = None;
     let mut snapshot_tail_append_inflight: Option<SnapshotTailAppendKey> = None;
+    let mut snapshot_tail_terminal_inflight: Option<SnapshotTailTerminalKey> = None;
     let mut snapshot_tail_state_download_started = false;
     let mut finalized_snapshot_waiting: Option<(FinalizedSnapshotStaging, usize, libp2p::PeerId)> =
         None;
@@ -2459,6 +2478,20 @@ async fn handle_p2p_events(
     // Segment IDs queued but not yet requested (concurrency cap).
     let mut segment_queue: std::collections::VecDeque<u16> = std::collections::VecDeque::new();
 
+    // Clear only manifest-round bookkeeping. Unlike reset_sync_state!, this
+    // does not disturb an already-applied direct suffix, orphan pool, or any
+    // unrelated recovery state.
+    macro_rules! clear_manifest_round_state {
+        () => {{
+            manifest_candidates.clear();
+            manifest_requested_peers.clear();
+            manifest_force_snapshot_peers.clear();
+            manifest_response_count = 0;
+            manifest_first_candidate_at = None;
+            manifest_round_started_at = None;
+        }};
+    }
+
     // Helper: reset all segment-sync state on any failure.
     // Called whenever sync needs to restart (bad terminal, apply failure, missing segment).
     // Clearing manifest_requested_peers lets the next PeerConnected start fresh.
@@ -2478,17 +2511,13 @@ async fn handle_p2p_events(
             if let Some(stale_headers) = pending_snapshot_header_sync.take() {
                 cleanup_snapshot_header_staging_offthread(stale_headers.staging);
             }
-            manifest_candidates.clear();
-            manifest_requested_peers.clear();
-            manifest_force_snapshot_peers.clear();
-            manifest_response_count = 0;
-            manifest_first_candidate_at = None;
-            manifest_round_started_at = None;
+            clear_manifest_round_state!();
             if let Some(stale_staging) = snapshot_staging.take() {
                 cleanup_snapshot_staging_session_offthread(stale_staging);
             }
             drop(snapshot_tail_staging.take());
             snapshot_tail_request_inflight = None;
+            snapshot_tail_terminal_inflight = None;
             snapshot_tail_state_download_started = false;
             snapshot_tail_install_target = None;
             if let Some((finalized, _, _)) = finalized_snapshot_waiting.take() {
@@ -2549,7 +2578,7 @@ async fn handle_p2p_events(
                 };
                 snapshot_tail_request_inflight = Some(key);
                 if p2p_cmd
-                    .send(noid_p2p::NetworkCommand::RequestBlock { peer: from, height })
+                    .send(noid_p2p::NetworkCommand::RequestBlockBody { peer: from, height })
                     .await
                     .is_err()
                 {
@@ -2592,14 +2621,14 @@ async fn handle_p2p_events(
         }};
     }
 
-    macro_rules! stage_snapshot_tail_bundle {
-        ($from:expr, $bundle:expr, $inbound_permit:expr) => {{
+    macro_rules! stage_snapshot_tail_body {
+        ($from:expr, $height:expr, $block_bytes:expr, $inbound_permit:expr) => {{
             let from = $from;
-            let bundle = $bundle;
-            let height = bundle.height();
+            let height = $height;
+            let block_bytes = $block_bytes;
             let Some(staging) = snapshot_tail_staging.take() else {
-                tracing::warn!(from = %from, height, "snapshot tail bundle arrived without staging");
-                drop(bundle);
+                tracing::warn!(from = %from, height, "snapshot tail body arrived without staging");
+                drop(block_bytes);
                 drop($inbound_permit);
                 reset_sync_state!();
                 continue;
@@ -2614,7 +2643,7 @@ async fn handle_p2p_events(
             let inbound_permit = $inbound_permit;
             tokio::task::spawn_blocking(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let result = staging.append(bundle);
+                    let result = staging.append(block_bytes);
                     drop(inbound_permit);
                     result
                 }))
@@ -2622,6 +2651,49 @@ async fn handle_p2p_events(
                 .and_then(|result| result);
                 let _ = completion.blocking_send(SnapshotTailAppendCompletion { key, result });
             });
+        }};
+    }
+
+    macro_rules! request_snapshot_tail_terminal {
+        ($from:expr) => {{
+            let from = $from;
+            if snapshot_tail_terminal_inflight.is_none()
+                && snapshot_tail_request_inflight.is_none()
+                && snapshot_tail_append_inflight.is_none()
+                && finalized_snapshot_waiting.is_some()
+            {
+                if let Some(tail) = snapshot_tail_staging.as_ref() {
+                    let target = snapshot_tail_install_target.unwrap_or(tail.tip_height());
+                    if tail.tip_height() >= target && tail.block_count() != 0 {
+                        let key = SnapshotTailTerminalKey {
+                            generation: snapshot_sync_generation,
+                            from,
+                            height: tail.tip_height(),
+                            block_hash: tail.tip_hash(),
+                        };
+                        snapshot_tail_terminal_inflight = Some(key);
+                        if p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                                peer: from,
+                                height: key.height,
+                                block_hash: key.block_hash,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            snapshot_tail_terminal_inflight = None;
+                        } else {
+                            tracing::info!(
+                                peer = %from,
+                                height = key.height,
+                                blocks = tail.block_count(),
+                                bytes = tail.payload_bytes(),
+                                "snapshot compact suffix sealed — requesting one final HistoryStep terminal"
+                            );
+                        }
+                    }
+                }
+            }
         }};
     }
 
@@ -2813,7 +2885,9 @@ async fn handle_p2p_events(
                     && (snapshot_tail_staging.is_some()
                         || snapshot_tail_append_inflight.is_some())
                 {
-                    if snapshot_tail_request_inflight.is_none()
+                    if snapshot_tail_install_target.is_none()
+                        && snapshot_tail_terminal_inflight.is_none()
+                        && snapshot_tail_request_inflight.is_none()
                         && snapshot_tail_append_inflight.is_none()
                     {
                         if let Some(staging) = snapshot_tail_staging.as_ref() {
@@ -3000,11 +3074,52 @@ async fn handle_p2p_events(
                         .await;
                 }
             }
+            Ok(NetworkEvent::SnapshotBlockBody {
+                from,
+                height: advertised_height,
+                block_bytes,
+                mut inbound_memory_permit,
+            }) => {
+                let request_matches = snapshot_tail_request_inflight.is_some_and(|request| {
+                    request.generation == snapshot_sync_generation
+                        && request.from == from
+                        && request.height == advertised_height
+                });
+                let expected_height = snapshot_tail_staging
+                    .as_ref()
+                    .map(SnapshotTailStaging::next_height);
+                let selected_peer_matches = pending_manifest
+                    .as_ref()
+                    .is_some_and(|pending| pending.from == from);
+                if !request_matches
+                    || !selected_peer_matches
+                    || expected_height != Some(advertised_height)
+                    || snapshot_tail_append_inflight.is_some()
+                    || snapshot_install_inflight.is_some()
+                {
+                    drop(block_bytes);
+                    drop(inbound_memory_permit.take());
+                    tracing::debug!(
+                        peer = %from,
+                        advertised_height,
+                        ?expected_height,
+                        "dropping stale or mismatched snapshot block body"
+                    );
+                    continue;
+                }
+                snapshot_tail_request_inflight = None;
+                stage_snapshot_tail_body!(
+                    from,
+                    advertised_height,
+                    block_bytes,
+                    inbound_memory_permit.take()
+                );
+                continue;
+            }
             Ok(
                 block_event @ (NetworkEvent::IncomingBlock { .. }
                 | NetworkEvent::RecentBlock { .. }),
             ) => {
-                let pulled_response = matches!(&block_event, NetworkEvent::RecentBlock { .. });
                 let (from, bundle, mut inbound_memory_permit) = match block_event {
                     NetworkEvent::IncomingBlock {
                         from,
@@ -3062,62 +3177,13 @@ async fn handle_p2p_events(
                     peer_block_rate.retain(|_, (_, t)| *t >= cutoff);
                 }
 
-                if let Some(selected_snapshot_peer) =
-                    pending_manifest.as_ref().map(|pending| pending.from)
-                {
-                    debug_assert_eq!(from, selected_snapshot_peer);
-                    if let Some(staging) = snapshot_tail_staging.as_ref() {
-                        let expected = staging.next_height();
-                        let response_matches_request = pulled_response
-                            && snapshot_tail_request_inflight.is_some_and(|request| {
-                                request.generation == snapshot_sync_generation
-                                    && request.from == from
-                                    && request.height == advertised_height
-                            });
-                        if advertised_height == expected
-                            && snapshot_tail_append_inflight.is_none()
-                            && (snapshot_tail_request_inflight.is_none()
-                                || response_matches_request)
-                        {
-                            if response_matches_request {
-                                snapshot_tail_request_inflight = None;
-                            }
-                            stage_snapshot_tail_bundle!(
-                                from,
-                                bundle,
-                                inbound_memory_permit.take()
-                            );
-                            continue;
-                        }
-                        if advertised_height == expected {
-                            // An exact pull is already correlated at the P2P
-                            // layer.  Ignore an inline duplicate so only one
-                            // transport response can advance the disk tail.
-                            drop(bundle);
-                            drop(inbound_memory_permit.take());
-                            continue;
-                        }
-                        if advertised_height <= staging.tip_height()
-                            || advertised_height > expected
-                        {
-                            drop(bundle);
-                            drop(inbound_memory_permit.take());
-                            if advertised_height > expected
-                                && snapshot_tail_request_inflight.is_none()
-                                && snapshot_tail_append_inflight.is_none()
-                            {
-                                let peer = pending_manifest
-                                    .as_ref()
-                                    .map_or(from, |pending| pending.from);
-                                request_snapshot_tail_block!(peer, expected);
-                            }
-                            continue;
-                        }
-                    } else if snapshot_tail_append_inflight.is_some() {
-                        drop(bundle);
-                        drop(inbound_memory_permit.take());
-                        continue;
-                    }
+                if pending_manifest.is_some() {
+                    // Snapshot catch-up owns canonical mutation. Full bundles
+                    // announced in parallel are deliberately ignored; the
+                    // compact suffix is advanced only by correlated body pulls.
+                    drop(bundle);
+                    drop(inbound_memory_permit.take());
+                    continue;
                 }
 
                 tracing::debug!(peer = %from, "received block from P2P");
@@ -3891,16 +3957,25 @@ async fn handle_p2p_events(
                     &availability_event,
                     NetworkEvent::RecentBlockRequestFailed { .. }
                 );
-                let (from, height) = match availability_event {
-                    NetworkEvent::RecentBlockUnavailable { from, height }
-                    | NetworkEvent::RecentBlockRequestFailed { from, height } => (from, height),
+                let (from, height, payload_kind) = match availability_event {
+                    NetworkEvent::RecentBlockUnavailable {
+                        from,
+                        height,
+                        payload_kind,
+                    }
+                    | NetworkEvent::RecentBlockRequestFailed {
+                        from,
+                        height,
+                        payload_kind,
+                    } => (from, height, payload_kind),
                     _ => unreachable!("matched retained-block availability event"),
                 };
                 let unavailable_shallow = pending_shallow_fork
                     .as_ref()
                     .filter(|pending| pending.peer == from)
                     .and_then(|pending| pending.expected_header())
-                    .is_some_and(|expected| expected.height == height);
+                    .is_some_and(|expected| expected.height == height)
+                    && payload_kind == noid_p2p::protocol::RecentBlockPayloadKind::Complete;
                 if unavailable_shallow {
                     tracing::warn!(
                         peer = %from,
@@ -3915,6 +3990,8 @@ async fn handle_p2p_events(
                     request.generation == snapshot_sync_generation
                         && request.from == from
                         && request.height == height
+                        && payload_kind
+                            == noid_p2p::protocol::RecentBlockPayloadKind::BlockBody
                 }) && pending_manifest
                     .as_ref()
                     .is_some_and(|pending| pending.from == from);
@@ -3965,29 +4042,15 @@ async fn handle_p2p_events(
                         request_failed,
                         "optional snapshot live-tail exhausted"
                     );
-                    if let Some((finalized, segment_count, finalized_from)) =
-                        finalized_snapshot_waiting.take()
-                    {
-                        let tail = match snapshot_tail_staging
-                            .take()
-                            .expect("finalized snapshot retains its disk tail")
-                            .finalize()
-                        {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                tracing::warn!(from = %from, err = %error, "snapshot tail finalization failed");
-                                cleanup_finalized_snapshot_staging_offthread(finalized);
-                                reset_sync_state!();
-                                continue;
-                            }
-                        };
-                        start_snapshot_install!(
-                            finalized,
-                            segment_count,
-                            finalized_from,
-                            tail
-                        );
-                    }
+                    request_snapshot_tail_terminal!(from);
+                    continue;
+                }
+                if payload_kind == noid_p2p::protocol::RecentBlockPayloadKind::BlockBody {
+                    tracing::debug!(
+                        peer = %from,
+                        requested_height = height,
+                        "ignoring stale compact snapshot-body availability event"
+                    );
                     continue;
                 }
                 if snapshot_install_inflight.is_some() {
@@ -4732,6 +4795,24 @@ async fn handle_p2p_events(
                             snapshot_height = manifest.tip_height,
                             "manifest snapshot boundary not ahead"
                         );
+                        if manifest_round_gap_is_resolved(our_height, highest_announced)
+                            && pending_manifest.is_none()
+                            && pending_snapshot_header_sync.is_none()
+                            && snapshot_header_staging_inflight.is_none()
+                            && history_step_verification_inflight.is_none()
+                            && snapshot_staging.is_none()
+                            && snapshot_staging_inflight.is_none()
+                            && snapshot_install_inflight.is_none()
+                            && pending_segment_ids.is_empty()
+                            && segment_queue.is_empty()
+                        {
+                            clear_manifest_round_state!();
+                            tracing::debug!(
+                                our_height,
+                                highest_announced,
+                                "announced gap closed — discarded obsolete manifest round"
+                            );
+                        }
                         continue;
                     }
 
@@ -5000,6 +5081,74 @@ async fn handle_p2p_events(
                 terminal_bytes,
                 inbound_memory_permit,
             }) => {
+                let tail_correlated =
+                    snapshot_tail_terminal_inflight.is_some_and(|pending| {
+                        pending.generation == snapshot_sync_generation
+                            && pending.from == from
+                            && pending.height == height
+                            && pending.block_hash == block_hash
+                    });
+                if tail_correlated {
+                    snapshot_tail_terminal_inflight = None;
+                    let Some((finalized, segment_count, finalized_from)) =
+                        finalized_snapshot_waiting.take()
+                    else {
+                        drop(terminal_bytes);
+                        drop(inbound_memory_permit);
+                        tracing::warn!(
+                            from = %from,
+                            height,
+                            "snapshot suffix terminal arrived without finalized state"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    };
+                    let Some(staging) = snapshot_tail_staging.take() else {
+                        drop(terminal_bytes);
+                        drop(inbound_memory_permit);
+                        cleanup_finalized_snapshot_staging_offthread(finalized);
+                        tracing::warn!(
+                            from = %from,
+                            height,
+                            "snapshot suffix terminal arrived without compact tail"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    };
+                    if finalized_from != from
+                        || staging.tip_height() != height
+                        || staging.tip_hash() != block_hash
+                    {
+                        drop(terminal_bytes);
+                        drop(inbound_memory_permit);
+                        drop(staging);
+                        cleanup_finalized_snapshot_staging_offthread(finalized);
+                        tracing::warn!(
+                            from = %from,
+                            height,
+                            "snapshot suffix terminal no longer matches sealed tail"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+                    let tail = match staging.finalize(terminal_bytes, inbound_memory_permit) {
+                        Ok(tail) => tail,
+                        Err(error) => {
+                            cleanup_finalized_snapshot_staging_offthread(finalized);
+                            tracing::warn!(
+                                from = %from,
+                                height,
+                                err = %error,
+                                "snapshot suffix terminal rejected"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+                    };
+                    start_snapshot_install!(finalized, segment_count, finalized_from, tail);
+                    continue;
+                }
+
                 let snapshot_correlated = pending_snapshot_header_sync
                     .as_ref()
                     .is_some_and(|pending| {
@@ -5499,24 +5648,7 @@ async fn handle_p2p_events(
                     .is_some_and(|tail| tail.tip_height() >= target)
             }) && finalized_snapshot_waiting.is_some();
             if install_ready {
-                let (finalized, segment_count, finalized_from) =
-                    finalized_snapshot_waiting
-                        .take()
-                        .expect("ready finalized snapshot is retained");
-                let tail = match snapshot_tail_staging
-                    .take()
-                    .expect("ready snapshot tail is retained")
-                    .finalize()
-                {
-                    Ok(tail) => tail,
-                    Err(error) => {
-                        tracing::warn!(from = %from, err = %error, "snapshot tail finalization failed");
-                        cleanup_finalized_snapshot_staging_offthread(finalized);
-                        reset_sync_state!();
-                        continue;
-                    }
-                };
-                start_snapshot_install!(finalized, segment_count, finalized_from, tail);
+                request_snapshot_tail_terminal!(from);
                 continue;
             }
 
@@ -5722,28 +5854,15 @@ async fn handle_p2p_events(
                         .map_or(target, |append| target.max(append.height))
                         .max(pending.manifest.bridge_tip_height);
                     snapshot_tail_install_target = Some(target);
-                    if snapshot_tail_request_inflight.is_none()
+                    let tail_ready = snapshot_tail_request_inflight.is_none()
                         && snapshot_tail_append_inflight.is_none()
                         && snapshot_tail_staging
                             .as_ref()
-                            .is_some_and(|tail| tail.tip_height() >= target)
-                    {
-                        let tail = snapshot_tail_staging
-                            .take()
-                            .expect("ready snapshot tail is present")
-                            .finalize();
-                        let tail = match tail {
-                            Ok(tail) => tail,
-                            Err(error) => {
-                                tracing::warn!(from = %from, err = %error, "snapshot tail finalization failed");
-                                cleanup_finalized_snapshot_staging_offthread(finalized);
-                                reset_sync_state!();
-                                continue;
-                            }
-                        };
-                        start_snapshot_install!(finalized, segment_count, from, tail);
+                            .is_some_and(|tail| tail.tip_height() >= target);
+                    finalized_snapshot_waiting = Some((finalized, segment_count, from));
+                    if tail_ready {
+                        request_snapshot_tail_terminal!(from);
                     } else {
-                        finalized_snapshot_waiting = Some((finalized, segment_count, from));
                         tracing::info!(
                             from = %from,
                             target,
@@ -6027,28 +6146,37 @@ async fn handle_p2p_events(
                 && pending_segment_ids.is_empty()
                 && segment_queue.is_empty()
             {
-                tracing::warn!(
-                    peers = manifest_peers.len(),
-                    responses = manifest_response_count,
-                    "state manifest round produced no usable candidate — re-requesting"
-                );
-                reset_sync_state!();
                 let our_height = {
                     let ctx = chain.read().await;
                     ctx.tip_height()
                 };
-                for peer in manifest_peers.iter().copied() {
-                    manifest_requested_peers.insert(peer);
-                    p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                            peer,
-                            requester_height: our_height,
-                        })
-                        .await
-                        .ok();
-                }
-                if !manifest_peers.is_empty() {
-                    manifest_round_started_at = Some(now);
+                if manifest_round_gap_is_resolved(our_height, highest_announced) {
+                    clear_manifest_round_state!();
+                    tracing::debug!(
+                        our_height,
+                        highest_announced,
+                        "announced gap closed — cancelled manifest retry"
+                    );
+                } else {
+                    tracing::warn!(
+                        peers = manifest_peers.len(),
+                        responses = manifest_response_count,
+                        "state manifest round produced no usable candidate — re-requesting"
+                    );
+                    reset_sync_state!();
+                    for peer in manifest_peers.iter().copied() {
+                        manifest_requested_peers.insert(peer);
+                        p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                                peer,
+                                requester_height: our_height,
+                            })
+                            .await
+                            .ok();
+                    }
+                    if !manifest_peers.is_empty() {
+                        manifest_round_started_at = Some(now);
+                    }
                 }
             }
 
@@ -6460,6 +6588,7 @@ async fn apply_verified_snapshot(
         // Keep the verified terminal capability and its process-global inbound
         // charge alive through the atomic HistoryStep/snapshot commit.
         let inbound_memory_permit = inbound_memory_permit;
+        let mut tail = tail;
         let mut ctx = install_chain.blocking_write();
         let state_install_started = Instant::now();
         if let Err(error) = ctx.apply_staged_state_snapshot(&staging, &boundary, &mut headers) {
@@ -6468,90 +6597,120 @@ async fn apply_verified_snapshot(
             return Err(format!("apply authenticated state snapshot: {error:?}"));
         }
         let state_install_elapsed = state_install_started.elapsed();
-        // The atomic MDBX commit now owns the snapshot boundary. Replay the
-        // immutable bridge and the disk-staged live suffix through the normal
-        // block acceptance path while the chain writer excludes any competing
-        // in-process mutation. Each accepted bundle remains independently
-        // durable; if a later bundle is rejected, the caller reconciles the
-        // mempool and wallet to the last valid committed tip before retrying.
+        // The atomic MDBX commit now owns the snapshot boundary. Verify one
+        // recursive terminal for the sealed compact suffix before mutating any
+        // post-boundary state. Every body is then materialized through the same
+        // native header/PoW/epoch/transaction/state checks as ordinary blocks.
         let tail_apply_started = Instant::now();
-        let mut tail_reader = match tail.reader() {
-            Ok(reader) => reader,
-            Err(error) => {
-                let view = ChainView::from_mdbx(&ctx);
-                let height = ctx.tip_height();
-                drop(ctx);
-                drop(staging);
-                drop(boundary);
-                drop(inbound_memory_permit);
-                drop(tail);
-                if let Err(cleanup_error) = headers.discard() {
-                    tracing::warn!(
-                        err = %cleanup_error,
-                        "committed snapshot header staging cleanup deferred"
-                    );
-                }
-                return Ok::<_, String>((
-                    height,
-                    view,
-                    Vec::new(),
-                    Some(error),
-                    0u64,
-                    state_install_elapsed,
-                    tail_apply_started.elapsed(),
-                ));
-            }
-        };
         let mut confirmed_tx_hashes = Vec::new();
         let mut applied_tail_blocks = 0u64;
         let mut tail_error = None;
-        loop {
-            let bundle = match tail_reader.next_bundle() {
-                Ok(Some(bundle)) => bundle,
-                Ok(None) => break,
+
+        let suffix_tip_header = tail.tip_header();
+        let suffix_authority = suffix_tip_header.and_then(|tip_header| {
+            let epoch_height =
+                noid_chain::consensus::tx_epoch_anchor_height_for_child(tip_header.height);
+            let epoch_anchor_header = if epoch_height <= ctx.tip_height() {
+                ctx.get_header_from_store(epoch_height)
+                    .map_err(|error| {
+                        format!("load recursive suffix epoch anchor: {error}")
+                    })?
+                    .ok_or_else(|| {
+                        "recursive suffix epoch anchor is missing from snapshot headers".to_string()
+                    })?
+            } else {
+                tail.header_at(epoch_height)?
+                    .ok_or_else(|| {
+                        "recursive suffix epoch anchor is missing from compact tail".to_string()
+                    })?
+            };
+            let terminal_bytes = tail.take_terminal_bytes();
+            let terminal_len = terminal_bytes.len();
+            let terminal_started = Instant::now();
+            let result = ctx
+                .verify_recursive_suffix(
+                    tip_header,
+                    epoch_anchor_header,
+                    terminal_bytes,
+                    |claim| {
+                        verify_history_step_terminal(claim, history_step_runtime.as_deref())
+                    },
+                )
+                .map_err(|error| format!("verify recursive snapshot suffix: {error}"));
+            tracing::info!(
+                height = tip_header.height,
+                terminal_bytes = terminal_len,
+                elapsed_ms = terminal_started.elapsed().as_millis(),
+                accepted = result.is_ok(),
+                "snapshot compact suffix terminal verification completed"
+            );
+            result
+        });
+
+        if let Err(error) = &suffix_authority {
+            tail_error = Some(error.clone());
+        }
+        if let Ok(mut authority) = suffix_authority {
+            let mut tail_reader = match tail.reader() {
+                Ok(reader) => Some(reader),
                 Err(error) => {
                     tail_error = Some(error);
-                    break;
+                    None
                 }
             };
-            let block = match noid_chain::Block::from_bytes(bundle.block_bytes()) {
-                Ok(block) => block,
-                Err(error) => {
+            while tail_error.is_none() {
+                let block_bytes = match tail_reader
+                    .as_mut()
+                    .expect("tail reader exists while no error is recorded")
+                    .next_block()
+                {
+                    Ok(Some(block_bytes)) => block_bytes,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tail_error = Some(error);
+                        break;
+                    }
+                };
+                let block = match noid_chain::Block::from_bytes(&block_bytes) {
+                    Ok(block) => block,
+                    Err(error) => {
+                        tail_error = Some(format!(
+                            "decode staged tail block: {error:?}"
+                        ));
+                        break;
+                    }
+                };
+                let block_height = block.header.height;
+                let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
+                    Ok(txids) => txids,
+                    Err(error) => {
+                        tail_error = Some(format!(
+                            "staged tail block {block_height} has invalid logical transactions: {error}"
+                        ));
+                        break;
+                    }
+                };
+                if let Err(error) = ctx.apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    &block_bytes,
+                    unix_now(),
+                    |block, state| {
+                        noid_chain::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                ) {
                     tail_error = Some(format!(
-                        "decode staged tail block {}: {error:?}",
-                        bundle.height()
+                        "apply staged tail block {block_height}: {error}"
                     ));
                     break;
                 }
-            };
-            let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
-                Ok(txids) => txids,
-                Err(error) => {
-                    tail_error = Some(format!(
-                        "staged tail block {} has invalid logical transactions: {error}",
-                        bundle.height()
-                    ));
-                    break;
-                }
-            };
-            let apply_result = ctx.apply_next_block(
-                &bundle,
-                unix_now(),
-                |block, state| {
-                    noid_chain::materialize_accepted_block_state(state, block)
-                        .map_err(|error| format!("{error:?}"))
-                },
-                |claim| verify_history_step_terminal(claim, history_step_runtime.as_deref()),
-            );
-            if let Err(error) = apply_result {
-                tail_error = Some(format!(
-                    "apply staged tail block {}: {error}",
-                    bundle.height()
-                ));
-                break;
+                confirmed_tx_hashes.extend(txids);
+                applied_tail_blocks = applied_tail_blocks.saturating_add(1);
             }
-            confirmed_tx_hashes.extend(txids);
-            applied_tail_blocks = applied_tail_blocks.saturating_add(1);
+            if tail_error.is_none() && !authority.is_complete() {
+                tail_error =
+                    Some("recursive snapshot suffix ended before its verified tip".to_string());
+            }
         }
         let view = ChainView::from_mdbx(&ctx);
         let height = ctx.tip_height();

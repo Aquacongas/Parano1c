@@ -8,16 +8,23 @@ use std::{io, sync::Arc};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use noid_chain::{AcceptedBlockBundle, MAX_ACCEPTED_BLOCK_BUNDLE_BYTES};
+use noid_chain::{
+    consensus::wire_limits::MAX_BLOCK_BYTES, AcceptedBlockBundle, Block,
+    MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
+};
 
 use crate::inbound_budget::process_global_inbound_budget;
 use crate::outbound_budget::OutboundResponseBudget;
-use crate::protocol::{GetRecentBlockRequest, GetRecentBlockResponse};
+use crate::protocol::{
+    GetRecentBlockRequest, GetRecentBlockResponse, RecentBlockPayload, RecentBlockPayloadKind,
+};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NBR1";
-const RESPONSE_MAGIC: [u8; 4] = *b"NBS1";
-const REQUEST_HEADER_BYTES: usize = 12;
-const RESPONSE_HEADER_BYTES: usize = 16;
+const REQUEST_MAGIC: [u8; 4] = *b"NBR2";
+const RESPONSE_MAGIC: [u8; 4] = *b"NBS2";
+const REQUEST_HEADER_BYTES: usize = 13;
+const RESPONSE_HEADER_BYTES: usize = 17;
+const PAYLOAD_COMPLETE: u8 = 0;
+const PAYLOAD_BLOCK_BODY: u8 = 1;
 const NONE_LEN: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
@@ -84,9 +91,11 @@ impl request_response::Codec for BlockSyncCodec {
         if header[..4] != REQUEST_MAGIC {
             return Err(invalid_data("invalid block-sync request magic/version"));
         }
+        let payload_kind = decode_payload_kind(header[12])?;
         ensure_eof(io).await?;
         Ok(GetRecentBlockRequest {
             height: u64::from_le_bytes(header[4..12].try_into().unwrap()),
+            payload_kind,
         })
     }
 
@@ -104,27 +113,43 @@ impl request_response::Codec for BlockSyncCodec {
             return Err(invalid_data("invalid block-sync response magic/version"));
         }
         let height = u64::from_le_bytes(header[4..12].try_into().unwrap());
-        let encoded_len = u32::from_le_bytes(header[12..16].try_into().unwrap());
-        let bundle_len = validate_encoded_len(encoded_len)?;
-        let inbound_memory_permit = self.acquire_inbound(bundle_len).await?;
-        let bundle = if encoded_len == NONE_LEN {
+        let payload_kind = decode_payload_kind(header[12])?;
+        let encoded_len = u32::from_le_bytes(header[13..17].try_into().unwrap());
+        let payload_len = validate_encoded_len(encoded_len, payload_kind)?;
+        let inbound_memory_permit = self.acquire_inbound(payload_len).await?;
+        let payload = if encoded_len == NONE_LEN {
             None
         } else {
-            let mut encoded = allocate_payload(bundle_len)?;
+            let mut encoded = allocate_payload(payload_len)?;
             io.read_exact(&mut encoded).await?;
-            let bundle = AcceptedBlockBundle::decode(&encoded)
-                .map_err(|error| invalid_data(&format!("accepted-block bundle: {error}")))?;
-            if bundle.height() != height {
-                return Err(invalid_data(
-                    "accepted-block bundle height does not match response",
-                ));
+            match payload_kind {
+                RecentBlockPayloadKind::Complete => {
+                    let bundle = AcceptedBlockBundle::decode(&encoded).map_err(|error| {
+                        invalid_data(&format!("accepted-block bundle: {error}"))
+                    })?;
+                    if bundle.height() != height {
+                        return Err(invalid_data(
+                            "accepted-block bundle height does not match response",
+                        ));
+                    }
+                    Some(RecentBlockPayload::Complete(bundle))
+                }
+                RecentBlockPayloadKind::BlockBody => {
+                    let block = Block::from_bytes(&encoded).map_err(|error| {
+                        invalid_data(&format!("canonical block body: {error:?}"))
+                    })?;
+                    if block.header.height != height {
+                        return Err(invalid_data("block body height does not match response"));
+                    }
+                    Some(RecentBlockPayload::BlockBody(encoded))
+                }
             }
-            Some(bundle)
         };
         ensure_eof(io).await?;
         Ok(GetRecentBlockResponse {
             height,
-            bundle,
+            payload_kind,
+            payload,
             inbound_memory_permit,
             outbound_memory_permit: None,
         })
@@ -142,6 +167,7 @@ impl request_response::Codec for BlockSyncCodec {
         let mut header = [0u8; REQUEST_HEADER_BYTES];
         header[..4].copy_from_slice(&REQUEST_MAGIC);
         header[4..12].copy_from_slice(&request.height.to_le_bytes());
+        header[12] = encode_payload_kind(request.payload_kind);
         io.write_all(&header).await
     }
 
@@ -156,25 +182,48 @@ impl request_response::Codec for BlockSyncCodec {
     {
         let GetRecentBlockResponse {
             height,
-            bundle,
+            payload_kind,
+            payload,
             inbound_memory_permit,
             outbound_memory_permit,
         } = response;
-        if bundle
-            .as_ref()
-            .is_some_and(|bundle| bundle.height() != height)
-        {
-            return Err(invalid_data(
-                "accepted-block bundle height does not match response",
-            ));
+        match payload.as_ref() {
+            Some(RecentBlockPayload::Complete(bundle)) => {
+                if payload_kind != RecentBlockPayloadKind::Complete {
+                    return Err(invalid_data(
+                        "complete payload does not match declared response kind",
+                    ));
+                }
+                if bundle.height() != height {
+                    return Err(invalid_data(
+                        "accepted-block bundle height does not match response",
+                    ));
+                }
+            }
+            Some(RecentBlockPayload::BlockBody(block_bytes)) => {
+                if payload_kind != RecentBlockPayloadKind::BlockBody {
+                    return Err(invalid_data(
+                        "block body does not match declared response kind",
+                    ));
+                }
+                let block = Block::from_bytes(block_bytes)
+                    .map_err(|error| invalid_data(&format!("canonical block body: {error:?}")))?;
+                if block.header.height != height {
+                    return Err(invalid_data("block body height does not match response"));
+                }
+            }
+            None => {}
         }
-        let encoded = bundle.as_ref().map(AcceptedBlockBundle::encode);
+        let encoded = payload.as_ref().map(|payload| match payload {
+            RecentBlockPayload::Complete(bundle) => bundle.encode(),
+            RecentBlockPayload::BlockBody(block_bytes) => block_bytes.clone(),
+        });
         let encoded_len = match encoded.as_ref() {
             Some(encoded) => u32::try_from(encoded.len())
-                .map_err(|_| invalid_data("accepted-block bundle length does not fit u32"))?,
+                .map_err(|_| invalid_data("block-sync payload length does not fit u32"))?,
             None => NONE_LEN,
         };
-        let payload_len = validate_encoded_len(encoded_len)?;
+        let payload_len = validate_encoded_len(encoded_len, payload_kind)?;
         let outbound_memory_permit = match outbound_memory_permit {
             Some(permit) => Some(permit),
             None => self.outbound_budget.acquire(payload_len).await?,
@@ -184,7 +233,8 @@ impl request_response::Codec for BlockSyncCodec {
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
         header[4..12].copy_from_slice(&height.to_le_bytes());
-        header[12..16].copy_from_slice(&encoded_len.to_le_bytes());
+        header[12] = encode_payload_kind(payload_kind);
+        header[13..17].copy_from_slice(&encoded_len.to_le_bytes());
         io.write_all(&header).await?;
         if let Some(encoded) = encoded {
             io.write_all(&encoded).await?;
@@ -193,20 +243,40 @@ impl request_response::Codec for BlockSyncCodec {
     }
 }
 
-fn validate_encoded_len(encoded_len: u32) -> io::Result<usize> {
+fn validate_encoded_len(
+    encoded_len: u32,
+    payload_kind: RecentBlockPayloadKind,
+) -> io::Result<usize> {
     if encoded_len == NONE_LEN {
         return Ok(0);
     }
     let len = encoded_len as usize;
     if len == 0 {
-        return Err(invalid_data("present accepted-block bundle is empty"));
+        return Err(invalid_data("present block-sync payload is empty"));
     }
-    if len > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES {
-        return Err(invalid_data(
-            "declared accepted-block bundle exceeds wire cap",
-        ));
+    let maximum = match payload_kind {
+        RecentBlockPayloadKind::Complete => MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
+        RecentBlockPayloadKind::BlockBody => MAX_BLOCK_BYTES,
+    };
+    if len > maximum {
+        return Err(invalid_data("declared block-sync payload exceeds wire cap"));
     }
     Ok(len)
+}
+
+fn encode_payload_kind(kind: RecentBlockPayloadKind) -> u8 {
+    match kind {
+        RecentBlockPayloadKind::Complete => PAYLOAD_COMPLETE,
+        RecentBlockPayloadKind::BlockBody => PAYLOAD_BLOCK_BODY,
+    }
+}
+
+fn decode_payload_kind(encoded: u8) -> io::Result<RecentBlockPayloadKind> {
+    match encoded {
+        PAYLOAD_COMPLETE => Ok(RecentBlockPayloadKind::Complete),
+        PAYLOAD_BLOCK_BODY => Ok(RecentBlockPayloadKind::BlockBody),
+        _ => Err(invalid_data("unknown block-sync payload kind")),
+    }
 }
 
 fn allocate_payload(len: usize) -> io::Result<Vec<u8>> {
@@ -243,7 +313,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/block/1")
+        StreamProtocol::new("/noid/test/sync/block/2")
     }
 
     fn bundle(height: u64) -> AcceptedBlockBundle {
@@ -277,6 +347,7 @@ mod tests {
         let mut wire = Vec::with_capacity(RESPONSE_HEADER_BYTES + encoded.len());
         wire.extend_from_slice(&RESPONSE_MAGIC);
         wire.extend_from_slice(&bundle.height().to_le_bytes());
+        wire.push(PAYLOAD_COMPLETE);
         wire.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
         wire.extend_from_slice(&encoded);
         wire
@@ -286,18 +357,23 @@ mod tests {
     async fn request_round_trip_is_exact() {
         let mut wire = Cursor::new(Vec::new());
         BlockSyncCodec::default()
-            .write_request(&protocol(), &mut wire, GetRecentBlockRequest { height: 42 })
+            .write_request(
+                &protocol(),
+                &mut wire,
+                GetRecentBlockRequest {
+                    height: 42,
+                    payload_kind: RecentBlockPayloadKind::BlockBody,
+                },
+            )
             .await
             .unwrap();
         wire.set_position(0);
-        assert_eq!(
-            BlockSyncCodec::default()
-                .read_request(&protocol(), &mut wire)
-                .await
-                .unwrap()
-                .height,
-            42
-        );
+        let decoded = BlockSyncCodec::default()
+            .read_request(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.height, 42);
+        assert_eq!(decoded.payload_kind, RecentBlockPayloadKind::BlockBody);
     }
 
     #[tokio::test]
@@ -305,7 +381,8 @@ mod tests {
         let bundle = bundle(42);
         let response = GetRecentBlockResponse {
             height: 42,
-            bundle: Some(bundle.clone()),
+            payload_kind: RecentBlockPayloadKind::Complete,
+            payload: Some(RecentBlockPayload::Complete(bundle.clone())),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -320,14 +397,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded.height, 42);
-        assert_eq!(decoded.bundle, Some(bundle));
+        assert_eq!(decoded.payload_kind, RecentBlockPayloadKind::Complete);
+        assert_eq!(decoded.payload, Some(RecentBlockPayload::Complete(bundle)));
+    }
+
+    #[tokio::test]
+    async fn body_only_payload_round_trips_without_a_terminal() {
+        let bundle = bundle(42);
+        let body = bundle.block_bytes().to_vec();
+        let response = GetRecentBlockResponse {
+            height: 42,
+            payload_kind: RecentBlockPayloadKind::BlockBody,
+            payload: Some(RecentBlockPayload::BlockBody(body.clone())),
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        BlockSyncCodec::default()
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        assert!(wire.get_ref().len() < bundle.encode().len());
+        wire.set_position(0);
+        let decoded = BlockSyncCodec::default()
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.payload_kind, RecentBlockPayloadKind::BlockBody);
+        assert_eq!(decoded.payload, Some(RecentBlockPayload::BlockBody(body)));
     }
 
     #[tokio::test]
     async fn unavailable_response_has_no_partial_payload_shape() {
         let response = GetRecentBlockResponse {
             height: 42,
-            bundle: None,
+            payload_kind: RecentBlockPayloadKind::BlockBody,
+            payload: None,
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -338,12 +443,28 @@ mod tests {
             .unwrap();
         assert_eq!(wire.get_ref().len(), RESPONSE_HEADER_BYTES);
         wire.set_position(0);
-        assert!(BlockSyncCodec::default()
+        let decoded = BlockSyncCodec::default()
             .read_response(&protocol(), &mut wire)
             .await
-            .unwrap()
-            .bundle
-            .is_none());
+            .unwrap();
+        assert_eq!(decoded.payload_kind, RecentBlockPayloadKind::BlockBody);
+        assert!(decoded.payload.is_none());
+    }
+
+    #[tokio::test]
+    async fn response_payload_must_match_its_declared_kind() {
+        let body = bundle(42).block_bytes().to_vec();
+        let response = GetRecentBlockResponse {
+            height: 42,
+            payload_kind: RecentBlockPayloadKind::Complete,
+            payload: Some(RecentBlockPayload::BlockBody(body)),
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        assert!(BlockSyncCodec::default()
+            .write_response(&protocol(), &mut Cursor::new(Vec::new()), response)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -351,7 +472,8 @@ mod tests {
         let mut header = vec![0u8; RESPONSE_HEADER_BYTES];
         header[..4].copy_from_slice(&RESPONSE_MAGIC);
         header[4..12].copy_from_slice(&42u64.to_le_bytes());
-        header[12..16]
+        header[12] = PAYLOAD_COMPLETE;
+        header[13..17]
             .copy_from_slice(&((MAX_ACCEPTED_BLOCK_BUNDLE_BYTES + 1) as u32).to_le_bytes());
         let error = BlockSyncCodec::default()
             .read_response(&protocol(), &mut Cursor::new(header))
@@ -401,7 +523,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap()
-                .bundle
+                .payload
                 .is_some()
         );
     }

@@ -83,6 +83,7 @@ const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
 const KEY_CONSENSUS_META: &[u8] = &[0u8];
 const KEY_RETAINED_PAYLOAD_PRUNE_WATERMARK: &[u8] = &[2u8];
+const KEY_VERIFIED_SUFFIX_AUTHORITY: &[u8] = &[3u8];
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -265,6 +266,18 @@ impl MdbxHistoricalReadSnapshot<'_> {
                 "accepted block bundle length changed during read",
             ));
         }
+        let block = crate::Block::from_bytes(&block_bytes)
+            .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
+        if recursive_suffix_marker_authority(
+            &terminal_bytes,
+            height,
+            crate::block_header::semantic_header_id(&block.header),
+            None,
+        )
+        .is_some()
+        {
+            return Ok(None);
+        }
         let bundle = crate::AcceptedBlockBundle::try_from_parts(block_bytes, terminal_bytes)
             .map_err(|_| StoreError::Decode("accepted block bundle is malformed"))?;
         if bundle.height() != height {
@@ -361,12 +374,34 @@ pub(crate) struct StagedAcceptedBlockCommit {
     pub undo_log: BlockUndoLog,
 }
 
+/// Payload authorization used by the single durable block-commit path.
+///
+/// Ordinary blocks carry their complete current-height terminal. During
+/// snapshot catch-up, intermediate bodies are already covered by one verified
+/// recursive suffix terminal; storing another ~750 KiB proof per height would
+/// defeat the compact transport. Those entries carry a fixed-size local
+/// authorization marker tied to the persisted verified suffix authority.
+#[derive(Clone, Copy)]
+pub(crate) enum AcceptedBlockCommit<'a> {
+    Complete(&'a crate::AcceptedBlockBundle),
+    RecursiveSuffix {
+        block_bytes: &'a [u8],
+        authority_tip_height: u64,
+        authority_tip_hash: [u8; 32],
+    },
+}
+
 // ---------------------------------------------------------------------------
 // HistoryStep terminal retention
 // ---------------------------------------------------------------------------
 
 const RETAINED_PAYLOAD_PRUNE_WATERMARK_MAGIC: [u8; 4] = *b"RPW1";
 const RETAINED_PAYLOAD_PRUNE_WATERMARK_BYTES: usize = 4 + 8;
+const VERIFIED_SUFFIX_AUTHORITY_MAGIC: [u8; 4] = *b"VSA1";
+const VERIFIED_SUFFIX_AUTHORITY_BYTES: usize = 4 + 8 + 32 + 8 + 32;
+const RECURSIVE_SUFFIX_MARKER_MAGIC: [u8; 4] = *b"RSM1";
+const RECURSIVE_SUFFIX_MARKER_BYTES: usize =
+    crate::history_step::HISTORY_STEP_TERMINAL_BINDING_BYTES + 4 + 8 + 32;
 /// Bound numeric maintenance work even after a large snapshot jump.
 const RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT: usize = 16;
 /// One retained block plus terminal is bounded by the canonical wire caps.
@@ -375,6 +410,92 @@ const RETAINED_PAYLOAD_PRUNE_BYTE_LIMIT: usize = crate::consensus::wire_limits::
 /// A normal retired height deletes a block and terminal; advancing the exact
 /// boundary additionally removes one block body.
 const RETAINED_PAYLOAD_PRUNE_DELETE_LIMIT: usize = RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT * 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct VerifiedSuffixAuthorityRecord {
+    boundary_height: u64,
+    boundary_hash: [u8; 32],
+    tip_height: u64,
+    tip_hash: [u8; 32],
+}
+
+fn encode_verified_suffix_authority(
+    authority: VerifiedSuffixAuthorityRecord,
+) -> [u8; VERIFIED_SUFFIX_AUTHORITY_BYTES] {
+    let mut encoded = [0u8; VERIFIED_SUFFIX_AUTHORITY_BYTES];
+    encoded[..4].copy_from_slice(&VERIFIED_SUFFIX_AUTHORITY_MAGIC);
+    encoded[4..12].copy_from_slice(&authority.boundary_height.to_le_bytes());
+    encoded[12..44].copy_from_slice(&authority.boundary_hash);
+    encoded[44..52].copy_from_slice(&authority.tip_height.to_le_bytes());
+    encoded[52..84].copy_from_slice(&authority.tip_hash);
+    encoded
+}
+
+fn decode_verified_suffix_authority(bytes: &[u8]) -> Option<VerifiedSuffixAuthorityRecord> {
+    if bytes.len() != VERIFIED_SUFFIX_AUTHORITY_BYTES
+        || bytes[..4] != VERIFIED_SUFFIX_AUTHORITY_MAGIC
+    {
+        return None;
+    }
+    let authority = VerifiedSuffixAuthorityRecord {
+        boundary_height: u64::from_le_bytes(bytes[4..12].try_into().ok()?),
+        boundary_hash: bytes[12..44].try_into().ok()?,
+        tip_height: u64::from_le_bytes(bytes[44..52].try_into().ok()?),
+        tip_hash: bytes[52..84].try_into().ok()?,
+    };
+    (authority.boundary_height < authority.tip_height).then_some(authority)
+}
+
+fn encode_recursive_suffix_marker(
+    header: &BlockHeader,
+    class_slot: usize,
+    authority_tip_height: u64,
+    authority_tip_hash: [u8; 32],
+) -> Result<[u8; RECURSIVE_SUFFIX_MARKER_BYTES], StoreError> {
+    let class_id = u8::try_from(class_slot)
+        .map_err(|_| StoreError::Decode("recursive suffix class does not fit u8"))?;
+    let metadata = crate::history_step::HistoryStepTerminalMetadata::new(
+        header.height,
+        crate::block_header::semantic_header_id(header),
+        class_id,
+    )
+    .map_err(|_| StoreError::Decode("recursive suffix class is not canonical"))?;
+    let mut encoded = [0u8; RECURSIVE_SUFFIX_MARKER_BYTES];
+    let prefix = metadata.encode_prefix();
+    encoded[..prefix.len()].copy_from_slice(&prefix);
+    let marker_start = prefix.len();
+    encoded[marker_start..marker_start + 4].copy_from_slice(&RECURSIVE_SUFFIX_MARKER_MAGIC);
+    encoded[marker_start + 4..marker_start + 12]
+        .copy_from_slice(&authority_tip_height.to_le_bytes());
+    encoded[marker_start + 12..marker_start + 44].copy_from_slice(&authority_tip_hash);
+    Ok(encoded)
+}
+
+fn recursive_suffix_marker_authority(
+    bytes: &[u8],
+    height: u64,
+    semantic_id: [u8; 32],
+    class_slot: Option<usize>,
+) -> Option<(u64, [u8; 32])> {
+    if bytes.len() != RECURSIVE_SUFFIX_MARKER_BYTES {
+        return None;
+    }
+    let prefix_len = crate::history_step::HISTORY_STEP_TERMINAL_BINDING_BYTES;
+    if bytes[prefix_len..prefix_len + 4] != RECURSIVE_SUFFIX_MARKER_MAGIC {
+        return None;
+    }
+    let (actual_height, actual_semantic, actual_class) = history_step_terminal_metadata(bytes)?;
+    if actual_height != height
+        || actual_semantic != semantic_id
+        || class_slot.is_some_and(|expected| actual_class != expected)
+    {
+        return None;
+    }
+    let authority_height =
+        u64::from_le_bytes(bytes[prefix_len + 4..prefix_len + 12].try_into().ok()?);
+    let authority_hash = bytes[prefix_len + 12..prefix_len + 44].try_into().ok()?;
+    (authority_height >= height).then_some((authority_height, authority_hash))
+}
 
 fn validate_history_step_parent_boundary_in_rw_txn(
     txn: &Transaction<'_, RW, NoWriteMap>,
@@ -407,6 +528,51 @@ fn validate_history_step_parent_boundary_in_rw_txn(
         if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
             return Err(StoreError::Decode(
                 "HistoryStep parent terminal exceeds hard bounds",
+            ));
+        }
+        let parent_terminal: Vec<u8> =
+            txn.get(&terminals, &u64_key(parent_height))?
+                .ok_or(StoreError::Decode(
+                    "HistoryStep parent terminal disappeared",
+                ))?;
+        let parent_semantic = crate::block_header::semantic_header_id(
+            &parent_raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode("HistoryStep parent header disappeared"))?,
+        );
+        let recursive_authority = recursive_suffix_marker_authority(
+            &parent_terminal,
+            parent_height,
+            parent_semantic,
+            None,
+        );
+        if let Some((authority_tip_height, authority_tip_hash)) = recursive_authority {
+            let retention = txn.open_table(Some(T_RETENTION_META))?;
+            let authority_raw: Option<Vec<u8>> =
+                txn.get(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY)?;
+            let authority = authority_raw
+                .as_deref()
+                .and_then(decode_verified_suffix_authority)
+                .ok_or(StoreError::Decode(
+                    "recursive suffix parent authority is missing",
+                ))?;
+            if authority.tip_height != authority_tip_height
+                || authority.tip_hash != authority_tip_hash
+                || parent_height <= authority.boundary_height
+                || parent_height >= authority.tip_height
+            {
+                return Err(StoreError::Decode(
+                    "recursive suffix parent authority does not match its marker",
+                ));
+            }
+        } else if !history_step_terminal_prefix_matches(
+            &parent_terminal,
+            parent_height,
+            parent_semantic,
+        ) {
+            return Err(StoreError::Decode(
+                "HistoryStep parent authorization is malformed",
             ));
         }
     }
@@ -542,7 +708,15 @@ fn read_history_step_terminal(
     let bytes: Vec<u8> = txn
         .get(&terminals, &u64_key(height))?
         .ok_or(StoreError::Decode("HistoryStep terminal disappeared"))?;
-    if bytes.len() != length || !history_step_terminal_prefix_matches(&bytes, height, semantic_id) {
+    if bytes.len() != length {
+        return Err(StoreError::Decode(
+            "HistoryStep terminal length changed during read",
+        ));
+    }
+    if recursive_suffix_marker_authority(&bytes, height, semantic_id, None).is_some() {
+        return Ok(None);
+    }
+    if !history_step_terminal_prefix_matches(&bytes, height, semantic_id) {
         return Err(StoreError::Decode(
             "HistoryStep terminal does not match its canonical boundary",
         ));
@@ -997,6 +1171,106 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_chain_work(&b)))
     }
 
+    /// Persist the authority for a previously verified recursive snapshot
+    /// suffix before its first body is committed. If the process stops between
+    /// bodies, the fixed-size per-height marker and this record explain the
+    /// durable partial tip without retaining every intermediate proof.
+    pub(crate) fn begin_verified_recursive_suffix(
+        &self,
+        boundary_height: u64,
+        boundary_hash: [u8; 32],
+        tip_header: &BlockHeader,
+        terminal_bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        if boundary_height >= tip_header.height {
+            return Err(StoreError::Decode(
+                "verified recursive suffix does not advance the boundary",
+            ));
+        }
+        let tip_hash = crate::block_header::block_id(tip_header);
+        let terminal =
+            crate::history_step::HistoryStepTerminalMetadata::decode_prefix(terminal_bytes)
+                .map_err(|_| {
+                    StoreError::Decode("verified recursive suffix terminal is malformed")
+                })?;
+        if terminal.terminal_height() != tip_header.height
+            || terminal.terminal_hash() != crate::block_header::semantic_header_id(tip_header)
+        {
+            return Err(StoreError::Decode(
+                "verified recursive suffix terminal does not bind its tip",
+            ));
+        }
+
+        let txn = self.db.begin_rw_txn()?;
+        let tip_table = txn.open_table(Some(T_CHAIN_TIP))?;
+        let durable_tip: Option<Vec<u8>> = txn.get(&tip_table, KEY_TIP)?;
+        if durable_tip.as_deref().and_then(decode_chain_tip)
+            != Some((boundary_height, boundary_hash))
+        {
+            return Err(StoreError::Decode(
+                "canonical boundary changed before recursive suffix authorization",
+            ));
+        }
+        let header_table = txn.open_table(Some(T_HEADERS))?;
+        let boundary_raw: Option<Vec<u8>> = txn.get(&header_table, &u64_key(boundary_height))?;
+        if boundary_raw
+            .as_deref()
+            .and_then(canonical_hash_from_encoded_header)
+            != Some(boundary_hash)
+        {
+            return Err(StoreError::Decode(
+                "recursive suffix boundary header is not canonical",
+            ));
+        }
+        let authority = VerifiedSuffixAuthorityRecord {
+            boundary_height,
+            boundary_hash,
+            tip_height: tip_header.height,
+            tip_hash,
+        };
+        let retention = txn.open_table(Some(T_RETENTION_META))?;
+        txn.put(
+            &retention,
+            KEY_VERIFIED_SUFFIX_AUTHORITY,
+            encode_verified_suffix_authority(authority),
+            WriteFlags::empty(),
+        )?;
+        txn.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn durable_tip_has_verified_suffix_authority(
+        &self,
+        tip_header: &BlockHeader,
+        tip_hash: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let retention = txn.open_table(Some(T_RETENTION_META))?;
+        let authority_raw: Option<Vec<u8>> = txn.get(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY)?;
+        let Some(authority) = authority_raw
+            .as_deref()
+            .and_then(decode_verified_suffix_authority)
+        else {
+            return Ok(false);
+        };
+        if tip_header.height <= authority.boundary_height
+            || tip_header.height >= authority.tip_height
+            || tip_hash != crate::block_header::block_id(tip_header)
+        {
+            return Ok(false);
+        }
+        let terminal_table = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
+        let marker: Option<Vec<u8>> = txn.get(&terminal_table, &u64_key(tip_header.height))?;
+        Ok(marker.as_deref().is_some_and(|marker| {
+            recursive_suffix_marker_authority(
+                marker,
+                tip_header.height,
+                crate::block_header::semantic_header_id(tip_header),
+                None,
+            ) == Some((authority.tip_height, authority.tip_hash))
+        }))
+    }
+
     /// Load one HistoryStep terminal at an exact canonical boundary.
     pub fn get_history_step_terminal_at(
         &self,
@@ -1035,7 +1309,20 @@ impl MdbxStore {
                 "HistoryStep terminal length exceeds hard bounds",
             ));
         }
-        Ok(true)
+        let terminal: Vec<u8> = txn
+            .get(&terminals, &key)?
+            .ok_or(StoreError::Decode("HistoryStep terminal disappeared"))?;
+        let header = header_raw
+            .as_deref()
+            .and_then(decode_header)
+            .ok_or(StoreError::Decode("canonical terminal header disappeared"))?;
+        Ok(recursive_suffix_marker_authority(
+            &terminal,
+            height,
+            crate::block_header::semantic_header_id(&header),
+            None,
+        )
+        .is_none())
     }
 
     pub fn put_consensus_meta(&self, meta: &ConsensusMeta) -> Result<(), StoreError> {
@@ -1212,6 +1499,18 @@ impl MdbxStore {
             return Err(StoreError::Decode(
                 "accepted block bundle length changed during read",
             ));
+        }
+        let block = crate::Block::from_bytes(&block_bytes)
+            .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
+        if recursive_suffix_marker_authority(
+            &terminal_bytes,
+            height,
+            crate::block_header::semantic_header_id(&block.header),
+            None,
+        )
+        .is_some()
+        {
+            return Ok(None);
         }
         let bundle = crate::AcceptedBlockBundle::try_from_parts(block_bytes, terminal_bytes)
             .map_err(|_| StoreError::Decode("accepted block bundle is malformed"))?;
@@ -2082,7 +2381,7 @@ impl MdbxStore {
         dirty_segment_summaries: &[(u16, u32, [u8; 32])],
         tx_hashes: &[TxBodyHash],
         tx_index_deletes: &[TxBodyHash],
-        accepted_bundle: Option<&crate::AcceptedBlockBundle>,
+        accepted_block: Option<AcceptedBlockCommit<'_>>,
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
     ) -> Result<(), StoreError> {
@@ -2104,15 +2403,40 @@ impl MdbxStore {
         // accidentally materialize a PoW-only tip even if it bypasses
         // `MdbxChainContext::apply_next_block`.
         let accepted_non_genesis = if header.height != 0 {
-            let bundle = accepted_bundle.ok_or(StoreError::Decode(
-                "non-genesis block is missing its accepted bundle",
+            let accepted = accepted_block.ok_or(StoreError::Decode(
+                "non-genesis block is missing its accepted authorization",
             ))?;
-            if bundle.height() != header.height || bundle.block_hash() != *hash {
-                return Err(StoreError::Decode(
-                    "accepted bundle does not bind the committed header",
-                ));
-            }
-            let block = crate::Block::from_bytes(bundle.block_bytes())
+            let (block_bytes, complete_terminal, recursive_authority) = match accepted {
+                AcceptedBlockCommit::Complete(bundle) => {
+                    if bundle.height() != header.height || bundle.block_hash() != *hash {
+                        return Err(StoreError::Decode(
+                            "accepted bundle does not bind the committed header",
+                        ));
+                    }
+                    (
+                        bundle.block_bytes(),
+                        Some(bundle.history_step_terminal_bytes()),
+                        None,
+                    )
+                }
+                AcceptedBlockCommit::RecursiveSuffix {
+                    block_bytes,
+                    authority_tip_height,
+                    authority_tip_hash,
+                } => {
+                    if authority_tip_height <= header.height {
+                        return Err(StoreError::Decode(
+                            "intermediate recursive suffix block is not below its authority tip",
+                        ));
+                    }
+                    (
+                        block_bytes,
+                        None,
+                        Some((authority_tip_height, authority_tip_hash)),
+                    )
+                }
+            };
+            let block = crate::Block::from_bytes(block_bytes)
                 .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
             let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
                 .map_err(|_| StoreError::Decode("accepted logical tx stream is malformed"))?;
@@ -2135,21 +2459,39 @@ impl MdbxStore {
             let expected_class = history_step_class_slot(effective_page_count).ok_or(
                 StoreError::Decode("accepted block page count has no canonical HistoryStep tier"),
             )?;
-            if !history_step_terminal_matches_class(
-                bundle.history_step_terminal_bytes(),
-                header.height,
-                crate::block_header::semantic_header_id(header),
-                expected_class,
-            ) {
-                return Err(StoreError::Decode(
-                    "accepted current-height history terminal class is malformed",
-                ));
-            }
-            Some(bundle)
+            let terminal_bytes: Cow<'_, [u8]> = match complete_terminal {
+                Some(terminal) => {
+                    if !history_step_terminal_matches_class(
+                        terminal,
+                        header.height,
+                        crate::block_header::semantic_header_id(header),
+                        expected_class,
+                    ) {
+                        return Err(StoreError::Decode(
+                            "accepted current-height history terminal class is malformed",
+                        ));
+                    }
+                    Cow::Borrowed(terminal)
+                }
+                None => {
+                    let (authority_tip_height, authority_tip_hash) =
+                        recursive_authority.expect("recursive authorization is present");
+                    Cow::Owned(
+                        encode_recursive_suffix_marker(
+                            header,
+                            expected_class,
+                            authority_tip_height,
+                            authority_tip_hash,
+                        )?
+                        .to_vec(),
+                    )
+                }
+            };
+            Some((block_bytes, terminal_bytes, recursive_authority))
         } else {
-            if accepted_bundle.is_some() {
+            if accepted_block.is_some() {
                 return Err(StoreError::Decode(
-                    "genesis must not carry an accepted block bundle",
+                    "genesis must not carry an accepted block authorization",
                 ));
             }
             None
@@ -2168,6 +2510,29 @@ impl MdbxStore {
                 ));
             }
             validate_history_step_parent_boundary_in_rw_txn(&txn, header)?;
+            if let Some((authority_tip_height, authority_tip_hash)) = accepted_non_genesis
+                .as_ref()
+                .and_then(|(_, _, authority)| *authority)
+            {
+                let retention = txn.open_table(Some(T_RETENTION_META))?;
+                let authority_raw: Option<Vec<u8>> =
+                    txn.get(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY)?;
+                let authority = authority_raw
+                    .as_deref()
+                    .and_then(decode_verified_suffix_authority)
+                    .ok_or(StoreError::Decode(
+                        "verified recursive suffix authority is missing",
+                    ))?;
+                if authority.tip_height != authority_tip_height
+                    || authority.tip_hash != authority_tip_hash
+                    || header.height <= authority.boundary_height
+                    || header.height >= authority.tip_height
+                {
+                    return Err(StoreError::Decode(
+                        "recursive suffix block lies outside its verified authority",
+                    ));
+                }
+            }
         }
 
         // --- 1. Dirty segments ---
@@ -2329,22 +2694,21 @@ impl MdbxStore {
         )?;
 
         // --- 8. Accepted block + HistoryStep terminal ---
-        if let Some(bundle) = accepted_non_genesis {
+        if let Some((block_bytes, terminal_bytes, recursive_authority)) = accepted_non_genesis {
             let height_key = u64_key(header.height);
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
-            txn.put(
-                &recent_tbl,
-                height_key,
-                bundle.block_bytes(),
-                WriteFlags::empty(),
-            )?;
+            txn.put(&recent_tbl, height_key, block_bytes, WriteFlags::empty())?;
             let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
             txn.put(
                 &terminal_tbl,
                 height_key,
-                bundle.history_step_terminal_bytes(),
+                terminal_bytes.as_ref(),
                 WriteFlags::empty(),
             )?;
+            if recursive_authority.is_none() {
+                let retention = txn.open_table(Some(T_RETENTION_META))?;
+                let _ = txn.del(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY, None);
+            }
         }
 
         // --- 8.5. tx_index: logical txid → (height, logical position) ---
@@ -3450,7 +3814,7 @@ mod tests {
                 &[],
                 &tx_hashes,
                 &[],
-                Some(&bundle),
+                Some(AcceptedBlockCommit::Complete(&bundle)),
                 &meta,
                 false,
             )
@@ -3496,7 +3860,7 @@ mod tests {
                 &[],
                 &tx_hashes,
                 &[],
-                Some(&bundle),
+                Some(AcceptedBlockCommit::Complete(&bundle)),
                 &meta,
                 false,
             )

@@ -179,6 +179,29 @@ impl SnapshotGeneration {
         )
     }
 
+    /// Read one exact terminal owned by this immutable generation.
+    ///
+    /// The boundary terminal is stored separately; bridge terminals remain
+    /// inside their authenticated accepted bundles. Exposing this uniform
+    /// lookup lets compact snapshot clients request only the single recursive
+    /// terminal at the sealed suffix tip even if live pruning has advanced.
+    pub fn read_terminal_at(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Vec<u8>, SnapshotGenerationError> {
+        if height == self.manifest.target_height && block_hash == self.manifest.target_hash {
+            return self.read_boundary_terminal();
+        }
+        let descriptor = self
+            .manifest
+            .bridge_block(height)
+            .filter(|descriptor| descriptor.block_hash == block_hash)
+            .ok_or(SnapshotGenerationError::BridgeBlockNotInManifest(height))?;
+        let bundle = self.read_bridge_block(descriptor.height)?;
+        Ok(bundle.history_step_terminal_bytes().to_vec())
+    }
+
     /// Read and authenticate one immutable post-snapshot accepted bundle.
     pub fn read_bridge_block(
         &self,
@@ -1714,7 +1737,9 @@ mod tests {
                 &[],
                 &tx_hashes,
                 &[],
-                Some(&bundle),
+                Some(crate::storage::mdbx_store::AcceptedBlockCommit::Complete(
+                    &bundle,
+                )),
                 &child_meta,
                 false,
             )
@@ -1792,7 +1817,9 @@ mod tests {
                 &[(0, 1, changed_state.cached_exact_segment_root(0).unwrap())],
                 &tx_hashes,
                 &[],
-                Some(&bundle),
+                Some(crate::storage::mdbx_store::AcceptedBlockCommit::Complete(
+                    &bundle,
+                )),
                 &grandchild_meta,
                 false,
             )

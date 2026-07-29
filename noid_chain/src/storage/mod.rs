@@ -25,7 +25,9 @@ pub use historical_state::{
     reconstruct_historical_exact_state, CanonicalTipBinding, HistoricalExactStateView,
     HistoricalStateError,
 };
-pub use mdbx_context::{HistoryStepTerminalClaim, MdbxChainContext, MdbxContextError};
+pub use mdbx_context::{
+    HistoryStepTerminalClaim, MdbxChainContext, MdbxContextError, VerifiedRecursiveSuffix,
+};
 pub use mdbx_store::{
     MdbxStore, SnapshotHeaderInstallSource, StoreError, VerifiedHeaderBatchRecord,
     VerifiedOwnerSnapshot, VerifiedOwnerUtxo,
