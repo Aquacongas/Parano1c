@@ -270,12 +270,22 @@ impl MiningPeerQuorum {
     }
 }
 
-/// A state-manifest round with zero responses is re-requested after this
-/// deadline. A dropped response stream must not wedge sync: with few peers
-/// there may never be another PeerConnected event to retrigger the probe
-/// (live-test finding, 2026-07-12).
+/// A state-manifest round with no usable candidate is re-requested after this
+/// deadline. Dropped streams and explicit empty cooldown responses must not
+/// wedge sync: with few peers there may never be another PeerConnected event
+/// to retrigger the probe.
 const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn manifest_round_retry_due(
+    started_at: Option<Instant>,
+    now: Instant,
+    usable_candidate_count: usize,
+) -> bool {
+    usable_candidate_count == 0
+        && started_at
+            .is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT)
+}
 
 fn history_step_cache_directory(data_dir: &Path, metadata_digest: [u8; 32]) -> PathBuf {
     let mut digest_hex = String::with_capacity(64);
@@ -1860,12 +1870,13 @@ fn state_segment_response_matches_snapshot_boundary(
 mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
-        mark_initial_sync_ready, next_block_has_competing_parent, p2p_listen_to_multiaddr,
-        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
-        unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
-        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        MINING_PEER_QUORUM,
+        manifest_round_retry_due, mark_initial_sync_ready, next_block_has_competing_parent,
+        p2p_listen_to_multiaddr, snapshot_header_next_action,
+        state_segment_response_matches_snapshot_boundary, unavailable_block_requires_snapshot,
+        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
+        validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
+        SnapshotHeaderBoundary, SnapshotHeaderNextAction, MINING_PEER_QUORUM,
+        STATE_MANIFEST_RESPONSE_TIMEOUT,
     };
 
     #[test]
@@ -1995,6 +2006,26 @@ mod tests {
         assert!(unavailable_block_requires_snapshot(10, 11, 11));
         assert!(unavailable_block_requires_snapshot(10, 11, 20));
         assert!(!unavailable_block_requires_snapshot(10, 12, 20));
+    }
+
+    #[test]
+    fn empty_manifest_response_round_is_retried_after_deadline() {
+        let started = std::time::Instant::now();
+        assert!(!manifest_round_retry_due(
+            Some(started),
+            started + STATE_MANIFEST_RESPONSE_TIMEOUT - std::time::Duration::from_millis(1),
+            0
+        ));
+        assert!(manifest_round_retry_due(
+            Some(started),
+            started + STATE_MANIFEST_RESPONSE_TIMEOUT,
+            0
+        ));
+        assert!(!manifest_round_retry_due(
+            Some(started),
+            started + STATE_MANIFEST_RESPONSE_TIMEOUT,
+            1
+        ));
     }
 
     #[test]
@@ -2361,9 +2392,10 @@ async fn handle_p2p_events(
     // within 10 seconds of the first candidate arriving, proceed anyway —
     // some peers may be offline, behind NAT, or not yet synced.
     let mut manifest_first_candidate_at: Option<std::time::Instant> = None;
-    // Set when a manifest round begins and no response has arrived yet; any
-    // manifest response clears it. The heartbeat re-requests a silent round
-    // after STATE_MANIFEST_RESPONSE_TIMEOUT.
+    // Set while a manifest round is waiting for at least one usable candidate.
+    // Empty responses are possible while a serving peer's short manifest
+    // cooldown is still active, so receiving a response alone must not disarm
+    // the retry timer.
     let mut manifest_round_started_at: Option<std::time::Instant> = None;
     // Connected peers eligible for manifest (re-)requests.
     let mut manifest_peers: std::collections::HashSet<libp2p::PeerId> =
@@ -4158,7 +4190,6 @@ async fn handle_p2p_events(
                 // Eclipse mitigation: collect from multiple peers, pick best.
                 // Track all responses (including tip=0) to detect when all
                 // requested peers have replied, avoiding infinite wait.
-                manifest_round_started_at = None;
                 let force_snapshot = manifest_force_snapshot_peers.remove(&from);
                 manifest_response_count += 1;
                 if manifest.tip_height == 0 {
@@ -5350,20 +5381,48 @@ async fn handle_p2p_events(
                 pending_block_fetches.retain(|_, pending| pending.peer != peer);
             }
 
-            // A manifest round that produced zero responses is dead air — a
-            // dropped response stream, a peer that never served it. Reset and
-            // re-request from every connected peer; with a single seed there
-            // is no second PeerConnected event to save us.
-            if manifest_round_started_at.is_some_and(|started| {
-                now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT
-            }) && manifest_response_count == 0
+            // Some manifest request sites are event-driven and may begin a
+            // round without explicitly arming its timer. Arm it here so every
+            // outstanding round has the same bounded recovery path.
+            if manifest_round_started_at.is_none()
+                && !manifest_requested_peers.is_empty()
+                && manifest_candidates.is_empty()
                 && pending_manifest.is_none()
-                && snapshot_staging.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_staging_inflight.is_none()
                 && snapshot_install_inflight.is_none()
+                && pending_segment_ids.is_empty()
+                && segment_queue.is_empty()
+            {
+                manifest_round_started_at = Some(now);
+            }
+
+            // A manifest round with no usable candidate is dead air. This
+            // includes dropped responses and explicit empty responses emitted
+            // by a peer's short manifest cooldown. Reset and re-request from
+            // every connected peer; with a single seed there is no second
+            // PeerConnected event to save us.
+            if manifest_round_retry_due(
+                manifest_round_started_at,
+                now,
+                manifest_candidates.len(),
+            )
+                && pending_manifest.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_staging.is_none()
+                && snapshot_staging_inflight.is_none()
+                && snapshot_install_inflight.is_none()
+                && pending_segment_ids.is_empty()
+                && segment_queue.is_empty()
             {
                 tracing::warn!(
                     peers = manifest_peers.len(),
-                    "state manifest round timed out with no responses — re-requesting"
+                    responses = manifest_response_count,
+                    "state manifest round produced no usable candidate — re-requesting"
                 );
                 reset_sync_state!();
                 let our_height = {
