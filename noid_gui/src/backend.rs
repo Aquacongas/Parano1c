@@ -625,9 +625,13 @@ impl Backend {
             )
         };
 
-        if !has_live_child {
-            self.spawn(mode, threads, genesis)?;
+        if has_live_child {
+            // A long snapshot operation may temporarily delay loopback RPC.
+            // The supervisor's job here is process liveness; an owned child
+            // that has not exited must not be reported as an offline wallet.
+            return Ok(());
         }
+        self.spawn(mode, threads, genesis)?;
         self.wait_until_ready().await
     }
 

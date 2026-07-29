@@ -17,6 +17,7 @@ use libp2p::{
     autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent,
     Multiaddr, PeerId,
 };
+use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
@@ -35,7 +36,7 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::outbound_budget::OutboundResponseBudget;
-use crate::peer_diversity::PeerDiversity;
+use crate::peer_diversity::{PeerDiversity, PublicNetworkGroup};
 use crate::protocol::{
     BlockGossipMsg, GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse,
     GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
@@ -102,7 +103,546 @@ const SNAPSHOT_BRIDGE_MAX_LIVE_GAP: u64 =
 const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize = MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
 const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
+const MAX_PENDING_HEADER_REQUESTS: usize = 64;
 const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
+const MAX_PENDING_HISTORY_STEP_REQUESTS: usize = 8;
+const AUTOMATIC_OUTBOUND_TARGET: usize = 12;
+// The shipped topology contains six individual DNS seeds plus one aggregate
+// dnsaddr source. Probe all of them when necessary, but leave room in the
+// global pending table for ordinary peers learned through Kademlia.
+const MAX_PENDING_BOOTSTRAP_DIALS: usize = 7;
+const MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS: usize =
+    AUTOMATIC_OUTBOUND_TARGET + MAX_PENDING_BOOTSTRAP_DIALS + 1;
+// Twelve peers may legitimately use two relay/direct paths each. Keep room
+// for those paths while bounding all automatic transports well below the
+// swarm's 64 established-outbound ceiling.
+const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 32;
+// The swarm itself admits at most 32 pending outbound transports.
+const _: () = assert!(MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS <= 32);
+const INITIAL_BOOTSTRAP_FANOUT: usize = 3;
+const BOOTSTRAP_RELEASE_NON_SEED_PEERS: usize = 8;
+const MAX_AUTOMATIC_PEER_CANDIDATES: usize = 512;
+const MAX_AUTOMATIC_ADDRS_PER_PEER: usize = 8;
+const AUTOMATIC_PEER_HEALTHY_AFTER: Duration = Duration::from_secs(30);
+const DISCOVERY_RETRY_MIN: Duration = Duration::from_secs(10);
+const DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Debug)]
+struct BootstrapCandidate {
+    peer: Option<PeerId>,
+    failures: u8,
+    next_attempt: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct AutomaticPeerCandidate {
+    addrs: Vec<Multiaddr>,
+    failures: u8,
+    next_attempt: Instant,
+    last_seen: Instant,
+}
+
+#[derive(Clone, Debug)]
+enum PendingAutomaticDial {
+    Bootstrap(Multiaddr),
+    Peer {
+        peer: PeerId,
+        group: PublicNetworkGroup,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum ManagedOutboundKind {
+    Bootstrap(Multiaddr),
+    Peer,
+}
+
+#[derive(Clone, Debug)]
+struct ManagedOutboundConnection {
+    peer: PeerId,
+    kind: ManagedOutboundKind,
+    established_at: Instant,
+    identified: bool,
+}
+
+struct AutomaticPeerState {
+    bootstrap: std::collections::HashMap<Multiaddr, BootstrapCandidate>,
+    peers: std::collections::HashMap<PeerId, AutomaticPeerCandidate>,
+    pending: std::collections::HashMap<libp2p::swarm::ConnectionId, PendingAutomaticDial>,
+    /// Every outbound transport, including short Kademlia/AutoNAT sessions.
+    /// These are useful for DNS classification and duplicate suppression but
+    /// do not count toward the maintained neighbour target by themselves.
+    outbound_connections: std::collections::HashMap<libp2p::swarm::ConnectionId, PeerId>,
+    managed_connections:
+        std::collections::HashMap<libp2p::swarm::ConnectionId, ManagedOutboundConnection>,
+    outbound_counts: std::collections::HashMap<PeerId, usize>,
+    bootstrap_complete: bool,
+    kad_bootstrap_started: bool,
+    kad_bootstrap_query: Option<kad::QueryId>,
+    retry_salt: Vec<u8>,
+    discovery_query: Option<kad::QueryId>,
+    discovery_learned: bool,
+    discovery_failures: u8,
+    next_discovery_at: Instant,
+}
+
+impl AutomaticPeerState {
+    fn new(local_peer: PeerId) -> Self {
+        Self {
+            bootstrap: std::collections::HashMap::new(),
+            peers: std::collections::HashMap::new(),
+            pending: std::collections::HashMap::new(),
+            outbound_connections: std::collections::HashMap::new(),
+            managed_connections: std::collections::HashMap::new(),
+            outbound_counts: std::collections::HashMap::new(),
+            bootstrap_complete: false,
+            kad_bootstrap_started: false,
+            kad_bootstrap_query: None,
+            retry_salt: local_peer.to_bytes(),
+            discovery_query: None,
+            discovery_learned: false,
+            discovery_failures: 0,
+            next_discovery_at: Instant::now(),
+        }
+    }
+
+    fn register_bootstrap(&mut self, addr: Multiaddr) {
+        self.bootstrap.entry(addr).or_insert(BootstrapCandidate {
+            peer: None,
+            failures: 0,
+            next_attempt: Instant::now(),
+        });
+    }
+
+    fn add_peer_candidate(
+        &mut self,
+        local: PeerId,
+        peer: PeerId,
+        addrs: impl IntoIterator<Item = Multiaddr>,
+    ) -> bool {
+        if peer == local {
+            return false;
+        }
+        let mut accepted = addrs
+            .into_iter()
+            .filter_map(|addr| sanitize_automatic_peer_addr(peer, addr))
+            .collect::<Vec<_>>();
+        accepted.sort_unstable_by(|a, b| a.to_string().cmp(&b.to_string()));
+        accepted.dedup();
+        if accepted.is_empty() {
+            return false;
+        }
+        if !self.peers.contains_key(&peer) && self.peers.len() >= MAX_AUTOMATIC_PEER_CANDIDATES {
+            let pending = self
+                .pending
+                .values()
+                .filter_map(|dial| match dial {
+                    PendingAutomaticDial::Peer { peer, .. } => Some(*peer),
+                    PendingAutomaticDial::Bootstrap(_) => None,
+                })
+                .collect::<std::collections::HashSet<_>>();
+            let evict = self
+                .peers
+                .iter()
+                .filter(|(candidate, _)| {
+                    !self.outbound_counts.contains_key(candidate) && !pending.contains(candidate)
+                })
+                .min_by_key(|(_, candidate)| candidate.last_seen)
+                .map(|(candidate, _)| *candidate);
+            if let Some(evict) = evict {
+                self.peers.remove(&evict);
+            }
+            if self.peers.len() >= MAX_AUTOMATIC_PEER_CANDIDATES {
+                return false;
+            }
+        }
+        let now = Instant::now();
+        let candidate = self.peers.entry(peer).or_insert(AutomaticPeerCandidate {
+            addrs: Vec::new(),
+            failures: 0,
+            next_attempt: now,
+            last_seen: now,
+        });
+        candidate.last_seen = now;
+        let mut changed = false;
+        for addr in accepted {
+            if candidate.addrs.contains(&addr) {
+                continue;
+            }
+            if candidate.addrs.len() == MAX_AUTOMATIC_ADDRS_PER_PEER {
+                candidate.addrs.remove(0);
+            }
+            candidate.addrs.push(addr);
+            changed = true;
+        }
+        changed
+    }
+
+    fn outbound_peer_count(&self) -> usize {
+        self.managed_connections
+            .values()
+            .filter_map(|connection| connection.identified.then_some(connection.peer))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    fn is_outbound(&self, peer: PeerId) -> bool {
+        self.outbound_connections
+            .values()
+            .any(|known| *known == peer)
+    }
+
+    fn bootstrap_peer_ids(&self) -> std::collections::HashSet<PeerId> {
+        self.bootstrap
+            .values()
+            .filter_map(|candidate| candidate.peer)
+            .collect()
+    }
+
+    fn connected_bootstrap_peer_ids(&self) -> Vec<PeerId> {
+        let bootstrap_peers = self.bootstrap_peer_ids();
+        self.managed_connections
+            .values()
+            .filter_map(|connection| {
+                (connection.identified && bootstrap_peers.contains(&connection.peer))
+                    .then_some(connection.peer)
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    fn stable_non_bootstrap_peer_count(&self, now: Instant) -> usize {
+        let bootstrap_peers = self.bootstrap_peer_ids();
+        self.managed_connections
+            .values()
+            .filter_map(|connection| {
+                (!bootstrap_peers.contains(&connection.peer)
+                    && matches!(connection.kind, ManagedOutboundKind::Peer)
+                    && connection.identified
+                    && now.duration_since(connection.established_at)
+                        >= AUTOMATIC_PEER_HEALTHY_AFTER)
+                    .then_some(connection.peer)
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    fn note_connection_established(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        outbound: bool,
+    ) {
+        let pending = self.pending.remove(&connection_id);
+        let managed_kind = match pending {
+            Some(pending) => match pending {
+                PendingAutomaticDial::Bootstrap(addr) => {
+                    if let Some(candidate) = self.bootstrap.get_mut(&addr) {
+                        candidate.peer = Some(peer);
+                    }
+                    Some(ManagedOutboundKind::Bootstrap(addr))
+                }
+                PendingAutomaticDial::Peer { peer: expected, .. } if expected == peer => {
+                    Some(ManagedOutboundKind::Peer)
+                }
+                PendingAutomaticDial::Peer { .. } => None,
+            },
+            None => self.bootstrap.iter().find_map(|(addr, candidate)| {
+                (candidate.peer == Some(peer)).then(|| ManagedOutboundKind::Bootstrap(addr.clone()))
+            }),
+        };
+        if outbound {
+            self.outbound_connections.insert(connection_id, peer);
+            let managed_kind = managed_kind.or_else(|| {
+                self.peers
+                    .contains_key(&peer)
+                    .then_some(ManagedOutboundKind::Peer)
+            });
+            if let Some(kind) = managed_kind {
+                // Keep up to the transport's two-path hard limit. A second
+                // connection may be the direct half of an active relay→DCUtR
+                // upgrade, so blindly closing every duplicate PeerId here
+                // would strand NATed wallets on the relay path.
+                self.track_managed_connection(connection_id, peer, kind);
+            }
+        }
+    }
+
+    fn track_managed_connection(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        kind: ManagedOutboundKind,
+    ) {
+        if self.managed_connections.contains_key(&connection_id) {
+            return;
+        }
+        self.managed_connections.insert(
+            connection_id,
+            ManagedOutboundConnection {
+                peer,
+                kind,
+                established_at: Instant::now(),
+                identified: false,
+            },
+        );
+        *self.outbound_counts.entry(peer).or_default() += 1;
+    }
+
+    fn note_identified(&mut self, connection_id: libp2p::swarm::ConnectionId, peer: PeerId) {
+        if !self.managed_connections.contains_key(&connection_id)
+            && self.outbound_connections.get(&connection_id) == Some(&peer)
+        {
+            let kind = self.bootstrap.iter().find_map(|(addr, candidate)| {
+                (candidate.peer == Some(peer)).then(|| ManagedOutboundKind::Bootstrap(addr.clone()))
+            });
+            if let Some(kind) = kind {
+                self.track_managed_connection(connection_id, peer, kind);
+            } else if self.peers.contains_key(&peer) {
+                self.track_managed_connection(connection_id, peer, ManagedOutboundKind::Peer);
+            }
+        }
+        if let Some(connection) = self.managed_connections.get_mut(&connection_id) {
+            connection.identified = true;
+        }
+    }
+
+    fn refresh_healthy_connections(&mut self, now: Instant) {
+        for connection in self.managed_connections.values() {
+            if !connection.identified
+                || now.duration_since(connection.established_at) < AUTOMATIC_PEER_HEALTHY_AFTER
+            {
+                continue;
+            }
+            match &connection.kind {
+                ManagedOutboundKind::Bootstrap(addr) => {
+                    if let Some(candidate) = self.bootstrap.get_mut(addr) {
+                        candidate.failures = 0;
+                        candidate.next_attempt = now;
+                    }
+                }
+                ManagedOutboundKind::Peer => {
+                    if let Some(candidate) = self.peers.get_mut(&connection.peer) {
+                        candidate.failures = 0;
+                        candidate.next_attempt = now;
+                    }
+                }
+            }
+        }
+    }
+
+    fn expired_unidentified_connections(
+        &self,
+        now: Instant,
+    ) -> Vec<(libp2p::swarm::ConnectionId, PeerId)> {
+        self.managed_connections
+            .iter()
+            .filter_map(|(connection_id, connection)| {
+                (!connection.identified
+                    && now.duration_since(connection.established_at)
+                        >= AUTOMATIC_PEER_HEALTHY_AFTER)
+                    .then_some((*connection_id, connection.peer))
+            })
+            .collect()
+    }
+
+    fn note_connection_closed(&mut self, connection_id: libp2p::swarm::ConnectionId) {
+        self.outbound_connections.remove(&connection_id);
+        let Some(managed) = self.managed_connections.remove(&connection_id) else {
+            return;
+        };
+        let peer = managed.peer;
+        let accelerate_discovery =
+            managed.identified || matches!(&managed.kind, ManagedOutboundKind::Peer);
+        if let Some(count) = self.outbound_counts.get_mut(&peer) {
+            *count -= 1;
+            if *count == 0 {
+                self.outbound_counts.remove(&peer);
+                match managed.kind {
+                    ManagedOutboundKind::Peer => {
+                        schedule_peer_retry(
+                            self.peers.get_mut(&peer),
+                            peer.to_bytes(),
+                            &self.retry_salt,
+                        );
+                    }
+                    ManagedOutboundKind::Bootstrap(addr) => {
+                        if let Some(candidate) = self.bootstrap.get_mut(&addr) {
+                            schedule_bootstrap_retry(candidate, addr.as_ref(), &self.retry_salt);
+                        }
+                    }
+                }
+            }
+        }
+        if accelerate_discovery {
+            self.accelerate_discovery();
+        }
+    }
+
+    fn note_dial_failed(&mut self, connection_id: libp2p::swarm::ConnectionId) {
+        let Some(pending) = self.pending.remove(&connection_id) else {
+            return;
+        };
+        let accelerate_discovery = matches!(&pending, PendingAutomaticDial::Peer { .. });
+        match pending {
+            PendingAutomaticDial::Bootstrap(addr) => {
+                if let Some(candidate) = self.bootstrap.get_mut(&addr) {
+                    // DNS pools may legitimately rotate to a different node
+                    // identity. One identity-bound reconnect is attempted;
+                    // after failure the next dial re-resolves without pinning
+                    // the obsolete PeerId.
+                    candidate.peer = None;
+                    schedule_bootstrap_retry(candidate, addr.as_ref(), &self.retry_salt);
+                }
+            }
+            PendingAutomaticDial::Peer { peer, .. } => {
+                schedule_peer_retry(self.peers.get_mut(&peer), peer.to_bytes(), &self.retry_salt);
+            }
+        }
+        // DNS sources have their own bounded retry schedule. Accelerating a
+        // Kademlia walk for every dead hostname would defeat discovery
+        // backoff when several future seed names are intentionally offline.
+        if accelerate_discovery {
+            self.accelerate_discovery();
+        }
+    }
+
+    fn pending_group_count(&self, group: PublicNetworkGroup) -> usize {
+        self.pending
+            .values()
+            .filter_map(|pending| match pending {
+                PendingAutomaticDial::Peer {
+                    peer,
+                    group: candidate_group,
+                } if *candidate_group == group => Some(*peer),
+                _ => None,
+            })
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+    }
+
+    fn pending_bootstrap_count(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|pending| matches!(pending, PendingAutomaticDial::Bootstrap(_)))
+            .count()
+    }
+
+    fn pending_ordinary_count(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|pending| matches!(pending, PendingAutomaticDial::Peer { .. }))
+            .count()
+    }
+
+    fn automatic_occupancy(&self) -> usize {
+        self.managed_connections
+            .len()
+            .saturating_add(self.pending.len())
+    }
+
+    fn automatic_dial_capacity(&self) -> usize {
+        let unconfirmed = self
+            .managed_connections
+            .values()
+            .filter(|connection| !connection.identified)
+            .count()
+            .saturating_add(self.pending.len());
+        MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS
+            .saturating_sub(unconfirmed)
+            .min(MAX_AUTOMATIC_TRANSPORT_OCCUPANCY.saturating_sub(self.automatic_occupancy()))
+    }
+
+    fn accelerate_discovery(&mut self) {
+        if !self.discovery_active() {
+            self.next_discovery_at = Instant::now();
+        }
+    }
+
+    fn discovery_active(&self) -> bool {
+        self.kad_bootstrap_query.is_some() || self.discovery_query.is_some()
+    }
+
+    fn begin_kad_bootstrap(&mut self, query: kad::QueryId) {
+        self.kad_bootstrap_started = true;
+        self.kad_bootstrap_query = Some(query);
+    }
+
+    fn finish_kad_bootstrap(&mut self, query: kad::QueryId) {
+        if self.kad_bootstrap_query == Some(query) {
+            self.kad_bootstrap_query = None;
+        }
+    }
+
+    fn begin_discovery(&mut self, query: kad::QueryId) {
+        self.discovery_query = Some(query);
+        self.discovery_learned = false;
+    }
+
+    fn observe_discovery(&mut self, query: kad::QueryId, learned: bool, complete: bool) {
+        if self.discovery_query != Some(query) {
+            return;
+        }
+        self.discovery_learned |= learned;
+        if !complete {
+            return;
+        }
+        self.discovery_query = None;
+        if self.discovery_learned {
+            self.discovery_failures = 0;
+        } else {
+            self.discovery_failures = self.discovery_failures.saturating_add(1);
+        }
+        let multiplier = 1u64 << self.discovery_failures.min(5);
+        let delay = DISCOVERY_RETRY_MIN
+            .saturating_mul(multiplier as u32)
+            .min(DISCOVERY_RETRY_MAX);
+        self.next_discovery_at = Instant::now() + delay;
+        self.discovery_learned = false;
+    }
+}
+
+fn automatic_retry_delay(
+    failures: u8,
+    salt: impl AsRef<[u8]>,
+    local_salt: impl AsRef<[u8]>,
+) -> Duration {
+    let exponential = 5u64.saturating_mul(1u64 << failures.saturating_sub(1).min(6));
+    let capped = exponential.min(300);
+    let jitter = salt
+        .as_ref()
+        .iter()
+        .chain(local_salt.as_ref())
+        .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
+        % 5;
+    Duration::from_secs(capped + jitter)
+}
+
+fn schedule_bootstrap_retry(
+    candidate: &mut BootstrapCandidate,
+    salt: impl AsRef<[u8]>,
+    local_salt: impl AsRef<[u8]>,
+) {
+    candidate.failures = candidate.failures.saturating_add(1);
+    candidate.next_attempt =
+        Instant::now() + automatic_retry_delay(candidate.failures, salt, local_salt);
+}
+
+fn schedule_peer_retry(
+    candidate: Option<&mut AutomaticPeerCandidate>,
+    salt: impl AsRef<[u8]>,
+    local_salt: impl AsRef<[u8]>,
+) {
+    let Some(candidate) = candidate else {
+        return;
+    };
+    candidate.failures = candidate.failures.saturating_add(1);
+    candidate.next_attempt =
+        Instant::now() + automatic_retry_delay(candidate.failures, salt, local_salt);
+}
 const _: () = assert!(
     MAX_PENDING_STATE_SEGMENT_REQUESTS >= noid_chain::consensus::wire_limits::MAX_INFLIGHT_SEGMENTS
 );
@@ -126,6 +666,51 @@ struct PendingStateSegmentRequest {
     segment_id: u16,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingHeaderRequest {
+    peer: PeerId,
+    start_height: u64,
+    count: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingHistoryStepTerminalRequest {
+    token: u64,
+    peer: PeerId,
+    height: u64,
+    block_hash: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestFailureKind {
+    Dial,
+    Timeout,
+    ConnectionClosed,
+    UnsupportedProtocol,
+    Io,
+    InvalidResponse,
+}
+
+impl From<&request_response::OutboundFailure> for RequestFailureKind {
+    fn from(failure: &request_response::OutboundFailure) -> Self {
+        match failure {
+            request_response::OutboundFailure::DialFailure => Self::Dial,
+            request_response::OutboundFailure::Timeout => Self::Timeout,
+            request_response::OutboundFailure::ConnectionClosed => Self::ConnectionClosed,
+            request_response::OutboundFailure::UnsupportedProtocols => Self::UnsupportedProtocol,
+            request_response::OutboundFailure::Io(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::InvalidData | std::io::ErrorKind::UnexpectedEof
+                ) =>
+            {
+                Self::InvalidResponse
+            }
+            request_response::OutboundFailure::Io(_) => Self::Io,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -213,6 +798,19 @@ impl<K: std::hash::Hash + Eq, V> BoundedPendingRequests<K, V> {
     }
 }
 
+impl<K: std::hash::Hash + Eq + Clone, V> BoundedPendingRequests<K, V> {
+    fn take_where(&mut self, mut matches: impl FnMut(&V) -> bool) -> Vec<V> {
+        let ids = self
+            .entries
+            .iter()
+            .filter_map(|(id, pending)| matches(pending).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        ids.into_iter()
+            .filter_map(|id| self.entries.remove(&id))
+            .collect()
+    }
+}
+
 fn retained_block_response_matches_pending(
     pending: PendingRetainedBlockRequest,
     peer: PeerId,
@@ -242,51 +840,6 @@ fn unavailable_state_segment_response(request: &GetStateSegmentRequest) -> GetSt
         inbound_memory_permit: None,
         outbound_memory_permit: None,
     }
-}
-
-fn notify_outbound_request_failed(
-    event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
-    peer: PeerId,
-) {
-    // This is the same retry-driving signal used for request-response
-    // OutboundFailure. The connection may still be live; node sync state must
-    // nevertheless release the logical request and choose/retry a peer.
-    let _ = event_tx.send(NetworkEvent::PeerRequestFailed(peer));
-}
-
-fn clear_peer_request_correlations(
-    pending_retained_block_requests: &mut BoundedPendingRequests<
-        request_response::OutboundRequestId,
-        PendingRetainedBlockRequest,
-    >,
-    pending_state_segment_requests: &mut BoundedPendingRequests<
-        request_response::OutboundRequestId,
-        PendingStateSegmentRequest,
-    >,
-    peer: PeerId,
-) {
-    pending_retained_block_requests.retain(|_, pending| pending.peer != peer);
-    pending_state_segment_requests.retain(|_, pending| pending.peer != peer);
-}
-
-fn fail_peer_requests(
-    pending_retained_block_requests: &mut BoundedPendingRequests<
-        request_response::OutboundRequestId,
-        PendingRetainedBlockRequest,
-    >,
-    pending_state_segment_requests: &mut BoundedPendingRequests<
-        request_response::OutboundRequestId,
-        PendingStateSegmentRequest,
-    >,
-    event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
-    peer: PeerId,
-) {
-    clear_peer_request_correlations(
-        pending_retained_block_requests,
-        pending_state_segment_requests,
-        peer,
-    );
-    notify_outbound_request_failed(event_tx, peer);
 }
 
 // Hard caps on incoming response sizes are shared via noid_chain::consensus::wire_limits.
@@ -486,8 +1039,11 @@ pub enum NetworkCommand {
     AnnounceBlock { bundle: AcceptedBlockBundle },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Arc<[u8]> },
-    /// Connect to a seed peer.
+    /// Register a bootstrap address with automatic retry and peer maintenance.
     Dial { addr: Multiaddr },
+    /// Initial chain synchronization is complete; bootstrap connections may be
+    /// released once enough ordinary outbound peers are available.
+    BootstrapComplete,
     /// Get current peer count.
     PeerCount {
         reply: tokio::sync::oneshot::Sender<usize>,
@@ -528,6 +1084,8 @@ pub enum NetworkCommand {
     },
     /// Request the fused HistoryStep terminal for an exact snapshot boundary.
     RequestHistoryStepTerminal {
+        /// Node-local correlation token. It is never sent on the wire.
+        token: u64,
         peer: PeerId,
         height: u64,
         block_hash: [u8; 32],
@@ -595,6 +1153,12 @@ pub enum NetworkEvent {
         from: PeerId,
         headers: Vec<noid_chain::block_header::BlockHeader>,
     },
+    /// Transport or decoding failed for one exact header request.
+    HeadersRequestFailed {
+        from: PeerId,
+        start_height: u64,
+        count: u16,
+    },
     /// State manifest received from a peer (step 1 of snapshot sync).
     StateManifest {
         from: PeerId,
@@ -605,8 +1169,17 @@ pub enum NetworkEvent {
         from: PeerId,
         response: crate::protocol::GetStateSegmentResponse,
     },
+    /// Transport failed for one exact state-segment request.
+    StateSegmentRequestFailed {
+        from: PeerId,
+        segment_id: u16,
+        expected_tip_height: u64,
+        expected_tip_hash: [u8; 32],
+    },
     /// Fused HistoryStep terminal response for O(1) snapshot sync.
     HistoryStepTerminal {
+        /// Exact node-local token supplied with the corresponding request.
+        token: u64,
         from: PeerId,
         height: u64,
         block_hash: [u8; 32],
@@ -615,6 +1188,16 @@ pub enum NetworkEvent {
         /// Holds the process-global inbound terminal byte budget until the node
         /// finishes verifying this response.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    },
+    /// Transport failed for one exact HistoryStep terminal request. The
+    /// request tuple remains available so snapshot sync can preserve unrelated
+    /// staged headers and report the real transport failure.
+    HistoryStepTerminalRequestFailed {
+        token: u64,
+        from: PeerId,
+        height: u64,
+        block_hash: [u8; 32],
+        kind: RequestFailureKind,
     },
     /// Mempool sync response: raw TxIntent bytes from a peer's mempool.
     /// Received after sending `RequestMempoolSync` on peer connect.
@@ -806,6 +1389,10 @@ impl P2PNetwork {
         let _ = self.cmd_tx.send(NetworkCommand::Dial { addr }).await;
     }
 
+    pub async fn mark_bootstrap_complete(&self) {
+        let _ = self.cmd_tx.send(NetworkCommand::BootstrapComplete).await;
+    }
+
     pub async fn sync_blocks_from(&self, peer: PeerId, from_height: u64, count: u16) {
         let _ = self
             .cmd_tx
@@ -866,6 +1453,7 @@ impl P2PNetwork {
     /// Request the HistoryStep terminal for an exact snapshot boundary.
     pub async fn request_history_step_terminal(
         &self,
+        token: u64,
         peer: PeerId,
         height: u64,
         block_hash: [u8; 32],
@@ -873,6 +1461,7 @@ impl P2PNetwork {
         let _ = self
             .cmd_tx
             .send(NetworkCommand::RequestHistoryStepTerminal {
+                token,
                 peer,
                 height,
                 block_hash,
@@ -955,10 +1544,15 @@ async fn run_swarm(
     // routing table (populated when seeds connect and identify fires).
     // The bootstrap is a no-op if the routing table is empty; it will be
     // re-triggered automatically when the first peer is added via identify.
-    // Load only previously successful outbound peers. They seed Kademlia and a
-    // randomized, network-diverse subset is dialled directly as restart
-    // anchors, so temporary DNS failure does not strand the node.
+    // Load only previously successful outbound peers. They seed Kademlia and
+    // enter the same bounded automatic manager as DNS bootstrap sources, so a
+    // restart cannot create a second untracked dial burst.
     let mut successful_peer_cache = crate::peer_store::load(&data_dir);
+    let local_peer_id = *swarm.local_peer_id();
+    let mut automatic_peers = AutomaticPeerState::new(local_peer_id);
+    for peer in successful_peer_cache.entries() {
+        automatic_peers.add_peer_candidate(local_peer_id, peer.peer_id, peer.addrs.iter().cloned());
+    }
     let cached_peer_count = successful_peer_cache.entries().count();
     if cached_peer_count > 0 {
         tracing::debug!(
@@ -973,28 +1567,12 @@ async fn run_swarm(
                     .add_address(&peer.peer_id, addr.clone());
             }
         }
-        for anchor in successful_peer_cache.randomized_startup_anchors() {
-            let options = libp2p::swarm::dial_opts::DialOpts::peer_id(anchor.peer_id)
-                .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
-                .addresses(anchor.addrs)
-                .build();
-            if let Err(error) = swarm.dial(options) {
-                tracing::debug!(peer = %anchor.peer_id, err = %error, "startup anchor dial failed");
-            }
-        }
     }
 
-    if let Err(e) = swarm.behaviour_mut().kad.bootstrap() {
-        tracing::debug!("kad bootstrap deferred (no peers yet): {e}");
-    }
-
-    // Reconnect list: peers whose addresses we know, to re-dial after disconnect.
-    // Maps PeerId -> (Multiaddr, next_retry_at, retry_count).
-    // Uses exponential backoff: 10s, 20s, 40s, 80s ... capped at 10 minutes.
-    let mut reconnect: std::collections::HashMap<
-        libp2p::PeerId,
-        (Multiaddr, tokio::time::Instant, u32),
-    > = std::collections::HashMap::new();
+    // Do not start a Kademlia walk from disk cache alone. A stale cached
+    // address can otherwise hold the single discovery slot for the full query
+    // timeout while a live DNS seed is already connected. Identify starts the
+    // first bootstrap only after a transport has proved live.
 
     // Cheap P2P-layer DoS guards that run before emitting NetworkEvent into
     // the bounded broadcast channel.
@@ -1012,8 +1590,11 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut pending_retained_block_requests =
         BoundedPendingRequests::new(MAX_PENDING_RETAINED_BLOCK_REQUESTS);
+    let mut pending_header_requests = BoundedPendingRequests::new(MAX_PENDING_HEADER_REQUESTS);
     let mut pending_state_segment_requests =
         BoundedPendingRequests::new(MAX_PENDING_STATE_SEGMENT_REQUESTS);
+    let mut pending_history_step_requests =
+        BoundedPendingRequests::new(MAX_PENDING_HISTORY_STEP_REQUESTS);
     let mut peer_diversity = PeerDiversity::default();
 
     // One waiting response of each kind is sufficient: the request-response
@@ -1042,13 +1623,8 @@ async fn run_swarm(
     let mut snapshot_export_timer = tokio::time::interval(Duration::from_secs(30));
     snapshot_export_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Reconnect timer: poll the reconnect list every 5 seconds.
-    let mut reconnect_timer = tokio::time::interval(std::time::Duration::from_secs(5));
-    reconnect_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    reconnect_timer.tick().await; // skip first immediate tick
-
     // Keep retry jitter effective under a large simultaneous fan-in. Folding
-    // this into the five-second reconnect tick would release every due peer
+    // this into the two-second peer-maintenance tick would release every due peer
     // as one batch and recreate the handshake herd we are avoiding.
     let mut mempool_retry_timer = tokio::time::interval(Duration::from_millis(250));
     mempool_retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1069,6 +1645,8 @@ async fn run_swarm(
     kad_walk_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the first immediate tick so we don't walk before any peers exist.
     kad_walk_interval.tick().await;
+    let mut automatic_peer_timer = tokio::time::interval(Duration::from_secs(2));
+    automatic_peer_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         // Drain all pending commands first (priority: outgoing blocks must propagate
@@ -1080,10 +1658,14 @@ async fn run_swarm(
                 &topics,
                 &mut mempool_sync_last_request,
                 &mut mempool_sync_retries,
-                &gossip_event_tx,
+                &required_event_tx,
                 &mut pending_retained_block_requests,
+                &mut pending_header_requests,
                 &mut pending_state_segment_requests,
-            );
+                &mut pending_history_step_requests,
+                &mut automatic_peers,
+            )
+            .await;
         }
 
         tokio::select! {
@@ -1108,7 +1690,6 @@ async fn run_swarm(
                     &outbound_response_budget,
                     &mut snapshot_exports,
                     &mut snapshot_export_leases,
-                    &mut reconnect,
                     &mut block_event_rate,
                     &mut tx_gossip_rate,
                     &mut mempool_sync_last_request,
@@ -1116,7 +1697,10 @@ async fn run_swarm(
                     &mut snapshot_manifest_last_request,
                     &mut snapshot_segment_rate,
                     &mut pending_retained_block_requests,
+                    &mut pending_header_requests,
                     &mut pending_state_segment_requests,
+                    &mut pending_history_step_requests,
+                    &mut automatic_peers,
                     &mut peer_diversity,
                     &mut successful_peer_cache,
                 )
@@ -1239,19 +1823,62 @@ async fn run_swarm(
                         &topics,
                         &mut mempool_sync_last_request,
                         &mut mempool_sync_retries,
-                        &gossip_event_tx,
+                        &required_event_tx,
                         &mut pending_retained_block_requests,
+                        &mut pending_header_requests,
                         &mut pending_state_segment_requests,
-                    ),
+                        &mut pending_history_step_requests,
+                        &mut automatic_peers,
+                    )
+                    .await,
                     None => break, // cmd_tx dropped
                 }
             }
 
             // Periodic Kademlia random walk for topology health.
             _ = kad_walk_interval.tick() => {
-                let random_peer = libp2p::PeerId::random();
-                swarm.behaviour_mut().kad.get_closest_peers(random_peer);
-                tracing::debug!("kad: periodic random walk");
+                if automatic_peers.kad_bootstrap_started
+                    && !automatic_peers.discovery_active()
+                {
+                    let query = swarm
+                        .behaviour_mut()
+                        .kad
+                        .get_closest_peers(libp2p::PeerId::random());
+                    automatic_peers.begin_discovery(query);
+                    tracing::debug!("kad: periodic random walk");
+                }
+            }
+
+            _ = automatic_peer_timer.tick() => {
+                maintain_automatic_outbound(
+                    &mut swarm,
+                    &mut automatic_peers,
+                    &peer_diversity,
+                );
+                let under_target = automatic_peers
+                    .outbound_peer_count()
+                    // A slow or unresolved DNS seed is only a probe. It must
+                    // not suppress discovery of a real ordinary neighbour.
+                    .saturating_add(automatic_peers.pending_ordinary_count())
+                    < AUTOMATIC_OUTBOUND_TARGET;
+                if under_target
+                    && swarm.connected_peers().next().is_some()
+                    && automatic_peers.kad_bootstrap_started
+                    && !automatic_peers.discovery_active()
+                    && Instant::now() >= automatic_peers.next_discovery_at
+                {
+                    let query = swarm
+                        .behaviour_mut()
+                        .kad
+                        .get_closest_peers(libp2p::PeerId::random());
+                    automatic_peers.begin_discovery(query);
+                    tracing::debug!(
+                        outbound = automatic_peers.outbound_peer_count(),
+                        pending = automatic_peers.pending.len(),
+                        target = AUTOMATIC_OUTBOUND_TARGET,
+                        "kad: accelerated lookup below outbound target"
+                    );
+                }
             }
 
             // Persist only peers confirmed by successful outbound transport.
@@ -1261,45 +1888,6 @@ async fn run_swarm(
                 tokio::task::spawn_blocking(move || {
                     crate::peer_store::save(&data_dir, &cache);
                 });
-            }
-
-            // Reconnect: re-dial known peers after disconnect with backoff.
-            _ = reconnect_timer.tick() => {
-                let now = tokio::time::Instant::now();
-                let to_dial: Vec<_> = reconnect
-                    .iter()
-                    .filter(|(peer, (_, retry_at, _))| {
-                        now >= *retry_at
-                            && !swarm.is_connected(peer)
-                    })
-                    .map(|(peer, (addr, _, count))| (*peer, addr.clone(), *count))
-                    .collect();
-                // Max reconnect attempts before giving up.
-                // Prevents unbounded map growth for permanently-offline peers.
-                const MAX_RECONNECT_ATTEMPTS: u32 = 10;
-
-                for (peer, addr, count) in to_dial {
-                    if count >= MAX_RECONNECT_ATTEMPTS {
-                        tracing::debug!(
-                            peer = %peer,
-                            attempts = count,
-                            "reconnect: giving up after max attempts"
-                        );
-                        reconnect.remove(&peer);
-                        continue;
-                    }
-                    tracing::debug!(peer = %peer, attempt = count + 1, "reconnecting");
-                    if let Err(e) = swarm.dial(addr.clone()) {
-                        tracing::debug!(peer = %peer, err = %e, "reconnect dial failed");
-                    }
-                    // Exponential backoff: 10s * 2^count, capped at 10min.
-                    let delay_secs = (10u64 * (1u64 << count.min(6))).min(600);
-                    let next_retry = tokio::time::Instant::now()
-                        + std::time::Duration::from_secs(delay_secs);
-                    reconnect.insert(peer, (addr, next_retry, count + 1));
-                }
-                // Remove peers that are now connected (reconnect succeeded).
-                reconnect.retain(|peer, _| !swarm.is_connected(peer));
             }
 
             // Recover a mempool exchange rejected during a busy simultaneous
@@ -1449,23 +2037,296 @@ fn is_routable_identify_addr(addr: &Multiaddr) -> bool {
     crate::peer_diversity::contains_public_ip(addr)
 }
 
+fn sanitize_automatic_peer_addr(peer: PeerId, mut addr: Multiaddr) -> Option<Multiaddr> {
+    if let Some(libp2p::multiaddr::Protocol::P2p(advertised_peer)) = addr.iter().last() {
+        if advertised_peer != peer {
+            return None;
+        }
+        addr.pop();
+    }
+    let has_tcp = addr
+        .iter()
+        .any(|protocol| matches!(protocol, libp2p::multiaddr::Protocol::Tcp(port) if port != 0));
+    (is_routable_identify_addr(&addr) && has_tcp).then_some(addr)
+}
+
+fn begin_bootstrap_dial(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    automatic: &mut AutomaticPeerState,
+    addr: Multiaddr,
+    peer: Option<PeerId>,
+) -> bool {
+    let options = if let Some(peer) = peer {
+        libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+            .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+            .addresses(vec![addr.clone()])
+            .build()
+    } else {
+        libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
+            .address(addr.clone())
+            .build()
+    };
+    let connection_id = options.connection_id();
+    automatic
+        .pending
+        .insert(connection_id, PendingAutomaticDial::Bootstrap(addr.clone()));
+    match swarm.dial(options) {
+        Ok(()) => {
+            tracing::debug!(address = %addr, "automatic bootstrap dial started");
+            true
+        }
+        Err(error) => {
+            automatic.note_dial_failed(connection_id);
+            tracing::debug!(address = %addr, err = %error, "automatic bootstrap dial rejected");
+            false
+        }
+    }
+}
+
+fn begin_peer_dial(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    automatic: &mut AutomaticPeerState,
+    peer: PeerId,
+    addr: Multiaddr,
+    group: PublicNetworkGroup,
+) -> bool {
+    let options = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
+        .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+        .addresses(vec![addr])
+        .build();
+    let connection_id = options.connection_id();
+    automatic
+        .pending
+        .insert(connection_id, PendingAutomaticDial::Peer { peer, group });
+    match swarm.dial(options) {
+        Ok(()) => {
+            tracing::debug!(peer = %peer, "automatic peer dial started");
+            true
+        }
+        Err(error) => {
+            automatic.note_dial_failed(connection_id);
+            tracing::debug!(peer = %peer, err = %error, "automatic peer dial rejected");
+            false
+        }
+    }
+}
+
+fn maintain_automatic_outbound(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    automatic: &mut AutomaticPeerState,
+    peer_diversity: &PeerDiversity,
+) {
+    let now = Instant::now();
+    automatic.refresh_healthy_connections(now);
+    let expired_unidentified = automatic.expired_unidentified_connections(now);
+    if !expired_unidentified.is_empty() {
+        for (connection_id, peer) in expired_unidentified {
+            if swarm.close_connection(connection_id) {
+                tracing::debug!(
+                    peer = %peer,
+                    "closing automatic outbound connection that did not identify in time"
+                );
+            }
+        }
+        // Let the close events retire their exact transport records before
+        // starting replacement dials on the next two-second maintenance tick.
+        return;
+    }
+    let stable_non_bootstrap = automatic.stable_non_bootstrap_peer_count(now);
+    let desired_bootstrap = desired_bootstrap_connections(
+        automatic.bootstrap_complete,
+        stable_non_bootstrap,
+        automatic.bootstrap.len(),
+    );
+    let connected_bootstrap = automatic.connected_bootstrap_peer_ids();
+    let bootstrap_peers = automatic.bootstrap_peer_ids();
+
+    // A replacement is connected before the old neighbour is released. This
+    // keeps the maintained set at the target throughout seed→ordinary and
+    // ordinary→seed transitions instead of creating a visible connectivity
+    // dip every time the topology changes.
+    // At the exact target, first establish an ordinary replacement below.
+    // Closing a seed here would create a visible 12→11 connectivity dip.
+    let release_seed = connected_bootstrap.len() > desired_bootstrap
+        && automatic.outbound_peer_count() > AUTOMATIC_OUTBOUND_TARGET;
+    let release_ordinary =
+        !release_seed && automatic.outbound_peer_count() > AUTOMATIC_OUTBOUND_TARGET;
+    if release_seed || release_ordinary {
+        let mut releasable = automatic
+            .managed_connections
+            .iter()
+            .filter(|(_, connection)| {
+                if release_seed {
+                    bootstrap_peers.contains(&connection.peer)
+                } else {
+                    matches!(connection.kind, ManagedOutboundKind::Peer)
+                        && !bootstrap_peers.contains(&connection.peer)
+                }
+            })
+            .map(|(connection_id, connection)| (*connection_id, connection.peer))
+            .collect::<Vec<_>>();
+        releasable.shuffle(&mut rand::thread_rng());
+        if let Some((connection_id, peer)) = releasable.first().copied() {
+            if swarm.close_connection(connection_id) {
+                tracing::debug!(
+                    peer = %peer,
+                    desired_bootstrap,
+                    "released replaced automatic outbound connection"
+                );
+            }
+        }
+        return;
+    }
+
+    let pending_capacity = automatic.automatic_dial_capacity();
+    if pending_capacity == 0 {
+        return;
+    }
+
+    let pending_bootstrap = automatic.pending_bootstrap_count();
+    // Pending DNS work is not connectivity. Start a small staggered reserve
+    // probe on later maintenance ticks instead of waiting for one dead seed's
+    // transport timeout before trying the next hostname.
+    let bootstrap_needed = desired_bootstrap.saturating_sub(connected_bootstrap.len());
+    if bootstrap_needed > 0 {
+        let occupied = automatic
+            .outbound_peer_count()
+            .saturating_add(automatic.pending.len());
+        let available = AUTOMATIC_OUTBOUND_TARGET
+            .saturating_add(1)
+            .saturating_sub(occupied)
+            .min(pending_capacity)
+            .min(MAX_PENDING_BOOTSTRAP_DIALS.saturating_sub(pending_bootstrap))
+            .min(bootstrap_needed);
+        let pending_addrs = automatic
+            .pending
+            .values()
+            .filter_map(|pending| match pending {
+                PendingAutomaticDial::Bootstrap(addr) => Some(addr.clone()),
+                PendingAutomaticDial::Peer { .. } => None,
+            })
+            .collect::<std::collections::HashSet<_>>();
+        let mut due = automatic
+            .bootstrap
+            .iter()
+            .filter(|(addr, candidate)| {
+                candidate.next_attempt <= now
+                    && !pending_addrs.contains(*addr)
+                    && candidate.peer.is_none_or(|peer| !swarm.is_connected(&peer))
+            })
+            .map(|(addr, candidate)| (addr.clone(), candidate.peer))
+            .collect::<Vec<_>>();
+        due.shuffle(&mut rand::thread_rng());
+        for (addr, peer) in due.into_iter().take(available) {
+            begin_bootstrap_dial(swarm, automatic, addr, peer);
+        }
+    }
+
+    let pending_peers = automatic
+        .pending
+        .values()
+        .filter_map(|pending| match pending {
+            PendingAutomaticDial::Peer { peer, .. } => Some(*peer),
+            PendingAutomaticDial::Bootstrap(_) => None,
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut candidates = automatic
+        .peers
+        .iter()
+        .filter(|(peer, candidate)| {
+            candidate.next_attempt <= now
+                && !candidate.addrs.is_empty()
+                && !bootstrap_peers.contains(peer)
+                && !pending_peers.contains(peer)
+                && !swarm.is_connected(peer)
+        })
+        .map(|(peer, candidate)| (*peer, candidate.addrs.clone()))
+        .collect::<Vec<_>>();
+    candidates.shuffle(&mut rand::thread_rng());
+
+    let pending_ordinary = automatic.pending_ordinary_count();
+    // A slow DNS bootstrap attempt must not hold a real neighbour slot
+    // hostage. If it later succeeds above target, the swap branch releases
+    // one ordinary connection without ever dropping below target.
+    let mut available = automatic_ordinary_dial_capacity(
+        automatic.outbound_peer_count(),
+        pending_ordinary,
+        connected_bootstrap.len() > desired_bootstrap,
+        automatic.automatic_dial_capacity(),
+    );
+    for (peer, mut addrs) in candidates {
+        if available == 0 {
+            break;
+        }
+        addrs.shuffle(&mut rand::thread_rng());
+        let selected = addrs.into_iter().find_map(|addr| {
+            let group = crate::peer_diversity::public_network_group(&addr)?;
+            let pending_same_group = automatic.pending_group_count(group);
+            peer_diversity
+                .outbound_candidate_allowed_with_pending(peer, &addr, pending_same_group)
+                .then_some((addr, group))
+        });
+        let Some((addr, group)) = selected else {
+            continue;
+        };
+        if begin_peer_dial(swarm, automatic, peer, addr, group) {
+            available -= 1;
+        }
+    }
+}
+
+fn desired_bootstrap_connections(
+    bootstrap_complete: bool,
+    stable_non_bootstrap: usize,
+    configured_bootstraps: usize,
+) -> usize {
+    let fanout = INITIAL_BOOTSTRAP_FANOUT.min(configured_bootstraps);
+    if !bootstrap_complete || stable_non_bootstrap < BOOTSTRAP_RELEASE_NON_SEED_PEERS {
+        return fanout;
+    }
+    fanout.saturating_sub(stable_non_bootstrap - BOOTSTRAP_RELEASE_NON_SEED_PEERS)
+}
+
+fn automatic_ordinary_dial_capacity(
+    outbound_peers: usize,
+    pending_ordinary: usize,
+    seed_replacement_needed: bool,
+    transport_capacity: usize,
+) -> usize {
+    let occupied = outbound_peers.saturating_add(pending_ordinary);
+    let replacement = usize::from(seed_replacement_needed && occupied >= AUTOMATIC_OUTBOUND_TARGET);
+    AUTOMATIC_OUTBOUND_TARGET
+        .saturating_add(replacement)
+        .saturating_sub(occupied)
+        .min(transport_capacity)
+}
+
 /// Process a single network command. Separated from the select! loop so that
-/// pending commands can be drained synchronously via `try_recv` before blocking.
-fn handle_network_command(
+/// pending commands can be drained via `try_recv` before blocking.
+async fn handle_network_command(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     cmd: NetworkCommand,
     topics: &NetworkTopics,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     mempool_sync_retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
-    failure_event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
+    required_event_tx: &mpsc::Sender<NetworkEvent>,
     pending_retained_block_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingRetainedBlockRequest,
+    >,
+    pending_header_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingHeaderRequest,
     >,
     pending_state_segment_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingStateSegmentRequest,
     >,
+    pending_history_step_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingHistoryStepTerminalRequest,
+    >,
+    automatic_peers: &mut AutomaticPeerState,
 ) {
     match cmd {
         NetworkCommand::AnnounceBlock { bundle } => {
@@ -1492,9 +2353,12 @@ fn handle_network_command(
             }
         }
         NetworkCommand::Dial { addr } => {
-            if let Err(e) = swarm.dial(addr) {
-                tracing::warn!("dial: {e}");
-            }
+            tracing::debug!(address = %addr, "registered automatic bootstrap candidate");
+            automatic_peers.register_bootstrap(addr);
+        }
+        NetworkCommand::BootstrapComplete => {
+            automatic_peers.bootstrap_complete = true;
+            tracing::debug!("initial synchronization complete — bootstrap peers are releasable");
         }
         NetworkCommand::PeerCount { reply } => {
             let count = swarm.connected_peers().count();
@@ -1519,12 +2383,13 @@ fn handle_network_command(
                         limit = MAX_PENDING_RETAINED_BLOCK_REQUESTS,
                         "retained-block request correlation table full"
                     );
-                    fail_peer_requests(
-                        pending_retained_block_requests,
-                        pending_state_segment_requests,
-                        failure_event_tx,
-                        peer,
-                    );
+                    let _ = required_event_tx
+                        .send(NetworkEvent::RecentBlockRequestFailed {
+                            from: peer,
+                            height: h,
+                            payload_kind: RecentBlockPayloadKind::Complete,
+                        })
+                        .await;
                     break;
                 }
                 let request_id = swarm.behaviour_mut().block_sync.send_request(
@@ -1553,12 +2418,13 @@ fn handle_network_command(
                     limit = MAX_PENDING_RETAINED_BLOCK_REQUESTS,
                     "retained-block request correlation table full"
                 );
-                fail_peer_requests(
-                    pending_retained_block_requests,
-                    pending_state_segment_requests,
-                    failure_event_tx,
-                    peer,
-                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockRequestFailed {
+                        from: peer,
+                        height,
+                        payload_kind: RecentBlockPayloadKind::Complete,
+                    })
+                    .await;
                 return;
             }
             let request_id = swarm.behaviour_mut().block_sync.send_request(
@@ -1586,12 +2452,13 @@ fn handle_network_command(
                     limit = MAX_PENDING_RETAINED_BLOCK_REQUESTS,
                     "retained-block request correlation table full"
                 );
-                fail_peer_requests(
-                    pending_retained_block_requests,
-                    pending_state_segment_requests,
-                    failure_event_tx,
-                    peer,
-                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockRequestFailed {
+                        from: peer,
+                        height,
+                        payload_kind: RecentBlockPayloadKind::BlockBody,
+                    })
+                    .await;
                 return;
             }
             let request_id = swarm.behaviour_mut().block_sync.send_request(
@@ -1643,12 +2510,14 @@ fn handle_network_command(
                     limit = MAX_PENDING_STATE_SEGMENT_REQUESTS,
                     "state-segment request correlation table full"
                 );
-                fail_peer_requests(
-                    pending_retained_block_requests,
-                    pending_state_segment_requests,
-                    failure_event_tx,
-                    peer,
-                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateSegmentRequestFailed {
+                        from: peer,
+                        segment_id,
+                        expected_tip_height,
+                        expected_tip_hash,
+                    })
+                    .await;
                 return;
             }
             let request_id = swarm.behaviour_mut().state_segment_sync.send_request(
@@ -1672,15 +2541,50 @@ fn handle_network_command(
             tracing::debug!(peer = %peer, segment_id, "requesting state segment");
         }
         NetworkCommand::RequestHistoryStepTerminal {
+            token,
             peer,
             height,
             block_hash,
         } => {
-            let _ = swarm.behaviour_mut().history_step_sync.send_request(
+            // The node owns one snapshot state machine. A newer local token
+            // supersedes any transport still completing for an older
+            // boundary/peer; delayed responses remain harmless because their
+            // request IDs are no longer correlated.
+            pending_history_step_requests.retain(|_, pending| pending.token == token);
+            if !pending_history_step_requests.has_capacity() {
+                tracing::warn!(
+                    token,
+                    peer = %peer,
+                    height,
+                    limit = MAX_PENDING_HISTORY_STEP_REQUESTS,
+                    "HistoryStep request correlation table full"
+                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                        token,
+                        from: peer,
+                        height,
+                        block_hash,
+                        kind: RequestFailureKind::Io,
+                    })
+                    .await;
+                return;
+            }
+            let request_id = swarm.behaviour_mut().history_step_sync.send_request(
                 &peer,
                 crate::protocol::GetHistoryStepTerminalRequest { height, block_hash },
             );
-            tracing::debug!(peer = %peer, height, "requesting HistoryStep terminal for snapshot verification");
+            let inserted = pending_history_step_requests.try_insert(
+                request_id,
+                PendingHistoryStepTerminalRequest {
+                    token,
+                    peer,
+                    height,
+                    block_hash,
+                },
+            );
+            debug_assert!(inserted, "fresh HistoryStep request ID must be unique");
+            tracing::debug!(token, peer = %peer, height, "requesting HistoryStep terminal for snapshot verification");
         }
         NetworkCommand::FetchHeaders {
             peer,
@@ -1688,13 +2592,36 @@ fn handle_network_command(
             count,
         } => {
             let count = count.min(512);
-            let _ = swarm.behaviour_mut().chain_sync.send_request(
+            // Node-side fetch state is per peer. Retire an older request from
+            // the same peer before issuing its replacement so a delayed stream
+            // cannot consume correlation capacity or reset a newer session.
+            pending_header_requests.retain(|_, pending| pending.peer != peer);
+            if !pending_header_requests.has_capacity() {
+                let _ = required_event_tx
+                    .send(NetworkEvent::HeadersRequestFailed {
+                        from: peer,
+                        start_height,
+                        count,
+                    })
+                    .await;
+                return;
+            }
+            let request_id = swarm.behaviour_mut().chain_sync.send_request(
                 &peer,
                 crate::protocol::GetHeadersRequest {
                     start_height,
                     count,
                 },
             );
+            let inserted = pending_header_requests.try_insert(
+                request_id,
+                PendingHeaderRequest {
+                    peer,
+                    start_height,
+                    count,
+                },
+            );
+            debug_assert!(inserted, "fresh header request ID must be unique");
         }
         NetworkCommand::RequestMempoolSync { peer } => {
             const MEMPOOL_SYNC_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
@@ -1736,10 +2663,6 @@ async fn handle_swarm_event(
     outbound_response_budget: &OutboundResponseBudget,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     snapshot_export_leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
-    reconnect: &mut std::collections::HashMap<
-        libp2p::PeerId,
-        (Multiaddr, tokio::time::Instant, u32),
-    >,
     block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
@@ -1750,22 +2673,46 @@ async fn handle_swarm_event(
         request_response::OutboundRequestId,
         PendingRetainedBlockRequest,
     >,
+    pending_header_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingHeaderRequest,
+    >,
     pending_state_segment_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingStateSegmentRequest,
     >,
+    pending_history_step_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingHistoryStepTerminalRequest,
+    >,
+    automatic_peers: &mut AutomaticPeerState,
     peer_diversity: &mut PeerDiversity,
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
 ) {
-    macro_rules! fail_peer {
-        ($peer:expr) => {
-            fail_peer_requests(
-                pending_retained_block_requests,
-                pending_state_segment_requests,
-                gossip_event_tx,
-                $peer,
-            )
-        };
+    macro_rules! fail_retained_request {
+        ($pending:expr) => {{
+            let pending = $pending;
+            let _ = required_event_tx
+                .send(NetworkEvent::RecentBlockRequestFailed {
+                    from: pending.peer,
+                    height: pending.height,
+                    payload_kind: pending.payload_kind,
+                })
+                .await;
+        }};
+    }
+    macro_rules! fail_state_segment_request {
+        ($pending:expr) => {{
+            let pending = $pending;
+            let _ = required_event_tx
+                .send(NetworkEvent::StateSegmentRequestFailed {
+                    from: pending.peer,
+                    segment_id: pending.segment_id,
+                    expected_tip_height: pending.expected_tip_height,
+                    expected_tip_hash: pending.expected_tip_hash,
+                })
+                .await;
+        }};
     }
 
     match event {
@@ -1858,9 +2805,30 @@ async fn handle_swarm_event(
         //   through calls to Behaviour::add_address."
         SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify::Event::Received {
             peer_id,
+            connection_id,
             info,
             ..
         })) => {
+            // A Noise/libp2p endpoint is not yet a usable ParanO(1)d peer.
+            // Require the current network's exact header protocol before this
+            // connection can satisfy bootstrap fanout or the ordinary peer
+            // target. Old releases are intentionally not wire-compatible.
+            let required_protocol = format!("{}/sync/headers/2", topics.protocol_id);
+            if !info
+                .protocols
+                .iter()
+                .any(|protocol| protocol.as_ref() == required_protocol)
+            {
+                let _ = swarm.close_connection(connection_id);
+                swarm.behaviour_mut().kad.remove_peer(&peer_id);
+                tracing::debug!(
+                    peer = %peer_id,
+                    required_protocol,
+                    "closing endpoint without the current ParanO(1)d sync protocol"
+                );
+                return;
+            }
+
             // 1. Add a bounded, routable subset of advertised listen addresses
             //    to Kademlia and the swarm address book. Blindly accepting all
             //    Identify addresses lets a peer bloat our peer store/routing state
@@ -1868,6 +2836,7 @@ async fn handle_swarm_event(
             const MAX_IDENTIFY_ADDRS_PER_PEER: usize = 8;
             let mut accepted_addrs = 0usize;
             let mut dropped_addrs = 0usize;
+            let mut routable_addrs = Vec::new();
             for addr in &info.listen_addrs {
                 if accepted_addrs >= MAX_IDENTIFY_ADDRS_PER_PEER {
                     dropped_addrs += 1;
@@ -1884,7 +2853,41 @@ async fn handle_swarm_event(
                 // Also populate the swarm's address book so GossipSub PX
                 // can build signed PeerInfo records for this peer.
                 swarm.add_peer_address(peer_id, addr.clone());
+                routable_addrs.push(addr.clone());
                 accepted_addrs += 1;
+            }
+            if automatic_peers
+                .outbound_connections
+                .contains_key(&connection_id)
+            {
+                if let Some(addr) = routable_addrs.first() {
+                    if let Err(reason) = peer_diversity.classify_outbound_dns_connection(
+                        connection_id,
+                        peer_id,
+                        addr,
+                    ) {
+                        let _ = swarm.close_connection(connection_id);
+                        swarm.behaviour_mut().kad.remove_peer(&peer_id);
+                        tracing::debug!(
+                            peer = %peer_id,
+                            address = %addr,
+                            ?reason,
+                            "closing DNS connection that violates public peer diversity"
+                        );
+                        return;
+                    }
+                }
+            }
+            automatic_peers.add_peer_candidate(
+                *swarm.local_peer_id(),
+                peer_id,
+                routable_addrs.iter().cloned(),
+            );
+            automatic_peers.note_identified(connection_id, peer_id);
+            if automatic_peers.is_outbound(peer_id) {
+                for addr in routable_addrs {
+                    successful_peer_cache.record_success(peer_id, addr);
+                }
             }
 
             // 2. Kick off the bootstrap walk now that at least one routable
@@ -1892,7 +2895,11 @@ async fn handle_swarm_event(
             //    of GossipSub's explicit set: explicit peers receive every
             //    publication outside the bounded mesh, producing O(degree)
             //    block and transaction fan-out on large networks.
-            let _ = swarm.behaviour_mut().kad.bootstrap();
+            if !automatic_peers.kad_bootstrap_started {
+                if let Ok(query) = swarm.behaviour_mut().kad.bootstrap() {
+                    automatic_peers.begin_kad_bootstrap(query);
+                }
+            }
 
             tracing::debug!(
                 peer = %peer_id,
@@ -1955,18 +2962,66 @@ async fn handle_swarm_event(
                 }
             }
             kad::Event::OutboundQueryProgressed {
+                id,
+                step,
                 result: kad::QueryResult::Bootstrap(Ok(kad::BootstrapOk { num_remaining, .. })),
                 ..
             } => {
                 if num_remaining == 0 {
                     tracing::debug!("kad: bootstrap complete");
                 }
+                if step.last {
+                    automatic_peers.finish_kad_bootstrap(id);
+                }
             }
             kad::Event::OutboundQueryProgressed {
+                id,
+                step,
+                result: kad::QueryResult::Bootstrap(Err(error)),
+                ..
+            } => {
+                if step.last {
+                    automatic_peers.finish_kad_bootstrap(id);
+                }
+                tracing::debug!(err = %error, "kad: bootstrap query timed out");
+            }
+            kad::Event::OutboundQueryProgressed {
+                id,
+                step,
                 result: kad::QueryResult::GetClosestPeers(Ok(kad::GetClosestPeersOk { peers, .. })),
                 ..
             } => {
-                tracing::debug!(found = peers.len(), "kad: FIND_NODE returned peers");
+                let found = peers.len();
+                let local = *swarm.local_peer_id();
+                let mut learned = false;
+                for peer in peers {
+                    learned |= automatic_peers.add_peer_candidate(local, peer.peer_id, peer.addrs);
+                }
+                automatic_peers.observe_discovery(id, learned, step.last);
+                tracing::debug!(found, learned, "kad: FIND_NODE returned peers");
+            }
+            kad::Event::OutboundQueryProgressed {
+                id,
+                step,
+                result:
+                    kad::QueryResult::GetClosestPeers(Err(kad::GetClosestPeersError::Timeout {
+                        peers,
+                        ..
+                    })),
+                ..
+            } => {
+                let found = peers.len();
+                let local = *swarm.local_peer_id();
+                let mut learned = false;
+                for peer in peers {
+                    learned |= automatic_peers.add_peer_candidate(local, peer.peer_id, peer.addrs);
+                }
+                automatic_peers.observe_discovery(id, learned, step.last);
+                tracing::debug!(
+                    found,
+                    learned,
+                    "kad: timed-out FIND_NODE retained partial peers"
+                );
             }
             _ => {}
         },
@@ -2030,14 +3085,43 @@ async fn handle_swarm_event(
         // --- Request-Response: headers client side (response to our FetchHeaders) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
             request_response::Event::Message {
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 peer,
             },
         )) => {
+            let Some(pending) = pending_header_requests.remove(&request_id) else {
+                tracing::debug!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    "ignoring stale header response"
+                );
+                return;
+            };
+            if pending.peer != peer {
+                let _ = required_event_tx
+                    .send(NetworkEvent::HeadersRequestFailed {
+                        from: pending.peer,
+                        start_height: pending.start_height,
+                        count: pending.count,
+                    })
+                    .await;
+                return;
+            }
             let decoded = match decode_linked_header_batch(response.headers) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
+                    let _ = required_event_tx
+                        .send(NetworkEvent::HeadersRequestFailed {
+                            from: pending.peer,
+                            start_height: pending.start_height,
+                            count: pending.count,
+                        })
+                        .await;
                     return;
                 }
             };
@@ -2045,6 +3129,36 @@ async fn handle_swarm_event(
                 .send(NetworkEvent::HeadersBatch {
                     from: peer,
                     headers: decoded,
+                })
+                .await;
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+        )) => {
+            let Some(pending) = pending_header_requests.remove(&request_id) else {
+                tracing::debug!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    "ignoring stale header request failure"
+                );
+                return;
+            };
+            tracing::debug!(
+                peer = %peer,
+                request_id = %request_id,
+                err = %error,
+                "header request transport failed"
+            );
+            let _ = required_event_tx
+                .send(NetworkEvent::HeadersRequestFailed {
+                    from: pending.peer,
+                    start_height: pending.start_height,
+                    count: pending.count,
                 })
                 .await;
         }
@@ -2109,7 +3223,7 @@ async fn handle_swarm_event(
                     response_height = response.height,
                     "retained-block response does not match its exact request — dropped"
                 );
-                fail_peer!(pending.peer);
+                fail_retained_request!(pending);
                 return;
             }
             let inbound_memory_permit = response.inbound_memory_permit.clone();
@@ -2118,7 +3232,7 @@ async fn handle_swarm_event(
                 const BLOCK_RATE_MAX: u32 = 40;
                 if !allow_peer_rate(block_event_rate, peer, BLOCK_RATE_MAX, BLOCK_RATE_WINDOW) {
                     tracing::debug!(peer = %peer, "pulled block response rate limit exceeded — dropped before event channel");
-                    fail_peer!(pending.peer);
+                    fail_retained_request!(pending);
                     return;
                 }
                 match (pending.payload_kind, payload) {
@@ -2155,7 +3269,7 @@ async fn handle_swarm_event(
                             height,
                             "complete response cannot satisfy body-only request"
                         );
-                        fail_peer!(pending.peer);
+                        fail_retained_request!(pending);
                     }
                     (
                         RecentBlockPayloadKind::Complete,
@@ -2168,7 +3282,7 @@ async fn handle_swarm_event(
                             height = response.height,
                             "body-only response cannot satisfy complete-block request"
                         );
-                        fail_peer!(pending.peer);
+                        fail_retained_request!(pending);
                     }
                 }
             } else {
@@ -2408,21 +3522,76 @@ async fn handle_swarm_event(
         // --- Request-Response: HistoryStep terminal client ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
             request_response::Event::Message {
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 peer,
             },
         )) => {
+            let Some(pending) = pending_history_step_requests.remove(&request_id) else {
+                tracing::debug!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    "ignoring stale HistoryStep terminal response"
+                );
+                return;
+            };
+            if pending.peer != peer
+                || pending.height != response.height
+                || pending.block_hash != response.block_hash
+            {
+                tracing::warn!(
+                    token = pending.token,
+                    peer = %peer,
+                    request_id = %request_id,
+                    "ignoring mismatched HistoryStep terminal response"
+                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                        token: pending.token,
+                        from: pending.peer,
+                        height: pending.height,
+                        block_hash: pending.block_hash,
+                        kind: RequestFailureKind::InvalidResponse,
+                    })
+                    .await;
+                return;
+            }
+            if response.terminal_bytes.is_none() {
+                tracing::warn!(
+                    token = pending.token,
+                    peer = %peer,
+                    request_id = %request_id,
+                    "HistoryStep terminal is unavailable from peer"
+                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                        token: pending.token,
+                        from: pending.peer,
+                        height: pending.height,
+                        block_hash: pending.block_hash,
+                        kind: RequestFailureKind::InvalidResponse,
+                    })
+                    .await;
+                return;
+            }
             let inbound_memory_permit = response.inbound_memory_permit.clone();
             let height = response.height;
             let block_hash = response.block_hash;
-            let terminal_bytes = response.terminal_bytes.unwrap_or_default();
+            let terminal_bytes = response
+                .terminal_bytes
+                .expect("availability checked before terminal delivery");
             tracing::debug!(
+                token = pending.token,
                 from = %peer,
                 terminal_len = terminal_bytes.len(),
                 "received HistoryStep terminal from peer"
             );
             let _ = required_event_tx
                 .send(NetworkEvent::HistoryStepTerminal {
+                    token: pending.token,
                     from: peer,
                     height,
                     block_hash,
@@ -2822,14 +3991,14 @@ async fn handle_swarm_event(
                     response_height = response.expected_tip_height,
                     "state-segment response does not match its exact request — dropped"
                 );
-                fail_peer!(pending.peer);
+                fail_state_segment_request!(pending);
                 return;
             }
             if let Some(ref data) = response.data {
                 let Some(maximum_len) = max_encoded_segment_len_for_eff_log(response.eff_log)
                 else {
                     tracing::warn!(peer = %peer, segment = response.segment_id, eff_log = response.eff_log, "segment response has invalid effective segment log — dropped");
-                    fail_peer!(pending.peer);
+                    fail_state_segment_request!(pending);
                     return;
                 };
                 if maximum_len > MAX_SEGMENT_BYTES
@@ -2842,12 +4011,12 @@ async fn handle_swarm_event(
                         len = data.len(),
                         "segment response has non-canonical sparse length — dropped"
                     );
-                    fail_peer!(pending.peer);
+                    fail_state_segment_request!(pending);
                     return;
                 }
                 if data.len() > MAX_SEGMENT_BYTES {
                     tracing::warn!(peer = %peer, segment = response.segment_id, len = data.len(), "segment response too large — dropped");
-                    fail_peer!(pending.peer);
+                    fail_state_segment_request!(pending);
                     return;
                 }
             }
@@ -2997,6 +4166,7 @@ async fn handle_swarm_event(
                 endpoint.get_remote_address(),
                 endpoint.is_dialer(),
             ) {
+                automatic_peers.note_dial_failed(connection_id);
                 let _ = swarm.close_connection(connection_id);
                 // `BucketInserts::OnConnected` may have admitted the peer just
                 // before the outer swarm event reached us. Do not let a
@@ -3010,10 +4180,11 @@ async fn handle_swarm_event(
                 );
                 return;
             }
-            if endpoint.is_dialer() {
-                successful_peer_cache
-                    .record_success(peer_id, endpoint.get_remote_address().clone());
-            }
+            automatic_peers.note_connection_established(
+                connection_id,
+                peer_id,
+                endpoint.is_dialer(),
+            );
             // Only emit PeerConnected on the FIRST connection to a peer.
             // Multiple connections to the same peer are common (simultaneous dials,
             // mDNS re-discovery, relay + direct). Emitting for each one causes
@@ -3023,14 +4194,11 @@ async fn handle_swarm_event(
                     .await;
                 tracing::debug!(peer = %peer_id, "peer connected");
             }
-            // Clear any pending reconnect entry — connection succeeded.
-            reconnect.remove(&peer_id);
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
             connection_id,
             num_established,
-            endpoint,
             cause,
             ..
         } => {
@@ -3041,8 +4209,47 @@ async fn handle_swarm_event(
                 );
                 return;
             }
+            automatic_peers.note_connection_closed(connection_id);
             // Only emit PeerDisconnected when the LAST connection to a peer closes.
             if num_established == 0 {
+                // Deliver exact request failures before the generic
+                // disconnect event. This deterministic ordering lets the node
+                // retain or fail over its disk staging without racing the
+                // broader peer cleanup path.
+                let failed_blocks =
+                    pending_retained_block_requests.take_where(|pending| pending.peer == peer_id);
+                for pending in failed_blocks {
+                    fail_retained_request!(pending);
+                }
+                let failed_headers =
+                    pending_header_requests.take_where(|pending| pending.peer == peer_id);
+                for pending in failed_headers {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::HeadersRequestFailed {
+                            from: pending.peer,
+                            start_height: pending.start_height,
+                            count: pending.count,
+                        })
+                        .await;
+                }
+                let failed_segments =
+                    pending_state_segment_requests.take_where(|pending| pending.peer == peer_id);
+                for pending in failed_segments {
+                    fail_state_segment_request!(pending);
+                }
+                let failed_terminals =
+                    pending_history_step_requests.take_where(|pending| pending.peer == peer_id);
+                for pending in failed_terminals {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                            token: pending.token,
+                            from: pending.peer,
+                            height: pending.height,
+                            block_hash: pending.block_hash,
+                            kind: RequestFailureKind::ConnectionClosed,
+                        })
+                        .await;
+                }
                 let _ = required_event_tx
                     .send(NetworkEvent::PeerDisconnected(peer_id))
                     .await;
@@ -3055,29 +4262,20 @@ async fn handle_swarm_event(
                 snapshot_segment_rate.remove(&peer_id);
                 snapshot_export_leases.remove(&peer_id);
                 prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
-                clear_peer_request_correlations(
-                    pending_retained_block_requests,
-                    pending_state_segment_requests,
-                    peer_id,
-                );
-                // Schedule reconnect for peers we dialled (outbound connections).
-                // We don't attempt to reconnect inbound peers — they should re-dial us.
-                if let libp2p::core::ConnectedPoint::Dialer { address, .. } = endpoint {
-                    if let std::collections::hash_map::Entry::Vacant(e) = reconnect.entry(peer_id) {
-                        let retry_at =
-                            tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-                        e.insert((address, retry_at, 0));
-                        tracing::debug!(peer = %peer_id, "scheduled reconnect in 10s");
-                    }
-                }
             }
         }
 
         // --- Outgoing connection failed (dial error) ---
-        SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+        SwarmEvent::OutgoingConnectionError {
+            peer_id,
+            connection_id,
+            error,
+            ..
+        } => {
+            automatic_peers.note_dial_failed(connection_id);
             tracing::debug!(peer = ?peer_id, err = %error, "outgoing connection error");
-            // The error is already logged; Kademlia / GossipSub will try
-            // other peers.  No explicit action needed here.
+            // The automatic manager retries bootstrap addresses and replaces
+            // ordinary peers with bounded backoff.
         }
 
         // --- Request-response failure: emit event so consumers can retry ---
@@ -3129,21 +4327,63 @@ async fn handle_swarm_event(
             },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "segment sync request failed");
-            let correlated = pending_state_segment_requests
-                .remove(&request_id)
-                .is_some_and(|pending| pending.peer == peer);
-            if !correlated {
+            let Some(pending) = pending_state_segment_requests.remove(&request_id) else {
                 tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale segment-sync failure");
                 return;
+            };
+            if pending.peer != peer {
+                tracing::debug!(
+                    peer = %peer,
+                    requested_peer = %pending.peer,
+                    request_id = %request_id,
+                    "ignoring mismatched segment-sync failure"
+                );
+                return;
             }
-            fail_peer!(peer);
+            fail_state_segment_request!(pending);
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
-            request_response::Event::OutboundFailure { peer, error, .. },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
         )) => {
-            tracing::debug!(peer = %peer, err = %error, "HistoryStep terminal request failed");
-            notify_outbound_request_failed(gossip_event_tx, peer);
+            let kind = RequestFailureKind::from(&error);
+            tracing::warn!(
+                peer = %peer,
+                request_id = %request_id,
+                ?kind,
+                err = %error,
+                "HistoryStep terminal request transport failed"
+            );
+            let Some(pending) = pending_history_step_requests.remove(&request_id) else {
+                tracing::debug!(
+                    peer = %peer,
+                    request_id = %request_id,
+                    "ignoring stale HistoryStep request failure"
+                );
+                return;
+            };
+            if pending.peer != peer {
+                tracing::debug!(
+                    peer = %peer,
+                    requested_peer = %pending.peer,
+                    request_id = %request_id,
+                    "ignoring mismatched HistoryStep request failure"
+                );
+                return;
+            }
+            let _ = required_event_tx
+                .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                    token: pending.token,
+                    from: peer,
+                    height: pending.height,
+                    block_hash: pending.block_hash,
+                    kind,
+                })
+                .await;
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
@@ -3252,6 +4492,328 @@ mod tests {
     }
 
     #[test]
+    fn automatic_peer_state_recovers_bootstrap_and_unique_outbound_slots() {
+        let addr: Multiaddr = "/dns4/seed.example/tcp/9400".parse().unwrap();
+        let peer = PeerId::random();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(1);
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        state.register_bootstrap(addr.clone());
+        state
+            .pending
+            .insert(connection_id, PendingAutomaticDial::Bootstrap(addr.clone()));
+        state.note_connection_established(connection_id, peer, true);
+
+        assert_eq!(
+            state.outbound_peer_count(),
+            0,
+            "transport alone is not a usable network peer"
+        );
+        state.note_identified(connection_id, peer);
+        assert_eq!(state.outbound_peer_count(), 1);
+        assert_eq!(state.bootstrap.get(&addr).unwrap().peer, Some(peer));
+        assert!(state.pending.is_empty());
+
+        state.note_connection_closed(connection_id);
+        assert_eq!(state.outbound_peer_count(), 0);
+        let candidate = state.bootstrap.get(&addr).unwrap();
+        assert_eq!(candidate.failures, 1);
+        assert!(candidate.next_attempt > Instant::now());
+    }
+
+    #[test]
+    fn automatic_retry_is_bounded_and_jittered() {
+        let first = automatic_retry_delay(1, b"first", b"local-a");
+        let later = automatic_retry_delay(u8::MAX, b"later", b"local-b");
+        assert!((Duration::from_secs(5)..Duration::from_secs(10)).contains(&first));
+        assert!((Duration::from_secs(300)..Duration::from_secs(305)).contains(&later));
+    }
+
+    #[test]
+    fn malformed_history_transport_is_not_classified_as_transient_io() {
+        let malformed = request_response::OutboundFailure::Io(std::io::Error::from(
+            std::io::ErrorKind::InvalidData,
+        ));
+        let truncated = request_response::OutboundFailure::Io(std::io::Error::from(
+            std::io::ErrorKind::UnexpectedEof,
+        ));
+        let transient = request_response::OutboundFailure::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset,
+        ));
+
+        assert_eq!(
+            RequestFailureKind::from(&malformed),
+            RequestFailureKind::InvalidResponse
+        );
+        assert_eq!(
+            RequestFailureKind::from(&truncated),
+            RequestFailureKind::InvalidResponse
+        );
+        assert_eq!(RequestFailureKind::from(&transient), RequestFailureKind::Io);
+    }
+
+    #[test]
+    fn bootstrap_release_is_gradual_and_tiny_network_keeps_every_seed() {
+        for (ordinary, expected_seeds) in [(0, 3), (8, 3), (9, 2), (10, 1), (11, 0), (12, 0)] {
+            assert_eq!(
+                desired_bootstrap_connections(true, ordinary, 6),
+                expected_seeds,
+                "ordinary={ordinary}"
+            );
+        }
+        assert_eq!(desired_bootstrap_connections(false, 12, 3), 3);
+        assert_eq!(desired_bootstrap_connections(true, 0, 3), 3);
+        assert_eq!(desired_bootstrap_connections(true, 0, 2), 2);
+    }
+
+    #[test]
+    fn failed_dns_identity_pin_is_cleared_before_reresolution() {
+        let local = PeerId::random();
+        let old_peer = PeerId::random();
+        let addr: Multiaddr = "/dns4/seed.example/tcp/9400".parse().unwrap();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(7);
+        let mut state = AutomaticPeerState::new(local);
+        state.register_bootstrap(addr.clone());
+        state.bootstrap.get_mut(&addr).unwrap().peer = Some(old_peer);
+        state
+            .pending
+            .insert(connection_id, PendingAutomaticDial::Bootstrap(addr.clone()));
+
+        state.note_dial_failed(connection_id);
+
+        let candidate = state.bootstrap.get(&addr).unwrap();
+        assert_eq!(candidate.peer, None);
+        assert_eq!(candidate.failures, 1);
+        assert!(candidate.next_attempt > Instant::now());
+    }
+
+    #[test]
+    fn aggregate_and_individual_dns_sources_count_one_target_peer() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let aggregate: Multiaddr = "/dnsaddr/noid.network".parse().unwrap();
+        let individual: Multiaddr = "/dns4/seed1.noid.network/tcp/9400".parse().unwrap();
+        let first = libp2p::swarm::ConnectionId::new_unchecked(71);
+        let duplicate = libp2p::swarm::ConnectionId::new_unchecked(72);
+        let mut state = AutomaticPeerState::new(local);
+        state.register_bootstrap(aggregate.clone());
+        state.register_bootstrap(individual.clone());
+        state
+            .pending
+            .insert(first, PendingAutomaticDial::Bootstrap(aggregate.clone()));
+        state.pending.insert(
+            duplicate,
+            PendingAutomaticDial::Bootstrap(individual.clone()),
+        );
+
+        state.note_connection_established(first, peer, true);
+        state.note_connection_established(duplicate, peer, true);
+        state.note_identified(first, peer);
+        state.note_identified(duplicate, peer);
+        assert_eq!(state.outbound_peer_count(), 1);
+        assert_eq!(state.managed_connections.len(), 2);
+        assert_eq!(state.outbound_connections.get(&first), Some(&peer));
+        assert_eq!(state.outbound_connections.get(&duplicate), Some(&peer));
+        assert_eq!(state.bootstrap.get(&aggregate).unwrap().peer, Some(peer));
+        assert_eq!(state.bootstrap.get(&individual).unwrap().peer, Some(peer));
+    }
+
+    #[test]
+    fn unresolved_seed_probes_do_not_reserve_ordinary_peer_slots() {
+        let local = PeerId::random();
+        let mut state = AutomaticPeerState::new(local);
+        for id in 1..=MAX_PENDING_BOOTSTRAP_DIALS {
+            let addr: Multiaddr = format!("/dns4/seed{id}.example/tcp/9400").parse().unwrap();
+            state.pending.insert(
+                libp2p::swarm::ConnectionId::new_unchecked(id),
+                PendingAutomaticDial::Bootstrap(addr),
+            );
+        }
+        for id in 100..100 + AUTOMATIC_OUTBOUND_TARGET {
+            state.pending.insert(
+                libp2p::swarm::ConnectionId::new_unchecked(id),
+                PendingAutomaticDial::Peer {
+                    peer: PeerId::random(),
+                    group: PublicNetworkGroup::Ipv4([8, 8]),
+                },
+            );
+        }
+
+        assert_eq!(state.pending_bootstrap_count(), MAX_PENDING_BOOTSTRAP_DIALS);
+        assert_eq!(state.pending_ordinary_count(), AUTOMATIC_OUTBOUND_TARGET);
+        assert!(state.pending.len() < MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS);
+        assert_eq!(
+            state
+                .outbound_peer_count()
+                .saturating_add(state.pending_ordinary_count()),
+            AUTOMATIC_OUTBOUND_TARGET
+        );
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                0,
+                0,
+                false,
+                MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS - MAX_PENDING_BOOTSTRAP_DIALS,
+            ),
+            AUTOMATIC_OUTBOUND_TARGET
+        );
+    }
+
+    #[test]
+    fn unidentified_transports_are_bounded_without_counting_as_healthy_peers() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        for id in 0..MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS {
+            state.track_managed_connection(
+                libp2p::swarm::ConnectionId::new_unchecked(1_000 + id),
+                PeerId::random(),
+                ManagedOutboundKind::Peer,
+            );
+        }
+        assert_eq!(state.outbound_peer_count(), 0);
+        assert_eq!(
+            state.automatic_occupancy(),
+            MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS
+        );
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                state.outbound_peer_count(),
+                state.pending_ordinary_count(),
+                false,
+                state.automatic_dial_capacity(),
+            ),
+            0
+        );
+
+        let released = *state.managed_connections.keys().next().unwrap();
+        state.note_connection_closed(released);
+        assert_eq!(
+            state.automatic_occupancy(),
+            MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS - 1
+        );
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                state.outbound_peer_count(),
+                state.pending_ordinary_count(),
+                false,
+                state.automatic_dial_capacity(),
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn two_healthy_paths_per_peer_still_reach_the_unique_peer_target() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        for peer_index in 0..AUTOMATIC_OUTBOUND_TARGET {
+            let peer = PeerId::random();
+            for path in 0..2 {
+                let connection_id =
+                    libp2p::swarm::ConnectionId::new_unchecked(2_000 + peer_index * 2 + path);
+                state.track_managed_connection(connection_id, peer, ManagedOutboundKind::Peer);
+                state.note_identified(connection_id, peer);
+            }
+        }
+        assert_eq!(state.outbound_peer_count(), AUTOMATIC_OUTBOUND_TARGET);
+        assert_eq!(state.automatic_occupancy(), AUTOMATIC_OUTBOUND_TARGET * 2);
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                state.outbound_peer_count(),
+                state.pending_ordinary_count(),
+                false,
+                state.automatic_dial_capacity(),
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn seed_replacement_has_exactly_one_overlap_slot() {
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                AUTOMATIC_OUTBOUND_TARGET,
+                0,
+                true,
+                MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS,
+            ),
+            1
+        );
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                AUTOMATIC_OUTBOUND_TARGET,
+                1,
+                true,
+                MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS,
+            ),
+            0,
+            "one pending replacement must suppress another overlap dial"
+        );
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                AUTOMATIC_OUTBOUND_TARGET - 1,
+                0,
+                false,
+                MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn invalid_kad_candidates_cannot_fill_the_bounded_pool() {
+        let local = PeerId::random();
+        let mut state = AutomaticPeerState::new(local);
+        for _ in 0..(MAX_AUTOMATIC_PEER_CANDIDATES + 50) {
+            assert!(!state.add_peer_candidate(
+                local,
+                PeerId::random(),
+                ["/ip4/127.0.0.1/tcp/9400".parse().unwrap()]
+            ));
+        }
+        assert!(state.peers.is_empty());
+
+        let valid = PeerId::random();
+        assert!(state.add_peer_candidate(local, valid, ["/ip4/8.8.8.8/tcp/9400".parse().unwrap()]));
+        assert!(state.peers.contains_key(&valid));
+
+        let mismatched = PeerId::random();
+        let advertised = PeerId::random();
+        assert!(!state.add_peer_candidate(
+            local,
+            mismatched,
+            [format!("/ip4/9.9.9.9/tcp/9400/p2p/{advertised}")
+                .parse()
+                .unwrap()]
+        ));
+    }
+
+    #[test]
+    fn pending_outbound_dials_reserve_public_network_group_capacity() {
+        let local = PeerId::random();
+        let mut state = AutomaticPeerState::new(local);
+        let group =
+            crate::peer_diversity::public_network_group(&"/ip4/8.8.1.1/tcp/9400".parse().unwrap())
+                .unwrap();
+        for id in 1..=2 {
+            state.pending.insert(
+                libp2p::swarm::ConnectionId::new_unchecked(id),
+                PendingAutomaticDial::Peer {
+                    peer: PeerId::random(),
+                    group,
+                },
+            );
+        }
+        let candidate = PeerId::random();
+        let addr: Multiaddr = "/ip4/8.8.2.2/tcp/9400".parse().unwrap();
+        assert_eq!(state.pending_group_count(group), 2);
+        assert!(
+            !PeerDiversity::default().outbound_candidate_allowed_with_pending(
+                candidate,
+                &addr,
+                state.pending_group_count(group)
+            )
+        );
+    }
+
+    #[test]
     fn stored_bundle_decode_is_all_or_none_and_height_bound() {
         let bundle = accepted_bundle(77, 1);
         assert_eq!(
@@ -3315,13 +4877,6 @@ mod tests {
         ));
         registry.retain(|_, entry| entry.peer != peer);
         assert_eq!(registry.len(), 0, "disconnect clears peer-owned requests");
-
-        let (failure_tx, mut failure_rx) = tokio::sync::broadcast::channel(1);
-        notify_outbound_request_failed(&failure_tx, peer);
-        assert!(matches!(
-            failure_rx.try_recv(),
-            Ok(NetworkEvent::PeerRequestFailed(failed_peer)) if failed_peer == peer
-        ));
     }
 
     #[test]

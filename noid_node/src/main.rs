@@ -228,8 +228,10 @@ impl MiningPeerQuorum {
     }
 
     fn confirm(&mut self, peer: libp2p::PeerId) {
-        self.connected.insert(peer);
-        if self.confirmed.insert(peer) {
+        // Connectivity is owned exclusively by PeerConnected/Disconnected.
+        // A delayed verification result from a closed sync peer must never
+        // resurrect that identity and satisfy the mining network gate.
+        if self.connected.contains(&peer) && self.confirmed.insert(peer) {
             self.publish();
         }
     }
@@ -290,6 +292,34 @@ fn manifest_round_retry_due(
 
 fn manifest_round_gap_is_resolved(local_height: u64, highest_announced: u64) -> bool {
     local_height >= highest_announced
+}
+
+fn rotating_manifest_peers(
+    peers: &std::collections::HashSet<libp2p::PeerId>,
+    failed_peer: Option<libp2p::PeerId>,
+    allow_failed_peer: bool,
+    cursor: &mut usize,
+    limit: usize,
+) -> Vec<libp2p::PeerId> {
+    let mut candidates = peers
+        .iter()
+        .copied()
+        .filter(|peer| Some(*peer) != failed_peer)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|peer| peer.to_bytes());
+    if candidates.is_empty() {
+        return failed_peer
+            .filter(|peer| allow_failed_peer && peers.contains(peer))
+            .into_iter()
+            .collect();
+    }
+
+    let start = *cursor % candidates.len();
+    let selected = (0..limit.min(candidates.len()))
+        .map(|offset| candidates[(start + offset) % candidates.len()])
+        .collect::<Vec<_>>();
+    *cursor = (start + selected.len()) % candidates.len();
+    selected
 }
 
 fn history_step_cache_directory(data_dir: &Path, metadata_digest: [u8; 32]) -> PathBuf {
@@ -539,8 +569,8 @@ struct Cli {
 ///
 /// Handles four formats:
 ///
-/// 1. `HOST:PORT`            — IP or hostname + port  → `/ip4/H/tcp/P` or `/dns4/H/tcp/P`
-/// 2. `hostname`             — bare DNS name           → `/dns4/hostname/tcp/{default_port}`
+/// 1. `HOST:PORT`            — IP or hostname + port  → `/ip4/H/tcp/P` or `/dns/H/tcp/P`
+/// 2. `hostname`             — bare DNS name           → `/dns/hostname/tcp/{default_port}`
 /// 3. `/ip4/.../tcp/...`     — libp2p multiaddr, passed through unchanged
 /// 4. `dnsaddr:hostname`     — _dnsaddr TXT lookup     → `/dnsaddr/hostname`
 ///
@@ -553,36 +583,67 @@ struct Cli {
 ///   _dnsaddr.noid.network  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9400/p2p/12D3KooW..."
 ///   _dnsaddr.noid.network  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9400/p2p/12D3KooW..."
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
+    let seed = s.trim();
+
+    // Format 3: an explicit multiaddr is already complete. In particular,
+    // retain a trailing /p2p/<PeerId>: it cryptographically binds the dial to
+    // the identity selected by the operator.
+    if seed.starts_with('/') {
+        return seed
+            .parse()
+            .with_context(|| format!("parse multiaddr: {seed}"));
+    }
+
     // Format 4: "dnsaddr:<hostname>" → /dnsaddr/<hostname>
     // Resolves _dnsaddr.<hostname> TXT records (libp2p standard).
-    if let Some(host) = s.strip_prefix("dnsaddr:") {
+    if let Some(host) = seed.strip_prefix("dnsaddr:") {
         let ma_str = format!("/dnsaddr/{}", host.trim());
         return ma_str
             .parse()
             .with_context(|| format!("build dnsaddr multiaddr for {host:?}"));
     }
 
-    // Strip /p2p/<peer-id> suffix if present (format 3 variant)
-    let base = s.split("/p2p/").next().unwrap_or(s).trim();
-
-    // Format 3: already a multiaddr?
-    if base.starts_with('/') {
-        return base
-            .parse()
-            .with_context(|| format!("parse multiaddr: {base}"));
-    }
-
     // Format 1: HOST:PORT
-    if base.contains(':') {
-        return ip_port_to_multiaddr(base);
+    if seed.contains(':') {
+        return seed_host_port_to_multiaddr(seed);
     }
 
-    // Format 2: bare hostname — use default network port.
-    // /dns4/ triggers libp2p DNS resolution at dial time.
-    let ma_str = format!("/dns4/{base}/tcp/{default_port}");
+    // Format 2: bare hostname — use default network port. `/dns/` lets
+    // libp2p try both A and AAAA answers (up to its bounded dial limit).
+    let ma_str = format!("/dns/{seed}/tcp/{default_port}");
     ma_str
         .parse()
-        .with_context(|| format!("build dns4 multiaddr for {base:?}"))
+        .with_context(|| format!("build DNS multiaddr for {seed:?}"))
+}
+
+fn split_host_port(addr: &str) -> anyhow::Result<(&str, &str)> {
+    if let Some(rest) = addr.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once("]:")
+            .with_context(|| format!("invalid bracketed IPv6 address {addr:?}"))?;
+        return Ok((host, port));
+    }
+    addr.rsplit_once(':').with_context(|| {
+        format!(
+            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9301)",
+            addr
+        )
+    })
+}
+
+fn seed_host_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
+    let (host, port_str) = split_host_port(addr)?;
+    let port: u16 = port_str
+        .parse()
+        .with_context(|| format!("invalid port in {addr:?}"))?;
+    let protocol = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => format!("/ip4/{ip}"),
+        Ok(std::net::IpAddr::V6(ip)) => format!("/ip6/{ip}"),
+        Err(_) => format!("/dns/{host}"),
+    };
+    format!("{protocol}/tcp/{port}")
+        .parse()
+        .with_context(|| format!("build seed multiaddr from {addr:?}"))
 }
 
 /// Convert a user-friendly "HOST:PORT" string into a libp2p Multiaddr.
@@ -592,23 +653,17 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
 ///
 /// This conversion is purely internal — users never see multiaddrs.
 fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
-    // Parse HOST:PORT
-    let (host, port_str) = addr.rsplit_once(':').with_context(|| {
-        format!(
-            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9301)",
-            addr
-        )
-    })?;
+    let (host, port_str) = split_host_port(addr)?;
     let port: u16 = port_str
         .parse()
         .with_context(|| format!("invalid port in {:?}", addr))?;
 
-    // Build /ip4/<host>/tcp/<port> or /ip6/<host>/tcp/<port>
-    let ma_str = if host.contains(':') {
-        // IPv6
-        format!("/ip6/{host}/tcp/{port}")
-    } else {
-        format!("/ip4/{host}/tcp/{port}")
+    let ma_str = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => format!("/ip4/{ip}/tcp/{port}"),
+        Ok(std::net::IpAddr::V6(ip)) => format!("/ip6/{ip}/tcp/{port}"),
+        Err(error) => {
+            anyhow::bail!("invalid IP address {host:?} in {addr:?}: {error}");
+        }
     };
     ma_str
         .parse()
@@ -794,9 +849,11 @@ async fn main() -> anyhow::Result<()> {
         threads = cpu_plan.shared_pool_threads,
         "CPU proof and mining backend selected"
     );
-    // --seed accepts HOST:PORT; convert to multiaddr strings for internal use
+    // GUI Settings and the CLI share the complete seed syntax accepted by
+    // seed_to_multiaddr (hostname, IP, dnsaddr, or explicit multiaddr).
     for raw_seed in cli.seed {
-        let ma = ip_port_to_multiaddr(&raw_seed).with_context(|| format!("--seed {raw_seed}"))?;
+        let ma = seed_to_multiaddr(&raw_seed, net.default_p2p_port)
+            .with_context(|| format!("--seed {raw_seed}"))?;
         cfg.network.seeds.push(ma.to_string());
     }
 
@@ -1407,11 +1464,16 @@ fn log_sync_phase_measurement(measurement: SyncPhaseMeasurement) {
 }
 
 struct PendingSnapshotHeaderSync {
+    /// Peer that supplied the selected manifest and will serve its leased
+    /// state generation.
     from: libp2p::PeerId,
     manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
     staging: SnapshotHeaderStaging,
     next_height: u64,
     target_height: u64,
+    terminal_peer: Option<libp2p::PeerId>,
+    terminal_token: Option<u64>,
+    terminal_attempts: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1469,6 +1531,30 @@ fn snapshot_header_staging_path(
     ))
 }
 
+fn prune_superseded_snapshot_header_staging(directory: &Path, keep: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("read snapshot header staging directory: {error}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("read snapshot header staging entry: {error}"))?;
+        let path = entry.path();
+        if path == keep || path.extension().and_then(|ext| ext.to_str()) != Some("stage") {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "remove superseded snapshot header staging {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Find the highest contiguous canonical header boundary at or below target.
 /// Header anchors are created strictly in height order, so a binary search is
 /// sufficient and never materializes an O(H) header collection.
@@ -1521,6 +1607,11 @@ fn prepare_snapshot_header_sync(
     from: libp2p::PeerId,
     manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
 ) -> Result<PendingSnapshotHeaderSync, String> {
+    let target_height = manifest.tip_height;
+    let after_target = target_height
+        .checked_add(1)
+        .ok_or_else(|| "snapshot target height has no representable successor".to_owned())?;
+    let base = highest_snapshot_header_boundary(store, target_height)?;
     let directory = staging_root.join("headers");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("create snapshot header staging directory: {error}"))?;
@@ -1531,10 +1622,11 @@ fn prepare_snapshot_header_sync(
             .map_err(|error| format!("secure snapshot header staging directory: {error}"))?;
     }
     let path = snapshot_header_staging_path(staging_root, &manifest);
-    let target_height = manifest.tip_height;
-    let after_target = target_height
-        .checked_add(1)
-        .ok_or_else(|| "snapshot target height has no representable successor".to_owned())?;
+    // A failed exact terminal may leave one expensive header prefix available
+    // for immediate failover. Once a different boundary wins, delete the old
+    // file before opening the new session so disk use stays bounded to one
+    // O(height) staging artifact.
+    prune_superseded_snapshot_header_staging(&directory, &path)?;
 
     let staging = if path.exists() {
         match SnapshotHeaderStaging::open(&path, store) {
@@ -1543,7 +1635,6 @@ fn prepare_snapshot_header_sync(
             }
             Ok(staging) => {
                 staging.discard().map_err(|error| error.to_string())?;
-                let base = highest_snapshot_header_boundary(store, target_height)?;
                 if base.header.height == target_height {
                     SnapshotHeaderStaging::create_at_canonical_boundary(&path, store, base)
                 } else {
@@ -1559,7 +1650,6 @@ fn prepare_snapshot_header_sync(
                         return Err(format!("discard corrupt snapshot header staging: {error}"));
                     }
                 }
-                let base = highest_snapshot_header_boundary(store, target_height)?;
                 if base.header.height == target_height {
                     SnapshotHeaderStaging::create_at_canonical_boundary(&path, store, base)
                 } else {
@@ -1569,7 +1659,6 @@ fn prepare_snapshot_header_sync(
             }
         }
     } else {
-        let base = highest_snapshot_header_boundary(store, target_height)?;
         if base.header.height == target_height {
             SnapshotHeaderStaging::create_at_canonical_boundary(&path, store, base)
         } else {
@@ -1584,6 +1673,9 @@ fn prepare_snapshot_header_sync(
         staging,
         next_height,
         target_height,
+        terminal_peer: None,
+        terminal_token: None,
+        terminal_attempts: 0,
     })
 }
 
@@ -1898,12 +1990,13 @@ mod tests {
     use super::{
         compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        next_block_has_competing_parent, p2p_listen_to_multiaddr, snapshot_header_next_action,
-        state_segment_response_matches_snapshot_boundary, unavailable_block_requires_snapshot,
-        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
-        SnapshotHeaderBoundary, SnapshotHeaderNextAction, MINING_PEER_QUORUM,
-        STATE_MANIFEST_RESPONSE_TIMEOUT,
+        next_block_has_competing_parent, p2p_listen_to_multiaddr,
+        prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
+        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
+        unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
+        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
+        MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        MINING_PEER_QUORUM, STATE_MANIFEST_RESPONSE_TIMEOUT,
     };
 
     #[test]
@@ -1943,6 +2036,14 @@ mod tests {
         quorum.disconnect(first);
         assert_eq!(*count_rx.borrow(), 1);
         assert!(!*ready_rx.borrow());
+
+        quorum.confirm(first);
+        assert_eq!(
+            *count_rx.borrow(),
+            1,
+            "a delayed result cannot resurrect a disconnected peer"
+        );
+        assert!(!*ready_rx.borrow());
     }
 
     #[test]
@@ -1967,6 +2068,61 @@ mod tests {
                 .to_string(),
             "/ip4/0.0.0.0/tcp/9400"
         );
+    }
+
+    #[test]
+    fn seed_parser_accepts_gui_and_operator_forms_without_losing_peer_id() {
+        let peer = libp2p::PeerId::random();
+        assert_eq!(
+            seed_to_multiaddr("seed.example:9400", 9400)
+                .unwrap()
+                .to_string(),
+            "/dns/seed.example/tcp/9400"
+        );
+        assert_eq!(
+            seed_to_multiaddr("203.0.113.10:9400", 9400)
+                .unwrap()
+                .to_string(),
+            "/ip4/203.0.113.10/tcp/9400"
+        );
+        assert_eq!(
+            seed_to_multiaddr("[2001:db8::10]:9400", 9400)
+                .unwrap()
+                .to_string(),
+            "/ip6/2001:db8::10/tcp/9400"
+        );
+        assert_eq!(
+            seed_to_multiaddr("dnsaddr:example.net", 9400)
+                .unwrap()
+                .to_string(),
+            "/dnsaddr/example.net"
+        );
+        let explicit = format!("/ip4/203.0.113.10/tcp/9400/p2p/{peer}");
+        assert_eq!(
+            seed_to_multiaddr(&explicit, 9400).unwrap().to_string(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn snapshot_header_failover_keeps_only_the_exact_candidate_file() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("headers");
+        std::fs::create_dir(&directory).unwrap();
+        let keep = directory.join("current.stage");
+        let stale_a = directory.join("old-a.stage");
+        let stale_b = directory.join("old-b.stage");
+        let unrelated = directory.join("README");
+        for path in [&keep, &stale_a, &stale_b, &unrelated] {
+            std::fs::write(path, b"bounded test artifact").unwrap();
+        }
+
+        prune_superseded_snapshot_header_staging(&directory, &keep).unwrap();
+
+        assert!(keep.exists());
+        assert!(!stale_a.exists());
+        assert!(!stale_b.exists());
+        assert!(unrelated.exists());
     }
 
     #[test]
@@ -2053,6 +2209,25 @@ mod tests {
             started + STATE_MANIFEST_RESPONSE_TIMEOUT,
             1
         ));
+    }
+
+    #[test]
+    fn bounded_manifest_retries_rotate_across_six_peers() {
+        let peers = (0..6)
+            .map(|_| libp2p::PeerId::random())
+            .collect::<std::collections::HashSet<_>>();
+        let mut cursor = 0;
+        let first = rotating_manifest_peers(&peers, None, false, &mut cursor, 3);
+        let second = rotating_manifest_peers(&peers, None, false, &mut cursor, 3);
+        assert_eq!(first.len(), 3);
+        assert_eq!(second.len(), 3);
+        assert_eq!(
+            first
+                .into_iter()
+                .chain(second)
+                .collect::<std::collections::HashSet<_>>(),
+            peers
+        );
     }
 
     #[test]
@@ -2334,7 +2509,10 @@ async fn handle_p2p_events(
     #[derive(Clone, Copy, PartialEq, Eq)]
     struct HistoryStepVerificationKey {
         token: u64,
+        /// Peer that owns the selected manifest/state lease.
         from: libp2p::PeerId,
+        /// Peer that supplied the terminal bytes being verified.
+        terminal_from: libp2p::PeerId,
         height: u64,
         block_hash: [u8; 32],
     }
@@ -2386,7 +2564,10 @@ async fn handle_p2p_events(
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct SnapshotTailTerminalKey {
         generation: u64,
-        from: libp2p::PeerId,
+        manifest_from: libp2p::PeerId,
+        request_peer: libp2p::PeerId,
+        request_token: u64,
+        attempts: u8,
         height: u64,
         block_hash: [u8; 32],
     }
@@ -2423,6 +2604,7 @@ async fn handle_p2p_events(
     let mut snapshot_tail_request_inflight: Option<SnapshotTailAppendKey> = None;
     let mut snapshot_tail_append_inflight: Option<SnapshotTailAppendKey> = None;
     let mut snapshot_tail_terminal_inflight: Option<SnapshotTailTerminalKey> = None;
+    let mut history_step_request_token = 0u64;
     let mut snapshot_tail_state_download_started = false;
     let mut finalized_snapshot_waiting: Option<(FinalizedSnapshotStaging, usize, libp2p::PeerId)> =
         None;
@@ -2470,6 +2652,9 @@ async fn handle_p2p_events(
     // Connected peers eligible for manifest (re-)requests.
     let mut manifest_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // Bounded retries rotate through the connected set instead of repeatedly
+    // selecting the same HashSet iteration prefix.
+    let mut manifest_retry_cursor = 0usize;
     // Payloads are authenticated one at a time and sealed to disk.  The
     // session retains only compact descriptors and a received bitset.
     let mut snapshot_staging: Option<SnapshotStagingSession> = None;
@@ -2540,6 +2725,35 @@ async fn handle_p2p_events(
                 );
             } else {
                 tracing::debug!("sync state reset — ready for fresh manifest retry");
+            }
+        }};
+    }
+
+    macro_rules! request_bounded_manifest_failover {
+        ($failed_peer:expr, $allow_failed_peer:expr) => {{
+            let failed_peer = $failed_peer;
+            let our_height = {
+                let ctx = chain.read().await;
+                ctx.tip_height()
+            };
+            let candidates = rotating_manifest_peers(
+                &manifest_peers,
+                Some(failed_peer),
+                $allow_failed_peer,
+                &mut manifest_retry_cursor,
+                3,
+            );
+            for peer in candidates {
+                manifest_requested_peers.insert(peer);
+                let _ = p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                        peer,
+                        requester_height: our_height,
+                    })
+                    .await;
+            }
+            if !manifest_requested_peers.is_empty() {
+                manifest_round_started_at = Some(Instant::now());
             }
         }};
     }
@@ -2665,15 +2879,20 @@ async fn handle_p2p_events(
                 if let Some(tail) = snapshot_tail_staging.as_ref() {
                     let target = snapshot_tail_install_target.unwrap_or(tail.tip_height());
                     if tail.tip_height() >= target && tail.block_count() != 0 {
+                        history_step_request_token = history_step_request_token.wrapping_add(1);
                         let key = SnapshotTailTerminalKey {
                             generation: snapshot_sync_generation,
-                            from,
+                            manifest_from: from,
+                            request_peer: from,
+                            request_token: history_step_request_token,
+                            attempts: 1,
                             height: tail.tip_height(),
                             block_hash: tail.tip_hash(),
                         };
                         snapshot_tail_terminal_inflight = Some(key);
                         if p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                                token: key.request_token,
                                 peer: from,
                                 height: key.height,
                                 block_hash: key.block_hash,
@@ -2861,6 +3080,44 @@ async fn handle_p2p_events(
     let mut last_tip_advance: Instant = Instant::now();
     let mut highest_announced: u64 = 0;
     let mut last_announcement_peer: Option<libp2p::PeerId> = None;
+    let mut bootstrap_complete_sent = false;
+
+    macro_rules! mark_bootstrap_complete_if_caught_up {
+        ($local_height:expr) => {{
+            let local_height = $local_height;
+            if !bootstrap_complete_sent
+                && local_height >= highest_announced
+                && !manifest_peers.is_empty()
+                && manifest_requested_peers.is_empty()
+                && manifest_candidates.is_empty()
+                && manifest_round_started_at.is_none()
+                && pending_manifest.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_staging_inflight.is_none()
+                && snapshot_install_inflight.is_none()
+                && snapshot_tail_request_inflight.is_none()
+                && snapshot_tail_append_inflight.is_none()
+                && snapshot_tail_terminal_inflight.is_none()
+                && pending_segment_ids.is_empty()
+                && segment_queue.is_empty()
+            {
+                if p2p_cmd
+                    .send(noid_p2p::NetworkCommand::BootstrapComplete)
+                    .await
+                    .is_ok()
+                {
+                    bootstrap_complete_sent = true;
+                    tracing::debug!(
+                        local_height,
+                        highest_announced,
+                        "exact initial catch-up complete — bootstrap peers may be replaced"
+                    );
+                }
+            }
+        }};
+    }
 
     // Heartbeat for time-dependent checks (manifest timeout, etc.)
     let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -3396,6 +3653,7 @@ async fn handle_p2p_events(
                                             .await;
                                         last_tip_advance = Instant::now();
                                         mark_initial_sync_ready(&initial_sync_ready);
+                                        mark_bootstrap_complete_if_caught_up!(new_tip_height);
                                         mining_peer_quorum.confirm(from);
                                         let _ = template_changes.send(());
                                         tracing::info!(
@@ -3567,6 +3825,7 @@ async fn handle_p2p_events(
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 mark_initial_sync_ready(&initial_sync_ready);
+                                mark_bootstrap_complete_if_caught_up!(height);
                                 mining_peer_quorum.confirm(from);
                                 let _ = template_changes.send(()); // cancel/rebuild any active stale template
 
@@ -3631,6 +3890,7 @@ async fn handle_p2p_events(
                                                 "applied chained orphan block"
                                             );
                                             last_tip_advance = Instant::now();
+                                            mark_bootstrap_complete_if_caught_up!(h);
                                         }
                                         Err((e, rejected_orphan)) => {
                                             drop(rejected_orphan);
@@ -3780,6 +4040,9 @@ async fn handle_p2p_events(
 
                                                     last_tip_advance = Instant::now();
                                                     mark_initial_sync_ready(&initial_sync_ready);
+                                                    mark_bootstrap_complete_if_caught_up!(
+                                                        new_tip_height
+                                                    );
                                                     mining_peer_quorum.confirm(from);
                                                     let _ = template_changes.send(());
                                                     let new_tip = new_tip_height;
@@ -4429,6 +4692,7 @@ async fn handle_p2p_events(
                         // sync probe, not an absence of peers. Make readiness
                         // durable so a miner created later starts immediately.
                         mark_initial_sync_ready(&initial_sync_ready);
+                        mark_bootstrap_complete_if_caught_up!(our_tip);
                         mining_peer_quorum.confirm(from);
                         tracing::debug!(
                             peer = %from,
@@ -4660,6 +4924,50 @@ async fn handle_p2p_events(
                     }
                 }
             }
+            Ok(NetworkEvent::HeadersRequestFailed {
+                from,
+                start_height,
+                count,
+            }) => {
+                fetch_in_progress.remove(&from);
+                recent_header_fetches.remove(&(from, start_height, count));
+
+                let snapshot_correlated = pending_snapshot_header_sync
+                    .as_ref()
+                    .is_some_and(|sync| {
+                        sync.from == from
+                            && snapshot_header_next_action(sync.next_height, sync.target_height)
+                                == Ok(SnapshotHeaderNextAction::Fetch {
+                                    start_height,
+                                    count,
+                                })
+                    });
+                if !snapshot_correlated {
+                    tracing::debug!(
+                        peer = %from,
+                        start_height,
+                        count,
+                        "header request failed outside the active snapshot session"
+                    );
+                    continue;
+                }
+
+                // Keep the exact partial header stage on disk. A manifest for
+                // the same boundary can reopen it, while a different boundary
+                // is pruned by prepare_snapshot_header_sync.
+                if let Some(sync) = pending_snapshot_header_sync.take() {
+                    tracing::warn!(
+                        peer = %from,
+                        start_height,
+                        count,
+                        staged_headers = sync.staging.staged_len(),
+                        "snapshot header request failed — retaining exact stage and failing over"
+                    );
+                    drop(sync);
+                }
+                reset_sync_state!();
+                request_bounded_manifest_failover!(from, true);
+            }
             Ok(NetworkEvent::StateManifest { from, manifest }) => {
                 if snapshot_install_inflight.is_some() {
                     tracing::debug!(
@@ -4807,6 +5115,7 @@ async fn handle_p2p_events(
                             && segment_queue.is_empty()
                         {
                             clear_manifest_round_state!();
+                            mark_bootstrap_complete_if_caught_up!(our_height);
                             tracing::debug!(
                                 our_height,
                                 highest_announced,
@@ -5074,21 +5383,53 @@ async fn handle_p2p_events(
                 }
             }
 
+            Ok(NetworkEvent::StateSegmentRequestFailed {
+                from,
+                segment_id,
+                expected_tip_height,
+                expected_tip_hash,
+            }) => {
+                let correlated = pending_manifest.as_ref().is_some_and(|pending| {
+                    pending.from == from
+                        && pending.manifest.tip_height == expected_tip_height
+                        && pending.manifest.tip_hash == expected_tip_hash
+                        && pending_segment_ids.contains(&segment_id)
+                });
+                if !correlated {
+                    tracing::debug!(
+                        peer = %from,
+                        segment = segment_id,
+                        expected_tip_height,
+                        "ignoring stale state-segment request failure"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    peer = %from,
+                    segment = segment_id,
+                    expected_tip_height,
+                    "snapshot segment request failed — restarting through bounded failover"
+                );
+                reset_sync_state!();
+                request_bounded_manifest_failover!(from, true);
+            }
+
             Ok(NetworkEvent::HistoryStepTerminal {
+                token,
                 from,
                 height,
                 block_hash,
                 terminal_bytes,
                 inbound_memory_permit,
             }) => {
-                let tail_correlated =
-                    snapshot_tail_terminal_inflight.is_some_and(|pending| {
+                let tail_key = snapshot_tail_terminal_inflight.filter(|pending| {
                         pending.generation == snapshot_sync_generation
-                            && pending.from == from
+                            && pending.request_token == token
+                            && pending.request_peer == from
                             && pending.height == height
                             && pending.block_hash == block_hash
                     });
-                if tail_correlated {
+                if let Some(tail_key) = tail_key {
                     snapshot_tail_terminal_inflight = None;
                     let Some((finalized, segment_count, finalized_from)) =
                         finalized_snapshot_waiting.take()
@@ -5115,7 +5456,7 @@ async fn handle_p2p_events(
                         reset_sync_state!();
                         continue;
                     };
-                    if finalized_from != from
+                    if finalized_from != tail_key.manifest_from
                         || staging.tip_height() != height
                         || staging.tip_hash() != block_hash
                     {
@@ -5142,6 +5483,7 @@ async fn handle_p2p_events(
                                 "snapshot suffix terminal rejected"
                             );
                             reset_sync_state!();
+                            request_bounded_manifest_failover!(from, false);
                             continue;
                         }
                     };
@@ -5152,7 +5494,8 @@ async fn handle_p2p_events(
                 let snapshot_correlated = pending_snapshot_header_sync
                     .as_ref()
                     .is_some_and(|pending| {
-                        pending.from == from
+                        pending.terminal_token == Some(token)
+                            && pending.terminal_peer == Some(from)
                             && pending.next_height
                                 == pending.target_height.saturating_add(1)
                             && pending.manifest.tip_height == height
@@ -5199,7 +5542,12 @@ async fn handle_p2p_events(
                 }
 
                 let sync = match pending_snapshot_header_sync.take() {
-                    Some(sync) if sync.from == from => sync,
+                    Some(sync)
+                        if sync.terminal_peer == Some(from)
+                            && sync.terminal_token == Some(token) =>
+                    {
+                        sync
+                    }
                     Some(sync) => {
                         tracing::warn!(
                             terminal_from = %from, manifest_from = %sync.from,
@@ -5226,11 +5574,13 @@ async fn handle_p2p_events(
                 };
                 let expected_height = sync.manifest.tip_height;
                 let expected_hash = sync.manifest.tip_hash;
+                let manifest_from = sync.from;
                 history_step_verification_token =
                     history_step_verification_token.wrapping_add(1);
                 let key = HistoryStepVerificationKey {
                     token: history_step_verification_token,
-                    from,
+                    from: manifest_from,
+                    terminal_from: from,
                     height: expected_height,
                     block_hash: expected_hash,
                 };
@@ -5324,9 +5674,161 @@ async fn handle_p2p_events(
                     });
                 });
                 tracing::info!(
-                    from = %from,
+                    from = %manifest_from,
+                    terminal_from = %from,
                     tip = expected_height,
                     "snapshot HistoryStep verification started off-thread"
+                );
+            }
+            Ok(NetworkEvent::HistoryStepTerminalRequestFailed {
+                token,
+                from,
+                height,
+                block_hash,
+                kind,
+            }) => {
+                let tail_correlated = snapshot_tail_terminal_inflight.is_some_and(|pending| {
+                    pending.generation == snapshot_sync_generation
+                        && pending.request_token == token
+                        && pending.request_peer == from
+                        && pending.height == height
+                        && pending.block_hash == block_hash
+                });
+                if tail_correlated {
+                    let mut pending = snapshot_tail_terminal_inflight
+                        .take()
+                        .expect("correlated suffix terminal is present");
+                    let alternate = (pending.attempts < 2).then(|| {
+                        manifest_peers
+                            .iter()
+                            .copied()
+                            .find(|peer| *peer != from)
+                    }).flatten();
+                    if let Some(alternate) = alternate {
+                        history_step_request_token =
+                            history_step_request_token.wrapping_add(1);
+                        pending.request_peer = alternate;
+                        pending.request_token = history_step_request_token;
+                        pending.attempts = pending.attempts.saturating_add(1);
+                        snapshot_tail_terminal_inflight = Some(pending);
+                        if p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                                token: pending.request_token,
+                                peer: alternate,
+                                height,
+                                block_hash,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            tracing::warn!(
+                                peer = %from,
+                                alternate = %alternate,
+                                height,
+                                ?kind,
+                                "snapshot suffix terminal failed — trying one alternate peer"
+                            );
+                            continue;
+                        }
+                    }
+
+                    tracing::warn!(
+                        peer = %from,
+                        height,
+                        ?kind,
+                        "snapshot suffix terminal exhausted — restarting bounded snapshot sync"
+                    );
+                    reset_sync_state!();
+                    request_bounded_manifest_failover!(
+                        from,
+                        matches!(kind, noid_p2p::RequestFailureKind::Timeout)
+                    );
+                    continue;
+                }
+
+                let correlated = pending_snapshot_header_sync
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.terminal_token == Some(token)
+                            && pending.terminal_peer == Some(from)
+                            && pending.next_height
+                                == pending.target_height.saturating_add(1)
+                            && pending.manifest.tip_height == height
+                            && pending.manifest.tip_hash == block_hash
+                    });
+                if !correlated {
+                    tracing::debug!(
+                        peer = %from,
+                        height,
+                        ?kind,
+                        "ignoring stale HistoryStep transport failure"
+                    );
+                    continue;
+                }
+
+                let alternate = pending_snapshot_header_sync.as_ref().and_then(|pending| {
+                    (pending.terminal_attempts < 2
+                        && !(matches!(
+                            kind,
+                            noid_p2p::RequestFailureKind::ConnectionClosed
+                        ) && pending.from == from))
+                        .then(|| {
+                            manifest_peers
+                                .iter()
+                                .copied()
+                                .find(|peer| *peer != from)
+                        })
+                        .flatten()
+                });
+                if let Some(alternate) = alternate {
+                    history_step_request_token = history_step_request_token.wrapping_add(1);
+                    let pending = pending_snapshot_header_sync
+                        .as_mut()
+                        .expect("correlated header terminal is present");
+                    pending.terminal_peer = Some(alternate);
+                    pending.terminal_token = Some(history_step_request_token);
+                    pending.terminal_attempts = pending.terminal_attempts.saturating_add(1);
+                    if p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                            token: history_step_request_token,
+                            peer: alternate,
+                            height,
+                            block_hash,
+                        })
+                        .await
+                        .is_ok()
+                    {
+                        tracing::warn!(
+                            peer = %from,
+                            alternate = %alternate,
+                            height,
+                            ?kind,
+                            "HistoryStep terminal failed — retaining headers and trying one alternate peer"
+                        );
+                        continue;
+                    }
+                }
+
+                // Keep the validated native header file on disk. A fresh
+                // manifest for the same exact boundary reopens it instead of
+                // downloading O(height) headers again.
+                if let Some(sync) = pending_snapshot_header_sync.take() {
+                    let staged_headers = sync.staging.staged_len();
+                    let staging_path = sync.staging.path().to_owned();
+                    drop(sync);
+                    tracing::warn!(
+                        peer = %from,
+                        height,
+                        ?kind,
+                        staged_headers,
+                        path = %staging_path.display(),
+                        "HistoryStep transport exhausted — retaining exact header staging for failover"
+                    );
+                }
+                reset_sync_state!();
+                request_bounded_manifest_failover!(
+                    from,
+                    matches!(kind, noid_p2p::RequestFailureKind::Timeout)
                 );
             }
             Ok(event @ NetworkEvent::PeerDisconnected(peer))
@@ -5349,9 +5851,12 @@ async fn handle_p2p_events(
                     );
                     pending_shallow_fork = None;
                 }
-                let snapshot_sync_lost = pending_manifest
-                    .as_ref()
-                    .is_some_and(|pending| pending.from == peer)
+                let finalized_tail_no_longer_needs_manifest_peer =
+                    finalized_snapshot_waiting.is_some()
+                        && snapshot_tail_terminal_inflight.is_some();
+                let snapshot_sync_lost = pending_manifest.as_ref().is_some_and(|pending| {
+                    pending.from == peer && !finalized_tail_no_longer_needs_manifest_peer
+                })
                     || pending_snapshot_header_sync
                         .as_ref()
                         .is_some_and(|pending| pending.from == peer)
@@ -5418,7 +5923,7 @@ async fn handle_p2p_events(
                 continue;
             }
             sync_phase_telemetry.record_header_work(completed.work_elapsed);
-            let sync = match completed.result {
+            let mut sync = match completed.result {
                 Ok(sync) => sync,
                 Err(error) => {
                     tracing::warn!(
@@ -5471,9 +5976,14 @@ async fn handle_p2p_events(
                 SnapshotHeaderNextAction::RequestTerminal => {
                     let terminal_height = sync.manifest.tip_height;
                     let terminal_hash = sync.manifest.tip_hash;
+                    history_step_request_token = history_step_request_token.wrapping_add(1);
+                    sync.terminal_peer = Some(from);
+                    sync.terminal_token = Some(history_step_request_token);
+                    sync.terminal_attempts = 1;
                     pending_snapshot_header_sync = Some(sync);
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                            token: history_step_request_token,
                             peer: from,
                             height: terminal_height,
                             block_hash: terminal_hash,
@@ -5906,6 +6416,7 @@ async fn handle_p2p_events(
                     }
                     last_tip_advance = Instant::now();
                     mark_initial_sync_ready(&initial_sync_ready);
+                    mark_bootstrap_complete_if_caught_up!(height);
                     mining_peer_quorum.confirm(completed.key.from);
                     let _ = template_changes.send(());
                     if highest_announced > height {
@@ -5975,6 +6486,7 @@ async fn handle_p2p_events(
                     .staged_header_count
                     .saturating_mul(noid_chain::BLOCK_HEADER_WIRE_SIZE as u64),
             );
+            let terminal_was_checked = completed.terminal_measurement.is_some();
             if let Some(measurement) = completed.terminal_measurement {
                 log_sync_phase_measurement(measurement);
             }
@@ -5983,13 +6495,20 @@ async fn handle_p2p_events(
             let verified_history_step = match completed.result {
                 Ok(verified) => verified,
                 Err(error) => {
+                    let failed_peer = if terminal_was_checked {
+                        completed.key.terminal_from
+                    } else {
+                        completed.key.from
+                    };
                     tracing::error!(
-                        from = %from,
+                        manifest_from = %from,
+                        terminal_from = %completed.key.terminal_from,
                         tip = completed.key.height,
                         err = %error,
                         "snapshot rejected: HistoryStep terminal verification failed"
                     );
                     reset_sync_state!();
+                    request_bounded_manifest_failover!(failed_peer, false);
                     continue;
                 }
             };
@@ -6129,7 +6648,7 @@ async fn handle_p2p_events(
             // A manifest round with no usable candidate is dead air. This
             // includes dropped responses and explicit empty responses emitted
             // by a peer's short manifest cooldown. Reset and re-request from
-            // every connected peer; with a single seed there is no second
+            // a bounded peer set; with a single seed there is no second
             // PeerConnected event to save us.
             if manifest_round_retry_due(
                 manifest_round_started_at,
@@ -6152,6 +6671,7 @@ async fn handle_p2p_events(
                 };
                 if manifest_round_gap_is_resolved(our_height, highest_announced) {
                     clear_manifest_round_state!();
+                    mark_bootstrap_complete_if_caught_up!(our_height);
                     tracing::debug!(
                         our_height,
                         highest_announced,
@@ -6164,7 +6684,14 @@ async fn handle_p2p_events(
                         "state manifest round produced no usable candidate — re-requesting"
                     );
                     reset_sync_state!();
-                    for peer in manifest_peers.iter().copied() {
+                    let retry_peers = rotating_manifest_peers(
+                        &manifest_peers,
+                        None,
+                        false,
+                        &mut manifest_retry_cursor,
+                        3,
+                    );
+                    for peer in retry_peers {
                         manifest_requested_peers.insert(peer);
                         p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestStateManifest {

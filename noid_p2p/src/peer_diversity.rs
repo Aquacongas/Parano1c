@@ -10,7 +10,7 @@
 //! addresses are deliberately outside this policy so local clusters and
 //! multiple nodes behind a development NAT remain usable.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use libp2p::{multiaddr::Protocol, swarm::ConnectionId, Multiaddr, PeerId};
@@ -20,8 +20,18 @@ use libp2p::{multiaddr::Protocol, swarm::ConnectionId, Multiaddr, PeerId};
 // group preserve provider/NAT usability without letting one cheap prefix fill
 // a 64-connection outbound budget.
 const MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP: usize = 2;
-const MAX_PUBLIC_INBOUND_PEERS_PER_IP: usize = 8;
-const MAX_PUBLIC_INBOUND_PEERS_PER_GROUP: usize = 32;
+// Shared VPN exits, carrier-grade NAT and enterprise gateways routinely place
+// many unrelated wallets behind one public address. Permit a useful cohort,
+// while retaining a hard per-address bound against one-source exhaustion.
+const MAX_PUBLIC_INBOUND_PEERS_PER_IP: usize = 32;
+const MAX_PUBLIC_INBOUND_CONNECTIONS_PER_GROUP: usize = 96;
+// The connection layer permits 128 inbound sessions. Once the first 96 public
+// identities are occupied, the final quarter is reserved for network groups
+// that are not already well represented. This is softer than rejecting every
+// ninth wallet behind a shared gateway and still prevents one /16 from taking
+// the entire node.
+const INBOUND_UNRESERVED_PEERS: usize = 96;
+const INBOUND_RESERVED_GROUP_PEERS: usize = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PublicNetworkGroup {
@@ -53,6 +63,8 @@ pub(crate) enum DiversityRejection {
     OutboundGroupFull { group: PublicNetworkGroup },
     InboundIpFull { ip: IpAddr },
     InboundGroupFull { group: PublicNetworkGroup },
+    InboundDiversityReserve { group: PublicNetworkGroup },
+    InboundUnclassifiedReserve,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -80,6 +92,7 @@ pub(crate) struct PeerDiversity {
     outbound_groups: HashMap<PublicNetworkGroup, HashMap<PeerId, usize>>,
     inbound_ips: HashMap<IpAddr, HashMap<PeerId, usize>>,
     inbound_groups: HashMap<PublicNetworkGroup, HashMap<PeerId, usize>>,
+    unclassified_inbound: HashSet<ConnectionId>,
 }
 
 impl PeerDiversity {
@@ -92,8 +105,16 @@ impl PeerDiversity {
     ) -> Result<(), DiversityRejection> {
         let Some(ip) = public_ip(remote_addr) else {
             // Local/private transports are useful for LAN discovery and test
-            // clusters. They cannot consume public network-group diversity.
+            // clusters. Inbound sessions still consume the unreserved pool:
+            // otherwise relayed or unclassified connections could fill the
+            // hard swarm limit while the diversity reserve appeared empty.
+            if !outbound && self.inbound_connection_count() >= INBOUND_UNRESERVED_PEERS {
+                return Err(DiversityRejection::InboundUnclassifiedReserve);
+            }
             self.connections.insert(connection_id, None);
+            if !outbound {
+                self.unclassified_inbound.insert(connection_id);
+            }
             return Ok(());
         };
         let group = PublicNetworkGroup::from_ip(ip);
@@ -109,10 +130,14 @@ impl PeerDiversity {
             {
                 return Err(DiversityRejection::InboundIpFull { ip });
             }
-            if distinct_peer_count(&self.inbound_groups, &group, peer)
-                >= MAX_PUBLIC_INBOUND_PEERS_PER_GROUP
-            {
+            let group_connections = connection_count(&self.inbound_groups, &group);
+            if group_connections >= MAX_PUBLIC_INBOUND_CONNECTIONS_PER_GROUP {
                 return Err(DiversityRejection::InboundGroupFull { group });
+            }
+            if self.inbound_connection_count() >= INBOUND_UNRESERVED_PEERS
+                && group_connections >= INBOUND_RESERVED_GROUP_PEERS
+            {
+                return Err(DiversityRejection::InboundDiversityReserve { group });
             }
         }
 
@@ -138,6 +163,7 @@ impl PeerDiversity {
     }
 
     pub(crate) fn remove(&mut self, connection_id: ConnectionId) -> bool {
+        self.unclassified_inbound.remove(&connection_id);
         let Some(connection) = self.connections.remove(&connection_id) else {
             return false;
         };
@@ -154,6 +180,73 @@ impl PeerDiversity {
             }
         }
         true
+    }
+
+    pub(crate) fn outbound_candidate_allowed_with_pending(
+        &self,
+        peer: PeerId,
+        remote_addr: &Multiaddr,
+        pending_same_group: usize,
+    ) -> bool {
+        let Some(group) = public_network_group(remote_addr) else {
+            return false;
+        };
+        distinct_peer_count(&self.outbound_groups, &group, peer).saturating_add(pending_same_group)
+            < MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP
+    }
+
+    /// DNS transports may surface `/dns4/...` at ConnectionEstablished and
+    /// only reveal the peer's public listen address through Identify. Upgrade
+    /// that already-admitted outbound connection once without double-counting
+    /// connections whose endpoint was an IP from the start.
+    pub(crate) fn classify_outbound_dns_connection(
+        &mut self,
+        connection_id: ConnectionId,
+        peer: PeerId,
+        remote_addr: &Multiaddr,
+    ) -> Result<(), DiversityRejection> {
+        let Some(existing) = self.connections.get(&connection_id) else {
+            return Ok(());
+        };
+        if existing.is_some() {
+            return Ok(());
+        }
+        let Some(ip) = public_ip(remote_addr) else {
+            return Ok(());
+        };
+        let group = PublicNetworkGroup::from_ip(ip);
+        if distinct_peer_count(&self.outbound_groups, &group, peer)
+            >= MAX_PUBLIC_OUTBOUND_PEERS_PER_GROUP
+        {
+            return Err(DiversityRejection::OutboundGroupFull { group });
+        }
+        increment_peer_count(&mut self.outbound_groups, group, peer);
+        self.connections.insert(
+            connection_id,
+            Some(TrackedConnection {
+                peer,
+                ip,
+                group,
+                direction: TrackedDirection::Outbound,
+            }),
+        );
+        Ok(())
+    }
+
+    fn inbound_connection_count(&self) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| {
+                matches!(
+                    connection,
+                    Some(TrackedConnection {
+                        direction: TrackedDirection::Inbound,
+                        ..
+                    })
+                )
+            })
+            .count()
+            .saturating_add(self.unclassified_inbound.len())
     }
 }
 
@@ -173,6 +266,15 @@ fn increment_peer_count<K: Eq + std::hash::Hash>(
     peer: PeerId,
 ) {
     *groups.entry(key).or_default().entry(peer).or_default() += 1;
+}
+
+fn connection_count<K: Eq + std::hash::Hash>(
+    groups: &HashMap<K, HashMap<PeerId, usize>>,
+    key: &K,
+) -> usize {
+    groups
+        .get(key)
+        .map_or(0, |peers| peers.values().copied().sum())
 }
 
 fn decrement_peer_count<K: Eq + std::hash::Hash>(
@@ -327,6 +429,167 @@ mod tests {
                 false,
             ),
             Err(DiversityRejection::InboundIpFull { .. })
+        ));
+    }
+
+    #[test]
+    fn inbound_reserve_stays_open_for_underrepresented_networks() {
+        let mut diversity = PeerDiversity::default();
+        let mut connection = 1u64;
+        for first_octet in 20u8..32 {
+            let group_addr = addr(&format!("/ip4/{first_octet}.1.1.1/tcp/50000"));
+            for _ in 0..INBOUND_RESERVED_GROUP_PEERS {
+                diversity
+                    .try_admit(
+                        ConnectionId::new_unchecked(connection as usize),
+                        PeerId::random(),
+                        &group_addr,
+                        false,
+                    )
+                    .unwrap();
+                connection += 1;
+            }
+        }
+        assert_eq!(connection - 1, INBOUND_UNRESERVED_PEERS as u64);
+        assert!(matches!(
+            diversity.try_admit(
+                ConnectionId::new_unchecked(connection as usize),
+                PeerId::random(),
+                &addr("/ip4/20.1.2.3/tcp/50000"),
+                false,
+            ),
+            Err(DiversityRejection::InboundDiversityReserve { .. })
+        ));
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked((connection + 1) as usize),
+                PeerId::random(),
+                &addr("/ip4/40.1.2.3/tcp/50000"),
+                false,
+            )
+            .expect("reserved capacity admits a new network group");
+    }
+
+    #[test]
+    fn second_paths_cannot_fill_the_inbound_budget_from_one_public_group() {
+        let mut diversity = PeerDiversity::default();
+        let mut connection = 1usize;
+        for host in 1..=48u8 {
+            let peer = PeerId::random();
+            let remote = addr(&format!("/ip4/8.8.1.{host}/tcp/50000"));
+            for _ in 0..2 {
+                diversity
+                    .try_admit(
+                        ConnectionId::new_unchecked(connection),
+                        peer,
+                        &remote,
+                        false,
+                    )
+                    .unwrap();
+                connection += 1;
+            }
+        }
+        assert_eq!(diversity.inbound_connection_count(), 96);
+        assert!(matches!(
+            diversity.try_admit(
+                ConnectionId::new_unchecked(connection),
+                PeerId::random(),
+                &addr("/ip4/8.8.2.1/tcp/50000"),
+                false,
+            ),
+            Err(DiversityRejection::InboundGroupFull { .. })
+        ));
+
+        diversity.remove(ConnectionId::new_unchecked(2));
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(connection + 1),
+                PeerId::random(),
+                &addr("/ip4/8.8.2.2/tcp/50000"),
+                false,
+            )
+            .expect("removing one path releases exactly one group slot");
+    }
+
+    #[test]
+    fn shared_ip_limit_counts_identities_but_every_path_consumes_capacity() {
+        let mut diversity = PeerDiversity::default();
+        let remote = addr("/ip4/9.9.9.9/tcp/50000");
+        let mut connection = 1usize;
+        for _ in 0..MAX_PUBLIC_INBOUND_PEERS_PER_IP {
+            let peer = PeerId::random();
+            for _ in 0..2 {
+                diversity
+                    .try_admit(
+                        ConnectionId::new_unchecked(connection),
+                        peer,
+                        &remote,
+                        false,
+                    )
+                    .unwrap();
+                connection += 1;
+            }
+        }
+        assert_eq!(diversity.inbound_connection_count(), 64);
+        assert!(matches!(
+            diversity.try_admit(
+                ConnectionId::new_unchecked(connection),
+                PeerId::random(),
+                &remote,
+                false,
+            ),
+            Err(DiversityRejection::InboundIpFull { .. })
+        ));
+    }
+
+    #[test]
+    fn unclassified_inbound_cannot_consume_the_diversity_reserve() {
+        let mut diversity = PeerDiversity::default();
+        let private = addr("/ip4/10.0.0.1/tcp/50000");
+        for connection in 1..=INBOUND_UNRESERVED_PEERS {
+            diversity
+                .try_admit(
+                    ConnectionId::new_unchecked(connection),
+                    PeerId::random(),
+                    &private,
+                    false,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            diversity.try_admit(
+                ConnectionId::new_unchecked(INBOUND_UNRESERVED_PEERS + 1),
+                PeerId::random(),
+                &private,
+                false,
+            ),
+            Err(DiversityRejection::InboundUnclassifiedReserve)
+        ));
+    }
+
+    #[test]
+    fn dns_outbound_is_classified_after_identify() {
+        let mut diversity = PeerDiversity::default();
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let third = PeerId::random();
+        let id1 = ConnectionId::new_unchecked(1);
+        let id2 = ConnectionId::new_unchecked(2);
+        let id3 = ConnectionId::new_unchecked(3);
+        let dns = addr("/dns4/seed.example/tcp/9400");
+
+        diversity.try_admit(id1, first, &dns, true).unwrap();
+        diversity
+            .classify_outbound_dns_connection(id1, first, &addr("/ip4/8.8.1.1/tcp/9400"))
+            .unwrap();
+        diversity.try_admit(id2, second, &dns, true).unwrap();
+        diversity
+            .classify_outbound_dns_connection(id2, second, &addr("/ip4/8.8.2.2/tcp/9400"))
+            .unwrap();
+        diversity.try_admit(id3, third, &dns, true).unwrap();
+        assert!(matches!(
+            diversity.classify_outbound_dns_connection(id3, third, &addr("/ip4/8.8.3.3/tcp/9400"),),
+            Err(DiversityRejection::OutboundGroupFull { .. })
         ));
     }
 }

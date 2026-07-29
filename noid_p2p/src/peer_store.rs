@@ -5,8 +5,8 @@
 //!
 //! The cache is an availability hint, never an authority. Only peers reached
 //! through a successful outbound connection are recorded; inbound identities
-//! cannot poison the next restart merely by filling Kademlia buckets. Startup
-//! anchors are randomized and selected from distinct public network groups.
+//! cannot poison the next restart merely by filling Kademlia buckets. Cached
+//! addresses enter the bounded automatic peer manager on the next startup.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -14,14 +14,12 @@ use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use libp2p::{Multiaddr, PeerId};
-use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
-use crate::peer_diversity::{contains_public_ip, public_network_group, PublicNetworkGroup};
+use crate::peer_diversity::contains_public_ip;
 
 const MAX_PEERS: usize = 500;
 const MAX_ADDRS_PER_PEER: usize = 8;
-pub(crate) const MAX_STARTUP_ANCHORS: usize = 8;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PeerEntry {
@@ -68,28 +66,6 @@ impl SuccessfulPeerCache {
             entry.addrs.push(addr);
         }
         self.prune();
-    }
-
-    /// A cold restart should not deterministically contact the same peers, and
-    /// one hosting provider must not occupy every anchor attempt.
-    pub(crate) fn randomized_startup_anchors(&self) -> Vec<CachedPeer> {
-        let mut candidates: Vec<_> = self.entries.values().cloned().collect();
-        candidates.shuffle(&mut rand::thread_rng());
-        let mut groups = HashSet::<PublicNetworkGroup>::new();
-        let mut selected = Vec::with_capacity(MAX_STARTUP_ANCHORS);
-        for mut candidate in candidates {
-            candidate.addrs.shuffle(&mut rand::thread_rng());
-            let Some(group) = candidate.addrs.iter().find_map(public_network_group) else {
-                continue;
-            };
-            if groups.insert(group) {
-                selected.push(candidate);
-                if selected.len() == MAX_STARTUP_ANCHORS {
-                    break;
-                }
-            }
-        }
-        selected
     }
 
     fn prune(&mut self) {
@@ -214,21 +190,6 @@ mod tests {
         assert_eq!(cache.entries().count(), 0);
         cache.record_success(peer, public_addr("8.8.8.8"));
         assert_eq!(cache.entries().count(), 1);
-    }
-
-    #[test]
-    fn startup_anchors_have_distinct_groups() {
-        let mut cache = SuccessfulPeerCache::default();
-        for ip in ["8.8.1.1", "8.8.2.2", "9.9.1.1", "11.1.1.1"] {
-            cache.record_success(PeerId::random(), public_addr(ip));
-        }
-        let anchors = cache.randomized_startup_anchors();
-        let groups: HashSet<_> = anchors
-            .iter()
-            .flat_map(|entry| entry.addrs.iter().find_map(public_network_group))
-            .collect();
-        assert_eq!(anchors.len(), 3);
-        assert_eq!(groups.len(), anchors.len());
     }
 
     #[test]

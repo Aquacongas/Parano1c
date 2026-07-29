@@ -119,6 +119,10 @@ pub struct NodeBehaviour {
     ///    64 pending inbound      — cap half-open handshakes
     ///    32 pending outbound     — cap simultaneous dial attempts
     ///     2 established per peer — direct plus relay during path upgrade
+    ///
+    /// Inbound network-group admission keeps 32 slots reserved for
+    /// underrepresented prefixes, while allowing shared CGNAT/VPN exits to
+    /// use the unreserved pool.
     pub connection_limits: connection_limits::Behaviour,
 
     /// State manifest sync — step 1: request chain metadata + active segment IDs.
@@ -283,7 +287,10 @@ impl NodeBehaviour {
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(10))
+                // A legal terminal is almost 1 MiB. Ten seconds was shorter
+                // than an ordinary residential path needs and caused a
+                // verified header staging pass to be thrown away mid-sync.
+                .with_request_timeout(Duration::from_secs(60))
                 .with_max_concurrent_streams(4),
         );
 

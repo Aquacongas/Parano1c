@@ -25,5 +25,6 @@ pub mod state_segment_codec;
 
 pub use network::{
     NetworkCommand, NetworkEvent, NetworkEventReceiver, NetworkEventRecvError, P2PNetwork,
+    RequestFailureKind,
 };
 pub use protocol::{NetworkTopics, Topics};
