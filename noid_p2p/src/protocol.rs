@@ -71,10 +71,18 @@ pub enum RecentBlockPayloadKind {
     BlockBody,
 }
 
-/// Request one retained block payload from the bounded suffix window.
+/// Maximum canonical block bodies returned by one snapshot-tail request.
+///
+/// This is exactly the consensus retention window.  It keeps the fast path to
+/// one bounded response without allowing an unbounded range allocation.
+pub const MAX_BLOCK_BODY_BATCH: u16 =
+    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16;
+
+/// Request one retained proof bundle or one bounded range of block bodies.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetRecentBlockRequest {
     pub height: u64,
+    pub count: u16,
     pub payload_kind: RecentBlockPayloadKind,
 }
 
@@ -83,14 +91,16 @@ pub struct GetRecentBlockRequest {
 pub enum RecentBlockPayload {
     /// Canonical block plus its current-height HistoryStep terminal.
     Complete(AcceptedBlockBundle),
-    /// Canonical block bytes only. Used exclusively by snapshot suffix sync.
-    BlockBody(Vec<u8>),
+    /// Consecutive canonical block bodies. Used exclusively by snapshot
+    /// suffix sync and bounded by [`MAX_BLOCK_BODY_BATCH`].
+    BlockBodies(Vec<Vec<u8>>),
 }
 
 /// Response: the requested payload, or `None` when it is unavailable.
 #[derive(Debug, Clone)]
 pub struct GetRecentBlockResponse {
     pub height: u64,
+    pub count: u16,
     pub payload_kind: RecentBlockPayloadKind,
     pub payload: Option<RecentBlockPayload>,
     /// Process-global inbound block-byte budget retained until the node has

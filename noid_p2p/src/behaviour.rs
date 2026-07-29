@@ -271,9 +271,10 @@ impl NodeBehaviour {
 
         let block_sync = request_response::Behaviour::new(
             [(
-                // v2 can return a canonical block body without repeating its
-                // proof-sized terminal during authenticated snapshot sync.
-                StreamProtocol::try_from_owned(format!("{}/sync/block/2", protocol_id))?,
+                // v3 returns the bounded authenticated snapshot bridge as one
+                // range of bodies without repeating proof-sized terminals or
+                // opening one request stream per retained height.
+                StreamProtocol::try_from_owned(format!("{}/sync/block/3", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

@@ -192,6 +192,22 @@ impl SnapshotTailStaging {
         Ok(self)
     }
 
+    /// Append one transport-bounded consecutive batch. Each body still passes
+    /// through the exact same canonical decode, link, work and disk checks as
+    /// the former one-request-per-height path.
+    pub fn append_batch(mut self, block_bodies: Vec<Vec<u8>>) -> Result<Self, String> {
+        if block_bodies.is_empty()
+            || block_bodies.len()
+                > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as usize
+        {
+            return Err("snapshot tail batch count is outside bounds".to_string());
+        }
+        for block_bytes in block_bodies {
+            self = self.append(block_bytes)?;
+        }
+        Ok(self)
+    }
+
     pub fn finalize(
         mut self,
         terminal_bytes: Vec<u8>,
@@ -541,5 +557,32 @@ mod tests {
         assert_eq!(reader.next_block().unwrap(), Some(first.to_bytes()));
         assert_eq!(reader.next_block().unwrap(), Some(second.to_bytes()));
         assert_eq!(reader.next_block().unwrap(), None);
+    }
+
+    #[test]
+    fn linked_batch_uses_the_same_tail_invariants() {
+        let root = tempfile::tempdir().unwrap();
+        let genesis = Block {
+            header: genesis_header(),
+            transactions: Vec::new(),
+        };
+        let boundary_hash = noid_chain::hash_block_header(&genesis.header);
+        let first = linked_block(&genesis, 1);
+        let second = linked_block(&first, 2);
+        let staged = SnapshotTailStaging::create(root.path(), 0, boundary_hash, [0; 32])
+            .unwrap()
+            .append_batch(vec![first.to_bytes(), second.to_bytes()])
+            .unwrap();
+        assert_eq!(staged.tip_height(), 2);
+        assert_eq!(staged.block_count(), 2);
+
+        let mut broken = second;
+        broken.header.prev_block_hash = [0x55; 32];
+        assert!(
+            SnapshotTailStaging::create(root.path(), 0, boundary_hash, [0; 32])
+                .unwrap()
+                .append_batch(vec![first.to_bytes(), broken.to_bytes()])
+                .is_err()
+        );
     }
 }

@@ -2685,6 +2685,12 @@ async fn handle_p2p_events(
         generation: u64,
         from: libp2p::PeerId,
         height: u64,
+        count: u16,
+    }
+    impl SnapshotTailAppendKey {
+        fn end_height(self) -> u64 {
+            self.height + u64::from(self.count - 1)
+        }
     }
     struct SnapshotTailAppendCompletion {
         key: SnapshotTailAppendKey,
@@ -2907,19 +2913,25 @@ async fn handle_p2p_events(
         }};
     }
 
-    macro_rules! request_snapshot_tail_block {
-        ($from:expr, $height:expr) => {{
+    macro_rules! request_snapshot_tail_blocks {
+        ($from:expr, $height:expr, $count:expr) => {{
             let from = $from;
             let height = $height;
+            let count = $count;
             if snapshot_tail_request_inflight.is_none() && snapshot_tail_append_inflight.is_none() {
                 let key = SnapshotTailAppendKey {
                     generation: snapshot_sync_generation,
                     from,
                     height,
+                    count,
                 };
                 snapshot_tail_request_inflight = Some(key);
                 if p2p_cmd
-                    .send(noid_p2p::NetworkCommand::RequestBlockBody { peer: from, height })
+                    .send(noid_p2p::NetworkCommand::RequestBlockBodies {
+                        peer: from,
+                        height,
+                        count,
+                    })
                     .await
                     .is_err()
                 {
@@ -2962,14 +2974,16 @@ async fn handle_p2p_events(
         }};
     }
 
-    macro_rules! stage_snapshot_tail_body {
-        ($from:expr, $height:expr, $block_bytes:expr, $inbound_permit:expr) => {{
+    macro_rules! stage_snapshot_tail_bodies {
+        ($from:expr, $height:expr, $block_bodies:expr, $inbound_permit:expr) => {{
             let from = $from;
             let height = $height;
-            let block_bytes = $block_bytes;
+            let block_bodies = $block_bodies;
+            let count = u16::try_from(block_bodies.len())
+                .expect("P2P codec bounds snapshot block-body batch count");
             let Some(staging) = snapshot_tail_staging.take() else {
-                tracing::warn!(from = %from, height, "snapshot tail body arrived without staging");
-                drop(block_bytes);
+                tracing::warn!(from = %from, height, count, "snapshot tail bodies arrived without staging");
+                drop(block_bodies);
                 drop($inbound_permit);
                 reset_sync_state!();
                 continue;
@@ -2978,13 +2992,14 @@ async fn handle_p2p_events(
                 generation: snapshot_sync_generation,
                 from,
                 height,
+                count,
             };
             snapshot_tail_append_inflight = Some(key);
             let completion = snapshot_tail_append_tx.clone();
             let inbound_permit = $inbound_permit;
             tokio::task::spawn_blocking(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    let result = staging.append(block_bytes);
+                    let result = staging.append_batch(block_bodies);
                     drop(inbound_permit);
                     result
                 }))
@@ -3282,7 +3297,7 @@ async fn handle_p2p_events(
                                 let peer = pending_manifest
                                     .as_ref()
                                     .map_or(from, |pending| pending.from);
-                                request_snapshot_tail_block!(peer, expected);
+                                request_snapshot_tail_blocks!(peer, expected, 1);
                             }
                         }
                     }
@@ -3460,16 +3475,19 @@ async fn handle_p2p_events(
                         .await;
                 }
             }
-            Ok(NetworkEvent::SnapshotBlockBody {
+            Ok(NetworkEvent::SnapshotBlockBodies {
                 from,
                 height: advertised_height,
-                block_bytes,
+                block_bodies,
                 mut inbound_memory_permit,
             }) => {
+                let advertised_count = u16::try_from(block_bodies.len())
+                    .expect("P2P codec bounds snapshot block-body batch count");
                 let request_matches = snapshot_tail_request_inflight.is_some_and(|request| {
                     request.generation == snapshot_sync_generation
                         && request.from == from
                         && request.height == advertised_height
+                        && request.count == advertised_count
                 });
                 let expected_height = snapshot_tail_staging
                     .as_ref()
@@ -3483,21 +3501,22 @@ async fn handle_p2p_events(
                     || snapshot_tail_append_inflight.is_some()
                     || snapshot_install_inflight.is_some()
                 {
-                    drop(block_bytes);
+                    drop(block_bodies);
                     drop(inbound_memory_permit.take());
                     tracing::debug!(
                         peer = %from,
                         advertised_height,
+                        advertised_count,
                         ?expected_height,
-                        "dropping stale or mismatched snapshot block body"
+                        "dropping stale or mismatched snapshot block-body batch"
                     );
                     continue;
                 }
                 snapshot_tail_request_inflight = None;
-                stage_snapshot_tail_body!(
+                stage_snapshot_tail_bodies!(
                     from,
                     advertised_height,
-                    block_bytes,
+                    block_bodies,
                     inbound_memory_permit.take()
                 );
                 continue;
@@ -6183,7 +6202,8 @@ async fn handle_p2p_events(
                 drop(completed.result);
                 tracing::debug!(
                     from = %completed.key.from,
-                    height = completed.key.height,
+                    from_height = completed.key.height,
+                    to_height = completed.key.end_height(),
                     "discarding snapshot tail from a reset sync generation"
                 );
                 continue;
@@ -6194,9 +6214,10 @@ async fn handle_p2p_events(
                 Err(error) => {
                     tracing::warn!(
                         from = %from,
-                        height = completed.key.height,
+                        from_height = completed.key.height,
+                        to_height = completed.key.end_height(),
                         err = %error,
-                        "snapshot tail append failed"
+                        "snapshot tail batch append failed"
                     );
                     reset_sync_state!();
                     continue;
@@ -6233,7 +6254,8 @@ async fn handle_p2p_events(
                 drop(staging);
                 tracing::warn!(
                     from = %from,
-                    height = completed.key.height,
+                    from_height = completed.key.height,
+                    to_height = completed.key.end_height(),
                     bridge_tip,
                     "snapshot tail crossed bridge before state download started"
                 );
@@ -6343,7 +6365,7 @@ async fn handle_p2p_events(
                     .as_ref()
                     .expect("tail target comparison retained staging")
                     .next_height();
-                request_snapshot_tail_block!(from, height);
+                request_snapshot_tail_blocks!(from, height, 1);
             }
         }
 
@@ -6527,9 +6549,9 @@ async fn handle_p2p_events(
                         .as_ref()
                         .map_or(pending.manifest.bridge_tip_height, SnapshotTailStaging::tip_height);
                     let target = snapshot_tail_request_inflight
-                        .map_or(staged_tip, |request| staged_tip.max(request.height));
+                        .map_or(staged_tip, |request| staged_tip.max(request.end_height()));
                     let target = snapshot_tail_append_inflight
-                        .map_or(target, |append| target.max(append.height))
+                        .map_or(target, |append| target.max(append.end_height()))
                         .max(pending.manifest.bridge_tip_height);
                     snapshot_tail_install_target = Some(target);
                     let tail_ready = snapshot_tail_request_inflight.is_none()
@@ -6735,7 +6757,9 @@ async fn handle_p2p_events(
                     .manifest
                     .tip_height
                     .saturating_add(1);
-                request_snapshot_tail_block!(from, height);
+                let count = u16::try_from(bridge_tip.saturating_sub(height).saturating_add(1))
+                    .expect("manifest codec bounds the immutable bridge span");
+                request_snapshot_tail_blocks!(from, height, count);
             }
         }
 

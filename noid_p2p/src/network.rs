@@ -41,7 +41,7 @@ use crate::protocol::{
     BlockGossipMsg, GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse,
     GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
     GetStateSegmentResponse, NetworkTopics, RecentBlockPayload, RecentBlockPayloadKind,
-    BLOCK_GOSSIP_FIXED_BYTES,
+    BLOCK_GOSSIP_FIXED_BYTES, MAX_BLOCK_BODY_BATCH,
 };
 
 struct PendingStateSegmentResponse {
@@ -101,6 +101,10 @@ const SNAPSHOT_EXPORT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 const SNAPSHOT_BRIDGE_MAX_LIVE_GAP: u64 =
     noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH / 2;
 const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize = MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
+const MAX_OUTBOUND_BLOCK_BODY_BATCH_BYTES: usize =
+    (MAX_BLOCK_BYTES + 4) * MAX_BLOCK_BODY_BATCH as usize;
+const MAX_OUTBOUND_BLOCK_BODY_BATCH_RESERVATION: usize =
+    MAX_OUTBOUND_BLOCK_BODY_BATCH_BYTES + 2 * MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
 const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
 const MAX_PENDING_HEADER_REQUESTS: usize = 64;
@@ -657,6 +661,7 @@ struct SnapshotExportLease {
 struct PendingRetainedBlockRequest {
     peer: PeerId,
     height: u64,
+    count: u16,
     payload_kind: RecentBlockPayloadKind,
 }
 
@@ -815,8 +820,9 @@ fn retained_block_response_matches_pending(
     pending: PendingRetainedBlockRequest,
     peer: PeerId,
     response_height: u64,
+    response_count: u16,
 ) -> bool {
-    pending.peer == peer && pending.height == response_height
+    pending.peer == peer && pending.height == response_height && pending.count == response_count
 }
 
 fn state_segment_response_matches_pending(
@@ -1059,9 +1065,13 @@ pub enum NetworkCommand {
     /// Request a specific block by height from a peer (orphan resolution).
     /// Emits `NetworkEvent::RecentBlock` if the peer has the bundle.
     RequestBlock { peer: PeerId, height: u64 },
-    /// Request only one canonical block body for authenticated snapshot-tail
-    /// staging.
-    RequestBlockBody { peer: PeerId, height: u64 },
+    /// Request one bounded consecutive range of canonical block bodies for
+    /// authenticated snapshot-tail staging.
+    RequestBlockBodies {
+        peer: PeerId,
+        height: u64,
+        count: u16,
+    },
     /// Fetch a range of headers from a peer for reorg ancestor search.
     /// Emits `NetworkEvent::HeadersBatch` with the decoded headers.
     /// Used to find the common ancestor efficiently in O(1) round-trips
@@ -1122,11 +1132,12 @@ pub enum NetworkEvent {
         /// validation and persistence have consumed the pulled response.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
-    /// Canonical block bytes pulled for an authenticated snapshot suffix.
-    SnapshotBlockBody {
+    /// Consecutive canonical block bytes pulled for an authenticated snapshot
+    /// suffix.
+    SnapshotBlockBodies {
         from: PeerId,
         height: u64,
-        block_bytes: Vec<u8>,
+        block_bodies: Vec<Vec<u8>>,
         /// Holds the process-global inbound byte budget until disk staging has
         /// consumed the body.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -1412,11 +1423,16 @@ impl P2PNetwork {
             .await;
     }
 
-    /// Request only the canonical block bytes needed by snapshot suffix sync.
-    pub async fn request_block_body(&self, peer: PeerId, height: u64) {
+    /// Request only the bounded canonical block range needed by snapshot
+    /// suffix sync.
+    pub async fn request_block_bodies(&self, peer: PeerId, height: u64, count: u16) {
         let _ = self
             .cmd_tx
-            .send(NetworkCommand::RequestBlockBody { peer, height })
+            .send(NetworkCommand::RequestBlockBodies {
+                peer,
+                height,
+                count,
+            })
             .await;
     }
 
@@ -1516,7 +1532,7 @@ async fn run_swarm(
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
-            tcp::Config::default(),
+            tcp::Config::default().nodelay(true),
             noise::Config::new,
             yamux::Config::default,
         )?
@@ -2396,6 +2412,7 @@ async fn handle_network_command(
                     &peer,
                     crate::protocol::GetRecentBlockRequest {
                         height: h,
+                        count: 1,
                         payload_kind: RecentBlockPayloadKind::Complete,
                     },
                 );
@@ -2404,6 +2421,7 @@ async fn handle_network_command(
                     PendingRetainedBlockRequest {
                         peer,
                         height: h,
+                        count: 1,
                         payload_kind: RecentBlockPayloadKind::Complete,
                     },
                 );
@@ -2431,6 +2449,7 @@ async fn handle_network_command(
                 &peer,
                 crate::protocol::GetRecentBlockRequest {
                     height,
+                    count: 1,
                     payload_kind: RecentBlockPayloadKind::Complete,
                 },
             );
@@ -2439,16 +2458,38 @@ async fn handle_network_command(
                 PendingRetainedBlockRequest {
                     peer,
                     height,
+                    count: 1,
                     payload_kind: RecentBlockPayloadKind::Complete,
                 },
             );
             debug_assert!(inserted, "fresh block-sync request ID must be unique");
         }
-        NetworkCommand::RequestBlockBody { peer, height } => {
+        NetworkCommand::RequestBlockBodies {
+            peer,
+            height,
+            count,
+        } => {
+            if count == 0 || count > crate::protocol::MAX_BLOCK_BODY_BATCH {
+                tracing::warn!(
+                    peer = %peer,
+                    height,
+                    count,
+                    "invalid snapshot block-body batch request"
+                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockRequestFailed {
+                        from: peer,
+                        height,
+                        payload_kind: RecentBlockPayloadKind::BlockBody,
+                    })
+                    .await;
+                return;
+            }
             if !pending_retained_block_requests.has_capacity() {
                 tracing::warn!(
                     peer = %peer,
                     height,
+                    count,
                     limit = MAX_PENDING_RETAINED_BLOCK_REQUESTS,
                     "retained-block request correlation table full"
                 );
@@ -2465,6 +2506,7 @@ async fn handle_network_command(
                 &peer,
                 crate::protocol::GetRecentBlockRequest {
                     height,
+                    count,
                     payload_kind: RecentBlockPayloadKind::BlockBody,
                 },
             );
@@ -2473,6 +2515,7 @@ async fn handle_network_command(
                 PendingRetainedBlockRequest {
                     peer,
                     height,
+                    count,
                     payload_kind: RecentBlockPayloadKind::BlockBody,
                 },
             );
@@ -3211,15 +3254,21 @@ async fn handle_swarm_event(
                 );
                 return;
             };
-            if !retained_block_response_matches_pending(pending, peer, response.height)
-                || response.payload_kind != pending.payload_kind
+            if !retained_block_response_matches_pending(
+                pending,
+                peer,
+                response.height,
+                response.count,
+            ) || response.payload_kind != pending.payload_kind
             {
                 tracing::warn!(
                     peer = %peer,
                     request_id = %request_id,
                     requested_peer = %pending.peer,
                     requested_height = pending.height,
+                    requested_count = pending.count,
                     response_height = response.height,
+                    response_count = response.count,
                     "retained-block response does not match its exact request — dropped"
                 );
                 fail_retained_request!(pending);
@@ -3247,14 +3296,21 @@ async fn handle_swarm_event(
                     }
                     (
                         RecentBlockPayloadKind::BlockBody,
-                        RecentBlockPayload::BlockBody(block_bytes),
+                        RecentBlockPayload::BlockBodies(block_bodies),
                     ) => {
-                        tracing::debug!(peer = %peer, height = response.height, bytes = block_bytes.len(), "received compact snapshot block body");
+                        let bytes = block_bodies.iter().map(Vec::len).sum::<usize>();
+                        tracing::debug!(
+                            peer = %peer,
+                            height = response.height,
+                            count = response.count,
+                            bytes,
+                            "received compact snapshot block-body batch"
+                        );
                         let _ = required_event_tx
-                            .send(NetworkEvent::SnapshotBlockBody {
+                            .send(NetworkEvent::SnapshotBlockBodies {
                                 from: peer,
                                 height: response.height,
-                                block_bytes,
+                                block_bodies,
                                 inbound_memory_permit,
                             })
                             .await;
@@ -3272,14 +3328,14 @@ async fn handle_swarm_event(
                     }
                     (
                         RecentBlockPayloadKind::Complete,
-                        RecentBlockPayload::BlockBody(block_bytes),
+                        RecentBlockPayload::BlockBodies(block_bodies),
                     ) => {
-                        drop(block_bytes);
+                        drop(block_bodies);
                         drop(inbound_memory_permit);
                         tracing::warn!(
                             peer = %peer,
                             height = response.height,
-                            "body-only response cannot satisfy complete-block request"
+                            "body-batch response cannot satisfy complete-block request"
                         );
                         fail_retained_request!(pending);
                     }
@@ -3300,7 +3356,7 @@ async fn handle_swarm_event(
             }
         }
 
-        // --- Block pull: server side — serve one complete retained bundle ---
+        // --- Block pull: serve one complete bundle or one bounded body range ---
         //
         // Only last FINALITY_DEPTH blocks are available; pruned blocks return None.
         // Peers that request pruned blocks must do a full state sync instead.
@@ -3332,14 +3388,18 @@ async fn handle_swarm_event(
             let budget = outbound_response_budget.clone();
             let completion = block_response_tx.clone();
             let height = request.height;
+            let count = request.count;
             let payload_kind = request.payload_kind;
             let response_reservation = match payload_kind {
                 RecentBlockPayloadKind::Complete => MAX_OUTBOUND_BLOCK_RESPONSE_BYTES,
-                RecentBlockPayloadKind::BlockBody => MAX_BLOCK_BYTES,
+                RecentBlockPayloadKind::BlockBody => MAX_OUTBOUND_BLOCK_BODY_BATCH_RESERVATION,
             };
+            let end_height = height.saturating_add(count.saturating_sub(1) as u64);
             let leased_bridge = snapshot_export_leases.get_mut(&peer).and_then(|lease| {
                 let generation = snapshot_exports.get(&lease.key)?;
-                if generation.manifest().bridge_block(height).is_some() {
+                if generation.manifest().bridge_block(height).is_some()
+                    && generation.manifest().bridge_block(end_height).is_some()
+                {
                     lease.last_activity = Instant::now();
                     Some(generation.clone())
                 } else {
@@ -3373,23 +3433,36 @@ async fn handle_swarm_event(
                         }
                         RecentBlockPayloadKind::BlockBody => {
                             if let Some(generation) = leased_bridge {
-                                return generation
-                                    .read_bridge_block(height)
-                                    .ok()
-                                    .map(|bundle| {
-                                        RecentBlockPayload::BlockBody(
-                                            bundle.block_bytes().to_vec(),
-                                        )
-                                    });
+                                let mut bodies = Vec::with_capacity(count as usize);
+                                for current_height in height..=end_height {
+                                    let Ok(bundle) =
+                                        generation.read_bridge_block(current_height)
+                                    else {
+                                        return None;
+                                    };
+                                    let (block_bytes, terminal_bytes) = bundle.into_parts();
+                                    drop(terminal_bytes);
+                                    bodies.push(block_bytes);
+                                }
+                                return Some(RecentBlockPayload::BlockBodies(bodies));
                             }
                             let ctx = chain.blocking_read();
-                            match ctx.store.get_recent_block(height) {
-                                Ok(block_bytes) => block_bytes.map(RecentBlockPayload::BlockBody),
-                                Err(error) => {
-                                    tracing::warn!(height, err = %error, "bounded block-body response read failed");
-                                    None
+                            let mut bodies = Vec::with_capacity(count as usize);
+                            for current_height in height..=end_height {
+                                match ctx.store.get_recent_block(current_height) {
+                                    Ok(Some(block_bytes)) => bodies.push(block_bytes),
+                                    Ok(None) => return None,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            height = current_height,
+                                            err = %error,
+                                            "bounded block-body response read failed"
+                                        );
+                                        return None;
+                                    }
                                 }
                             }
+                            Some(RecentBlockPayload::BlockBodies(bodies))
                         }
                     }
                 })
@@ -3403,6 +3476,7 @@ async fn handle_swarm_event(
                 };
                 let response = GetRecentBlockResponse {
                     height,
+                    count,
                     payload_kind,
                     payload,
                     inbound_memory_permit: None,
@@ -4830,13 +4904,21 @@ mod tests {
         let pending = PendingRetainedBlockRequest {
             peer,
             height: 77,
+            count: 1,
             payload_kind: RecentBlockPayloadKind::Complete,
         };
-        assert!(retained_block_response_matches_pending(pending, peer, 77));
-        assert!(!retained_block_response_matches_pending(
-            pending, other_peer, 77
+        assert!(retained_block_response_matches_pending(
+            pending, peer, 77, 1
         ));
-        assert!(!retained_block_response_matches_pending(pending, peer, 78));
+        assert!(!retained_block_response_matches_pending(
+            pending, other_peer, 77, 1
+        ));
+        assert!(!retained_block_response_matches_pending(
+            pending, peer, 78, 1
+        ));
+        assert!(!retained_block_response_matches_pending(
+            pending, peer, 77, 2
+        ));
 
         let mut registry = BoundedPendingRequests::new(2);
         assert!(registry.try_insert(10u64, pending));
@@ -4845,6 +4927,7 @@ mod tests {
             PendingRetainedBlockRequest {
                 peer,
                 height: 78,
+                count: 2,
                 payload_kind: RecentBlockPayloadKind::BlockBody,
             }
         ));
@@ -4853,6 +4936,7 @@ mod tests {
             PendingRetainedBlockRequest {
                 peer,
                 height: 79,
+                count: 1,
                 payload_kind: RecentBlockPayloadKind::Complete,
             }
         ));
@@ -4871,6 +4955,7 @@ mod tests {
             PendingRetainedBlockRequest {
                 peer,
                 height: 79,
+                count: 1,
                 payload_kind: RecentBlockPayloadKind::Complete,
             }
         ));
