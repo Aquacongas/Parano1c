@@ -1471,9 +1471,88 @@ struct PendingSnapshotHeaderSync {
     staging: SnapshotHeaderStaging,
     next_height: u64,
     target_height: u64,
-    terminal_peer: Option<libp2p::PeerId>,
-    terminal_token: Option<u64>,
-    terminal_attempts: u8,
+    terminal_requests: Option<TerminalRequestRace>,
+}
+
+const HISTORY_STEP_TERMINAL_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(12);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingTerminalRequest {
+    peer: libp2p::PeerId,
+    token: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalRequestRace {
+    primary: PendingTerminalRequest,
+    primary_active: bool,
+    hedge: Option<PendingTerminalRequest>,
+    hedge_active: bool,
+    started_at: Instant,
+}
+
+impl TerminalRequestRace {
+    fn new(peer: libp2p::PeerId, token: u64, now: Instant) -> Self {
+        Self {
+            primary: PendingTerminalRequest { peer, token },
+            primary_active: true,
+            hedge: None,
+            hedge_active: false,
+            started_at: now,
+        }
+    }
+
+    fn matches(&self, peer: libp2p::PeerId, token: u64) -> bool {
+        (self.primary_active && self.primary == PendingTerminalRequest { peer, token })
+            || (self.hedge_active && self.hedge == Some(PendingTerminalRequest { peer, token }))
+    }
+
+    fn has_active(&self) -> bool {
+        self.primary_active || self.hedge_active
+    }
+
+    fn used_peer(&self, peer: libp2p::PeerId) -> bool {
+        self.primary.peer == peer || self.hedge.is_some_and(|request| request.peer == peer)
+    }
+
+    fn hedge_due(&self, now: Instant) -> bool {
+        self.primary_active
+            && self.hedge.is_none()
+            && now.duration_since(self.started_at) >= HISTORY_STEP_TERMINAL_HEDGE_DELAY
+    }
+
+    fn install_hedge(&mut self, peer: libp2p::PeerId) {
+        debug_assert!(self.hedge.is_none());
+        self.hedge = Some(PendingTerminalRequest {
+            peer,
+            token: self.primary.token,
+        });
+        self.hedge_active = true;
+    }
+
+    fn mark_failed(&mut self, peer: libp2p::PeerId, token: u64) -> bool {
+        let request = PendingTerminalRequest { peer, token };
+        if self.primary_active && self.primary == request {
+            self.primary_active = false;
+            return true;
+        }
+        if self.hedge_active && self.hedge == Some(request) {
+            self.hedge_active = false;
+            return true;
+        }
+        false
+    }
+}
+
+fn terminal_alternate_peer(
+    peers: &std::collections::HashSet<libp2p::PeerId>,
+    requests: &TerminalRequestRace,
+) -> Option<libp2p::PeerId> {
+    peers
+        .iter()
+        .copied()
+        .filter(|peer| !requests.used_peer(*peer))
+        .min_by_key(|peer| peer.to_bytes())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1673,9 +1752,7 @@ fn prepare_snapshot_header_sync(
         staging,
         next_height,
         target_height,
-        terminal_peer: None,
-        terminal_token: None,
-        terminal_attempts: 0,
+        terminal_requests: None,
     })
 }
 
@@ -1993,10 +2070,11 @@ mod tests {
         next_block_has_competing_parent, p2p_listen_to_multiaddr,
         prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
         snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
-        unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
-        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        MINING_PEER_QUORUM, STATE_MANIFEST_RESPONSE_TIMEOUT,
+        terminal_alternate_peer, unavailable_block_requires_snapshot,
+        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
+        validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
+        SnapshotHeaderBoundary, SnapshotHeaderNextAction, TerminalRequestRace,
+        HISTORY_STEP_TERMINAL_HEDGE_DELAY, MINING_PEER_QUORUM, STATE_MANIFEST_RESPONSE_TIMEOUT,
     };
 
     #[test]
@@ -2009,6 +2087,57 @@ mod tests {
         assert!(*first.borrow());
         assert!(*second.borrow());
         assert!(*late.borrow());
+    }
+
+    #[test]
+    fn history_step_terminal_hedge_keeps_both_exact_requests_live() {
+        let primary = libp2p::PeerId::random();
+        let alternate = libp2p::PeerId::random();
+        let started_at = std::time::Instant::now();
+        let mut requests = TerminalRequestRace::new(primary, 41, started_at);
+
+        assert!(!requests.hedge_due(
+            started_at + HISTORY_STEP_TERMINAL_HEDGE_DELAY - std::time::Duration::from_millis(1)
+        ));
+        assert!(requests.hedge_due(started_at + HISTORY_STEP_TERMINAL_HEDGE_DELAY));
+
+        requests.install_hedge(alternate);
+        assert!(requests.matches(primary, 41));
+        assert!(requests.matches(alternate, 41));
+        assert!(!requests.hedge_due(
+            started_at + HISTORY_STEP_TERMINAL_HEDGE_DELAY + std::time::Duration::from_secs(1)
+        ));
+
+        assert!(requests.mark_failed(primary, 41));
+        assert!(requests.has_active());
+        assert!(requests.matches(alternate, 41));
+        assert!(requests.mark_failed(alternate, 41));
+        assert!(!requests.has_active());
+    }
+
+    #[test]
+    fn history_step_terminal_hedge_uses_one_distinct_connected_peer() {
+        let primary = libp2p::PeerId::random();
+        let alternate = libp2p::PeerId::random();
+        let third = libp2p::PeerId::random();
+        let mut peers = std::collections::HashSet::from([primary, alternate, third]);
+        let mut requests = TerminalRequestRace::new(primary, 1, std::time::Instant::now());
+
+        let selected =
+            terminal_alternate_peer(&peers, &requests).expect("one alternate must be selected");
+        assert_ne!(selected, primary);
+        requests.install_hedge(selected);
+        assert_eq!(
+            terminal_alternate_peer(&peers, &requests),
+            Some(if selected == alternate {
+                third
+            } else {
+                alternate
+            })
+        );
+
+        peers.retain(|peer| requests.used_peer(*peer));
+        assert_eq!(terminal_alternate_peer(&peers, &requests), None);
     }
 
     #[test]
@@ -2565,9 +2694,7 @@ async fn handle_p2p_events(
     struct SnapshotTailTerminalKey {
         generation: u64,
         manifest_from: libp2p::PeerId,
-        request_peer: libp2p::PeerId,
-        request_token: u64,
-        attempts: u8,
+        requests: TerminalRequestRace,
         height: u64,
         block_hash: [u8; 32],
     }
@@ -2883,16 +3010,18 @@ async fn handle_p2p_events(
                         let key = SnapshotTailTerminalKey {
                             generation: snapshot_sync_generation,
                             manifest_from: from,
-                            request_peer: from,
-                            request_token: history_step_request_token,
-                            attempts: 1,
+                            requests: TerminalRequestRace::new(
+                                from,
+                                history_step_request_token,
+                                Instant::now(),
+                            ),
                             height: tail.tip_height(),
                             block_hash: tail.tip_hash(),
                         };
                         snapshot_tail_terminal_inflight = Some(key);
                         if p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
-                                token: key.request_token,
+                                token: key.requests.primary.token,
                                 peer: from,
                                 height: key.height,
                                 block_hash: key.block_hash,
@@ -5424,8 +5553,7 @@ async fn handle_p2p_events(
             }) => {
                 let tail_key = snapshot_tail_terminal_inflight.filter(|pending| {
                         pending.generation == snapshot_sync_generation
-                            && pending.request_token == token
-                            && pending.request_peer == from
+                            && pending.requests.matches(from, token)
                             && pending.height == height
                             && pending.block_hash == block_hash
                     });
@@ -5494,8 +5622,9 @@ async fn handle_p2p_events(
                 let snapshot_correlated = pending_snapshot_header_sync
                     .as_ref()
                     .is_some_and(|pending| {
-                        pending.terminal_token == Some(token)
-                            && pending.terminal_peer == Some(from)
+                        pending
+                            .terminal_requests
+                            .is_some_and(|requests| requests.matches(from, token))
                             && pending.next_height
                                 == pending.target_height.saturating_add(1)
                             && pending.manifest.tip_height == height
@@ -5543,8 +5672,9 @@ async fn handle_p2p_events(
 
                 let sync = match pending_snapshot_header_sync.take() {
                     Some(sync)
-                        if sync.terminal_peer == Some(from)
-                            && sync.terminal_token == Some(token) =>
+                        if sync
+                            .terminal_requests
+                            .is_some_and(|requests| requests.matches(from, token)) =>
                     {
                         sync
                     }
@@ -5689,8 +5819,7 @@ async fn handle_p2p_events(
             }) => {
                 let tail_correlated = snapshot_tail_terminal_inflight.is_some_and(|pending| {
                     pending.generation == snapshot_sync_generation
-                        && pending.request_token == token
-                        && pending.request_peer == from
+                        && pending.requests.matches(from, token)
                         && pending.height == height
                         && pending.block_hash == block_hash
                 });
@@ -5698,22 +5827,30 @@ async fn handle_p2p_events(
                     let mut pending = snapshot_tail_terminal_inflight
                         .take()
                         .expect("correlated suffix terminal is present");
-                    let alternate = (pending.attempts < 2).then(|| {
-                        manifest_peers
-                            .iter()
-                            .copied()
-                            .find(|peer| *peer != from)
-                    }).flatten();
+                    let marked = pending.requests.mark_failed(from, token);
+                    debug_assert!(marked, "correlated suffix request must be active");
+                    if pending.requests.has_active() {
+                        snapshot_tail_terminal_inflight = Some(pending);
+                        tracing::warn!(
+                            peer = %from,
+                            height,
+                            ?kind,
+                            "one snapshot suffix terminal request failed — alternate remains active"
+                        );
+                        continue;
+                    }
+                    let alternate = if pending.requests.hedge.is_none() {
+                        terminal_alternate_peer(&manifest_peers, &pending.requests)
+                    } else {
+                        None
+                    };
                     if let Some(alternate) = alternate {
-                        history_step_request_token =
-                            history_step_request_token.wrapping_add(1);
-                        pending.request_peer = alternate;
-                        pending.request_token = history_step_request_token;
-                        pending.attempts = pending.attempts.saturating_add(1);
+                        let request_token = pending.requests.primary.token;
+                        pending.requests.install_hedge(alternate);
                         snapshot_tail_terminal_inflight = Some(pending);
                         if p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
-                                token: pending.request_token,
+                                token: request_token,
                                 peer: alternate,
                                 height,
                                 block_hash,
@@ -5749,8 +5886,9 @@ async fn handle_p2p_events(
                 let correlated = pending_snapshot_header_sync
                     .as_ref()
                     .is_some_and(|pending| {
-                        pending.terminal_token == Some(token)
-                            && pending.terminal_peer == Some(from)
+                        pending
+                            .terminal_requests
+                            .is_some_and(|requests| requests.matches(from, token))
                             && pending.next_height
                                 == pending.target_height.saturating_add(1)
                             && pending.manifest.tip_height == height
@@ -5766,31 +5904,59 @@ async fn handle_p2p_events(
                     continue;
                 }
 
+                let manifest_lease_was_lost = pending_snapshot_header_sync
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        matches!(kind, noid_p2p::RequestFailureKind::ConnectionClosed)
+                            && pending.from == from
+                    });
+                if !manifest_lease_was_lost {
+                    let pending = pending_snapshot_header_sync
+                        .as_mut()
+                        .expect("correlated header terminal is present");
+                    let requests = pending
+                        .terminal_requests
+                        .as_mut()
+                        .expect("correlated terminal race is present");
+                    let marked = requests.mark_failed(from, token);
+                    debug_assert!(marked, "correlated HistoryStep request must be active");
+                    if requests.has_active() {
+                        tracing::warn!(
+                            peer = %from,
+                            height,
+                            ?kind,
+                            "one HistoryStep terminal request failed — alternate remains active"
+                        );
+                        continue;
+                    }
+                }
+
                 let alternate = pending_snapshot_header_sync.as_ref().and_then(|pending| {
-                    (pending.terminal_attempts < 2
-                        && !(matches!(
-                            kind,
-                            noid_p2p::RequestFailureKind::ConnectionClosed
-                        ) && pending.from == from))
+                    (!manifest_lease_was_lost)
                         .then(|| {
-                            manifest_peers
-                                .iter()
-                                .copied()
-                                .find(|peer| *peer != from)
+                            pending
+                                .terminal_requests
+                                .as_ref()
+                                .filter(|requests| requests.hedge.is_none())
+                                .and_then(|requests| {
+                                    terminal_alternate_peer(&manifest_peers, requests)
+                                })
                         })
                         .flatten()
                 });
                 if let Some(alternate) = alternate {
-                    history_step_request_token = history_step_request_token.wrapping_add(1);
                     let pending = pending_snapshot_header_sync
                         .as_mut()
                         .expect("correlated header terminal is present");
-                    pending.terminal_peer = Some(alternate);
-                    pending.terminal_token = Some(history_step_request_token);
-                    pending.terminal_attempts = pending.terminal_attempts.saturating_add(1);
+                    let requests = pending
+                        .terminal_requests
+                        .as_mut()
+                        .expect("correlated terminal race is present");
+                    let request_token = requests.primary.token;
+                    requests.install_hedge(alternate);
                     if p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
-                            token: history_step_request_token,
+                            token: request_token,
                             peer: alternate,
                             height,
                             block_hash,
@@ -5977,9 +6143,11 @@ async fn handle_p2p_events(
                     let terminal_height = sync.manifest.tip_height;
                     let terminal_hash = sync.manifest.tip_hash;
                     history_step_request_token = history_step_request_token.wrapping_add(1);
-                    sync.terminal_peer = Some(from);
-                    sync.terminal_token = Some(history_step_request_token);
-                    sync.terminal_attempts = 1;
+                    sync.terminal_requests = Some(TerminalRequestRace::new(
+                        from,
+                        history_step_request_token,
+                        Instant::now(),
+                    ));
                     pending_snapshot_header_sync = Some(sync);
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
@@ -6579,6 +6747,83 @@ async fn handle_p2p_events(
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
+
+            let header_terminal_hedge = pending_snapshot_header_sync
+                .as_ref()
+                .and_then(|pending| {
+                    let requests = pending.terminal_requests.as_ref()?;
+                    requests
+                        .hedge_due(now)
+                        .then(|| {
+                            terminal_alternate_peer(&manifest_peers, requests).map(|peer| {
+                                (peer, pending.manifest.tip_height, pending.manifest.tip_hash)
+                            })
+                        })
+                        .flatten()
+            });
+            if let Some((peer, height, block_hash)) = header_terminal_hedge {
+                let requests = pending_snapshot_header_sync
+                    .as_mut()
+                    .and_then(|pending| pending.terminal_requests.as_mut())
+                    .expect("hedged header terminal race is present");
+                let token = requests.primary.token;
+                requests.install_hedge(peer);
+                if p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                        token,
+                        peer,
+                        height,
+                        block_hash,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    tracing::info!(
+                        peer = %peer,
+                        height,
+                        delay_secs = HISTORY_STEP_TERMINAL_HEDGE_DELAY.as_secs(),
+                        "HistoryStep terminal still pending — requesting one alternate in parallel"
+                    );
+                }
+            }
+
+            let tail_terminal_hedge = snapshot_tail_terminal_inflight
+                .as_ref()
+                .and_then(|pending| {
+                    pending
+                        .requests
+                        .hedge_due(now)
+                        .then(|| {
+                            terminal_alternate_peer(&manifest_peers, &pending.requests)
+                                .map(|peer| (peer, pending.height, pending.block_hash))
+                        })
+                        .flatten()
+            });
+            if let Some((peer, height, block_hash)) = tail_terminal_hedge {
+                let requests = &mut snapshot_tail_terminal_inflight
+                    .as_mut()
+                    .expect("hedged suffix terminal race is present")
+                    .requests;
+                let token = requests.primary.token;
+                requests.install_hedge(peer);
+                if p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                        token,
+                        peer,
+                        height,
+                        block_hash,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    tracing::info!(
+                        peer = %peer,
+                        height,
+                        delay_secs = HISTORY_STEP_TERMINAL_HEDGE_DELAY.as_secs(),
+                        "snapshot suffix terminal still pending — requesting one alternate in parallel"
+                    );
+                }
+            }
 
             // Ordinary wallet nodes count toward mining readiness once they
             // confirm our canonical tip. A wallet may connect while still

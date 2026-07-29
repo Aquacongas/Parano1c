@@ -2546,10 +2546,9 @@ async fn handle_network_command(
             height,
             block_hash,
         } => {
-            // The node owns one snapshot state machine. A newer local token
-            // supersedes any transport still completing for an older
-            // boundary/peer; delayed responses remain harmless because their
-            // request IDs are no longer correlated.
+            // The node owns one snapshot state machine. Both requests in one
+            // exact-boundary hedge share a token; a newer logical token
+            // supersedes every older transport.
             pending_history_step_requests.retain(|_, pending| pending.token == token);
             if !pending_history_step_requests.has_capacity() {
                 tracing::warn!(
