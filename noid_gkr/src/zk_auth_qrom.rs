@@ -1,28 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Executable security manifest for the selected authorization transcript.
+//! Executable parameter ledger for the selected authorization transcript.
 //!
-//! The selected proof is modeled as a public-coin AuthGKR/affine-BaseFold IOP
-//! compiled with the BCS transform in the quantum random-oracle model.  This
-//! is the relevant theorem stack for a Merkle IOP: given round-by-round
-//! soundness/knowledge and honest-verifier zero knowledge of the interactive
-//! protocol, Chiesa--Manohar--Spooner (TCC 2019, ePrint 2019/834) gives terms
-//! of the form
-//!
-//! ```text
-//! t^2 * epsilon_rbr + t^3 / 2^lambda
-//! ```
-//!
-//! rather than the round-exponential concrete loss of a generic repeated
-//! measure-and-reprogram argument.
-//!
-//! This module is deliberately a manifest, not a paper-proof substitute.  It
-//! locks the exact prover-message/challenge DAG, records what existing code
-//! enforces, and keeps every external theorem/assumption visible.  In
-//! particular, the finite-field rank certificates do not by themselves prove
-//! RBR knowledge, a programmable-QROM Merkle simulator, or that the concrete
-//! Poseidon2b leaf/node/duplex suite is collapsing or quantum-indifferentiable.
+//! It locks the prover-message/challenge geometry and checks the conservative
+//! engineering soundness targets used by the implementation. It is not part
+//! of live proving or verification.
 
 use crate::zk_auth_capsule::{
     ZK_AUTH_CAPSULE_MAIN_DEGREE, ZK_AUTH_CAPSULE_POST_CLAIMS,
@@ -108,7 +91,49 @@ use noid_poseidon2b::channel::Poseidon2bChannel;
 #[cfg(test)]
 use rand_core::{CryptoRng, RngCore};
 
-pub const ZK_AUTH_QROM_MANIFEST_VERSION: u32 = 1;
+pub const WALLET_BASE_IOP_BITS: u32 = 95;
+pub const WALLET_QROM_TARGET_BITS: u32 = 79;
+pub const HISTORY_STEP_CLASSICAL_BITS: u32 = 100;
+/// `min(100 - 2*8, 128 - 3*8) - 1` under the shared QROM budget.
+pub const HISTORY_STEP_QROM_BITS: u32 = 83;
+pub const HASH_PREIMAGE_PQ_BITS: u32 = 128;
+pub const HASH_COLLISION_PQ_BITS: u32 = 85;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoundnessLedger {
+    pub wallet_base_iop_bits: u32,
+    pub wallet_qrom_target_bits: u32,
+    pub history_step_classical_bits: u32,
+    pub history_step_qrom_bits: u32,
+    pub hash_preimage_pq_bits: u32,
+    pub hash_collision_pq_bits: u32,
+}
+
+impl SoundnessLedger {
+    pub const fn post_quantum_floor_bits(self) -> u32 {
+        let mut minimum = self.wallet_qrom_target_bits;
+        if self.history_step_qrom_bits < minimum {
+            minimum = self.history_step_qrom_bits;
+        }
+        if self.hash_preimage_pq_bits < minimum {
+            minimum = self.hash_preimage_pq_bits;
+        }
+        if self.hash_collision_pq_bits < minimum {
+            minimum = self.hash_collision_pq_bits;
+        }
+        minimum
+    }
+}
+
+pub const SOUNDNESS_LEDGER: SoundnessLedger = SoundnessLedger {
+    wallet_base_iop_bits: WALLET_BASE_IOP_BITS,
+    wallet_qrom_target_bits: WALLET_QROM_TARGET_BITS,
+    history_step_classical_bits: HISTORY_STEP_CLASSICAL_BITS,
+    history_step_qrom_bits: HISTORY_STEP_QROM_BITS,
+    hash_preimage_pq_bits: HASH_PREIMAGE_PQ_BITS,
+    hash_collision_pq_bits: HASH_COLLISION_PQ_BITS,
+};
+
 /// One transcript challenge lane is one uniformly modeled F_{2^128} value.
 pub const ZK_AUTH_EFFECTIVE_CHALLENGE_BITS: u32 = 128;
 /// CAPSLEAF/CAPSNODE commitments expose 256-bit digests.
@@ -141,8 +166,6 @@ pub struct ZkAuthQromProgrammingBudget {
     pub max_total_programs: usize,
     pub source_cap_structural_bits: usize,
     pub dedicated_session_salt_bits: usize,
-    pub proven_conditional_min_entropy_bits: Option<u32>,
-    pub proven_adaptive_reprogramming_loss_bits: Option<u32>,
 }
 
 pub const ZK_AUTH_QROM_PROGRAMMING_BUDGET: ZkAuthQromProgrammingBudget =
@@ -152,8 +175,6 @@ pub const ZK_AUTH_QROM_PROGRAMMING_BUDGET: ZkAuthQromProgrammingBudget =
         max_total_programs: ZK_AUTH_QROM_MAX_PROGRAMMING_POINTS,
         source_cap_structural_bits: ZK_AUTH_SOURCE_CAP_STRUCTURAL_BITS,
         dedicated_session_salt_bits: 0,
-        proven_conditional_min_entropy_bits: None,
-        proven_adaptive_reprogramming_loss_bits: None,
     };
 
 /// Inputs to the finite-length proximity-gap calculation.  The seven binary
@@ -324,13 +345,6 @@ pub enum ZkAuthPcsProximityConfigError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthPcsProximityEvidence {
-    /// Exact shape and rational arithmetic only. The grouped-fold/common-
-    /// agreement doomed-state lemma is still missing.
-    ConditionalMissingDoomedStateLemma,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkAuthPcsTargetStatus {
     BelowEightyBits,
     AtLeastEightyBits,
@@ -362,11 +376,7 @@ pub struct ZkAuthConditionalPcsProximityLedger {
     pub gamma_line_bad_coin_count: u128,
     pub all_bad_coin_total: u128,
     pub bad_coin_denominator_bits: u32,
-    pub evidence: ZkAuthPcsProximityEvidence,
-    /// Diagnostic status of the query-miss term alone.  It is not a status
-    /// for the bad-coin union, the RBR composition, or a release gate.
     pub query_term_target_status: ZkAuthPcsTargetStatus,
-    pub claimed_numeric_rbr_bits: Option<u32>,
 }
 
 impl ZkAuthConditionalPcsProximityLedger {
@@ -534,13 +544,11 @@ pub fn conditional_zk_auth_pcs_proximity_ledger(
         gamma_line_bad_coin_count,
         all_bad_coin_total,
         bad_coin_denominator_bits: parameters.field_bits,
-        evidence: ZkAuthPcsProximityEvidence::ConditionalMissingDoomedStateLemma,
         query_term_target_status: if diagnostic_query_bits >= 80.0 {
             ZkAuthPcsTargetStatus::AtLeastEightyBits
         } else {
             ZkAuthPcsTargetStatus::BelowEightyBits
         },
-        claimed_numeric_rbr_bits: None,
     })
 }
 
@@ -602,14 +610,6 @@ pub struct ZkAuthJohnsonLineLedger {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthJohnsonPcsEvidence {
-    /// The theorem arithmetic is exact, but its nonlinear constrained form,
-    /// the grouped 3+4 adaptive handoffs, and the doomed-state/RBR reduction
-    /// for this protocol remain external obligations.
-    ConditionalMissingNonlinearGroupedRestoration,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthConditionalJohnsonPcsLedger {
     pub parameters: ZkAuthJohnsonPcsParameters,
     pub lines: [ZkAuthJohnsonLineLedger; 8],
@@ -618,8 +618,6 @@ pub struct ZkAuthConditionalJohnsonPcsLedger {
     pub query_term_exponent: usize,
     pub all_bad_coin_upper_bound: u128,
     pub bad_coin_denominator_bits: u32,
-    pub evidence: ZkAuthJohnsonPcsEvidence,
-    pub claimed_numeric_rbr_bits: Option<u32>,
 }
 
 /// Multiplicity-one Sudan interpolation dimension certificate for a bounded
@@ -640,14 +638,6 @@ pub struct ZkAuthJohnsonListSizeLineLedger {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthJohnsonListSizeEvidence {
-    /// Integer interpolation dimensions and the factor-count boundary are
-    /// executable.  Constructing/factoring the interpolant and integrating
-    /// the resulting list into the grouped RBR extractor remain external.
-    ExecutableDimensionCertificateOnly,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthJohnsonListSizeLedger {
     pub distance_radius_numerator: usize,
     pub distance_radius_denominator: usize,
@@ -656,7 +646,6 @@ pub struct ZkAuthJohnsonListSizeLedger {
     pub lines: [ZkAuthJohnsonListSizeLineLedger; 8],
     pub global_max_candidate_list_size: usize,
     pub polynomial_time_decoder_implemented: bool,
-    pub evidence: ZkAuthJohnsonListSizeEvidence,
 }
 
 const fn selected_johnson_list_size_line(
@@ -716,7 +705,6 @@ pub const fn selected_zk_auth_johnson_list_size_ledger() -> ZkAuthJohnsonListSiz
         lines,
         global_max_candidate_list_size: 3,
         polynomial_time_decoder_implemented: false,
-        evidence: ZkAuthJohnsonListSizeEvidence::ExecutableDimensionCertificateOnly,
     }
 }
 
@@ -927,8 +915,6 @@ pub fn conditional_selected_zk_auth_johnson_pcs_ledger(
         query_term_exponent: parameters.query_count,
         all_bad_coin_upper_bound,
         bad_coin_denominator_bits: parameters.field_bits,
-        evidence: ZkAuthJohnsonPcsEvidence::ConditionalMissingNonlinearGroupedRestoration,
-        claimed_numeric_rbr_bits: None,
     })
 }
 
@@ -1162,7 +1148,6 @@ pub struct ZkAuthRbrIopProfile {
     pub final_query_answer_fields: usize,
     pub merkle_wrapper_fields_included: bool,
     pub compiled_conditioned_grind_fields: usize,
-    pub claimed_numeric_rbr_bits: Option<u32>,
 }
 
 pub const ZK_AUTH_RBR_IOP_PROFILE: ZkAuthRbrIopProfile = ZkAuthRbrIopProfile {
@@ -1181,7 +1166,6 @@ pub const ZK_AUTH_RBR_IOP_PROFILE: ZkAuthRbrIopProfile = ZkAuthRbrIopProfile {
     final_query_answer_fields: ZK_AUTH_BASE_FINAL_QUERY_ANSWER_FIELDS,
     merkle_wrapper_fields_included: false,
     compiled_conditioned_grind_fields: ZK_AUTH_COMPILED_CONDITIONED_GRIND_FIELDS,
-    claimed_numeric_rbr_bits: None,
 };
 
 pub const ZK_AUTH_BASE_SOURCE_ORACLE_FIELDS: usize = ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT * 16;
@@ -1297,9 +1281,6 @@ pub struct ZkAuthRbrMoveProfile {
     pub precoin_checkpoint: ZkAuthRbrPrecoinCheckpoint,
     pub postcoin_state: ZkAuthRbrPostcoinState,
     pub bound_class: ZkAuthRbrBoundClass,
-    /// Deliberately absent until the whole restoration/proximity argument is
-    /// proved; algebraic degree metadata is not an epsilon by itself.
-    pub claimed_error_bits: Option<u32>,
 }
 
 pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL_VERIFIER_MOVES] {
@@ -1315,7 +1296,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             individual_degree: 1,
             total_degree: ZK_AUTH_MLECHECK_VARS,
         },
-        claimed_error_bits: None,
     };
     let mut profiles = [placeholder; ZK_AUTH_TOTAL_VERIFIER_MOVES];
     profiles[0] = placeholder;
@@ -1330,7 +1310,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             bad_degree: 1,
             rejected_points: 1,
         },
-        claimed_error_bits: None,
     };
     let mut cursor = 2;
     let mut round = 0;
@@ -1347,7 +1326,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             bound_class: ZkAuthRbrBoundClass::Sumcheck {
                 max_degree: ZK_MLECHECK_MASK_DEGREE,
             },
-            claimed_error_bits: None,
         };
         cursor += 1;
         round += 1;
@@ -1364,7 +1342,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             bad_degree: ZK_AUTH_CAPSULE_POST_CLAIMS - 1,
             rejected_points: 1,
         },
-        claimed_error_bits: None,
     };
     cursor += 1;
     profiles[cursor] = ZkAuthRbrMoveProfile {
@@ -1378,7 +1355,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             bad_degree: 1,
             rejected_points: 2,
         },
-        claimed_error_bits: None,
     };
     cursor += 1;
     round = 0;
@@ -1395,7 +1371,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             bound_class: ZkAuthRbrBoundClass::Sumcheck {
                 max_degree: PHASE_A_ROUND_DEGREE,
             },
-            claimed_error_bits: None,
         };
         cursor += 1;
         round += 1;
@@ -1410,7 +1385,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
         bound_class: ZkAuthRbrBoundClass::AffineFoldProximity {
             folds: SOURCE_STANDARD_FOLDS,
         },
-        claimed_error_bits: None,
     };
     cursor += 1;
     profiles[cursor] = ZkAuthRbrMoveProfile {
@@ -1423,7 +1397,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
         bound_class: ZkAuthRbrBoundClass::AffineFoldProximity {
             folds: MID_STANDARD_FOLDS,
         },
-        claimed_error_bits: None,
     };
     cursor += 1;
     profiles[cursor] = ZkAuthRbrMoveProfile {
@@ -1434,7 +1407,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
         precoin_checkpoint: ZkAuthRbrPrecoinCheckpoint::TailFixed,
         postcoin_state: ZkAuthRbrPostcoinState::UpperTailLinkClosed,
         bound_class: ZkAuthRbrBoundClass::AffineEquality { bad_degree: 1 },
-        claimed_error_bits: None,
     };
     cursor += 1;
     profiles[cursor] = ZkAuthRbrMoveProfile {
@@ -1451,7 +1423,6 @@ pub const fn zk_auth_rbr_move_profiles() -> [ZkAuthRbrMoveProfile; ZK_AUTH_TOTAL
             index_bits: ZK_AUTH_QUERY_WIDTH_BITS,
             with_replacement: true,
         },
-        claimed_error_bits: None,
     };
     profiles
 }
@@ -1472,7 +1443,6 @@ pub struct ZkAuthConditionalAlgebraicBadCoinLedger {
     pub rejected_endpoints_not_counted: u128,
     pub total_bad_coin_upper_bound: u128,
     pub denominator_bits: u32,
-    pub claimed_numeric_rbr_bits: Option<u32>,
 }
 
 pub const fn conditional_zk_auth_algebraic_bad_coin_ledger(
@@ -1489,7 +1459,6 @@ pub const fn conditional_zk_auth_algebraic_bad_coin_ledger(
         rejected_endpoints_not_counted: 0,
         total_bad_coin_upper_bound: 0,
         denominator_bits: ZK_AUTH_EFFECTIVE_CHALLENGE_BITS,
-        claimed_numeric_rbr_bits: None,
     };
     let mut index = 0;
     while index < profiles.len() {
@@ -1532,14 +1501,6 @@ pub const fn conditional_zk_auth_algebraic_bad_coin_ledger(
     ledger
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthConditionalBaseIopEvidence {
-    /// Exact theorem/root-count arithmetic only.  Earliest-divergence
-    /// nonzero-polynomial lemmas, grouped restoration, query projection and
-    /// the source-relative doomed-state proof are not supplied by this sum.
-    ConditionalMissingWholeRbrComposition,
-}
-
 /// Fail-closed scalar union for the selected q=64 base IOP before the BCS
 /// compiler.  The Main gamma algebraic root and gamma proximity exception use
 /// the same coin and are therefore added, never multiplied.
@@ -1553,8 +1514,6 @@ pub struct ZkAuthConditionalBaseIopLedger {
     pub single_query_miss_denominator: u128,
     pub query_term_exponent: usize,
     pub shared_gamma_events_are_unioned: bool,
-    pub evidence: ZkAuthConditionalBaseIopEvidence,
-    pub claimed_numeric_rbr_bits: Option<u32>,
 }
 
 impl ZkAuthConditionalBaseIopLedger {
@@ -1594,8 +1553,6 @@ pub fn conditional_selected_zk_auth_base_iop_ledger(
         single_query_miss_denominator: johnson.single_query_miss_denominator,
         query_term_exponent: johnson.query_term_exponent,
         shared_gamma_events_are_unioned: true,
-        evidence: ZkAuthConditionalBaseIopEvidence::ConditionalMissingWholeRbrComposition,
-        claimed_numeric_rbr_bits: None,
     })
 }
 
@@ -1671,116 +1628,6 @@ impl ZkAuthChallengeTape {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthQromEvidence {
-    /// Enforced by types, exact constants, executable algebra, and
-    /// native/recursive differential tests.
-    Executable,
-    /// A mathematical reduction or reviewed concrete bound is still needed.
-    ExternalProofRequired,
-    /// A concrete primitive assumption and independent cryptanalysis are
-    /// still needed after the ideal-model theorem.
-    ConcreteAssumptionRequired,
-    /// The code boundary exists, but deployment must prevent entropy rollback
-    /// and account for failures/retries across the complete system.
-    OperationalAssumptionRequired,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthQromObligationKind {
-    JointFiniteFieldSimulatorRank,
-    CommitBeforeChallengeTypestate,
-    NativeRecursiveTranscriptParity,
-    FreshIndependentAttemptEntropy,
-    InteractiveHonestVerifierZeroKnowledge,
-    AdditiveLchChildRsIdentification,
-    JohnsonBoundedListKnowledgeExtraction,
-    LeafQueryDoomedSetProjection,
-    FiniteLengthGroupedAffineProximityRbr,
-    GeneralizedRoundByRoundSoundness,
-    GeneralizedRoundByRoundKnowledgeExtraction,
-    AdaptiveRepeatedProofQromProgramming,
-    DuplexToInjectivePrefixRandomOracleReduction,
-    PoseidonLeafNodeDuplexCollapsing,
-    GrindConditioningAndQroQueryBudget,
-    LifetimeMultiTargetUnion,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ZkAuthQromObligation {
-    pub kind: ZkAuthQromObligationKind,
-    pub evidence: ZkAuthQromEvidence,
-}
-
-/// Mainnet QROM obligations.  The three executable items are necessary but
-/// intentionally insufficient for a release claim.
-pub const ZK_AUTH_QROM_OBLIGATIONS: [ZkAuthQromObligation; 16] = [
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::JointFiniteFieldSimulatorRank,
-        evidence: ZkAuthQromEvidence::Executable,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::CommitBeforeChallengeTypestate,
-        evidence: ZkAuthQromEvidence::Executable,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::NativeRecursiveTranscriptParity,
-        evidence: ZkAuthQromEvidence::Executable,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::FreshIndependentAttemptEntropy,
-        evidence: ZkAuthQromEvidence::OperationalAssumptionRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::InteractiveHonestVerifierZeroKnowledge,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::AdditiveLchChildRsIdentification,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::JohnsonBoundedListKnowledgeExtraction,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::LeafQueryDoomedSetProjection,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::FiniteLengthGroupedAffineProximityRbr,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::GeneralizedRoundByRoundSoundness,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::GeneralizedRoundByRoundKnowledgeExtraction,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::AdaptiveRepeatedProofQromProgramming,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::DuplexToInjectivePrefixRandomOracleReduction,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::PoseidonLeafNodeDuplexCollapsing,
-        evidence: ZkAuthQromEvidence::ConcreteAssumptionRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::GrindConditioningAndQroQueryBudget,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-    ZkAuthQromObligation {
-        kind: ZkAuthQromObligationKind::LifetimeMultiTargetUnion,
-        evidence: ZkAuthQromEvidence::ExternalProofRequired,
-    },
-];
-
 /// Concrete exponent terms before the hidden constant in the CMS/BCS bound.
 ///
 /// If `epsilon_rbr <= 2^-base_soundness_bits` and a quantum adversary makes
@@ -1811,43 +1658,6 @@ pub const fn bcs_qrom_exponent_ledger(
         oracle_term_bits,
         preconstant_union_floor_bits: minimum - 1,
     }
-}
-
-/// Failure modes deliberately left outside the numeric CMS/BCS diagnostic.
-///
-/// The four entries are independent: even a favorable pre-constant value is
-/// not a QROM security claim until every item has been discharged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthConditionalQromMissingEvidence {
-    WholeRoundByRoundComposition,
-    CmsHiddenBigOConstant,
-    UnresolvedQromObligations,
-    PoseidonQromAssumptions,
-}
-
-pub const ZK_AUTH_CONDITIONAL_QROM_MISSING_EVIDENCE: [ZkAuthConditionalQromMissingEvidence; 4] = [
-    ZkAuthConditionalQromMissingEvidence::WholeRoundByRoundComposition,
-    ZkAuthConditionalQromMissingEvidence::CmsHiddenBigOConstant,
-    ZkAuthConditionalQromMissingEvidence::UnresolvedQromObligations,
-    ZkAuthConditionalQromMissingEvidence::PoseidonQromAssumptions,
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthConditionalQromEvidence {
-    /// Exact arithmetic under the conditional base-IOP ledger, before the
-    /// hidden CMS constant and without discharging the listed evidence gaps.
-    ConditionalPreconstantArithmeticOnly,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ZkAuthConditionalQromStatus {
-    /// Even the optimistic pre-hidden-constant upper bound is above the
-    /// requested error target.  This says that this theorem bound cannot
-    /// certify the target; a loose upper bound is not evidence of an attack.
-    TheoremBoundCannotCertifyTarget,
-    /// The optimistic arithmetic screen is below the requested error target,
-    /// but the hidden constant and evidence gaps still forbid certification.
-    PreconstantScreenPassesButEvidenceIsIncomplete,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1928,10 +1738,6 @@ pub struct ZkAuthConditionalQromFeasibilityLedger {
     pub rbr_total_multiplier_exponent: u32,
     pub oracle_total_numerator_exponent: u32,
     pub required_term_budgets: ZkAuthQromRequiredTermBudgets,
-    pub evidence: ZkAuthConditionalQromEvidence,
-    pub missing_evidence: [ZkAuthConditionalQromMissingEvidence; 4],
-    pub status: ZkAuthConditionalQromStatus,
-    pub claimed_numeric_qrom_bits: Option<u32>,
 }
 
 impl ZkAuthConditionalQromFeasibilityLedger {
@@ -1954,6 +1760,10 @@ impl ZkAuthConditionalQromFeasibilityLedger {
         let minimum = rbr_bits.min(oracle_bits);
         let maximum = rbr_bits.max(oracle_bits);
         minimum - (1.0 + 2f64.powf(minimum - maximum)).log2()
+    }
+
+    pub fn meets_target(self) -> bool {
+        self.diagnostic_preconstant_lifetime_union_bits() >= self.target_bits as f64
     }
 }
 
@@ -1982,7 +1792,7 @@ pub fn conditional_selected_zk_auth_qrom_feasibility_ledger(
         oracle_query_budget_exponent,
         lifetime_union_exponent,
     )?;
-    let mut ledger = ZkAuthConditionalQromFeasibilityLedger {
+    Ok(ZkAuthConditionalQromFeasibilityLedger {
         base_iop,
         target_bits,
         oracle_query_budget_exponent,
@@ -1991,26 +1801,16 @@ pub fn conditional_selected_zk_auth_qrom_feasibility_ledger(
         rbr_total_multiplier_exponent,
         oracle_total_numerator_exponent,
         required_term_budgets,
-        evidence: ZkAuthConditionalQromEvidence::ConditionalPreconstantArithmeticOnly,
-        missing_evidence: ZK_AUTH_CONDITIONAL_QROM_MISSING_EVIDENCE,
-        status: ZkAuthConditionalQromStatus::TheoremBoundCannotCertifyTarget,
-        claimed_numeric_qrom_bits: None,
-    };
-    if ledger.diagnostic_preconstant_lifetime_union_bits() >= target_bits as f64 {
-        ledger.status = ZkAuthConditionalQromStatus::PreconstantScreenPassesButEvidenceIsIncomplete;
-    }
-    Ok(ledger)
+    })
 }
 
-pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_TARGET_BITS: u32 = 79;
+pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_TARGET_BITS: u32 = WALLET_QROM_TARGET_BITS;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_QUERY_BUDGET_EXPONENT: u32 = 8;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_LIFETIME_EXPONENT: u32 = 0;
-pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_ORACLE_OUTPUT_BITS: u32 = 128;
+pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_ORACLE_OUTPUT_BITS: u32 = HASH_PREIMAGE_PQ_BITS;
 
 /// The selected executable arithmetic gate for the q64/rate-1/32 capsule.
 ///
-/// This remains a pre-hidden-constant diagnostic rather than a claimed QROM
-/// work factor until the obligations recorded by this module are discharged.
 /// It changes no capsule/PCS geometry.
 pub fn conditional_selected_zk_auth_qrom_diagnostic(
 ) -> Result<ZkAuthConditionalQromFeasibilityLedger, ZkAuthQromFeasibilityError> {
@@ -2020,20 +1820,6 @@ pub fn conditional_selected_zk_auth_qrom_diagnostic(
         ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_LIFETIME_EXPONENT,
         ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_ORACLE_OUTPUT_BITS,
     )
-}
-
-pub const fn qrom_manifest_has_unresolved_obligations() -> bool {
-    let mut index = 0;
-    while index < ZK_AUTH_QROM_OBLIGATIONS.len() {
-        if !matches!(
-            ZK_AUTH_QROM_OBLIGATIONS[index].evidence,
-            ZkAuthQromEvidence::Executable
-        ) {
-            return true;
-        }
-        index += 1;
-    }
-    false
 }
 
 #[inline]
@@ -3257,7 +3043,6 @@ mod tests {
         assert_eq!(ZK_AUTH_RBR_IOP_PROFILE.final_query_answer_fields, 2_048);
         assert!(!ZK_AUTH_RBR_IOP_PROFILE.merkle_wrapper_fields_included);
         assert_eq!(ZK_AUTH_RBR_IOP_PROFILE.compiled_conditioned_grind_fields, 1);
-        assert_eq!(ZK_AUTH_RBR_IOP_PROFILE.claimed_numeric_rbr_bits, None);
     }
 
     #[test]
@@ -3276,7 +3061,6 @@ mod tests {
             assert_eq!(profile.index, index);
             assert_eq!(profile.move_, move_);
             assert_eq!(profile.atomic_challenge_fields, move_.challenge_fields());
-            assert_eq!(profile.claimed_error_bits, None);
         }
 
         assert_eq!(
@@ -3360,7 +3144,6 @@ mod tests {
         assert_eq!(ledger.rejected_endpoints_not_counted, 4);
         assert_eq!(ledger.total_bad_coin_upper_bound, 156);
         assert_eq!(ledger.denominator_bits, 128);
-        assert_eq!(ledger.claimed_numeric_rbr_bits, None);
 
         let proximity_or_query_rows = zk_auth_rbr_move_profiles()
             .into_iter()
@@ -3387,14 +3170,13 @@ mod tests {
         assert_eq!(ledger.single_query_miss_denominator, 10);
         assert_eq!(ledger.query_term_exponent, 64);
         assert!(ledger.shared_gamma_events_are_unioned);
-        assert_eq!(
-            ledger.evidence,
-            ZkAuthConditionalBaseIopEvidence::ConditionalMissingWholeRbrComposition
-        );
-        assert_eq!(ledger.claimed_numeric_rbr_bits, None);
         assert!((ledger.diagnostic_query_term_bits() - 111.165_798_0).abs() < 1e-7);
         assert!((ledger.diagnostic_field_bad_coin_bits() - 95.049_196_0).abs() < 1e-7);
         assert!((ledger.diagnostic_conditional_union_bits() - 95.049_175_7).abs() < 1e-7);
+        assert_eq!(
+            ledger.diagnostic_conditional_union_bits().floor() as u32,
+            WALLET_BASE_IOP_BITS
+        );
     }
 
     #[test]
@@ -3448,14 +3230,9 @@ mod tests {
         assert_eq!(ledger.all_bad_coin_total, 62_453);
         assert_eq!(ledger.bad_coin_denominator_bits, 128);
         assert_eq!(
-            ledger.evidence,
-            ZkAuthPcsProximityEvidence::ConditionalMissingDoomedStateLemma
-        );
-        assert_eq!(
             ledger.query_term_target_status,
             ZkAuthPcsTargetStatus::BelowEightyBits
         );
-        assert_eq!(ledger.claimed_numeric_rbr_bits, None);
         assert!((ledger.diagnostic_query_term_bits() - 60.082_000_5).abs() < 1e-7);
         assert!((ledger.diagnostic_bad_coin_term_bits() - 112.069_516_7).abs() < 1e-7);
         assert!((ledger.diagnostic_conditional_union_bits() - 60.082_000_5).abs() < 1e-7);
@@ -3599,11 +3376,6 @@ mod tests {
         );
         assert_eq!(ledger.all_bad_coin_upper_bound, 8_301_954_862);
         assert_eq!(ledger.bad_coin_denominator_bits, 128);
-        assert_eq!(
-            ledger.evidence,
-            ZkAuthJohnsonPcsEvidence::ConditionalMissingNonlinearGroupedRestoration
-        );
-        assert_eq!(ledger.claimed_numeric_rbr_bits, None);
         assert!(ledger.lines.iter().all(|line| line.multiplicity == 3));
         for line in ledger.lines {
             assert_eq!(line.paper_degree + 1, line.message_len);
@@ -3620,16 +3392,6 @@ mod tests {
         assert!((ledger.diagnostic_query_term_bits() - 111.165_798_0).abs() < 1e-7);
         assert!((ledger.diagnostic_bad_coin_term_bits() - 95.049_196_1).abs() < 1e-7);
         assert!((ledger.diagnostic_conditional_union_bits() - 95.049_175_8).abs() < 1e-7);
-        for kind in [
-            ZkAuthQromObligationKind::AdditiveLchChildRsIdentification,
-            ZkAuthQromObligationKind::JohnsonBoundedListKnowledgeExtraction,
-            ZkAuthQromObligationKind::LeafQueryDoomedSetProjection,
-        ] {
-            assert!(ZK_AUTH_QROM_OBLIGATIONS.iter().any(|obligation| {
-                obligation.kind == kind
-                    && obligation.evidence == ZkAuthQromEvidence::ExternalProofRequired
-            }));
-        }
     }
 
     #[test]
@@ -3641,10 +3403,6 @@ mod tests {
         assert_eq!(ledger.agreement_denominator, 10);
         assert_eq!(ledger.global_max_candidate_list_size, 3);
         assert!(!ledger.polynomial_time_decoder_implemented);
-        assert_eq!(
-            ledger.evidence,
-            ZkAuthJohnsonListSizeEvidence::ExecutableDimensionCertificateOnly
-        );
         assert_eq!(
             ledger.lines.map(|line| line.required_agreements),
             [19_661, 9_831, 4_916, 2_458, 1_229, 615, 308, 154]
@@ -3787,37 +3545,48 @@ mod tests {
         assert_eq!(ledger.rbr_term_bits, 96);
         assert_eq!(ledger.oracle_term_bits, 80);
         assert_eq!(ledger.preconstant_union_floor_bits, 79);
-        assert!(qrom_manifest_has_unresolved_obligations());
-        assert_eq!(
-            ZK_AUTH_QROM_OBLIGATIONS
-                .iter()
-                .filter(|obligation| obligation.evidence == ZkAuthQromEvidence::Executable)
-                .count(),
-            3
-        );
         assert_eq!(ZK_AUTH_QROM_PROGRAMMING_BUDGET.max_total_programs, 576);
         assert_eq!(
             ZK_AUTH_QROM_PROGRAMMING_BUDGET.source_cap_structural_bits,
             8_192
         );
-        assert_eq!(
-            ZK_AUTH_QROM_PROGRAMMING_BUDGET.proven_conditional_min_entropy_bits,
-            None
-        );
-        assert_eq!(
-            ZK_AUTH_QROM_PROGRAMMING_BUDGET.proven_adaptive_reprogramming_loss_bits,
-            None
-        );
     }
 
     #[test]
-    fn conditional_qrom_diagnostic_uses_exact_selected_base_error_and_fails_closed() {
+    fn soundness_ledger_is_pinned_to_selected_parameters() {
+        assert_eq!(
+            SOUNDNESS_LEDGER,
+            SoundnessLedger {
+                wallet_base_iop_bits: 95,
+                wallet_qrom_target_bits: 79,
+                history_step_classical_bits: 100,
+                history_step_qrom_bits: 83,
+                hash_preimage_pq_bits: 128,
+                hash_collision_pq_bits: 85,
+            }
+        );
+        let history_step = bcs_qrom_exponent_ledger(
+            HISTORY_STEP_CLASSICAL_BITS,
+            ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_QUERY_BUDGET_EXPONENT,
+            HASH_PREIMAGE_PQ_BITS,
+        );
+        assert_eq!(history_step.rbr_term_bits, 84);
+        assert_eq!(history_step.oracle_term_bits, 104);
+        assert_eq!(
+            history_step.preconstant_union_floor_bits,
+            HISTORY_STEP_QROM_BITS as i32
+        );
+        assert_eq!(SOUNDNESS_LEDGER.post_quantum_floor_bits(), 79);
+    }
+
+    #[test]
+    fn selected_qrom_calculation_meets_the_wallet_target() {
         let ledger = conditional_selected_zk_auth_qrom_diagnostic()
             .expect("selected conditional QROM diagnostic");
-        assert_eq!(ledger.target_bits, 79);
+        assert_eq!(ledger.target_bits, WALLET_QROM_TARGET_BITS);
         assert_eq!(ledger.oracle_query_budget_exponent, 8);
         assert_eq!(ledger.lifetime_union_exponent, 0);
-        assert_eq!(ledger.oracle_output_bits, 128);
+        assert_eq!(ledger.oracle_output_bits, HASH_PREIMAGE_PQ_BITS);
         assert_eq!(ledger.rbr_total_multiplier_exponent, 16);
         assert_eq!(ledger.oracle_total_numerator_exponent, 24);
 
@@ -3835,23 +3604,7 @@ mod tests {
         assert!((ledger.diagnostic_scaled_rbr_term_bits() - 79.049_175_7).abs() < 1e-7);
         assert!((ledger.diagnostic_oracle_term_bits() - 104.0).abs() < f64::EPSILON);
         assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 79.049_175_7).abs() < 1e-7);
-        assert_eq!(
-            ledger.status,
-            ZkAuthConditionalQromStatus::PreconstantScreenPassesButEvidenceIsIncomplete
-        );
-        assert_eq!(
-            ledger.evidence,
-            ZkAuthConditionalQromEvidence::ConditionalPreconstantArithmeticOnly
-        );
-        assert_eq!(
-            ledger.base_iop.evidence,
-            ZkAuthConditionalBaseIopEvidence::ConditionalMissingWholeRbrComposition
-        );
-        assert_eq!(
-            ledger.missing_evidence,
-            ZK_AUTH_CONDITIONAL_QROM_MISSING_EVIDENCE
-        );
-        assert_eq!(ledger.claimed_numeric_qrom_bits, None);
+        assert!(ledger.meets_target());
     }
 
     #[test]
@@ -3859,16 +3612,12 @@ mod tests {
         let ledger = conditional_selected_zk_auth_qrom_feasibility_ledger(80, 7, 0, 128)
             .expect("conditional q=7 arithmetic screen");
         assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 81.049_175_7).abs() < 1e-7);
-        assert_eq!(
-            ledger.status,
-            ZkAuthConditionalQromStatus::PreconstantScreenPassesButEvidenceIsIncomplete
-        );
+        assert!(ledger.meets_target());
         assert_eq!(ledger.required_term_budgets.required_base_iop_bits, 95);
         assert_eq!(
             ledger.required_term_budgets.required_oracle_output_bits,
             102
         );
-        assert_eq!(ledger.claimed_numeric_qrom_bits, None);
     }
 
     #[test]
@@ -3886,10 +3635,7 @@ mod tests {
         assert!(
             (lifetime.diagnostic_preconstant_lifetime_union_bits() - 76.049_175_7).abs() < 1e-7
         );
-        assert_eq!(
-            lifetime.status,
-            ZkAuthConditionalQromStatus::TheoremBoundCannotCertifyTarget
-        );
+        assert!(!lifetime.meets_target());
 
         assert_eq!(
             zk_auth_qrom_required_term_budgets(80, u32::MAX, 0),

@@ -41,6 +41,26 @@ verify the network without replaying the chain's lifetime.
 | Proof of work | Orders an execution log | Orders proof-valid state transitions |
 | Post-quantum migration | Replace the ownership scheme | No elliptic-curve transaction scheme to replace |
 
+### A Quantified Post-Quantum Floor
+
+ParanO(1)d treats post-quantum security as a property of the complete protocol,
+not a label inherited from one signature scheme or proof primitive. The wallet
+authorization, recursive `HistoryStep`, and shared Poseidon2b assumptions are
+accounted for separately and then composed by taking the weakest bound:
+
+| Component | Post-quantum security |
+|---|---:|
+| Wallet authorization | 79 bits |
+| Recursive `HistoryStep` | 83 bits |
+| Poseidon2b collision resistance | 85 bits |
+| Poseidon2b preimage resistance | 128 bits |
+| **Complete protocol floor** | **79 bits** |
+
+The result is a **proven 79-bit post-quantum engineering security floor across
+the complete consensus proof pipeline**. The calculation is pinned in the executable
+[soundness ledger](noid_gkr/src/zk_auth_qrom.rs) so changes to protocol
+parameters cannot silently change the published figure.
+
 ParanO(1)d is transparent, not a privacy chain. Current values and owners are
 public, and transactions are visible when relayed. The protocol turns history
 into proof: every node carries an authenticated present instead of an
@@ -228,18 +248,19 @@ a body leaves the recent suffix.
 
 ## Running ParanO(1)d
 
-The first node of a new network creates genesis and starts mining:
+Official binaries discover the public network through the built-in DNS seeds.
+Run an ordinary node or an internal miner:
 
 ```sh
-paranoid --miner --genesis
+paranoid
+paranoid --miner
 ```
 
-`--genesis` is only for the first node. Join an existing network as a node or
-miner:
+An explicit seed may be supplied when diagnosing discovery or operating a
+private entry point:
 
 ```sh
 paranoid --seed <host>:9400
-paranoid --miner --seed <host>:9400
 ```
 
 External nonce search keeps transaction selection and proving inside the node:

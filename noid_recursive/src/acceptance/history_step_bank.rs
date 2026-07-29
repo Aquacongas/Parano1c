@@ -1406,6 +1406,15 @@ mod tests {
     }
 
     #[test]
+    fn history_step_soundness_ledger_matches_basefold_target() {
+        assert_eq!(
+            noid_gkr::zk_auth_qrom::HISTORY_STEP_CLASSICAL_BITS,
+            noid_ivc_core::pcs::BASEFOLD_UDR_TARGET_BITS
+        );
+        assert_eq!(noid_gkr::zk_auth_qrom::HISTORY_STEP_QROM_BITS, 83);
+    }
+
+    #[test]
     fn common_layout_retains_all_variable_width_lanes() {
         let layout = history_step_bank_io_layout();
         assert_eq!(layout.matrix_lanes.len(), HISTORY_STEP_CLASS_COUNT);
