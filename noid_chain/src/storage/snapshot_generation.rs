@@ -33,7 +33,8 @@ use crate::consensus::params::{
     BLOCK_MAX_ACTIONS, LOG_SLOTS_MAX, RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH,
 };
 use crate::consensus::wire_limits::{
-    MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+    MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_SEGMENT_BYTES,
+    MAX_SNAPSHOT_MANIFEST_SEGMENTS,
 };
 use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, StateHash};
 use crate::fri_state::{SlotValue, LOG_SEGMENT_SIZE};
@@ -46,16 +47,15 @@ use crate::storage::serial::{
     max_encoded_segment_len_for_eff_log, SparseSegmentView,
 };
 use crate::storage::{MdbxStore, StoreError};
-use crate::{AcceptedBlockBundle, MAX_ACCEPTED_BLOCK_BUNDLE_BYTES};
-
-const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V5";
+const SNAPSHOT_MANIFEST_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_MANIFEST_V6";
 const SNAPSHOT_PAYLOAD_DOMAIN: &[u8] = b"NOID_DISK_SNAPSHOT_GENERATION_PAYLOAD_V1";
-const SNAPSHOT_GENERATION_VERSION: u32 = 5;
+const SNAPSHOT_GENERATION_VERSION: u32 = 6;
 const MANIFEST_FILE_NAME: &str = "manifest.bin";
 const MANIFEST_TEMP_FILE_NAME: &str = ".manifest.tmp";
 const SEGMENTS_DIRECTORY_NAME: &str = "segments";
 const BRIDGE_DIRECTORY_NAME: &str = "bridge";
 const BOUNDARY_TERMINAL_FILE_NAME: &str = "boundary.history-step";
+const BRIDGE_TERMINAL_FILE_NAME: &str = "bridge.history-step";
 
 /// A manifest contains only bounded segment metadata, never segment payloads.
 /// The complete `u16` segment namespace occupies less than 8 MiB here.
@@ -77,9 +77,10 @@ pub struct SnapshotSegmentDescriptor {
     pub encoded_len: u32,
 }
 
-/// One immutable accepted-block bundle following the finalized state
-/// boundary. Generations hard-link overlapping descriptors, so advancing the
-/// rolling snapshot normally writes only newly accepted suffix blocks.
+/// One immutable canonical block body following the finalized state boundary.
+/// The complete suffix shares one terminal at `bridge_tip_height`.
+/// Generations hard-link overlapping descriptors, so advancing the rolling
+/// snapshot normally writes only newly accepted suffix blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotBridgeDescriptor {
     pub height: u64,
@@ -108,6 +109,10 @@ pub struct SnapshotGenerationManifest {
     pub bridge_tip_height: u64,
     pub bridge_tip_hash: [u8; 32],
     pub bridge_cumulative_chainwork: [u8; 32],
+    /// One full HistoryStep terminal covering the complete bridge. Empty only
+    /// when the bridge itself is empty and the boundary terminal is sufficient.
+    pub bridge_terminal_len: u32,
+    pub bridge_terminal_digest: [u8; 32],
     pub bridge: Vec<SnapshotBridgeDescriptor>,
     /// Strictly increasing non-empty segment descriptors.  Payloads live in
     /// separate files and are never accumulated in this vector.
@@ -179,12 +184,26 @@ impl SnapshotGeneration {
         )
     }
 
+    /// Read the one exact terminal covering the complete immutable bridge.
+    pub fn read_bridge_terminal(&self) -> Result<Vec<u8>, SnapshotGenerationError> {
+        if self.manifest.bridge_tip_height == self.manifest.target_height {
+            return self.read_boundary_terminal();
+        }
+        read_authenticated_payload(
+            &self.directory.join(BRIDGE_TERMINAL_FILE_NAME),
+            self.manifest.bridge_terminal_len,
+            self.manifest.bridge_terminal_digest,
+            MAX_HISTORY_STEP_TERMINAL_BYTES,
+            "snapshot bridge terminal",
+        )
+    }
+
     /// Read one exact terminal owned by this immutable generation.
     ///
-    /// The boundary terminal is stored separately; bridge terminals remain
-    /// inside their authenticated accepted bundles. Exposing this uniform
-    /// lookup lets compact snapshot clients request only the single recursive
-    /// terminal at the sealed suffix tip even if live pruning has advanced.
+    /// The boundary and bridge-tip terminals are stored separately. Exposing
+    /// this uniform lookup lets compact snapshot clients request only the
+    /// single recursive terminal at the sealed suffix tip even if live pruning
+    /// has advanced.
     pub fn read_terminal_at(
         &self,
         height: u64,
@@ -193,20 +212,15 @@ impl SnapshotGeneration {
         if height == self.manifest.target_height && block_hash == self.manifest.target_hash {
             return self.read_boundary_terminal();
         }
-        let descriptor = self
-            .manifest
-            .bridge_block(height)
-            .filter(|descriptor| descriptor.block_hash == block_hash)
-            .ok_or(SnapshotGenerationError::BridgeBlockNotInManifest(height))?;
-        let bundle = self.read_bridge_block(descriptor.height)?;
-        Ok(bundle.history_step_terminal_bytes().to_vec())
+        if height == self.manifest.bridge_tip_height && block_hash == self.manifest.bridge_tip_hash
+        {
+            return self.read_bridge_terminal();
+        }
+        Err(SnapshotGenerationError::BridgeBlockNotInManifest(height))
     }
 
-    /// Read and authenticate one immutable post-snapshot accepted bundle.
-    pub fn read_bridge_block(
-        &self,
-        height: u64,
-    ) -> Result<AcceptedBlockBundle, SnapshotGenerationError> {
+    /// Read and authenticate one immutable post-snapshot block body.
+    pub fn read_bridge_block_body(&self, height: u64) -> Result<Vec<u8>, SnapshotGenerationError> {
         let descriptor = self
             .manifest
             .bridge_block(height)
@@ -215,15 +229,15 @@ impl SnapshotGeneration {
             &bridge_path(&self.directory, height),
             descriptor.encoded_len,
             descriptor.encoded_digest,
-            MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
+            MAX_BLOCK_BYTES,
             "snapshot bridge block",
         )?;
-        let bundle = AcceptedBlockBundle::decode(&encoded)
+        let block = crate::Block::from_bytes(&encoded)
             .map_err(|_| SnapshotGenerationError::InvalidBridgeBlock(height))?;
-        if bundle.height() != height || bundle.block_hash() != descriptor.block_hash {
+        if block.header.height != height || block_id(&block.header) != descriptor.block_hash {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
-        Ok(bundle)
+        Ok(encoded)
     }
 
     /// Read and authenticate one encoded segment without expanding its empty
@@ -317,6 +331,7 @@ pub enum SnapshotGenerationError {
     InvalidSegment(u16, &'static str),
     SegmentNotInManifest(u16),
     MissingBoundaryTerminal(u64),
+    MissingBridgeTerminal(u64),
     MissingBridgeBlock(u64),
     InvalidBridgeBlock(u64),
     BridgeBlockNotInManifest(u64),
@@ -377,6 +392,9 @@ impl std::fmt::Display for SnapshotGenerationError {
             }
             Self::MissingBoundaryTerminal(height) => {
                 write!(f, "snapshot boundary terminal {height} is missing")
+            }
+            Self::MissingBridgeTerminal(height) => {
+                write!(f, "snapshot bridge terminal {height} is missing")
             }
             Self::MissingBridgeBlock(height) => {
                 write!(f, "snapshot bridge block {height} is missing")
@@ -739,24 +757,19 @@ pub fn export_snapshot_generation(
     let mut expected_parent = target_hash;
     for height in target_height.saturating_add(1)..=tip_height {
         let encoded = snapshot
-            .get_accepted_block_bundle(height)?
+            .get_recent_block(height)?
             .ok_or(SnapshotGenerationError::MissingBridgeBlock(height))?;
-        if encoded.is_empty() || encoded.len() > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES {
+        if encoded.is_empty() || encoded.len() > MAX_BLOCK_BYTES {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
-        let bundle = AcceptedBlockBundle::decode(&encoded)
+        let block = crate::Block::from_bytes(&encoded)
             .map_err(|_| SnapshotGenerationError::InvalidBridgeBlock(height))?;
-        let block = crate::Block::from_bytes(bundle.block_bytes())
-            .map_err(|_| SnapshotGenerationError::InvalidBridgeBlock(height))?;
-        if bundle.height() != height
-            || block.header.height != height
-            || block.header.prev_block_hash != expected_parent
-        {
+        if block.header.height != height || block.header.prev_block_hash != expected_parent {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
         let canonical = canonical_header(&snapshot, height)?;
         let block_hash = block_id(&canonical);
-        if canonical != block.header || bundle.block_hash() != block_hash {
+        if canonical != block.header {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(height));
         }
         expected_parent = block_hash;
@@ -780,6 +793,27 @@ pub fn export_snapshot_generation(
     }
     sync_directory(&bridge_directory)?;
 
+    let (bridge_terminal_len, bridge_terminal_digest) = if bridge_span == 0 {
+        (0, [0; 32])
+    } else {
+        let terminal = snapshot
+            .get_history_step_terminal_at(tip_height, tip_hash)?
+            .ok_or(SnapshotGenerationError::MissingBridgeTerminal(tip_height))?;
+        if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
+            return Err(SnapshotGenerationError::InvalidPayload(
+                "snapshot bridge terminal length is outside bounds",
+            ));
+        }
+        let terminal_len = u32::try_from(terminal.len()).map_err(|_| {
+            SnapshotGenerationError::InvalidPayload(
+                "snapshot bridge terminal length does not fit u32",
+            )
+        })?;
+        let terminal_digest = snapshot_payload_digest(&terminal);
+        write_synced_file(&temporary.path().join(BRIDGE_TERMINAL_FILE_NAME), &terminal)?;
+        (terminal_len, terminal_digest)
+    };
+
     let manifest = SnapshotGenerationManifest {
         version: SNAPSHOT_GENERATION_VERSION,
         target_height,
@@ -797,6 +831,8 @@ pub fn export_snapshot_generation(
         bridge_cumulative_chainwork: snapshot
             .get_chain_work(tip_height)?
             .ok_or(SnapshotGenerationError::MissingChainwork(tip_height))?,
+        bridge_terminal_len,
+        bridge_terminal_digest,
         bridge,
         segments: entries,
     };
@@ -1253,11 +1289,24 @@ fn validate_manifest(manifest: &SnapshotGenerationManifest) -> Result<(), Snapsh
             "snapshot bridge length is outside retention bounds",
         ));
     }
+    if bridge_span == 0 {
+        if manifest.bridge_terminal_len != 0 || manifest.bridge_terminal_digest != [0; 32] {
+            return Err(SnapshotGenerationError::Corrupt(
+                "empty snapshot bridge carries a separate terminal",
+            ));
+        }
+    } else if manifest.bridge_terminal_len == 0
+        || manifest.bridge_terminal_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+    {
+        return Err(SnapshotGenerationError::Corrupt(
+            "snapshot bridge terminal length is outside bounds",
+        ));
+    }
     let mut expected_height = manifest.target_height.saturating_add(1);
     for descriptor in &manifest.bridge {
         if descriptor.height != expected_height
             || descriptor.encoded_len == 0
-            || descriptor.encoded_len as usize > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES
+            || descriptor.encoded_len as usize > MAX_BLOCK_BYTES
         {
             return Err(SnapshotGenerationError::InvalidBridgeBlock(
                 descriptor.height,
@@ -1388,7 +1437,7 @@ fn segment_path(generation_directory: &Path, segment_id: u16) -> PathBuf {
 fn bridge_path(generation_directory: &Path, height: u64) -> PathBuf {
     generation_directory
         .join(BRIDGE_DIRECTORY_NAME)
-        .join(format!("{height:020}.bundle"))
+        .join(format!("{height:020}.block"))
 }
 
 fn snapshot_payload_digest(bytes: &[u8]) -> [u8; 32] {
@@ -1551,6 +1600,8 @@ mod tests {
             bridge_tip_height: 1,
             bridge_tip_hash: [1; 32],
             bridge_cumulative_chainwork: [2; 32],
+            bridge_terminal_len: 0,
+            bridge_terminal_digest: [0; 32],
             bridge: Vec::new(),
             segments: Vec::new(),
         };
@@ -1607,6 +1658,8 @@ mod tests {
                 bridge_tip_height: 1,
                 bridge_tip_hash: [1; 32],
                 bridge_cumulative_chainwork: [2; 32],
+                bridge_terminal_len: 0,
+                bridge_terminal_digest: [0; 32],
                 bridge: Vec::new(),
                 segments: vec![SnapshotSegmentDescriptor {
                     segment_id: 7,
@@ -1788,6 +1841,7 @@ mod tests {
         .encode_prefix()
         .to_vec();
         terminal.push(1);
+        let grandchild_terminal = terminal.clone();
         let bundle =
             crate::AcceptedBlockBundle::try_from_parts(grandchild_block.to_bytes(), terminal)
                 .unwrap();
@@ -1830,7 +1884,11 @@ mod tests {
         assert_eq!(bridged.manifest().bridge_tip_hash, grandchild_hash);
         assert_eq!(bridged.manifest().bridge.len(), 1);
         assert_eq!(bridged.read_boundary_terminal().unwrap(), child_terminal);
-        assert_eq!(bridged.read_bridge_block(2).unwrap(), bundle);
+        assert_eq!(
+            bridged.read_bridge_block_body(2).unwrap(),
+            grandchild_block.to_bytes()
+        );
+        assert_eq!(bridged.read_bridge_terminal().unwrap(), grandchild_terminal);
 
         let third = export_snapshot_generation(&store, exports.path(), 2, Some(&second)).unwrap();
         assert_ne!(

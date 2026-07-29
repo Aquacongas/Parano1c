@@ -3415,12 +3415,6 @@ async fn handle_swarm_event(
                 let loaded = tokio::task::spawn_blocking(move || {
                     match payload_kind {
                         RecentBlockPayloadKind::Complete => {
-                            if let Some(generation) = leased_bridge {
-                                return generation
-                                    .read_bridge_block(height)
-                                    .ok()
-                                    .map(RecentBlockPayload::Complete);
-                            }
                             let ctx = chain.blocking_read();
                             match ctx.store.get_recent_accepted_block_bundle_bounded(height) {
                                 Ok(encoded) => decode_stored_accepted_block_bundle(height, encoded)
@@ -3435,13 +3429,11 @@ async fn handle_swarm_event(
                             if let Some(generation) = leased_bridge {
                                 let mut bodies = Vec::with_capacity(count as usize);
                                 for current_height in height..=end_height {
-                                    let Ok(bundle) =
-                                        generation.read_bridge_block(current_height)
+                                    let Ok(block_bytes) =
+                                        generation.read_bridge_block_body(current_height)
                                     else {
                                         return None;
                                     };
-                                    let (block_bytes, terminal_bytes) = bundle.into_parts();
-                                    drop(terminal_bytes);
                                     bodies.push(block_bytes);
                                 }
                                 return Some(RecentBlockPayload::BlockBodies(bodies));
@@ -3528,9 +3520,8 @@ async fn handle_swarm_event(
                 let manifest = generation.manifest();
                 let exact_boundary = manifest.target_height == request_height
                     && manifest.target_hash == request_hash;
-                let exact_bridge = manifest
-                    .bridge_block(request_height)
-                    .is_some_and(|descriptor| descriptor.block_hash == request_hash);
+                let exact_bridge = manifest.bridge_tip_height == request_height
+                    && manifest.bridge_tip_hash == request_hash;
                 if !exact_boundary && !exact_bridge {
                     return None;
                 }

@@ -228,61 +228,32 @@ impl MdbxHistoricalReadSnapshot<'_> {
         read_history_step_terminal(&self.txn, height, block_hash)
     }
 
-    /// Encode one canonical accepted-block bundle from this same pinned MVCC
-    /// view. Keeping state reconstruction and suffix capture under one read
-    /// transaction makes a published snapshot generation internally
-    /// immutable even while mining advances the live database.
-    pub(super) fn get_accepted_block_bundle(
-        &self,
-        height: u64,
-    ) -> Result<Option<Vec<u8>>, StoreError> {
+    /// Read one canonical retained block body from this same pinned MVCC view.
+    /// Snapshot generations authenticate the complete body sequence together
+    /// with the one full HistoryStep terminal at its final height; compact
+    /// recursive-suffix markers are local storage authority and never become
+    /// network proof payloads.
+    pub(super) fn get_recent_block(&self, height: u64) -> Result<Option<Vec<u8>>, StoreError> {
         let key = u64_key(height);
         let blocks = self.txn.open_table(Some(T_RECENT_BLOCKS))?;
-        let terminals = self.txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
         let block_len: Option<ObjectLength> = self.txn.get(&blocks, &key)?;
-        let terminal_len: Option<ObjectLength> = self.txn.get(&terminals, &key)?;
-
         let Some(ObjectLength(block_len)) = block_len else {
             return Ok(None);
         };
-        let ObjectLength(terminal_len) = terminal_len.ok_or(StoreError::Decode(
-            "accepted block is missing its HistoryStep terminal",
-        ))?;
-        crate::AcceptedBlockBundle::validate_declared_lengths(
-            block_len as u64,
-            terminal_len as u64,
-        )
-        .map_err(|_| StoreError::Decode("accepted block bundle length is invalid"))?;
-
         let block_bytes: Vec<u8> = self
             .txn
             .get(&blocks, &key)?
             .ok_or(StoreError::Decode("accepted block disappeared during read"))?;
-        let terminal_bytes: Vec<u8> = self.txn.get(&terminals, &key)?.ok_or(StoreError::Decode(
-            "accepted HistoryStep terminal disappeared during read",
-        ))?;
-        if block_bytes.len() != block_len || terminal_bytes.len() != terminal_len {
+        if block_bytes.len() != block_len {
             return Err(StoreError::Decode(
-                "accepted block bundle length changed during read",
+                "accepted block length changed during read",
             ));
         }
         let block = crate::Block::from_bytes(&block_bytes)
             .map_err(|_| StoreError::Decode("accepted block body is malformed"))?;
-        if recursive_suffix_marker_authority(
-            &terminal_bytes,
-            height,
-            crate::block_header::semantic_header_id(&block.header),
-            None,
-        )
-        .is_some()
-        {
-            return Ok(None);
-        }
-        let bundle = crate::AcceptedBlockBundle::try_from_parts(block_bytes, terminal_bytes)
-            .map_err(|_| StoreError::Decode("accepted block bundle is malformed"))?;
-        if bundle.height() != height {
+        if block.header.height != height {
             return Err(StoreError::Decode(
-                "accepted block bundle height differs from its key",
+                "accepted block height differs from its key",
             ));
         }
         let headers = self.txn.open_table(Some(T_HEADERS))?;
@@ -290,11 +261,11 @@ impl MdbxHistoricalReadSnapshot<'_> {
         if header_raw
             .as_deref()
             .and_then(canonical_hash_from_encoded_header)
-            != Some(bundle.block_hash())
+            != Some(crate::block_header::block_id(&block.header))
         {
-            return Err(StoreError::Decode("accepted block bundle is not canonical"));
+            return Err(StoreError::Decode("accepted block body is not canonical"));
         }
-        Ok(Some(bundle.encode()))
+        Ok(Some(block_bytes))
     }
 
     pub(super) fn get_encoded_segment(

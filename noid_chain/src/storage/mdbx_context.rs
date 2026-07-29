@@ -2637,6 +2637,32 @@ mod tests {
             .store
             .durable_tip_has_verified_suffix_authority(context.tip_header(), context.tip_hash())
             .unwrap());
+
+        // A node which obtained this suffix through compact snapshot sync must
+        // immediately be able to export the same authenticated body sequence
+        // for the next node. Intermediate local markers are not proof payloads;
+        // the generation carries both bodies and only the final full terminal.
+        let exports = tempfile::tempdir().unwrap();
+        let generation =
+            crate::storage::export_snapshot_generation(&context.store, exports.path(), 0, None)
+                .unwrap();
+        assert_eq!(
+            generation.read_bridge_block_body(1).unwrap(),
+            first.block_bytes()
+        );
+        assert_eq!(
+            generation.read_bridge_block_body(2).unwrap(),
+            second.block_bytes()
+        );
+        assert_eq!(
+            generation.read_bridge_terminal().unwrap(),
+            second.history_step_terminal_bytes()
+        );
+        assert_eq!(
+            generation.read_terminal_at(2, second.block_hash()).unwrap(),
+            second.history_step_terminal_bytes()
+        );
+        assert!(generation.read_terminal_at(1, first.block_hash()).is_err());
     }
 
     #[test]
