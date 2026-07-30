@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use crate::block::Block;
 use crate::block_header::BlockHeader;
@@ -945,6 +946,7 @@ impl MdbxChainContext {
         undo: &crate::consensus::da_prune::BlockUndoLog,
         parent: &BlockHeader,
         parent_segment_summaries: &[ParentSegmentSummary],
+        retain_persisted_segments: bool,
     ) -> Result<(), MdbxContextError> {
         let tx_hashes = crate::block::try_compute_logical_txids(&block.transactions)
             .map_err(|_| MdbxContextError::Corrupt("committed logical tx stream is invalid"))?;
@@ -1028,10 +1030,12 @@ impl MdbxChainContext {
         self.finalized = new_finalized;
         if !staged {
             self.state.state.clear_dirty();
-            // The exact hierarchy is compact and current. Raw columns have
-            // reached MDBX atomically, so retain no full segment merely because
-            // it was touched by the latest block.
-            self.state.state.evict_all_persisted_segments();
+            if !retain_persisted_segments {
+                // The exact hierarchy is compact and current. Raw columns have
+                // reached MDBX atomically, so retain no full segment merely because
+                // it was touched by the latest block.
+                self.state.state.evict_all_persisted_segments();
+            }
         }
 
         let window = recent_header_lookback();
@@ -1157,6 +1161,7 @@ impl MdbxChainContext {
             &undo,
             &parent,
             &parent_segment_summaries,
+            false,
         )?;
         debug_assert_eq!(state_root, block.header.state_root);
         Ok((block, accepted_bundle))
@@ -1291,6 +1296,7 @@ impl MdbxChainContext {
             &undo,
             &parent,
             &parent_segment_summaries,
+            false,
         )?;
         Ok(state_root)
     }
@@ -1314,6 +1320,7 @@ impl MdbxChainContext {
         F: FnOnce(&Block, &mut ChainState) -> Result<[u8; 32], E>,
         E: std::fmt::Display,
     {
+        let total_started = Instant::now();
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
                 "recursive suffix cannot apply during reorg staging",
@@ -1359,6 +1366,7 @@ impl MdbxChainContext {
         }
 
         let parent = *self.tip_header();
+        let checks_started = Instant::now();
         let prev_timestamps = self.prev_timestamps();
         let finalized_active_counts = self.finalized_active_counts()?;
         let anchor = self.anchor_info();
@@ -1377,7 +1385,9 @@ impl MdbxChainContext {
             local_time,
             &anchor,
         )?;
+        let checks_elapsed = checks_started.elapsed();
 
+        let preload_started = Instant::now();
         let touched_segment_ids = self.segment_ids_for_block(&block);
         let parent_segment_summaries: Vec<ParentSegmentSummary> = touched_segment_ids
             .iter()
@@ -1389,6 +1399,8 @@ impl MdbxChainContext {
         let undo = build_undo_log(&self.state, &block).map_err(|_| {
             MdbxContextError::Corrupt("recursive suffix block has invalid logical transactions")
         })?;
+        let preload_elapsed = preload_started.elapsed();
+        let materialize_started = Instant::now();
         let state_root = match materialize_state(&block, &mut self.state) {
             Ok(state_root) => state_root,
             Err(error) => {
@@ -1403,6 +1415,7 @@ impl MdbxChainContext {
                 ));
             }
         };
+        let materialize_elapsed = materialize_started.elapsed();
         if state_root != block.header.state_root {
             return Err(self.reject_uncommitted_block(
                 &undo,
@@ -1440,17 +1453,29 @@ impl MdbxChainContext {
                 authority_tip_hash: block_id(&authority.tip_header),
             },
         };
+        let commit_started = Instant::now();
         self.commit_applied_next_block(
             commit_authorization,
             &block,
             &undo,
             &parent,
             &parent_segment_summaries,
+            !is_final,
         )?;
+        let commit_elapsed = commit_started.elapsed();
 
         authority.previous_hash = block_id(&block.header);
         authority.next_height = block.header.height.saturating_add(1);
         authority.complete = is_final;
+        tracing::debug!(
+            height = block.header.height,
+            checks_ms = checks_elapsed.as_millis(),
+            preload_undo_ms = preload_elapsed.as_millis(),
+            materialize_ms = materialize_elapsed.as_millis(),
+            commit_ms = commit_elapsed.as_millis(),
+            total_ms = total_started.elapsed().as_millis(),
+            "recursive snapshot suffix block profile"
+        );
         Ok(state_root)
     }
 

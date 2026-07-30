@@ -36,7 +36,7 @@ const RECORD_SIZE: usize = BLOCK_HEADER_WIRE_SIZE + 32 + 32;
 /// Matches the P2P header response cap.  Keeping this explicit prevents an
 /// accidentally unbounded caller-provided slice from becoming the temporary
 /// working set even though the on-disk chain itself is not RAM-bounded.
-pub const MAX_STAGED_HEADER_BATCH: usize = 512;
+pub const MAX_STAGED_HEADER_BATCH: usize = noid_p2p::header_sync_codec::MAX_HEADERS_PER_BATCH;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotHeaderStagingError {

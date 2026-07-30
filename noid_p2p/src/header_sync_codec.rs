@@ -5,7 +5,7 @@
 //!
 //! The generic libp2p CBOR codec buffers as many as ten MiB before decoding
 //! attacker-controlled sequence lengths.  Header sync has a much smaller
-//! consensus surface: at most 512 headers, each exactly
+//! consensus surface: at most 4,096 headers, each exactly
 //! [`noid_chain::BLOCK_HEADER_WIRE_SIZE`] bytes.  This codec checks that count
 //! in its fixed header before reserving the response vectors.
 
@@ -22,7 +22,11 @@ const REQUEST_MAGIC: [u8; 4] = *b"NHQ2";
 const RESPONSE_MAGIC: [u8; 4] = *b"NHB2";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
 const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 2;
-const MAX_HEADERS: usize = 512;
+/// Maximum fixed-framing header batch.
+///
+/// At the canonical 212-byte header size this keeps one response below
+/// 0.83 MiB while avoiding a network round trip for every 512 headers.
+pub const MAX_HEADERS_PER_BATCH: usize = 4_096;
 
 /// Fixed-framing header request/response codec.
 #[derive(Debug, Clone, Copy, Default)]
@@ -147,8 +151,10 @@ impl request_response::Codec for HeaderSyncCodec {
 }
 
 fn validate_count(count: u16) -> io::Result<()> {
-    if usize::from(count) > MAX_HEADERS {
-        return Err(invalid_data("declared header batch count exceeds 512"));
+    if usize::from(count) > MAX_HEADERS_PER_BATCH {
+        return Err(invalid_data(
+            "declared header batch count exceeds the fixed cap",
+        ));
     }
     Ok(())
 }
@@ -187,7 +193,7 @@ mod tests {
     async fn request_is_exact_and_caps_count() {
         let request = GetHeadersRequest {
             start_height: 41,
-            count: 512,
+            count: MAX_HEADERS_PER_BATCH as u16,
         };
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
@@ -201,10 +207,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded.start_height, 41);
-        assert_eq!(decoded.count, 512);
+        assert_eq!(decoded.count, MAX_HEADERS_PER_BATCH as u16);
 
         let mut oversized = wire.into_inner();
-        oversized[12..14].copy_from_slice(&513u16.to_le_bytes());
+        oversized[12..14].copy_from_slice(&((MAX_HEADERS_PER_BATCH as u16) + 1).to_le_bytes());
         let error = HeaderSyncCodec
             .read_request(&protocol(), &mut Cursor::new(oversized))
             .await

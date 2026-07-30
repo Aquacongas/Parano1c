@@ -861,26 +861,35 @@ fn snapshot_suffix_is_retained(tip_height: u64, terminal_height: u64) -> bool {
 /// terminal is durably available.
 fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
     let meta = store.get_consensus_meta().ok().flatten()?;
-    let finalized = meta.finalized;
-    let height = finalized.height;
-    if height == 0
-        || height > meta.tip_height
-        || !snapshot_suffix_is_retained(meta.tip_height, height)
-    {
+    if meta.finalized.height > meta.tip_height {
         return None;
     }
-    let header = store.get_header(height).ok().flatten()?;
-    let block_hash = noid_chain::hash_block_header(&header);
-    if block_hash != finalized.hash {
+    let newest = meta.finalized.height.min(meta.tip_height);
+    let oldest = meta
+        .tip_height
+        .saturating_sub(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH);
+    if newest == 0 || newest < oldest {
         return None;
     }
-    if !store
-        .has_history_step_terminal_at(height, block_hash)
-        .ok()?
-    {
-        return None;
+
+    // Snapshot-installed compact suffix rows intentionally carry local
+    // authorization markers rather than duplicate full terminals. Select the
+    // newest canonical boundary in the retained suffix whose complete
+    // terminal is already durable, then export the remaining retained bodies.
+    for height in (oldest.max(1)..=newest).rev() {
+        let header = store.get_header(height).ok().flatten()?;
+        let block_hash = noid_chain::hash_block_header(&header);
+        if height == meta.finalized.height && block_hash != meta.finalized.hash {
+            return None;
+        }
+        if store
+            .has_history_step_terminal_at(height, block_hash)
+            .ok()?
+        {
+            return Some((height, block_hash));
+        }
     }
-    Some((height, block_hash))
+    None
 }
 
 fn snapshot_bridge_has_live_headroom(live_tip: u64, bridge_tip: u64) -> bool {
@@ -988,7 +997,7 @@ fn decode_stored_accepted_block_bundle(
 fn decode_linked_header_batch(
     encoded_headers: Vec<Vec<u8>>,
 ) -> Result<Vec<noid_chain::block_header::BlockHeader>, &'static str> {
-    if encoded_headers.len() > 512 {
+    if encoded_headers.len() > crate::header_sync_codec::MAX_HEADERS_PER_BATCH {
         return Err("header count exceeds cap");
     }
     let mut decoded: Vec<noid_chain::block_header::BlockHeader> = Vec::new();
@@ -1072,7 +1081,7 @@ pub enum NetworkCommand {
     FetchHeaders {
         peer: PeerId,
         start_height: u64,
-        count: u16, // max 512
+        count: u16, // bounded by the fixed header codec
     },
     /// Request the state manifest from a peer (step 1 of snapshot sync).
     /// Returns metadata + active segment IDs. Emits `NetworkEvent::StateManifest`.
@@ -1634,8 +1643,10 @@ async fn run_swarm(
     let mut snapshot_export_leases: std::collections::HashMap<PeerId, SnapshotExportLease> =
         std::collections::HashMap::new();
     prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
-    let (snapshot_export_tx, mut snapshot_export_rx) =
-        mpsc::channel::<(SnapshotExportKey, Result<SnapshotGeneration, String>)>(1);
+    let (snapshot_export_tx, mut snapshot_export_rx) = mpsc::channel::<(
+        SnapshotExportKey,
+        Result<SnapshotGeneration, noid_chain::storage::SnapshotGenerationError>,
+    )>(1);
     let mut snapshot_export_inflight: Option<SnapshotExportKey> = None;
     let mut snapshot_export_timer = tokio::time::interval(Duration::from_secs(30));
     snapshot_export_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1791,7 +1802,21 @@ async fn run_swarm(
                             prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
                         }
                         Ok(_) => tracing::warn!(height = key.0, "snapshot generation boundary mismatch"),
-                        Err(error) => tracing::warn!(height = key.0, err = %error, "snapshot generation build failed"),
+                        Err(error) => {
+                            let retry_after_tail_install = matches!(
+                                error,
+                                noid_chain::storage::SnapshotGenerationError::MissingBridgeTerminal(_)
+                                    | noid_chain::storage::SnapshotGenerationError::MissingBoundaryTerminal(_)
+                            );
+                            tracing::warn!(height = key.0, err = %error, "snapshot generation build failed");
+                            if retry_after_tail_install {
+                                // The exporter may race the atomic compact-tail
+                                // installer and pin an intermediate marker.
+                                // Retry after that fixed local race instead of
+                                // waiting for the regular 30-second cadence.
+                                snapshot_export_timer.reset_after(Duration::from_secs(1));
+                            }
+                        }
                     }
                 }
             }
@@ -1820,8 +1845,7 @@ async fn run_swarm(
                                 &export_root,
                                 key.0,
                                 previous.as_deref(),
-                            )
-                            .map_err(|error| error.to_string());
+                            );
                             let _ = completion.blocking_send((key, result));
                         });
                     }
@@ -2631,7 +2655,11 @@ async fn handle_network_command(
             start_height,
             count,
         } => {
-            let count = count.min(512);
+            let count = count.min(
+                crate::header_sync_codec::MAX_HEADERS_PER_BATCH
+                    .try_into()
+                    .expect("header batch cap fits u16"),
+            );
             // Node-side fetch state is per peer. Retire an older request from
             // the same peer before issuing its replacement so a delayed stream
             // cannot consume correlation capacity or reset a newer session.
@@ -3214,7 +3242,11 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            let count = request.count.min(512);
+            let count = request.count.min(
+                crate::header_sync_codec::MAX_HEADERS_PER_BATCH
+                    .try_into()
+                    .expect("header batch cap fits u16"),
+            );
             let headers = match chain_store.get_headers(request.start_height, count) {
                 Ok(headers) => headers
                     .into_iter()

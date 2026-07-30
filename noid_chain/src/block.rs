@@ -19,7 +19,9 @@ use noid_tx::wire::WireError;
 use noid_tx::{PagedSpendError, Transaction, TxPage};
 
 use crate::block_header::BlockHeader;
-use crate::state::{apply_tx_at, ApplyError, ChainState, StateTransition};
+#[cfg(test)]
+use crate::state::apply_tx_at;
+use crate::state::{apply_tx_checked_deferred_root, ApplyError, ChainState, StateTransition};
 
 /// Hard DoS cap on the number of transactions accepted by the decoder.
 ///
@@ -201,7 +203,13 @@ pub(crate) fn apply_block(
                 .map_err(|_| BlockApplyError::InvalidTxBody)?;
         }
 
-        apply_tx_at(&mut snap, &tx.body, block.header.height).map_err(BlockApplyError::Tx)?;
+        // `snap` is already the block-level rollback image. Apply every
+        // transaction with deferred rooting, then seal and compare the exact
+        // post-root once below. Rooting and cloning once per physical page
+        // would add no validation and makes large accepted blocks needlessly
+        // repeat the same segment work.
+        apply_tx_checked_deferred_root(&mut snap, &tx.body, Some(block.header.height))
+            .map_err(BlockApplyError::Tx)?;
     }
 
     if block.header.state_root
