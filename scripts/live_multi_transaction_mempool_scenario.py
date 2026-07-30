@@ -116,6 +116,7 @@ class Node:
             f"127.0.0.1:{self.p2p_port}",
             "--rpc-listen",
             f"127.0.0.1:{self.rpc_port}",
+            "--disable-dns-seeds",
             "--log",
             "debug",
         ]

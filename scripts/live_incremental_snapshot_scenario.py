@@ -180,9 +180,12 @@ def main():
         export_dirs = sorted(
             path.name
             for path in (source.data_dir / "snapshot-exports").iterdir()
-            if path.is_dir() and path.name.startswith("snapshot-v5-")
+            if path.is_dir() and re.fullmatch(r"snapshot-v\d+-[0-9a-f-]+", path.name)
         )
-        require(len(export_dirs) >= 2, f"fewer than two V5 generations persisted: {export_dirs}")
+        require(
+            len(export_dirs) >= 2,
+            f"fewer than two immutable snapshot generations persisted: {export_dirs}",
+        )
 
         source_label = "02-source-frozen-restart"
         source.start(source_label)
@@ -240,7 +243,7 @@ def main():
                 "status": "passed",
                 "source_tip": source_tip,
                 "snapshot_builds": builds,
-                "persisted_v5_generations": export_dirs,
+                "persisted_generations": export_dirs,
                 "receiver_startup_s": round(receiver_startup_s, 3),
                 "receiver_sync_s": round(sync_s, 3),
                 "receiver_snapshot_boundary": boundaries[0],

@@ -547,6 +547,11 @@ struct Cli {
     #[arg(long, value_name = "HOST:PORT", action = clap::ArgAction::Append)]
     seed: Vec<String>,
 
+    /// Do not dial the embedded DNS bootstrap set.
+    /// Used by isolated multi-node protocol tests with explicit loopback seeds.
+    #[arg(long, hide = true)]
+    disable_dns_seeds: bool,
+
     /// Log level filter. Examples: debug, info, warn, error.
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
@@ -1125,13 +1130,21 @@ async fn main() -> anyhow::Result<()> {
     .context("start P2P network")?;
     tracing::debug!(listen = %listen_addr, "P2P started");
 
-    // Dial seeds: CLI seeds + config seeds + DNS seeds.
+    // Dial seeds: CLI seeds + config seeds + the embedded DNS bootstrap set.
+    // Isolated release-binary protocol tests disable only the final source;
+    // explicit loopback seeds still exercise the normal P2P dial path.
+    let dns_seeds = if cli.disable_dns_seeds {
+        tracing::debug!("embedded DNS bootstrap disabled for isolated protocol test");
+        &[][..]
+    } else {
+        net.dns_seeds
+    };
     let all_seeds: Vec<String> = cfg
         .network
         .seeds
         .clone()
         .into_iter()
-        .chain(net.dns_seeds.iter().map(|s| s.to_string()))
+        .chain(dns_seeds.iter().map(|s| s.to_string()))
         .collect();
     for seed_addr in &all_seeds {
         let ma = seed_to_multiaddr(seed_addr, net.default_p2p_port);
