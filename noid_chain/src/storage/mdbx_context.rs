@@ -267,6 +267,7 @@ impl MdbxChainContext {
             .map_err(|_| MdbxContextError::Corrupt("invalid durable state depth"))?;
         let mut exact_segment_roots = Vec::new();
         let mut counted_live = 0u64;
+        let mut circulating_supply_micronoid = 0u128;
         store.visit_segments(|segment_id, stored_log, columns| {
             if usize::from(stored_log) != effective_log
                 || columns.values.len() != expected_segment_len
@@ -298,6 +299,9 @@ impl MdbxChainContext {
                 segment_live = segment_live
                     .checked_add(1)
                     .ok_or(StoreError::Decode("durable segment live-count overflow"))?;
+                circulating_supply_micronoid = circulating_supply_micronoid
+                    .checked_add(u128::from(slot.amount()))
+                    .ok_or(StoreError::Decode("durable circulating supply overflow"))?;
                 exact
                     .push_leaf(
                         base | local as u32,
@@ -341,6 +345,7 @@ impl MdbxChainContext {
             segmented,
             active_slot_count,
             alloc_counter,
+            circulating_supply_micronoid,
             root,
             &exact_segment_roots,
         )
@@ -355,6 +360,7 @@ impl MdbxChainContext {
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
+        circulating_supply_micronoid: u128,
         expected_root: [u8; 32],
     ) -> Result<Option<ChainState>, MdbxContextError> {
         let segment_ids = store.segment_ids()?;
@@ -406,6 +412,7 @@ impl MdbxChainContext {
             segmented,
             active_slot_count,
             alloc_counter,
+            circulating_supply_micronoid,
             expected_root,
             &exact_segment_roots,
         ) {
@@ -419,26 +426,30 @@ impl MdbxChainContext {
         log_slots: u32,
         active_slot_count: u64,
         alloc_counter: u64,
+        persisted_circulating_supply_micronoid: Option<u128>,
         tip_height: u64,
         expected_root: [u8; 32],
     ) -> Result<ChainState, MdbxContextError> {
-        if let Some(state) = Self::try_load_compact_chain_state(
-            store,
-            log_slots,
-            active_slot_count,
-            alloc_counter,
-            expected_root,
-        )? {
-            tracing::info!(
-                active_segments = state.state.active_segment_ids().count(),
+        if let Some(circulating_supply_micronoid) = persisted_circulating_supply_micronoid {
+            if let Some(state) = Self::try_load_compact_chain_state(
+                store,
+                log_slots,
                 active_slot_count,
-                "resumed exact state from compact segment summaries"
-            );
-            return Ok(state);
+                alloc_counter,
+                circulating_supply_micronoid,
+                expected_root,
+            )? {
+                tracing::info!(
+                    active_segments = state.state.active_segment_ids().count(),
+                    active_slot_count,
+                    "resumed exact state from compact segment summaries"
+                );
+                return Ok(state);
+            }
         }
 
         tracing::info!(
-            "compact segment summaries are absent or incomplete; performing one-time dense verification"
+            "compact state metadata is absent or incomplete; performing one-time dense verification"
         );
         let state = Self::load_dense_chain_state(
             store,
@@ -572,6 +583,7 @@ impl MdbxChainContext {
             &[],
             &[],
             None, // genesis is built in and has no accepted bundle
+            self.state.circulating_supply_micronoid,
             &meta,
             false,
         )?;
@@ -610,6 +622,7 @@ impl MdbxChainContext {
         let (log_slots, active_slot_count, alloc_counter) = store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
+        let circulating_supply_micronoid = store.get_circulating_supply()?;
         // 3. Validate canonical metadata before restoring compact state.
         let tip_hdr = store
             .get_header(tip_height)?
@@ -647,6 +660,7 @@ impl MdbxChainContext {
             log_slots,
             active_slot_count,
             alloc_counter,
+            circulating_supply_micronoid,
             tip_height,
             tip_hdr.state_root,
         )?;
@@ -720,6 +734,7 @@ impl MdbxChainContext {
             .store
             .get_state_meta()?
             .ok_or(MdbxContextError::Corrupt("missing state_meta"))?;
+        let circulating_supply_micronoid = self.store.get_circulating_supply()?;
         let tip_header = self
             .store
             .get_header(meta.tip_height)?
@@ -745,6 +760,7 @@ impl MdbxChainContext {
             log_slots,
             active_slot_count,
             alloc_counter,
+            circulating_supply_micronoid,
             tip_header.height,
             tip_header.state_root,
         )?;
@@ -819,6 +835,12 @@ impl MdbxChainContext {
                 "uncommitted block has invalid rollback geometry",
             ));
         }
+        let circulating_supply_micronoid = self
+            .state
+            .supply_after_slot_updates(&undo.slot_changes)
+            .ok_or(MdbxContextError::Corrupt(
+                "uncommitted block supply rollback failed",
+            ))?;
         let current_slots = self.state.state.num_slots();
         for &(slot_index, previous) in &undo.slot_changes {
             if u64::from(slot_index) >= current_slots {
@@ -860,6 +882,7 @@ impl MdbxChainContext {
         }
         self.state.active_slot_count = undo.active_slot_count_before;
         self.state.alloc_counter = undo.alloc_counter_before;
+        self.state.circulating_supply_micronoid = circulating_supply_micronoid;
         if self.state.state.log_slots() as u32 != parent.log_slots
             || self.state.active_slot_count != parent.active_slot_count
             || self.state.alloc_counter != parent.alloc_counter
@@ -981,6 +1004,7 @@ impl MdbxChainContext {
                     &tx_hashes,
                     &[],
                     Some(accepted_block),
+                    self.state.circulating_supply_micronoid,
                     &consensus_meta,
                     false,
                 )
@@ -1622,7 +1646,9 @@ impl MdbxChainContext {
                             ))?;
                     Self::preload_segments_for_undo_in_state(&self.store, &mut self.state, &undo)?;
                     reclaimed_tx_hashes.extend_from_slice(&undo.tx_hashes);
-                    revert_block(&mut self.state.state, &undo);
+                    revert_block(&mut self.state, &undo).map_err(|_| {
+                        MdbxContextError::Corrupt("circulating supply reorg rollback failed")
+                    })?;
                     self.state
                         .state
                         .shrink_to_log_slots(undo.log_slots_before as usize)
@@ -1738,6 +1764,7 @@ impl MdbxChainContext {
                 &reclaimed_tx_hashes,
                 replacement,
                 &staged,
+                self.state.circulating_supply_micronoid,
                 &consensus_meta,
             )?;
             Ok(())
@@ -2384,6 +2411,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                state.circulating_supply_micronoid,
                 &ConsensusMeta {
                     tip_height: 0,
                     tip_hash: hash,

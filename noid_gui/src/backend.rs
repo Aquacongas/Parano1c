@@ -809,6 +809,10 @@ impl Backend {
             ),
         )?;
         sort_wallet_utxos_newest_first(&mut wallet_utxos);
+        let circulating_supply_micronoid = chain
+            .circulating_supply_micronoid
+            .parse::<u128>()
+            .map_err(|_| "getChainInfo returned an invalid circulating supply".to_owned())?;
 
         let tip_header = self
             .rpc::<Option<BlockHeaderInfo>>("getBlockHeader", json!([chain.height]))
@@ -827,10 +831,6 @@ impl Backend {
                 .unwrap_or_else(|| tip_header.clone())
         };
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
         let block_span = chain.height.saturating_sub(average_start_header.height);
         let average_block_time_ms = tip_header
             .timestamp
@@ -838,6 +838,20 @@ impl Backend {
             .saturating_mul(1_000)
             .checked_div(block_span)
             .unwrap_or(15_000);
+        let network_hashrate_hps = estimated_network_hashrate(
+            &mining.difficulty_target,
+            average_block_time_ms,
+            chain.height,
+        );
+        let pow_work_bits = target_work_bits(&mining.difficulty_target);
+        let pow_work_change_percent = (average_start_header.height < tip_header.height)
+            .then(|| {
+                target_work_change_percent(
+                    &mining.difficulty_target,
+                    &average_start_header.difficulty_target,
+                )
+            })
+            .flatten();
         let (cpu_load, memory_used_bytes, memory_total_bytes) = self.system_metrics();
         let mining_enabled = node_status.mining;
         let selected_threads = if mining_enabled {
@@ -963,9 +977,14 @@ impl Backend {
                 cpu_load,
                 memory_used_bytes,
                 memory_total_bytes,
-                last_block_age_seconds: now.saturating_sub(tip_header.timestamp),
+                circulating_supply_micronoid,
+                block_reward_micronoid: mining.block_reward_micronoid,
+                network_hashrate_hps,
                 average_block_time_ms,
                 difficulty: target_difficulty(&mining.difficulty_target),
+                pow_work_bits,
+                pow_work_change_percent,
+                difficulty_target: mining.difficulty_target,
                 backend: node_status.backend.to_ascii_uppercase(),
                 synced: node_status.synced,
                 // Reaching this snapshot means the production node accepted
@@ -1821,17 +1840,59 @@ fn target_difficulty(target_hex: &str) -> f64 {
     let Ok(bytes) = hex::decode(target_hex) else {
         return 1.0;
     };
-    let Some((index, byte)) = bytes
-        .iter()
-        .copied()
-        .enumerate()
-        .rev()
-        .find(|(_, byte)| *byte != 0)
-    else {
+    if bytes.len() != 32 {
+        return 1.0;
+    }
+    let Some(target_log2) = le_u256_log2(&bytes) else {
         return f64::INFINITY;
     };
-    let target_log2 = index as f64 * 8.0 + f64::from(byte).log2();
     2.0_f64.powf(GENESIS_DIFFICULTY_LOG2 - target_log2).max(1.0)
+}
+
+fn target_work_bits(target_hex: &str) -> Option<f64> {
+    let bytes = hex::decode(target_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let target_log2 = le_u256_log2(&bytes)?;
+    let work_bits = 256.0 - target_log2;
+    work_bits.is_finite().then_some(work_bits)
+}
+
+fn target_work_change_percent(current_target_hex: &str, previous_target_hex: &str) -> Option<f64> {
+    let current = target_work_bits(current_target_hex)?;
+    let previous = target_work_bits(previous_target_hex)?;
+    let change = 2.0_f64.powf(current - previous).mul_add(100.0, -100.0);
+    change.is_finite().then_some(change)
+}
+
+fn estimated_network_hashrate(
+    target_hex: &str,
+    average_block_time_ms: u64,
+    height: u64,
+) -> Option<f64> {
+    if height < 2 || average_block_time_ms == 0 {
+        return None;
+    }
+    let bytes = hex::decode(target_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let target_log2 = le_u256_log2(&bytes)?;
+    let expected_hashes = 2.0_f64.powf(256.0 - target_log2);
+    let seconds = average_block_time_ms as f64 / 1_000.0;
+    let hashrate = expected_hashes / seconds;
+    hashrate.is_finite().then_some(hashrate)
+}
+
+fn le_u256_log2(bytes: &[u8]) -> Option<f64> {
+    let highest = bytes.iter().rposition(|byte| *byte != 0)?;
+    let start = highest.saturating_sub(6);
+    let mut mantissa = 0u64;
+    for &byte in bytes[start..=highest].iter().rev() {
+        mantissa = (mantissa << 8) | u64::from(byte);
+    }
+    Some((start * 8) as f64 + (mantissa as f64).log2())
 }
 
 #[derive(Serialize)]
@@ -1865,6 +1926,7 @@ struct ChainInfo {
     #[allow(dead_code)]
     active_slot_count: u64,
     log_slots: u32,
+    circulating_supply_micronoid: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1890,6 +1952,7 @@ struct MiningInfo {
     #[allow(dead_code)]
     difficulty_bits: u32,
     difficulty_target: String,
+    block_reward_micronoid: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2908,6 +2971,57 @@ mod tests {
         let mut twice_as_hard = genesis;
         twice_as_hard[29] = 0x20;
         assert!((target_difficulty(&hex::encode(twice_as_hard)) - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn pow_work_bits_preserve_fractional_asert_difficulty() {
+        let mut genesis = [0u8; 32];
+        genesis[29] = 0x40;
+        assert!((target_work_bits(&hex::encode(genesis)).unwrap() - 18.0).abs() < f64::EPSILON);
+
+        let forty_x = "9999999999999999999999999999999999999999999999999999999999010000";
+        assert!((target_work_bits(forty_x).unwrap() - 23.321_928_094_887_36).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pow_work_change_is_a_ratio_not_a_difference_of_exponents() {
+        let mut genesis = [0u8; 32];
+        genesis[29] = 0x40;
+        let mut twice_as_hard = genesis;
+        twice_as_hard[29] = 0x20;
+        assert!(
+            (target_work_change_percent(&hex::encode(twice_as_hard), &hex::encode(genesis))
+                .unwrap()
+                - 100.0)
+                .abs()
+                < 1e-10
+        );
+        assert!(
+            (target_work_change_percent(&hex::encode(genesis), &hex::encode(twice_as_hard))
+                .unwrap()
+                + 50.0)
+                .abs()
+                < 1e-10
+        );
+    }
+
+    #[test]
+    fn network_hashrate_uses_existing_target_and_observed_block_time() {
+        let mut genesis = [0u8; 32];
+        genesis[29] = 0x40;
+        assert_eq!(
+            estimated_network_hashrate(&hex::encode(genesis), 15_000, 1),
+            None
+        );
+
+        let genesis_rate = estimated_network_hashrate(&hex::encode(genesis), 15_000, 2).unwrap();
+        assert!((genesis_rate - 262_144.0 / 15.0).abs() < 0.001);
+
+        let mut twice_as_hard = genesis;
+        twice_as_hard[29] = 0x20;
+        let harder_rate =
+            estimated_network_hashrate(&hex::encode(twice_as_hard), 15_000, 2).unwrap();
+        assert!((harder_rate - genesis_rate * 2.0).abs() < 0.001);
     }
 
     #[test]

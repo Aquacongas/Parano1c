@@ -663,8 +663,6 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "CPU" => ("CPU", "CPU"),
         "MEMORY" => ("ПАМЯТЬ", "内存"),
         "MINING TH" => ("ПОТОКИ", "挖矿线程"),
-        "LAST BLOCK" => ("ПОСЛ. БЛОК", "最新区块"),
-        "AVG TIME" => ("СР. ВРЕМЯ", "平均时间"),
         "DIFFICULTY" => ("СЛОЖНОСТЬ", "难度"),
         "ACTIVE ADDRESS" => ("АКТИВНЫЙ АДРЕС", "当前地址"),
         "SWITCH" => ("СМЕНИТЬ", "切换"),

@@ -1448,6 +1448,7 @@ impl ParanoidApiServer for RpcHandler {
             difficulty_target: hex::encode(tip.difficulty_target),
             active_slot_count: tip.active_slot_count,
             log_slots: tip.log_slots,
+            circulating_supply_micronoid: chain.state.circulating_supply_micronoid.to_string(),
         })
     }
 

@@ -13,8 +13,8 @@ use crate::app::{
 use crate::i18n::translate;
 use crate::i18n::{address_label, text, text_input};
 use crate::model::{
-    format_creation_origin, BlockDetailsSnapshot, BlockTransactionSnapshot, MatrixCacheState,
-    MinedBlockSnapshot,
+    display_pow_target, format_creation_origin, format_expected_pow_hashes, format_pow_work_change,
+    BlockDetailsSnapshot, BlockTransactionSnapshot, MatrixCacheState, MinedBlockSnapshot,
 };
 use crate::theme::{self, ButtonKind};
 
@@ -128,41 +128,57 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
     } else {
         ("STOPPED", theme::DIM)
     };
-    let connection = match app.backend_state {
-        BackendState::Online => "LOCAL NODE ONLINE",
-        BackendState::Starting => "LOCAL NODE STARTING",
-        BackendState::Offline => "LOCAL NODE OFFLINE",
-        BackendState::Mock => "DESIGN PREVIEW",
+    let network = &app.snapshot.network;
+    let change_color = match network.pow_work_change_percent {
+        Some(change) if change > 0.05 => theme::ACCENT,
+        Some(change) if change < -0.05 => theme::WARNING,
+        _ => theme::MUTED,
     };
-    let matrix_color = if matches!(app.matrix_b64, MatrixCacheState::Failed(_))
-        || matches!(app.matrix_b255, MatrixCacheState::Failed(_))
-    {
-        theme::DANGER
-    } else if app.matrix_b64 == MatrixCacheState::Ready
-        && app.matrix_b255 == MatrixCacheState::Ready
-    {
-        theme::ACCENT
+    let target = display_pow_target(&network.difficulty_target);
+    let target_metric: Element<'_, Message> = if let Some(target) = target {
+        let copied = app.copied_value.as_deref() == Some(target.as_str());
+        row![
+            mining_detail("POW TARGET", short_pow_target(&target), theme::MUTED),
+            copy_value_button(&target, copied),
+        ]
+        .spacing(3)
+        .align_y(Alignment::Center)
+        .into()
     } else {
-        theme::WARNING
+        mining_detail("POW TARGET", "—".into(), theme::MUTED)
     };
-    let matrix_status = format!(
-        "B64 {} · B255 {}",
-        app.matrix_b64.label(),
-        app.matrix_b255.label()
-    );
-    let matrix_failed = matches!(app.matrix_b64, MatrixCacheState::Failed(_))
-        || matches!(app.matrix_b255, MatrixCacheState::Failed(_));
-    let mut matrix_summary = row![text(matrix_status).size(12).color(matrix_color)]
-        .spacing(4)
-        .align_y(Alignment::Center);
-    if matrix_failed {
-        matrix_summary = matrix_summary.push(
-            button(text("RETRY").size(12))
-                .on_press(Message::PrepareMatrices)
-                .padding([2, 5])
-                .style(|_, status| theme::button(ButtonKind::Ghost, status)),
-        );
-    }
+    let pow_metrics = column![
+        row![
+            container(mining_detail(
+                "DIFFICULTY",
+                format!("{:.2}×", network.difficulty),
+                theme::PROOF,
+            ))
+            .width(Length::FillPortion(1)),
+            mining_metric_separator(),
+            container(mining_detail(
+                "EXPECTED POW WORK",
+                format_expected_pow_hashes(network.pow_work_bits),
+                theme::CYAN,
+            ))
+            .width(Length::FillPortion(1)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+        row![
+            container(mining_detail(
+                "10-BLOCK CHANGE",
+                format_pow_work_change(network.pow_work_change_percent),
+                change_color,
+            ))
+            .width(Length::FillPortion(1)),
+            mining_metric_separator(),
+            container(target_metric).width(Length::FillPortion(1)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(7);
 
     container(
         column![
@@ -196,28 +212,7 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
                     .spacing(6)
                     .align_y(Alignment::Center),
                     divider(),
-                    row![
-                        detail("BACKEND", app.snapshot.network.backend.clone()),
-                        iced::widget::Space::new().width(Length::Fill),
-                        detail(
-                            "THREADS",
-                            format!(
-                                "{}/{}",
-                                app.snapshot.mining.selected_threads,
-                                app.snapshot.mining.available_threads
-                            ),
-                        ),
-                    ]
-                    .spacing(12),
-                    row![
-                        detail("TARGET", "15 s".into()),
-                        iced::widget::Space::new().width(Length::Fill),
-                        matrix_summary,
-                        text("·").size(12).color(theme::DIM),
-                        text(connection).size(12).color(theme::DIM),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
+                    pow_metrics,
                 ]
                 .spacing(7),
             )
@@ -1229,6 +1224,36 @@ fn detail(label: &'static str, value: String) -> Element<'static, Message> {
     .spacing(6)
     .align_y(Alignment::Center)
     .into()
+}
+
+fn mining_detail(
+    label: &'static str,
+    value: String,
+    color: iced::Color,
+) -> Element<'static, Message> {
+    row![
+        iced::widget::text(label).size(12).color(theme::DIM),
+        text(format!("[{value}]")).size(13).color(color),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+fn mining_metric_separator() -> Element<'static, Message> {
+    container(iced::widget::Space::new())
+        .width(1)
+        .height(16)
+        .style(theme::divider)
+        .into()
+}
+
+fn short_pow_target(target: &str) -> String {
+    if target.len() <= 15 {
+        target.to_owned()
+    } else {
+        format!("{}…{}", &target[..6], &target[target.len() - 6..])
+    }
 }
 
 fn divider() -> Element<'static, Message> {

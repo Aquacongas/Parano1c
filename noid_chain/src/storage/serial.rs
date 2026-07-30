@@ -517,24 +517,45 @@ pub fn decode_chain_tip(bytes: &[u8]) -> Option<(u64, [u8; 32])> {
     Some((height, hash))
 }
 
-// state_meta value: log_slots(u32) + active_slot_count(u64) + alloc_counter(u64) = 20 bytes
+// state_meta v1:
+//   log_slots(u32) + active_slot_count(u64) + alloc_counter(u64) = 20 bytes
+// state_meta v2 appends:
+//   circulating_supply_micronoid(u128) = 16 bytes
+//
+// The first 20 bytes remain unchanged so pre-v2 databases can be upgraded by
+// one dense verification pass instead of being discarded.
+pub const ENCODED_STATE_META_V1_BYTES: usize = 20;
+pub const ENCODED_STATE_META_BYTES: usize = 36;
 
-pub fn encode_state_meta(log_slots: u32, active: u64, alloc: u64) -> [u8; 20] {
-    let mut out = [0u8; 20];
+pub fn encode_state_meta(
+    log_slots: u32,
+    active: u64,
+    alloc: u64,
+    circulating_supply_micronoid: u128,
+) -> [u8; ENCODED_STATE_META_BYTES] {
+    let mut out = [0u8; ENCODED_STATE_META_BYTES];
     out[0..4].copy_from_slice(&log_slots.to_le_bytes());
     out[4..12].copy_from_slice(&active.to_le_bytes());
     out[12..20].copy_from_slice(&alloc.to_le_bytes());
+    out[20..36].copy_from_slice(&circulating_supply_micronoid.to_le_bytes());
     out
 }
 
 pub fn decode_state_meta(bytes: &[u8]) -> Option<(u32, u64, u64)> {
-    if bytes.len() < 20 {
+    if bytes.len() < ENCODED_STATE_META_V1_BYTES {
         return None;
     }
     let log_slots = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
     let active = u64::from_le_bytes(bytes[4..12].try_into().ok()?);
     let alloc = u64::from_le_bytes(bytes[12..20].try_into().ok()?);
     Some((log_slots, active, alloc))
+}
+
+pub fn decode_circulating_supply(bytes: &[u8]) -> Option<u128> {
+    if bytes.len() < ENCODED_STATE_META_BYTES {
+        return None;
+    }
+    Some(u128::from_le_bytes(bytes[20..36].try_into().ok()?))
 }
 
 // Compact restart accelerator for one non-empty durable segment:
@@ -743,11 +764,17 @@ mod tests {
 
     #[test]
     fn state_meta_roundtrip() {
-        let bytes = encode_state_meta(25, 1234567, 999999);
+        let supply = 123_456_789_012_345u128;
+        let bytes = encode_state_meta(25, 1234567, 999999, supply);
         let (ls, active, alloc) = decode_state_meta(&bytes).expect("decode");
         assert_eq!(ls, 25);
         assert_eq!(active, 1234567);
         assert_eq!(alloc, 999999);
+        assert_eq!(decode_circulating_supply(&bytes), Some(supply));
+
+        let legacy = &bytes[..ENCODED_STATE_META_V1_BYTES];
+        assert_eq!(decode_state_meta(legacy), Some((25, 1234567, 999999)));
+        assert_eq!(decode_circulating_supply(legacy), None);
     }
 
     #[test]

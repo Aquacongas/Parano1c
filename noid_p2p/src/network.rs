@@ -27,6 +27,7 @@ use noid_chain::consensus::wire_limits::{
 };
 use noid_chain::storage::{
     encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log, MdbxChainContext,
+    MdbxStore,
 };
 use noid_chain::storage::{
     export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,
@@ -858,22 +859,22 @@ fn snapshot_suffix_is_retained(tip_height: u64, terminal_height: u64) -> bool {
 
 /// Choose the finalized snapshot boundary only when its exact HistoryStep
 /// terminal is durably available.
-fn local_history_step_boundary(ctx: &MdbxChainContext) -> Option<(u64, [u8; 32])> {
-    let finalized = ctx.finalized_checkpoint();
+fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
+    let meta = store.get_consensus_meta().ok().flatten()?;
+    let finalized = meta.finalized;
     let height = finalized.height;
     if height == 0
-        || height > ctx.tip_height()
-        || !snapshot_suffix_is_retained(ctx.tip_height(), height)
+        || height > meta.tip_height
+        || !snapshot_suffix_is_retained(meta.tip_height, height)
     {
         return None;
     }
-    let header = ctx.store.get_header(height).ok().flatten()?;
+    let header = store.get_header(height).ok().flatten()?;
     let block_hash = noid_chain::hash_block_header(&header);
     if block_hash != finalized.hash {
         return None;
     }
-    if !ctx
-        .store
+    if !store
         .has_history_step_terminal_at(height, block_hash)
         .ok()?
     {
@@ -892,24 +893,24 @@ fn snapshot_bridge_has_live_headroom(live_tip: u64, bridge_tip: u64) -> bool {
 /// complete initial suffix are generation-owned and therefore cannot race
 /// pruning.
 fn select_snapshot_export(
-    ctx: &MdbxChainContext,
+    store: &MdbxStore,
     exports: &std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     requester_height: u64,
 ) -> Option<SnapshotExport> {
+    let meta = store.get_consensus_meta().ok().flatten()?;
     exports
         .values()
         .filter(|generation| {
             let manifest = generation.manifest();
             if manifest.target_height == 0
                 || manifest.target_height <= requester_height
-                || manifest.target_height > ctx.finalized_checkpoint().height
+                || manifest.target_height > meta.finalized.height
                 || manifest.bridge_tip_height < manifest.target_height
-                || !snapshot_bridge_has_live_headroom(ctx.tip_height(), manifest.bridge_tip_height)
+                || !snapshot_bridge_has_live_headroom(meta.tip_height, manifest.bridge_tip_height)
             {
                 return false;
             }
-            let boundary_matches = ctx
-                .store
+            let boundary_matches = store
                 .get_header(manifest.target_height)
                 .ok()
                 .flatten()
@@ -920,22 +921,16 @@ fn select_snapshot_export(
                         && header.active_slot_count == manifest.active_slot_count
                         && header.alloc_counter == manifest.alloc_counter
                 });
-            let bridge_matches = ctx
-                .store
+            let bridge_matches = store
                 .get_header(manifest.bridge_tip_height)
                 .ok()
                 .flatten()
                 .is_some_and(|header| {
                     noid_chain::hash_block_header(&header) == manifest.bridge_tip_hash
                 });
-            let work_matches = ctx
-                .store
-                .get_chain_work(manifest.target_height)
-                .ok()
-                .flatten()
+            let work_matches = store.get_chain_work(manifest.target_height).ok().flatten()
                 == Some(manifest.cumulative_chainwork)
-                && ctx
-                    .store
+                && store
                     .get_chain_work(manifest.bridge_tip_height)
                     .ok()
                     .flatten()
@@ -955,17 +950,15 @@ fn select_snapshot_export(
 /// window. Snapshot state boundaries are finalized, while the compact suffix
 /// tip may legitimately be newer when blocks arrive during state download.
 fn local_history_step_terminal(
-    ctx: &MdbxChainContext,
+    store: &MdbxStore,
     height: u64,
     block_hash: [u8; 32],
 ) -> Option<Vec<u8>> {
-    if height == 0
-        || height > ctx.tip_height()
-        || !snapshot_suffix_is_retained(ctx.tip_height(), height)
-    {
+    let tip_height = store.get_consensus_meta().ok().flatten()?.tip_height;
+    if height == 0 || height > tip_height || !snapshot_suffix_is_retained(tip_height, height) {
         return None;
     }
-    ctx.store
+    store
         .get_history_step_terminal_at(height, block_hash)
         .ok()
         .flatten()
@@ -1528,6 +1521,14 @@ async fn run_swarm(
 ) -> anyhow::Result<()> {
     use libp2p::{noise, tcp, yamux, SwarmBuilder};
 
+    // P2P data serving must remain responsive while expensive block proof
+    // verification owns the mutable hot chain context. MDBX readers use
+    // independent MVCC snapshots and never need that application-level lock.
+    let chain_store = {
+        let ctx = chain.read().await;
+        ctx.store.clone()
+    };
+
     let protocol_id = topics.protocol_id.clone();
     let mut swarm = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
@@ -1692,7 +1693,7 @@ async fn run_swarm(
                     event,
                     &gossip_event_tx,
                     &required_event_tx,
-                    &chain,
+                    &chain_store,
                     &mempool,
                     &topics,
                     &block_response_tx,
@@ -1797,21 +1798,18 @@ async fn run_swarm(
 
             _ = snapshot_export_timer.tick() => {
                 if snapshot_export_inflight.is_none() {
-                    let candidate = {
-                        let ctx = chain.read().await;
-                        local_history_step_boundary(&ctx).and_then(|key| {
-                            if snapshot_exports.contains_key(&key) {
-                                None
-                            } else {
-                                let previous = snapshot_exports
-                                    .iter()
-                                    .filter(|((height, _), _)| *height < key.0)
-                                    .max_by_key(|((height, _), _)| *height)
-                                    .map(|(_, generation)| generation.clone());
-                                Some((key, ctx.store.clone(), previous))
-                            }
-                        })
-                    };
+                    let candidate = local_history_step_boundary(&chain_store).and_then(|key| {
+                        if snapshot_exports.contains_key(&key) {
+                            None
+                        } else {
+                            let previous = snapshot_exports
+                                .iter()
+                                .filter(|((height, _), _)| *height < key.0)
+                                .max_by_key(|((height, _), _)| *height)
+                                .map(|(_, generation)| generation.clone());
+                            Some((key, chain_store.clone(), previous))
+                        }
+                    });
                     if let Some((key, store, previous)) = candidate {
                         snapshot_export_inflight = Some(key);
                         let export_root = snapshot_export_root.clone();
@@ -2691,7 +2689,7 @@ async fn handle_swarm_event(
     event: SwarmEvent<NodeBehaviourEvent>,
     gossip_event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
     required_event_tx: &mpsc::Sender<NetworkEvent>,
-    chain: &Arc<RwLock<MdbxChainContext>>,
+    chain_store: &MdbxStore,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
     block_response_tx: &mpsc::Sender<PendingBlockResponse>,
@@ -3216,18 +3214,26 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            let ctx = chain.read().await;
-            let mut headers = Vec::new();
             let count = request.count.min(512);
-            let end = request.start_height.saturating_add(count as u64);
-            for h in request.start_height..end {
-                if let Ok(Some(hdr)) = ctx.get_header_from_store(h) {
-                    let mut buf = Vec::new();
-                    hdr.encode(&mut buf);
-                    headers.push(buf);
+            let headers = match chain_store.get_headers(request.start_height, count) {
+                Ok(headers) => headers
+                    .into_iter()
+                    .map(|header| {
+                        let mut encoded = Vec::with_capacity(noid_chain::BLOCK_HEADER_WIRE_SIZE);
+                        header.encode(&mut encoded);
+                        encoded
+                    })
+                    .collect(),
+                Err(error) => {
+                    tracing::warn!(
+                        start_height = request.start_height,
+                        count,
+                        err = %error,
+                        "canonical header range read failed"
+                    );
+                    Vec::new()
                 }
-            }
-            drop(ctx);
+            };
             let _ = swarm
                 .behaviour_mut()
                 .chain_sync
@@ -3384,7 +3390,7 @@ async fn handle_swarm_event(
                 // failure; it must not masquerade as a durable pruned block.
                 return;
             };
-            let chain = chain.clone();
+            let store = chain_store.clone();
             let budget = outbound_response_budget.clone();
             let completion = block_response_tx.clone();
             let height = request.height;
@@ -3415,8 +3421,7 @@ async fn handle_swarm_event(
                 let loaded = tokio::task::spawn_blocking(move || {
                     match payload_kind {
                         RecentBlockPayloadKind::Complete => {
-                            let ctx = chain.blocking_read();
-                            match ctx.store.get_recent_accepted_block_bundle_bounded(height) {
+                            match store.get_recent_accepted_block_bundle_bounded(height) {
                                 Ok(encoded) => decode_stored_accepted_block_bundle(height, encoded)
                                     .map(RecentBlockPayload::Complete),
                                 Err(error) => {
@@ -3438,10 +3443,9 @@ async fn handle_swarm_event(
                                 }
                                 return Some(RecentBlockPayload::BlockBodies(bodies));
                             }
-                            let ctx = chain.blocking_read();
                             let mut bodies = Vec::with_capacity(count as usize);
                             for current_height in height..=end_height {
-                                match ctx.store.get_recent_block(current_height) {
+                                match store.get_recent_block(current_height) {
                                     Ok(Some(block_bytes)) => bodies.push(block_bytes),
                                     Ok(None) => return None,
                                     Err(error) => {
@@ -3510,7 +3514,7 @@ async fn handle_swarm_event(
                 );
                 return;
             };
-            let chain = chain.clone();
+            let store = chain_store.clone();
             let budget = outbound_response_budget.clone();
             let completion = history_step_response_tx.clone();
             let request_height = request.height;
@@ -3542,8 +3546,7 @@ async fn handle_swarm_event(
                             .read_terminal_at(request_height, request_hash)
                             .ok();
                     }
-                    let ctx = chain.blocking_read();
-                    local_history_step_terminal(&ctx, request_height, request_hash)
+                    local_history_step_terminal(&store, request_height, request_hash)
                 })
                 .await;
                 let terminal_bytes = match loaded {
@@ -3696,10 +3699,11 @@ async fn handle_swarm_event(
             prune_snapshot_export_leases(snapshot_export_leases);
             prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             let response = 'ready_manifest: {
-                let ctx = chain.read().await;
-                let Some(generation) =
-                    select_snapshot_export(&ctx, snapshot_exports, request.requester_height)
-                else {
+                let Some(generation) = select_snapshot_export(
+                    &chain_store,
+                    snapshot_exports,
+                    request.requester_height,
+                ) else {
                     break 'ready_manifest GetStateManifestResponse::default();
                 };
                 let key = generation.key();
@@ -3712,6 +3716,11 @@ async fn handle_swarm_event(
                     break 'ready_manifest GetStateManifestResponse::default();
                 }
                 let manifest = generation.manifest();
+                let live_tip = chain_store
+                    .get_consensus_meta()
+                    .ok()
+                    .flatten()
+                    .map_or(manifest.bridge_tip_height, |meta| meta.tip_height);
 
                 let segment_ids = manifest
                     .segments
@@ -3732,7 +3741,7 @@ async fn handle_swarm_event(
                     requester_height = request.requester_height,
                     snapshot_height = manifest.target_height,
                     bridge_tip = manifest.bridge_tip_height,
-                    live_tip = ctx.tip_height(),
+                    live_tip,
                     segments = manifest.segments.len(),
                     "serving immutable snapshot manifest and bridge"
                 );

@@ -10,15 +10,17 @@ use crate::app::{Action, AddressOperation, App, Message};
 use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmission};
 use crate::i18n::{address_label, text, text_input};
 use crate::model::{
-    format_creation_origin, format_micronoid, AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
+    format_compact_count, format_compact_micronoid, format_creation_origin, format_hashrate,
+    format_micronoid, format_micronoid_trimmed, format_pow_work, AddressSnapshot, UtxoSnapshot,
+    UTXO_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::{ProofForge, StateField};
 
 use super::copy_value_button;
 
-const DESKTOP_METER_CELLS: usize = 34;
-const COMPACT_METER_CELLS: usize = 16;
+const DESKTOP_METER_CELLS: usize = 20;
+const COMPACT_METER_CELLS: usize = 12;
 
 pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
     let page = if compact {
@@ -103,7 +105,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
     } else {
         DESKTOP_METER_CELLS
     };
-    let meter_label_width = if compact { 90.0 } else { 110.0 };
+    let meter_label_width = if compact { 72.0 } else { 80.0 };
     let state_color = if state_ratio >= 0.75 {
         theme::WARNING
     } else {
@@ -117,91 +119,112 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
         theme::CYAN
     };
 
-    let meters: Element<'_, Message> = row![
-        column![
-            state_scale(network.log_slots, compact),
-            terminal_meter(
-                "STATE USE".into(),
-                state_ratio,
-                state_color,
-                format!("{:.1}%", state_ratio.clamp(0.0, 1.0) * 100.0),
-                meter_cells,
-                meter_label_width,
-                false,
-            ),
-            terminal_meter(
-                "MEMPOOL".into(),
-                mempool_ratio,
-                mempool_color,
-                format!("{:.1}%", mempool_ratio.clamp(0.0, 1.0) * 100.0),
-                meter_cells,
-                meter_label_width,
-                false,
-            ),
-        ]
-        .spacing(3)
-        .width(Length::FillPortion(if compact { 5 } else { 1 })),
-        column![
-            terminal_meter(
-                "CPU".into(),
-                network.cpu_load,
-                theme::ACCENT,
-                format!("{:.1}%", network.cpu_load.clamp(0.0, 1.0) * 100.0),
-                meter_cells,
-                meter_label_width,
-                false,
-            ),
-            terminal_meter(
-                "MEMORY".into(),
-                memory_ratio,
-                theme::WARNING,
-                format!("{:.1}%", memory_ratio.clamp(0.0, 1.0) * 100.0),
-                meter_cells,
-                meter_label_width,
-                false,
-            ),
-            terminal_meter(
-                "MINING TH".into(),
-                miner_ratio,
-                if app.snapshot.mining.enabled && app.snapshot.mining.ready {
-                    theme::ACCENT
-                } else {
-                    theme::DIM
-                },
-                format!(
-                    "{}/{}",
-                    app.snapshot.mining.selected_threads, app.snapshot.mining.available_threads,
-                ),
-                meter_cells,
-                meter_label_width,
-                !(app.snapshot.mining.enabled && app.snapshot.mining.ready),
-            ),
-        ]
-        .spacing(3)
-        .width(Length::FillPortion(if compact { 4 } else { 1 })),
+    let state_status: Element<'_, Message> = column![
+        state_scale(network.log_slots, compact),
+        terminal_meter(
+            "STATE USE".into(),
+            state_ratio,
+            state_color,
+            format!("{:.1}%", state_ratio.clamp(0.0, 1.0) * 100.0),
+            meter_cells,
+            meter_label_width,
+            false,
+        ),
+        terminal_meter(
+            "MEMPOOL".into(),
+            mempool_ratio,
+            mempool_color,
+            format!("{:.1}%", mempool_ratio.clamp(0.0, 1.0) * 100.0),
+            meter_cells,
+            meter_label_width,
+            false,
+        ),
     ]
-    .spacing(if compact { 10 } else { 18 })
+    .spacing(3)
+    .width(Length::Fill)
+    .into();
+
+    let machine_status: Element<'_, Message> = column![
+        terminal_meter(
+            "CPU".into(),
+            network.cpu_load,
+            theme::ACCENT,
+            format!("{:.1}%", network.cpu_load.clamp(0.0, 1.0) * 100.0),
+            meter_cells,
+            meter_label_width,
+            false,
+        ),
+        terminal_meter(
+            "MEMORY".into(),
+            memory_ratio,
+            theme::WARNING,
+            format!("{:.1}%", memory_ratio.clamp(0.0, 1.0) * 100.0),
+            meter_cells,
+            meter_label_width,
+            false,
+        ),
+        terminal_meter(
+            "MINING TH".into(),
+            miner_ratio,
+            if app.snapshot.mining.enabled && app.snapshot.mining.ready {
+                theme::ACCENT
+            } else {
+                theme::DIM
+            },
+            format!(
+                "{}/{}",
+                app.snapshot.mining.selected_threads, app.snapshot.mining.available_threads,
+            ),
+            meter_cells,
+            meter_label_width,
+            !(app.snapshot.mining.enabled && app.snapshot.mining.ready),
+        ),
+    ]
+    .spacing(3)
+    .width(Length::Fill)
+    .into();
+
+    let economy_status: Element<'_, Message> = column![
+        telemetry_value(
+            "CIRC SUPPLY",
+            format!(
+                "{} NOID",
+                format_compact_micronoid(network.circulating_supply_micronoid)
+            ),
+            theme::ACCENT,
+        ),
+        telemetry_value(
+            "BLOCK REWARD",
+            format!(
+                "{} NOID",
+                format_micronoid_trimmed(network.block_reward_micronoid)
+            ),
+            theme::ACCENT,
+        ),
+        telemetry_value(
+            "LIVE UTXOS",
+            format_compact_count(network.active_slots),
+            theme::ACCENT,
+        ),
+    ]
+    .spacing(7)
     .width(Length::Fill)
     .into();
 
     let network_status: Element<'_, Message> = column![
         telemetry_value(
-            "LAST BLOCK",
-            if network.height == 0 {
-                "genesis".into()
-            } else {
-                format!("{}s ago", network.last_block_age_seconds)
-            },
+            "NETWORK",
+            format_hashrate(network.network_hashrate_hps),
             theme::ACCENT,
         ),
         telemetry_value(
-            "AVG TIME",
+            "AVG BLOCK TIME",
             format!("{:.1}s", network.average_block_time_ms as f64 / 1_000.0),
             theme::ACCENT,
         ),
         telemetry_value(
-            "DIFFICULTY",
-            format!("{:.2}×", network.difficulty),
+            "POW WORK",
+            format_pow_work(network.pow_work_bits, network.pow_work_change_percent),
             theme::WARNING,
         ),
     ]
@@ -211,19 +234,23 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
 
     let dashboard: Element<'_, Message> = if compact {
         row![
-            container(meters).width(Length::FillPortion(11)),
-            container(network_status).width(Length::FillPortion(4)),
+            container(state_status).width(Length::FillPortion(1)),
+            container(machine_status).width(Length::FillPortion(1)),
+            container(economy_status).width(Length::FillPortion(1)),
+            container(network_status).width(Length::FillPortion(1)),
         ]
-        .spacing(12)
+        .spacing(8)
         .align_y(Alignment::Center)
         .width(Length::Fill)
         .into()
     } else {
         row![
-            container(meters).width(Length::FillPortion(4)),
-            container(network_status).width(Length::FillPortion(1)),
+            container(state_status).width(Length::FillPortion(6)),
+            container(machine_status).width(Length::FillPortion(6)),
+            container(economy_status).width(Length::FillPortion(5)),
+            container(network_status).width(Length::FillPortion(6)),
         ]
-        .spacing(26)
+        .spacing(14)
         .align_y(Alignment::Center)
         .width(Length::Fill)
         .into()
@@ -260,7 +287,7 @@ fn terminal_meter(
     let value_color = if disabled { theme::DIM } else { theme::MUTED };
 
     row![
-        text(label)
+        iced::widget::text(label)
             .size(13)
             .color(label_color)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -278,41 +305,49 @@ fn terminal_meter(
 }
 
 fn state_scale(current: u32, compact: bool) -> Element<'static, Message> {
-    let badge_width = if compact { 20.0 } else { 25.0 };
-    let label_width = if compact { 90.0 } else { 110.0 };
+    let badge_width = if compact { 20.0 } else { 24.0 };
+    let label_width = if compact { 72.0 } else { 80.0 };
+    let visible_levels = visible_state_levels(current);
     let mut levels = row![].align_y(Alignment::Center).width(Length::Fill);
 
-    for log_slots in 24..=32 {
-        let active = log_slots == current;
-        levels = levels.push(
-            container(
-                column![
-                    text(log_slots.to_string()).size(13).color(if active {
-                        theme::ACCENT
-                    } else {
-                        theme::DIM
-                    }),
-                    container(iced::widget::Space::new())
-                        .width(Length::Fill)
-                        .height(if active { 3 } else { 1 })
-                        .style(theme::state_scale_tick(active)),
-                ]
-                .spacing(2)
-                .align_x(Alignment::Center),
-            )
-            .width(badge_width)
-            .height(23)
-            .align_x(Alignment::Center)
-            .align_y(Alignment::Center),
-        );
+    for (index, visible) in visible_levels.iter().copied().enumerate() {
+        let badge = match visible {
+            Some(log_slots) => {
+                let active = log_slots == current;
+                container(
+                    column![
+                        iced::widget::text(log_slots.to_string())
+                            .size(13)
+                            .color(if active { theme::ACCENT } else { theme::DIM }),
+                        container(iced::widget::Space::new())
+                            .width(Length::Fill)
+                            .height(if active { 3 } else { 1 })
+                            .style(theme::state_scale_tick(active)),
+                    ]
+                    .spacing(2)
+                    .align_x(Alignment::Center),
+                )
+            }
+            None => container(
+                iced::widget::text("…")
+                    .size(13)
+                    .color(theme::DIM)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            ),
+        }
+        .width(badge_width)
+        .height(23)
+        .align_x(Alignment::Center)
+        .align_y(Alignment::Center);
+        levels = levels.push(badge);
 
-        if log_slots < 32 {
+        if index + 1 < visible_levels.len() {
             levels = levels.push(iced::widget::Space::new().width(Length::Fill));
         }
     }
 
     row![
-        text("STATE LVL")
+        iced::widget::text("STATE LVL")
             .size(13)
             .color(theme::CYAN)
             .wrapping(iced::widget::text::Wrapping::None)
@@ -325,6 +360,20 @@ fn state_scale(current: u32, compact: bool) -> Element<'static, Message> {
     .into()
 }
 
+fn visible_state_levels(current: u32) -> Vec<Option<u32>> {
+    const MAX_LEVEL: u32 = 32;
+    let start = current.min(MAX_LEVEL);
+    let visible_end = start.saturating_add(2).min(MAX_LEVEL);
+    let mut levels = (start..=visible_end).map(Some).collect::<Vec<_>>();
+    if visible_end < MAX_LEVEL {
+        if visible_end + 1 < MAX_LEVEL {
+            levels.push(None);
+        }
+        levels.push(Some(MAX_LEVEL));
+    }
+    levels
+}
+
 fn telemetry_value(
     label: &'static str,
     value: String,
@@ -332,17 +381,19 @@ fn telemetry_value(
 ) -> Element<'static, Message> {
     container(
         row![
-            text(label)
+            iced::widget::text(label)
                 .size(13)
                 .color(theme::CYAN)
-                .wrapping(iced::widget::text::Wrapping::None),
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Fill),
             text(format!("[{value}]"))
                 .size(14)
                 .color(color)
                 .wrapping(iced::widget::text::Wrapping::None),
         ]
         .spacing(6)
-        .align_y(Alignment::Center),
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
     )
     .width(Length::Fill)
     .into()
@@ -2014,4 +2065,27 @@ fn form_line(
     .width(Length::Fill)
     .style(theme::surface)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_state_levels;
+
+    #[test]
+    fn state_level_scale_advances_without_showing_dead_history() {
+        assert_eq!(
+            visible_state_levels(24),
+            vec![Some(24), Some(25), Some(26), None, Some(32)]
+        );
+        assert_eq!(
+            visible_state_levels(25),
+            vec![Some(25), Some(26), Some(27), None, Some(32)]
+        );
+        assert_eq!(
+            visible_state_levels(29),
+            vec![Some(29), Some(30), Some(31), Some(32)]
+        );
+        assert_eq!(visible_state_levels(31), vec![Some(31), Some(32)]);
+        assert_eq!(visible_state_levels(32), vec![Some(32)]);
+    }
 }

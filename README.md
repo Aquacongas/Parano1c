@@ -185,6 +185,11 @@ proof systems glued together afterward.
 
 ### Proof-Native PoW
 
+**Hashpower alone cannot produce blocks. Mining is stateful and proof-gated.**
+A producer must follow the canonical state and complete the nonce-independent
+`HistoryStep` before its internal or external worker can search the fixed
+header.
+
 PoW has one job: choose the order of valid transitions. Hash power cannot make
 an invalid `HistoryStep` acceptable.
 

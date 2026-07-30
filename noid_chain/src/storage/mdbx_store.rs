@@ -32,12 +32,13 @@ use crate::segmented_state::SegmentColumns;
 use crate::state::{ChainState, StreamingSparseRoot};
 use crate::storage::meta::ConsensusMeta;
 use crate::storage::serial::{
-    decode_chain_tip, decode_chain_work, decode_consensus_meta, decode_header,
-    decode_header_chain_anchor, decode_segment, decode_segment_summary, decode_sparse_segment,
-    decode_state_meta, decode_tx_index_value, decode_undo_log, encode_chain_tip, encode_chain_work,
-    encode_consensus_meta, encode_header, encode_header_chain_anchor, encode_segment,
-    encode_segment_summary, encode_state_meta, encode_tx_index_value, encode_undo_log,
-    encoded_segment_live_count_from_len, u64_from_key, u64_key,
+    decode_chain_tip, decode_chain_work, decode_circulating_supply, decode_consensus_meta,
+    decode_header, decode_header_chain_anchor, decode_segment, decode_segment_summary,
+    decode_sparse_segment, decode_state_meta, decode_tx_index_value, decode_undo_log,
+    encode_chain_tip, encode_chain_work, encode_consensus_meta, encode_header,
+    encode_header_chain_anchor, encode_segment, encode_segment_summary, encode_state_meta,
+    encode_tx_index_value, encode_undo_log, encoded_segment_live_count_from_len, u64_from_key,
+    u64_key,
 };
 use crate::storage::snapshot_staging::{FinalizedSnapshotStaging, SnapshotStagingError};
 
@@ -1316,11 +1317,53 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_state_meta(&b)))
     }
 
+    pub fn get_circulating_supply(&self) -> Result<Option<u128>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_STATE_META))?;
+        let raw: Option<Vec<u8>> = txn.get(&tbl, KEY_META)?;
+        Ok(raw.and_then(|bytes| decode_circulating_supply(&bytes)))
+    }
+
     pub fn get_header(&self, height: u64) -> Result<Option<BlockHeader>, StoreError> {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_HEADERS))?;
         let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
         Ok(raw.and_then(|b| decode_header(&b)))
+    }
+
+    /// Load one bounded consecutive canonical-header range from a single
+    /// MDBX read snapshot.
+    ///
+    /// The shared store handle is MVCC-backed, so P2P serving can use this
+    /// path while block acceptance owns the hot chain-context writer. A
+    /// missing height ends the range; malformed durable rows fail the whole
+    /// read rather than silently producing a non-contiguous response.
+    pub fn get_headers(
+        &self,
+        start_height: u64,
+        count: u16,
+    ) -> Result<Vec<BlockHeader>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let tbl = txn.open_table(Some(T_HEADERS))?;
+        let mut headers = Vec::with_capacity(count as usize);
+        for offset in 0..u64::from(count) {
+            let Some(height) = start_height.checked_add(offset) else {
+                break;
+            };
+            let raw: Option<Vec<u8>> = txn.get(&tbl, &u64_key(height))?;
+            let Some(raw) = raw else {
+                break;
+            };
+            let header =
+                decode_header(&raw).ok_or(StoreError::Decode("canonical header is malformed"))?;
+            if header.height != height {
+                return Err(StoreError::Decode(
+                    "canonical header row has the wrong height",
+                ));
+            }
+            headers.push(header);
+        }
+        Ok(headers)
     }
 
     pub fn get_header_anchor(&self, height: u64) -> Result<Option<HeaderChainAnchor>, StoreError> {
@@ -1784,6 +1827,7 @@ impl MdbxStore {
             .map_err(|_| StoreError::Decode("invalid staged snapshot exact-root depth"))?;
         let mut exact_segment_roots = Vec::with_capacity(staging.descriptors().len());
         let mut counted_live = 0u64;
+        let mut circulating_supply_micronoid = 0u128;
         let mut previous_segment = None;
 
         let txn = self.db.begin_rw_txn()?;
@@ -2076,6 +2120,11 @@ impl MdbxStore {
                 counted_live = counted_live
                     .checked_add(1)
                     .ok_or(StoreError::Decode("staged snapshot active-count overflow"))?;
+                circulating_supply_micronoid = circulating_supply_micronoid
+                    .checked_add(u128::from(slot.amount()))
+                    .ok_or(StoreError::Decode(
+                        "staged snapshot circulating supply overflow",
+                    ))?;
                 let global = segment_base
                     .checked_add(u64::from(local))
                     .and_then(|index| u32::try_from(index).ok())
@@ -2149,6 +2198,7 @@ impl MdbxStore {
             segmented,
             tip_header.active_slot_count,
             tip_header.alloc_counter,
+            circulating_supply_micronoid,
             exact_root,
             &exact_segment_roots,
         )
@@ -2179,6 +2229,7 @@ impl MdbxStore {
                 tip_header.log_slots,
                 tip_header.active_slot_count,
                 tip_header.alloc_counter,
+                circulating_supply_micronoid,
             ),
             WriteFlags::empty(),
         )?;
@@ -2299,6 +2350,18 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
         }
+        let state_meta = txn.open_table(Some(T_STATE_META))?;
+        txn.put(
+            &state_meta,
+            KEY_META,
+            encode_state_meta(
+                header.log_slots,
+                header.active_slot_count,
+                header.alloc_counter,
+                state.circulating_supply_micronoid,
+            ),
+            WriteFlags::empty(),
+        )?;
         txn.commit()?;
         Ok(())
     }
@@ -2353,6 +2416,7 @@ impl MdbxStore {
         tx_hashes: &[TxBodyHash],
         tx_index_deletes: &[TxBodyHash],
         accepted_block: Option<AcceptedBlockCommit<'_>>,
+        circulating_supply_micronoid: u128,
         consensus_meta: &ConsensusMeta,
         rebuild_owner_index: bool,
     ) -> Result<(), StoreError> {
@@ -2651,6 +2715,7 @@ impl MdbxStore {
                 header.log_slots,
                 header.active_slot_count,
                 header.alloc_counter,
+                circulating_supply_micronoid,
             ),
             WriteFlags::empty(),
         )?;
@@ -2859,6 +2924,7 @@ impl MdbxStore {
         reverted_tx_hashes: &[TxBodyHash],
         replacement_bundles: &[crate::AcceptedBlockBundle],
         replacement: &[StagedAcceptedBlockCommit],
+        circulating_supply_micronoid: u128,
         consensus_meta: &ConsensusMeta,
     ) -> Result<(), StoreError> {
         if final_dirty_segments.len() != final_dirty_segment_summaries.len()
@@ -3197,6 +3263,7 @@ impl MdbxStore {
                 final_header.log_slots,
                 final_header.active_slot_count,
                 final_header.alloc_counter,
+                circulating_supply_micronoid,
             ),
             WriteFlags::empty(),
         )?;
@@ -3451,6 +3518,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                0,
                 &meta,
                 false,
             )
@@ -3485,11 +3553,28 @@ mod tests {
                 &[],
                 &[],
                 None,
+                state.circulating_supply_micronoid,
                 &meta,
                 true,
             )
             .unwrap();
+        assert_eq!(
+            store.get_circulating_supply().unwrap(),
+            Some(state.circulating_supply_micronoid)
+        );
         (state, header, hash)
+    }
+
+    #[test]
+    fn canonical_header_batch_uses_one_bounded_contiguous_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, _) = commit_genesis(&store);
+
+        assert_eq!(store.get_headers(0, 512).unwrap(), vec![genesis]);
+        assert!(store.get_headers(1, 512).unwrap().is_empty());
+        assert!(store.get_headers(0, 0).unwrap().is_empty());
+        assert!(store.get_headers(u64::MAX, 2).unwrap().is_empty());
     }
 
     #[test]
@@ -3544,7 +3629,7 @@ mod tests {
         txn.put(
             &state_meta,
             KEY_META,
-            encode_state_meta(24, 256, 256),
+            encode_state_meta(24, 256, 256, 0),
             WriteFlags::empty(),
         )
         .unwrap();
@@ -3573,12 +3658,57 @@ mod tests {
             header.log_slots,
             header.active_slot_count,
             header.alloc_counter,
+            store.get_circulating_supply().unwrap(),
             header.height,
             header.state_root,
         )
         .unwrap();
         assert_eq!(restored.cached_state_root(), state.cached_state_root());
+        assert_eq!(
+            restored.circulating_supply_micronoid,
+            state.circulating_supply_micronoid
+        );
         assert_eq!(store.segment_summaries().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn legacy_state_metadata_upgrades_supply_during_existing_dense_verification() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (state, header, _) = commit_stateful_test_genesis(&store);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_STATE_META)).unwrap();
+        let encoded: Vec<u8> = txn.get(&table, KEY_META).unwrap().unwrap();
+        txn.put(
+            &table,
+            KEY_META,
+            &encoded[..crate::storage::serial::ENCODED_STATE_META_V1_BYTES],
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.get_circulating_supply().unwrap(), None);
+
+        let restored = crate::storage::mdbx_context::MdbxChainContext::load_streamed_chain_state(
+            &store,
+            header.log_slots,
+            header.active_slot_count,
+            header.alloc_counter,
+            store.get_circulating_supply().unwrap(),
+            header.height,
+            header.state_root,
+        )
+        .unwrap();
+
+        assert_eq!(
+            restored.circulating_supply_micronoid,
+            state.circulating_supply_micronoid
+        );
+        assert_eq!(
+            store.get_circulating_supply().unwrap(),
+            Some(state.circulating_supply_micronoid)
+        );
     }
 
     #[test]
@@ -3608,6 +3738,7 @@ mod tests {
                 header.log_slots,
                 header.active_slot_count,
                 header.alloc_counter,
+                store.get_circulating_supply().unwrap(),
                 header.height,
                 header.state_root,
             )
@@ -3786,6 +3917,7 @@ mod tests {
                 &tx_hashes,
                 &[],
                 Some(AcceptedBlockCommit::Complete(&bundle)),
+                0,
                 &meta,
                 false,
             )
@@ -3832,6 +3964,7 @@ mod tests {
                 &tx_hashes,
                 &[],
                 Some(AcceptedBlockCommit::Complete(&bundle)),
+                0,
                 &meta,
                 false,
             )
@@ -3890,6 +4023,7 @@ mod tests {
                 &tx_hashes,
                 &[],
                 None,
+                0,
                 &meta,
                 false,
             )
@@ -4019,6 +4153,7 @@ mod tests {
             store.get_state_meta().unwrap(),
             Some((target.header.log_slots, 0, 0))
         );
+        assert_eq!(store.get_circulating_supply().unwrap(), Some(0));
     }
 
     #[test]

@@ -127,17 +127,6 @@ pub enum MatrixCacheState {
     Failed(String),
 }
 
-impl MatrixCacheState {
-    pub fn label(&self) -> &'static str {
-        match self {
-            Self::Pending => "PENDING",
-            Self::Preparing => "PREPARING",
-            Self::Ready => "READY",
-            Self::Failed(_) => "FAILED",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofsTab {
     Mine,
@@ -191,9 +180,14 @@ pub struct NetworkSnapshot {
     pub cpu_load: f32,
     pub memory_used_bytes: u64,
     pub memory_total_bytes: u64,
-    pub last_block_age_seconds: u64,
+    pub circulating_supply_micronoid: u128,
+    pub block_reward_micronoid: u64,
+    pub network_hashrate_hps: Option<f64>,
     pub average_block_time_ms: u64,
     pub difficulty: f64,
+    pub pow_work_bits: Option<f64>,
+    pub pow_work_change_percent: Option<f64>,
+    pub difficulty_target: String,
     pub backend: String,
     pub synced: bool,
     pub terminal_verified: bool,
@@ -644,9 +638,14 @@ impl AppSnapshot {
                 cpu_load: 0.0,
                 memory_used_bytes: 0,
                 memory_total_bytes: 1,
-                last_block_age_seconds: 0,
+                circulating_supply_micronoid: 0,
+                block_reward_micronoid: 50_000_000,
+                network_hashrate_hps: None,
                 average_block_time_ms: 15_000,
                 difficulty: 1.0,
+                pow_work_bits: None,
+                pow_work_change_percent: None,
+                difficulty_target: String::new(),
                 backend: "STARTING".into(),
                 synced: false,
                 terminal_verified: false,
@@ -788,9 +787,15 @@ impl AppSnapshot {
                 cpu_load: 0.147,
                 memory_used_bytes: 12_300_000_000,
                 memory_total_bytes: 31_000_000_000,
-                last_block_age_seconds: 4,
+                circulating_supply_micronoid: 118_982_430_000,
+                block_reward_micronoid: 50_000_000,
+                network_hashrate_hps: Some(689_853.0),
                 average_block_time_ms: 15_200,
-                difficulty: 10.60,
+                difficulty: 40.0,
+                pow_work_bits: Some(23.321_928_094_887_36),
+                pow_work_change_percent: Some(8.2),
+                difficulty_target:
+                    "9999999999999999999999999999999999999999999999999999999999010000".into(),
                 backend: "AVX2".into(),
                 synced: true,
                 terminal_verified: true,
@@ -880,14 +885,268 @@ pub fn format_micronoid(value: u64) -> String {
     format!("{whole}.{fractional:06}")
 }
 
+pub fn format_micronoid_trimmed(value: u64) -> String {
+    let mut formatted = format_micronoid(value);
+    while formatted.ends_with('0') {
+        formatted.pop();
+    }
+    if formatted.ends_with('.') {
+        formatted.pop();
+    }
+    formatted
+}
+
+pub fn format_hashrate(hashrate_hps: Option<f64>) -> String {
+    let Some(mut scaled) = hashrate_hps.filter(|value| value.is_finite() && *value > 0.0) else {
+        return "—".into();
+    };
+    const UNITS: [&str; 7] = ["H/s", "KH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s"];
+    let mut unit = 0usize;
+    while scaled >= 1_000.0 && unit + 1 < UNITS.len() {
+        scaled /= 1_000.0;
+        unit += 1;
+    }
+    let value = if scaled >= 100.0 {
+        format!("{scaled:.0}")
+    } else if scaled >= 10.0 {
+        format!("{scaled:.1}")
+    } else {
+        format!("{scaled:.2}")
+    };
+    format!("~{value} {}", UNITS[unit])
+}
+
+pub fn format_pow_work(work_bits: Option<f64>, change_percent: Option<f64>) -> String {
+    let Some(work_bits) = work_bits.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return "—".into();
+    };
+    let work = format!("2^{work_bits:.1}");
+    let Some(change) = change_percent.filter(|value| value.is_finite()) else {
+        return work;
+    };
+    let (arrow, magnitude) = if change > 0.05 {
+        ("↑", change)
+    } else if change < -0.05 {
+        ("↓", -change)
+    } else {
+        ("→", 0.0)
+    };
+    format!("{work} {arrow}{magnitude:.1}%")
+}
+
+pub fn format_pow_work_change(change_percent: Option<f64>) -> String {
+    let Some(change) = change_percent.filter(|value| value.is_finite()) else {
+        return "—".into();
+    };
+    if change > 0.05 {
+        format!("↑ {:.1}%", change)
+    } else if change < -0.05 {
+        format!("↓ {:.1}%", -change)
+    } else {
+        "→ 0.0%".into()
+    }
+}
+
+pub fn format_expected_pow_hashes(work_bits: Option<f64>) -> String {
+    let Some(work_bits) = work_bits.filter(|value| value.is_finite() && *value >= 0.0) else {
+        return "—".into();
+    };
+    let hashes = 2.0_f64.powf(work_bits);
+    if !hashes.is_finite() {
+        return "—".into();
+    }
+    const UNITS: [&str; 9] = ["", "K", "M", "B", "T", "Q", "Qi", "Sx", "Sp"];
+    let mut scaled = hashes;
+    let mut unit = 0usize;
+    while scaled >= 1_000.0 && unit + 1 < UNITS.len() {
+        scaled /= 1_000.0;
+        unit += 1;
+    }
+    if scaled >= 1_000.0 {
+        return format!("~{hashes:.2e} HASHES");
+    }
+    let value = if scaled >= 100.0 {
+        format!("{scaled:.0}")
+    } else if scaled >= 10.0 {
+        format!("{scaled:.1}")
+    } else {
+        format!("{scaled:.2}")
+    };
+    format!("~{value}{} HASHES", UNITS[unit])
+}
+
+pub fn display_pow_target(target_hex_le: &str) -> Option<String> {
+    let mut bytes = hex::decode(target_hex_le).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    bytes.reverse();
+    Some(hex::encode(bytes))
+}
+
+pub fn format_compact_count(value: u64) -> String {
+    const UNITS: [(&str, u128); 5] = [
+        ("", 1),
+        ("K", 1_000),
+        ("M", 1_000_000),
+        ("B", 1_000_000_000),
+        ("T", 1_000_000_000_000),
+    ];
+
+    let value = u128::from(value);
+    let mut unit_index = UNITS
+        .iter()
+        .rposition(|(_, divisor)| value >= *divisor)
+        .unwrap_or(0);
+
+    loop {
+        let (suffix, divisor) = UNITS[unit_index];
+        let rounded_hundredths = value
+            .checked_mul(100)
+            .expect("u64 counts fit u128 compact formatting")
+            .saturating_add(divisor / 2)
+            / divisor;
+
+        if rounded_hundredths >= 100_000 && unit_index + 1 < UNITS.len() {
+            unit_index += 1;
+            continue;
+        }
+
+        let whole = rounded_hundredths / 100;
+        let fractional = (rounded_hundredths % 100) as u8;
+        return match fractional {
+            0 => format!("{whole}{suffix}"),
+            value if value.is_multiple_of(10) => format!("{whole}.{}{suffix}", value / 10),
+            value => format!("{whole}.{value:02}{suffix}"),
+        };
+    }
+}
+
+/// Compact whole-network monetary value with at most two decimal places.
+///
+/// The caller supplies μNOID; the returned text deliberately omits the final
+/// `NOID` suffix so views can retain it unconditionally at every window size.
+pub fn format_compact_micronoid(value: u128) -> String {
+    const UNITS: [(&str, u128); 5] = [
+        ("", 1_000_000),
+        ("K", 1_000_000_000),
+        ("M", 1_000_000_000_000),
+        ("B", 1_000_000_000_000_000),
+        ("T", 1_000_000_000_000_000_000),
+    ];
+
+    let mut unit_index = UNITS
+        .iter()
+        .rposition(|(_, divisor)| value >= *divisor)
+        .unwrap_or(0);
+
+    loop {
+        let (suffix, divisor) = UNITS[unit_index];
+        let whole = value / divisor;
+        let remainder = value % divisor;
+        let rounded_hundredths = whole * 100 + (remainder * 100 + divisor / 2) / divisor;
+
+        if rounded_hundredths >= 100_000 && unit_index + 1 < UNITS.len() {
+            unit_index += 1;
+            continue;
+        }
+
+        let scaled_whole = rounded_hundredths / 100;
+        let fractional = (rounded_hundredths % 100) as u8;
+        return match fractional {
+            0 => format!("{scaled_whole}{suffix}"),
+            value if value.is_multiple_of(10) => {
+                format!("{scaled_whole}.{}{suffix}", value / 10)
+            }
+            value => format!("{scaled_whole}.{value:02}{suffix}"),
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{format_creation_origin, AppSnapshot, SensitiveString};
+    use super::{
+        display_pow_target, format_compact_count, format_compact_micronoid, format_creation_origin,
+        format_expected_pow_hashes, format_hashrate, format_micronoid_trimmed, format_pow_work,
+        format_pow_work_change, AppSnapshot, SensitiveString,
+    };
 
     #[test]
     fn formats_creation_id_namespaces_semantically() {
         assert_eq!(format_creation_origin(4), "OUT #4");
         assert_eq!(format_creation_origin((1 << 63) | 1), "CB #1");
+    }
+
+    #[test]
+    fn compacts_network_supply_without_losing_the_unit_scale() {
+        assert_eq!(format_compact_micronoid(0), "0");
+        assert_eq!(format_compact_micronoid(950_000_000), "950");
+        assert_eq!(format_compact_micronoid(999_995_000), "1K");
+        assert_eq!(format_compact_micronoid(118_982_430_000), "118.98K");
+        assert_eq!(format_compact_micronoid(105_120_000_000_000), "105.12M");
+        assert_eq!(format_compact_micronoid(1_230_000_000_000_000), "1.23B");
+        assert_eq!(
+            format_compact_micronoid(12_350_000_000_000_000_000),
+            "12.35T"
+        );
+    }
+
+    #[test]
+    fn trims_only_insignificant_reward_decimals() {
+        assert_eq!(format_micronoid_trimmed(50_000_000), "50");
+        assert_eq!(format_micronoid_trimmed(12_500_000), "12.5");
+        assert_eq!(format_micronoid_trimmed(3_125_000), "3.125");
+        assert_eq!(format_micronoid_trimmed(1_562_500), "1.5625");
+        assert_eq!(format_micronoid_trimmed(1_000_001), "1.000001");
+    }
+
+    #[test]
+    fn formats_network_hashrate_as_an_explicit_estimate() {
+        assert_eq!(format_hashrate(None), "—");
+        assert_eq!(format_hashrate(Some(17_476.266)), "~17.5 KH/s");
+        assert_eq!(format_hashrate(Some(1_118_481.0)), "~1.12 MH/s");
+        assert_eq!(format_hashrate(Some(12_345_678_901.0)), "~12.3 GH/s");
+    }
+
+    #[test]
+    fn formats_pow_work_as_a_fractional_power_with_recent_direction() {
+        let bits = Some(23.321_928_094_887_36);
+        assert_eq!(format_pow_work(bits, Some(8.2)), "2^23.3 ↑8.2%");
+        assert_eq!(format_pow_work(bits, Some(-5.14)), "2^23.3 ↓5.1%");
+        assert_eq!(format_pow_work(bits, Some(0.01)), "2^23.3 →0.0%");
+        assert_eq!(format_pow_work(bits, None), "2^23.3");
+        assert_eq!(format_pow_work(None, Some(8.2)), "—");
+    }
+
+    #[test]
+    fn formats_pow_work_detail_values() {
+        let bits = Some(23.321_928_094_887_36);
+        assert_eq!(format_expected_pow_hashes(bits), "~10.5M HASHES");
+        assert_eq!(format_expected_pow_hashes(Some(18.0)), "~262K HASHES");
+        assert_eq!(format_pow_work_change(Some(8.2)), "↑ 8.2%");
+        assert_eq!(format_pow_work_change(Some(-5.14)), "↓ 5.1%");
+        assert_eq!(format_pow_work_change(Some(0.01)), "→ 0.0%");
+    }
+
+    #[test]
+    fn renders_numeric_pow_target_in_conventional_big_endian_order() {
+        let little_endian = "9999999999999999999999999999999999999999999999999999999999010000";
+        assert_eq!(
+            display_pow_target(little_endian).as_deref(),
+            Some("0000019999999999999999999999999999999999999999999999999999999999")
+        );
+        assert_eq!(display_pow_target("abcd"), None);
+    }
+
+    #[test]
+    fn compacts_live_utxo_counts_without_hiding_small_networks() {
+        assert_eq!(format_compact_count(0), "0");
+        assert_eq!(format_compact_count(999), "999");
+        assert_eq!(format_compact_count(1_000), "1K");
+        assert_eq!(format_compact_count(2_567), "2.57K");
+        assert_eq!(format_compact_count(999_995), "1M");
+        assert_eq!(format_compact_count(1_276_944), "1.28M");
+        assert_eq!(format_compact_count(4_294_967_296), "4.29B");
     }
 
     #[test]

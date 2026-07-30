@@ -15,6 +15,9 @@ pub struct ChainInfo {
     pub difficulty_target: String,
     pub active_slot_count: u64,
     pub log_slots: u32,
+    /// Exact sum of all live UTXO values, encoded as a decimal string so the
+    /// JSON boundary never loses precision.
+    pub circulating_supply_micronoid: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

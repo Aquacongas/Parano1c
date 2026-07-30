@@ -1723,6 +1723,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                state.circulating_supply_micronoid,
                 &genesis_meta,
                 true,
             )
@@ -1793,6 +1794,7 @@ mod tests {
                 Some(crate::storage::mdbx_store::AcceptedBlockCommit::Complete(
                     &bundle,
                 )),
+                state.circulating_supply_micronoid,
                 &child_meta,
                 false,
             )
@@ -1820,6 +1822,7 @@ mod tests {
             .state
             .apply_delta_unrooted(&[(7, changed_slot)])
             .unwrap();
+        changed_state.circulating_supply_micronoid = u128::from(changed_slot.amount());
         let changed_root = changed_state.try_state_root().unwrap();
         let mut grandchild = child;
         grandchild.height = 2;
@@ -1874,6 +1877,7 @@ mod tests {
                 Some(crate::storage::mdbx_store::AcceptedBlockCommit::Complete(
                     &bundle,
                 )),
+                changed_state.circulating_supply_micronoid,
                 &grandchild_meta,
                 false,
             )

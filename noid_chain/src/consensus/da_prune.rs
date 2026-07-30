@@ -17,7 +17,6 @@ use std::collections::{HashMap, HashSet};
 use crate::block::Block;
 use crate::consensus::params::UNDO_RETENTION_DEPTH;
 use crate::fri_state::SlotValue;
-use crate::segmented_state::SegmentedFriState;
 use crate::state::ChainState;
 use noid_poseidon2b::primitives::TxBodyHash;
 
@@ -129,18 +128,29 @@ pub fn build_undo_log(
 /// Revert the UTXO state to what it was before a block was applied by
 /// replaying `undo.slot_changes`. Each physical slot occurs exactly once.
 ///
-/// Only the `SegmentedFriState` is modified; the caller is responsible for
-/// updating `ChainState::active_slot_count` and `alloc_counter` if needed.
+/// Slot contents and the derived circulating-supply counter are restored
+/// together. The caller remains responsible for restoring the header-bound
+/// occupancy and allocation counters.
 ///
 /// After this call, `state.root()` should match the pre-block state root
 /// assuming no other mutations occurred between `build_undo_log` and here.
-pub fn revert_block(state: &mut SegmentedFriState, undo: &BlockUndoLog) {
+pub fn revert_block(
+    state: &mut ChainState,
+    undo: &BlockUndoLog,
+) -> Result<(), crate::state::ApplyError> {
+    let circulating_supply_micronoid = state
+        .supply_after_slot_updates(&undo.slot_changes)
+        .ok_or(crate::state::ApplyError::CirculatingSupplyInvariant)?;
     for (slot_index, prev_value) in undo.slot_changes.iter().rev() {
-        if (*slot_index as u64) < state.num_slots() {
-            // Ignore errors — out-of-range is already guarded above.
-            let _ = state.set_slot(*slot_index, *prev_value);
+        if (*slot_index as u64) < state.state.num_slots() {
+            state
+                .state
+                .set_slot(*slot_index, *prev_value)
+                .map_err(|_| crate::state::ApplyError::SlotOutOfRange)?;
         }
     }
+    state.circulating_supply_micronoid = circulating_supply_micronoid;
+    Ok(())
 }
 
 /// Remove undo logs older than `UNDO_RETENTION_DEPTH` blocks from `logs`.
@@ -246,13 +256,15 @@ mod tests {
         crate::block::apply_block(&mut state, &orphaned).unwrap();
         assert_eq!(state.active_slot_count, 3);
         assert_eq!(state.alloc_counter, 3);
+        assert!(state.circulating_supply_micronoid > 0);
 
-        revert_block(&mut state.state, &undo);
+        revert_block(&mut state, &undo).unwrap();
         state.active_slot_count = undo.active_slot_count_before;
         state.alloc_counter = undo.alloc_counter_before;
         assert_eq!(state.state_root(), parent_root);
         assert_eq!(state.active_slot_count, 0);
         assert_eq!(state.alloc_counter, 0);
+        assert_eq!(state.circulating_supply_micronoid, 0);
 
         let replacement = build(&state, Address([3u8; 32]), 3);
         crate::block::apply_block(&mut state, &replacement).unwrap();

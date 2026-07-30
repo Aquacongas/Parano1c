@@ -1815,9 +1815,10 @@ fn validate_snapshot_staged_header_boundary(
     ) {
         return Err("snapshot bridge does not advance cumulative chainwork".into());
     }
-    let expected_epoch_height = (manifest.tip_height
-        / noid_chain::consensus::params::TX_EPOCH_BLOCKS)
-        * noid_chain::consensus::params::TX_EPOCH_BLOCKS;
+    // A boundary block still consumes the preceding transaction-epoch
+    // anchor; its own header becomes active only for the following child.
+    let expected_epoch_height =
+        noid_chain::consensus::tx_epoch_anchor_height_for_child(manifest.tip_height);
     if boundary.epoch_anchor_header.height != expected_epoch_height {
         return Err("snapshot staged transaction-epoch anchor has wrong height".into());
     }
@@ -2507,6 +2508,82 @@ mod tests {
         assert!(validate_snapshot_staged_header_boundary(&bad, &boundary)
             .expect_err("bad chainwork must reject")
             .contains("chainwork"));
+    }
+
+    #[test]
+    fn snapshot_epoch_anchor_obeys_start_of_block_boundaries() {
+        for (tip_height, expected_epoch_height) in [
+            (143, 0),
+            (144, 0),
+            (145, 144),
+            (5_327, 5_184),
+            (5_328, 5_184),
+            (5_329, 5_328),
+        ] {
+            let mut tip_header = noid_chain::consensus::genesis_header();
+            tip_header.height = tip_height;
+            let tip_hash = noid_chain::hash_block_header(&tip_header);
+            let cumulative_chainwork = [0xA5; 32];
+            let manifest = noid_p2p::protocol::GetStateManifestResponse {
+                tip_height,
+                tip_hash,
+                cumulative_chainwork,
+                log_slots: tip_header.log_slots,
+                active_slot_count: tip_header.active_slot_count,
+                alloc_counter: tip_header.alloc_counter,
+                bridge_tip_height: tip_height,
+                bridge_tip_hash: tip_hash,
+                bridge_cumulative_chainwork: cumulative_chainwork,
+                ..Default::default()
+            };
+            let mut epoch_anchor_header = noid_chain::consensus::genesis_header();
+            epoch_anchor_header.height = expected_epoch_height;
+            let boundary = SnapshotHeaderBoundary {
+                tip_header,
+                tip_hash,
+                cumulative_chainwork,
+                epoch_anchor_header,
+            };
+
+            validate_snapshot_staged_header_boundary(&manifest, &boundary).unwrap_or_else(
+                |error| {
+                    panic!(
+                        "tip {tip_height} must accept epoch anchor {expected_epoch_height}: {error}"
+                    )
+                },
+            );
+        }
+
+        let tip_height = noid_chain::consensus::params::TX_EPOCH_BLOCKS;
+        let mut tip_header = noid_chain::consensus::genesis_header();
+        tip_header.height = tip_height;
+        let tip_hash = noid_chain::hash_block_header(&tip_header);
+        let cumulative_chainwork = [0x5A; 32];
+        let manifest = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height,
+            tip_hash,
+            cumulative_chainwork,
+            log_slots: tip_header.log_slots,
+            active_slot_count: tip_header.active_slot_count,
+            alloc_counter: tip_header.alloc_counter,
+            bridge_tip_height: tip_height,
+            bridge_tip_hash: tip_hash,
+            bridge_cumulative_chainwork: cumulative_chainwork,
+            ..Default::default()
+        };
+        let mut wrong_anchor = noid_chain::consensus::genesis_header();
+        wrong_anchor.height = tip_height;
+        let boundary = SnapshotHeaderBoundary {
+            tip_header,
+            tip_hash,
+            cumulative_chainwork,
+            epoch_anchor_header: wrong_anchor,
+        };
+        assert!(
+            validate_snapshot_staged_header_boundary(&manifest, &boundary)
+                .expect_err("a boundary block cannot activate itself as its own epoch anchor")
+                .contains("epoch anchor")
+        );
     }
 
     #[test]
