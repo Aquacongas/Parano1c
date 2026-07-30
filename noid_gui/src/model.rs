@@ -916,24 +916,6 @@ pub fn format_hashrate(hashrate_hps: Option<f64>) -> String {
     format!("~{value} {}", UNITS[unit])
 }
 
-pub fn format_pow_work(work_bits: Option<f64>, change_percent: Option<f64>) -> String {
-    let Some(work_bits) = work_bits.filter(|value| value.is_finite() && *value >= 0.0) else {
-        return "—".into();
-    };
-    let work = format!("2^{work_bits:.1}");
-    let Some(change) = change_percent.filter(|value| value.is_finite()) else {
-        return work;
-    };
-    let (arrow, magnitude) = if change > 0.05 {
-        ("↑", change)
-    } else if change < -0.05 {
-        ("↓", -change)
-    } else {
-        ("→", 0.0)
-    };
-    format!("{work} {arrow}{magnitude:.1}%")
-}
-
 pub fn format_pow_work_change(change_percent: Option<f64>) -> String {
     let Some(change) = change_percent.filter(|value| value.is_finite()) else {
         return "—".into();
@@ -1067,7 +1049,7 @@ pub fn format_compact_micronoid(value: u128) -> String {
 mod tests {
     use super::{
         display_pow_target, format_compact_count, format_compact_micronoid, format_creation_origin,
-        format_expected_pow_hashes, format_hashrate, format_micronoid_trimmed, format_pow_work,
+        format_expected_pow_hashes, format_hashrate, format_micronoid_trimmed,
         format_pow_work_change, AppSnapshot, SensitiveString,
     };
 
@@ -1106,16 +1088,6 @@ mod tests {
         assert_eq!(format_hashrate(Some(17_476.266)), "~17.5 KH/s");
         assert_eq!(format_hashrate(Some(1_118_481.0)), "~1.12 MH/s");
         assert_eq!(format_hashrate(Some(12_345_678_901.0)), "~12.3 GH/s");
-    }
-
-    #[test]
-    fn formats_pow_work_as_a_fractional_power_with_recent_direction() {
-        let bits = Some(23.321_928_094_887_36);
-        assert_eq!(format_pow_work(bits, Some(8.2)), "2^23.3 ↑8.2%");
-        assert_eq!(format_pow_work(bits, Some(-5.14)), "2^23.3 ↓5.1%");
-        assert_eq!(format_pow_work(bits, Some(0.01)), "2^23.3 →0.0%");
-        assert_eq!(format_pow_work(bits, None), "2^23.3");
-        assert_eq!(format_pow_work(None, Some(8.2)), "—");
     }
 
     #[test]

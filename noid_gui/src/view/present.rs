@@ -11,8 +11,7 @@ use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmissi
 use crate::i18n::{address_label, text, text_input};
 use crate::model::{
     format_compact_count, format_compact_micronoid, format_creation_origin, format_hashrate,
-    format_micronoid, format_micronoid_trimmed, format_pow_work, AddressSnapshot, UtxoSnapshot,
-    UTXO_PAGE_SIZE,
+    format_micronoid, format_micronoid_trimmed, AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::{ProofForge, StateField};
@@ -222,11 +221,7 @@ pub fn system_meters(app: &App, compact: bool) -> Element<'_, Message> {
             format!("{:.1}s", network.average_block_time_ms as f64 / 1_000.0),
             theme::ACCENT,
         ),
-        telemetry_value(
-            "POW WORK",
-            format_pow_work(network.pow_work_bits, network.pow_work_change_percent),
-            theme::WARNING,
-        ),
+        difficulty_telemetry(network.difficulty),
     ]
     .spacing(7)
     .width(Length::Fill)
@@ -392,6 +387,35 @@ fn telemetry_value(
                 .wrapping(iced::widget::text::Wrapping::None),
         ]
         .spacing(6)
+        .align_y(Alignment::Center)
+        .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .into()
+}
+
+fn difficulty_telemetry(difficulty: f64) -> Element<'static, Message> {
+    container(
+        row![
+            iced::widget::text("DIFFICULTY")
+                .size(13)
+                .color(theme::CYAN)
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(Length::Fill),
+            text("[")
+                .size(14)
+                .color(theme::DIM)
+                .wrapping(iced::widget::text::Wrapping::None),
+            text(format!("{difficulty:.2}"))
+                .size(14)
+                .color(theme::WARNING)
+                .wrapping(iced::widget::text::Wrapping::None),
+            text(" × 2^18]")
+                .size(14)
+                .color(theme::MUTED)
+                .wrapping(iced::widget::text::Wrapping::None),
+        ]
+        .spacing(0)
         .align_y(Alignment::Center)
         .width(Length::Fill),
     )

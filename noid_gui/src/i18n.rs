@@ -213,7 +213,7 @@ fn translate_localized(language: Language, source: &str) -> String {
         .and_then(|value| value.strip_suffix(" conf"))
     {
         return match language {
-            Language::Russian => format!("ТОЛЬКО ЗАГОЛОВОК · {value} подтв."),
+            Language::Russian => format!("ЗАГОЛОВОК · {value} подтв."),
             Language::Chinese => format!("仅区块头 · {value} 次确认"),
             Language::English => source.to_owned(),
         };

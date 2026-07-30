@@ -359,8 +359,8 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
             table_cell("FOUND".into(), 3, theme::INK),
             table_cell("REWARD".into(), 4, theme::INK),
             table_cell("PAYOUT".into(), 3, theme::INK),
-            table_cell("BLOCK".into(), 5, theme::INK),
-            table_cell("AVAILABLE".into(), 3, theme::INK),
+            table_cell("BLOCK".into(), 4, theme::INK),
+            table_cell("AVAILABLE".into(), 4, theme::INK),
             text("OPEN")
                 .size(13)
                 .color(theme::INK)
@@ -461,14 +461,10 @@ fn mined_block_row<'a>(
         .find(|address| address.key_index == block.payout_key_index)
         .map(|address| address_label(&address.label))
         .unwrap_or_else(|| "Address".into());
-    let mut open = button(text(if block.full_block_available {
-        "DETAILS"
-    } else {
-        "HEADER"
-    }))
-    .width(Length::Fixed(92.0))
-    .padding([6, 8])
-    .style(|_, status| theme::button(ButtonKind::Ghost, status));
+    let mut open = button(text("DETAILS"))
+        .width(Length::Fixed(92.0))
+        .padding([6, 8])
+        .style(|_, status| theme::button(ButtonKind::Ghost, status));
     if !app.block_details_loading {
         open = open.on_press(Message::OpenBlockDetails(block.height));
     }
@@ -483,8 +479,8 @@ fn mined_block_row<'a>(
                 3,
                 theme::PROOF,
             ),
-            table_cell(block.short_hash(), 5, theme::MUTED),
-            table_cell(available.0, 3, available.1),
+            table_cell(block.short_hash(), 4, theme::MUTED),
+            table_cell(available.0, 4, available.1),
             open,
         ]
         .spacing(8)
