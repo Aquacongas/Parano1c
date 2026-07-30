@@ -32,7 +32,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     fs::OpenOptions,
     io::{Read, Write},
@@ -44,8 +44,8 @@ use tokio::sync::RwLock;
 use tracing_subscriber::EnvFilter;
 
 use noid_chain::consensus::wire_limits::{
-    MAX_INFLIGHT_SEGMENTS, MAX_ORPHAN_POOL, MAX_ORPHAN_POOL_BYTES, MAX_SEGMENT_BYTES,
-    MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
+    MAX_ORPHAN_POOL, MAX_ORPHAN_POOL_BYTES, MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS,
+    MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::consensus::NetworkConfig;
 use noid_chain::storage::snapshot_staging::{
@@ -89,6 +89,32 @@ struct AppliedP2pBlock {
     height: u64,
     confirmed_tx_hashes: Vec<noid_poseidon2b::primitives::TxBodyHash>,
     view: ChainView,
+}
+
+struct AppliedCompactSuffix {
+    height: u64,
+    block_hash: [u8; 32],
+    confirmed_tx_hashes: Vec<noid_poseidon2b::primitives::TxBodyHash>,
+    view: ChainView,
+    applied_blocks: u64,
+    payload_bytes: u64,
+    apply_elapsed: std::time::Duration,
+    trailing_error: Option<String>,
+}
+
+fn compact_apply_signals(
+    applied_blocks: u64,
+    applied_height: u64,
+    target_height: u64,
+    has_trailing_error: bool,
+) -> (bool, bool) {
+    let advanced = applied_blocks != 0;
+    let complete = !has_trailing_error && applied_height == target_height;
+    (advanced, complete)
+}
+
+fn snapshot_bridge_requires_tail(boundary_height: u64, bridge_tip_height: u64) -> Option<bool> {
+    (bridge_tip_height >= boundary_height).then_some(bridge_tip_height > boundary_height)
 }
 
 struct AppliedReorg {
@@ -172,6 +198,14 @@ fn retained_suffix_has_more(local_height: u64, announced_height: u64) -> bool {
     local_height < announced_height
 }
 
+fn compact_suffix_eligible(local_height: u64, ancestor_height: u64, peer_height: u64) -> bool {
+    if ancestor_height != local_height || peer_height <= local_height {
+        return false;
+    }
+    let gap = peer_height - local_height;
+    (2..=noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH).contains(&gap)
+}
+
 fn next_block_has_competing_parent(
     local_height: u64,
     local_tip_hash: [u8; 32],
@@ -197,6 +231,8 @@ fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
 }
 
 const MINING_PEER_QUORUM: usize = 2;
+const CONNECTED_TIP_PROBE_HEADERS: u16 =
+    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2;
 
 struct MiningPeerQuorum {
     isolated: bool,
@@ -1471,7 +1507,6 @@ struct PendingSnapshotHeaderSync {
     staging: SnapshotHeaderStaging,
     next_height: u64,
     target_height: u64,
-    terminal_requests: Option<TerminalRequestRace>,
 }
 
 const HISTORY_STEP_TERMINAL_HEDGE_DELAY: std::time::Duration = std::time::Duration::from_secs(12);
@@ -1542,6 +1577,15 @@ impl TerminalRequestRace {
         }
         false
     }
+
+    fn mark_succeeded(&mut self, peer: libp2p::PeerId, token: u64) -> bool {
+        if !self.matches(peer, token) {
+            return false;
+        }
+        self.primary_active = false;
+        self.hedge_active = false;
+        true
+    }
 }
 
 fn terminal_alternate_peer(
@@ -1559,6 +1603,100 @@ fn terminal_alternate_peer(
 enum SnapshotHeaderNextAction {
     Fetch { start_height: u64, count: u16 },
     RequestTerminal,
+}
+
+const SNAPSHOT_HEADER_REQUEST_WINDOW: usize = 2;
+
+#[derive(Debug)]
+struct SnapshotHeaderPipeline {
+    generation: u64,
+    from: libp2p::PeerId,
+    target_height: u64,
+    next_request_height: u64,
+    outstanding: std::collections::BTreeMap<u64, u16>,
+    ready: std::collections::BTreeMap<u64, Vec<noid_chain::BlockHeader>>,
+}
+
+impl SnapshotHeaderPipeline {
+    fn new(generation: u64, from: libp2p::PeerId, next_height: u64, target_height: u64) -> Self {
+        Self {
+            generation,
+            from,
+            target_height,
+            next_request_height: next_height,
+            outstanding: std::collections::BTreeMap::new(),
+            ready: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn refill_plan(&mut self) -> Vec<(u64, u16)> {
+        let mut plan = Vec::with_capacity(SNAPSHOT_HEADER_REQUEST_WINDOW);
+        while self.outstanding.len() + self.ready.len() < SNAPSHOT_HEADER_REQUEST_WINDOW
+            && self.next_request_height <= self.target_height
+        {
+            let start_height = self.next_request_height;
+            let count =
+                (self.target_height - start_height + 1).min(MAX_STAGED_HEADER_BATCH as u64) as u16;
+            self.next_request_height += u64::from(count);
+            self.outstanding.insert(start_height, count);
+            plan.push((start_height, count));
+        }
+        plan
+    }
+
+    fn matches_session(&self, generation: u64, from: libp2p::PeerId) -> bool {
+        self.generation == generation && self.from == from
+    }
+
+    fn accept(
+        &mut self,
+        generation: u64,
+        from: libp2p::PeerId,
+        start_height: u64,
+        requested_count: u16,
+        headers: Vec<noid_chain::BlockHeader>,
+    ) -> Result<(), String> {
+        if generation != self.generation || from != self.from {
+            return Err("snapshot header response belongs to another session".into());
+        }
+        let Some(expected_count) = self.outstanding.remove(&start_height) else {
+            return Err("snapshot header response has no matching outstanding range".into());
+        };
+        if expected_count != requested_count || headers.len() != usize::from(expected_count) {
+            return Err("snapshot header response length does not match its exact request".into());
+        }
+        if headers
+            .first()
+            .is_none_or(|header| header.height != start_height)
+        {
+            return Err("snapshot header response starts at the wrong height".into());
+        }
+        let expected_end = start_height + u64::from(expected_count) - 1;
+        if headers
+            .last()
+            .is_none_or(|header| header.height != expected_end)
+        {
+            return Err("snapshot header response ends at the wrong height".into());
+        }
+        if self.ready.insert(start_height, headers).is_some() {
+            return Err("duplicate snapshot header response".into());
+        }
+        Ok(())
+    }
+
+    fn take_ready(&mut self, next_height: u64) -> Option<Vec<noid_chain::BlockHeader>> {
+        self.ready.remove(&next_height)
+    }
+
+    fn contains_outstanding(&self, start_height: u64, count: u16) -> bool {
+        self.outstanding.get(&start_height).copied() == Some(count)
+    }
+
+    fn is_drained(&self) -> bool {
+        self.next_request_height > self.target_height
+            && self.outstanding.is_empty()
+            && self.ready.is_empty()
+    }
 }
 
 fn snapshot_header_next_action(
@@ -1752,7 +1890,6 @@ fn prepare_snapshot_header_sync(
         staging,
         next_height,
         target_height,
-        terminal_requests: None,
     })
 }
 
@@ -1929,6 +2066,143 @@ async fn apply_p2p_block_offthread(
     .expect("apply_p2p_block_offthread panicked in spawn_blocking")
 }
 
+/// Apply one exact recent canonical suffix from compact bodies plus a single
+/// terminal proof. The recursive terminal authorizes the fixed suffix tip;
+/// every body still passes the native parent, header, PoW, epoch,
+/// transaction, and state-root checks before its individual MDBX commit.
+#[allow(clippy::too_many_arguments)]
+async fn apply_compact_suffix_offthread(
+    chain: &Arc<RwLock<MdbxChainContext>>,
+    mempool: &AsyncMempool,
+    wallet: &SharedWallet,
+    tail: FinalizedSnapshotTail,
+    expected_base_height: u64,
+    expected_base_hash: [u8; 32],
+    history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
+    wallet_operation_gate: &WalletOperationGate,
+) -> Result<AppliedCompactSuffix, String> {
+    let _wallet_operation = wallet_operation_gate.lock().await;
+    let apply_chain = Arc::clone(chain);
+    let apply_wallet = Arc::clone(wallet);
+    let result = tokio::task::spawn_blocking(move || {
+        let expected_blocks = tail.block_count();
+        let payload_bytes = tail.payload_bytes();
+        let mut tail = tail;
+        let mut ctx = apply_chain.blocking_write();
+        if ctx.tip_height() != expected_base_height || ctx.tip_hash() != expected_base_hash {
+            return Err("compact suffix base changed before atomic admission".to_owned());
+        }
+        if tail.boundary_height() != expected_base_height
+            || tail.boundary_hash() != expected_base_hash
+        {
+            return Err("compact suffix staging is bound to another base".to_owned());
+        }
+
+        let tip_header = tail.tip_header()?;
+        let epoch_height =
+            noid_chain::consensus::tx_epoch_anchor_height_for_child(tip_header.height);
+        let epoch_anchor_header = if epoch_height <= ctx.tip_height() {
+            ctx.get_header_from_store(epoch_height)
+                .map_err(|error| format!("load compact suffix epoch anchor: {error}"))?
+                .ok_or_else(|| "compact suffix epoch anchor is missing".to_owned())?
+        } else {
+            tail.header_at(epoch_height)?.ok_or_else(|| {
+                "compact suffix epoch anchor is absent from staged bodies".to_owned()
+            })?
+        };
+        let terminal_bytes = tail.take_terminal_bytes();
+        let mut authority = ctx
+            .verify_recursive_suffix(tip_header, epoch_anchor_header, terminal_bytes, |claim| {
+                verify_history_step_terminal(claim, history_step_runtime.as_deref())
+            })
+            .map_err(|error| format!("verify compact suffix terminal: {error}"))?;
+
+        let started = Instant::now();
+        let mut confirmed_tx_hashes = Vec::new();
+        let mut applied_blocks = 0u64;
+        let mut trailing_error = None;
+        let mut reader = tail.reader()?;
+        loop {
+            let block_bytes = match reader.next_block() {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => break,
+                Err(error) => {
+                    trailing_error = Some(error);
+                    break;
+                }
+            };
+            let block = match noid_chain::Block::from_bytes(&block_bytes) {
+                Ok(block) => block,
+                Err(error) => {
+                    trailing_error = Some(format!("decode compact suffix block: {error:?}"));
+                    break;
+                }
+            };
+            let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
+                Ok(txids) => txids,
+                Err(error) => {
+                    trailing_error = Some(format!(
+                        "compact suffix logical transaction stream: {error}"
+                    ));
+                    break;
+                }
+            };
+            if let Err(error) = ctx.apply_verified_recursive_suffix_block(
+                &mut authority,
+                &block_bytes,
+                unix_now(),
+                |block, state| {
+                    noid_chain::materialize_accepted_block_state(state, block)
+                        .map_err(|error| format!("{error:?}"))
+                },
+            ) {
+                trailing_error = Some(format!(
+                    "apply compact suffix block {}: {error}",
+                    block.header.height
+                ));
+                break;
+            }
+            update_wallet_for_block(&apply_wallet, &block);
+            confirmed_tx_hashes.extend(txids);
+            applied_blocks = applied_blocks.saturating_add(1);
+        }
+        if trailing_error.is_none() && !authority.is_complete() {
+            trailing_error = Some("compact suffix ended before its verified tip".to_owned());
+        }
+        if trailing_error.is_none() && applied_blocks != expected_blocks {
+            trailing_error = Some("compact suffix applied an unexpected body count".to_owned());
+        }
+        let view = ChainView::from_mdbx(&ctx);
+        let height = ctx.tip_height();
+        let block_hash = ctx.tip_hash();
+        drop(ctx);
+        drop(tail);
+        Ok(AppliedCompactSuffix {
+            height,
+            block_hash,
+            confirmed_tx_hashes,
+            view,
+            applied_blocks,
+            payload_bytes,
+            apply_elapsed: started.elapsed(),
+            trailing_error,
+        })
+    })
+    .await
+    .map_err(|error| format!("compact suffix worker panicked: {error}"))??;
+
+    if result.applied_blocks != 0 {
+        mempool
+            .on_new_block(
+                &result.confirmed_tx_hashes,
+                result.height,
+                result.view.clone(),
+            )
+            .await;
+    }
+    Ok(result)
+}
+
 /// Apply a chain reorg off the tokio executor.  Same `fsync` rationale.
 ///
 /// The owned replacement payloads are retained only on failure.  On success
@@ -2066,15 +2340,18 @@ fn state_segment_response_matches_snapshot_boundary(
 #[cfg(test)]
 mod tests {
     use super::{
+        admit_snapshot_segment_response, compact_apply_signals, compact_suffix_eligible,
         compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         next_block_has_competing_parent, p2p_listen_to_multiaddr,
         prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
-        snapshot_header_next_action, state_segment_response_matches_snapshot_boundary,
+        snapshot_bridge_requires_tail, snapshot_header_next_action,
+        snapshot_segment_request_capacity, state_segment_response_matches_snapshot_boundary,
         terminal_alternate_peer, unavailable_block_requires_snapshot,
         validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
         validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
-        SnapshotHeaderBoundary, SnapshotHeaderNextAction, TerminalRequestRace,
+        SnapshotHeaderBoundary, SnapshotHeaderNextAction, SnapshotHeaderPipeline,
+        SnapshotSegmentResponseAdmission, TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS,
         HISTORY_STEP_TERMINAL_HEDGE_DELAY, MINING_PEER_QUORUM, STATE_MANIFEST_RESPONSE_TIMEOUT,
     };
 
@@ -2114,6 +2391,15 @@ mod tests {
         assert!(requests.matches(alternate, 41));
         assert!(requests.mark_failed(alternate, 41));
         assert!(!requests.has_active());
+
+        let mut successful = TerminalRequestRace::new(primary, 42, started_at);
+        successful.install_hedge(alternate);
+        assert!(successful.mark_succeeded(primary, 42));
+        assert!(!successful.has_active());
+        assert!(!successful.matches(alternate, 42));
+        assert!(!successful.hedge_due(
+            started_at + HISTORY_STEP_TERMINAL_HEDGE_DELAY + std::time::Duration::from_secs(1)
+        ));
     }
 
     #[test]
@@ -2311,6 +2597,120 @@ mod tests {
         assert!(!gap_requires_snapshot_sync(local_height, local_height + 17));
         assert!(!gap_requires_snapshot_sync(local_height, local_height + 18));
         assert!(gap_requires_snapshot_sync(local_height, local_height + 19));
+    }
+
+    #[test]
+    fn exact_recent_extensions_use_one_compact_suffix_terminal() {
+        let local = 100;
+        assert!(!compact_suffix_eligible(local, local, local + 1));
+        assert!(compact_suffix_eligible(local, local, local + 2));
+        assert!(compact_suffix_eligible(local, local, local + 18));
+        assert!(!compact_suffix_eligible(local, local, local + 19));
+        assert!(!compact_suffix_eligible(local, local - 1, local + 2));
+    }
+
+    #[test]
+    fn compact_suffix_signals_only_real_and_complete_progress() {
+        assert_eq!(compact_apply_signals(0, 100, 102, true), (false, false));
+        assert_eq!(compact_apply_signals(1, 101, 102, true), (true, false));
+        assert_eq!(compact_apply_signals(2, 102, 102, false), (true, true));
+        assert_eq!(compact_apply_signals(2, 101, 102, false), (true, false));
+    }
+
+    #[test]
+    fn connected_tip_probe_covers_only_the_retained_decision_window() {
+        assert_eq!(
+            CONNECTED_TIP_PROBE_HEADERS,
+            noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2
+        );
+        assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 20);
+    }
+
+    #[test]
+    fn snapshot_header_pipeline_is_two_wide_and_reorders_exact_ranges() {
+        let peer = libp2p::PeerId::random();
+        let mut pipeline = SnapshotHeaderPipeline::new(7, peer, 1, 5_822);
+        assert_eq!(pipeline.refill_plan(), vec![(1, 4_096), (4_097, 1_726)]);
+        assert!(pipeline.refill_plan().is_empty());
+
+        let headers = |start: u64, count: u16| {
+            (start..start + u64::from(count))
+                .map(|height| {
+                    let mut header = noid_chain::consensus::genesis::genesis_header();
+                    header.height = height;
+                    header
+                })
+                .collect::<Vec<_>>()
+        };
+        pipeline
+            .accept(7, peer, 4_097, 1_726, headers(4_097, 1_726))
+            .unwrap();
+        assert!(pipeline.take_ready(1).is_none());
+        pipeline
+            .accept(7, peer, 1, 4_096, headers(1, 4_096))
+            .unwrap();
+        assert_eq!(pipeline.take_ready(1).unwrap().len(), 4_096);
+        assert_eq!(pipeline.take_ready(4_097).unwrap().len(), 1_726);
+        assert!(pipeline.is_drained());
+    }
+
+    #[test]
+    fn snapshot_empty_bridge_reuses_the_verified_boundary() {
+        assert_eq!(snapshot_bridge_requires_tail(144, 144), Some(false));
+        assert_eq!(snapshot_bridge_requires_tail(144, 145), Some(true));
+        assert_eq!(snapshot_bridge_requires_tail(144, 162), Some(true));
+        assert_eq!(snapshot_bridge_requires_tail(144, 143), None);
+    }
+
+    #[test]
+    fn delayed_snapshot_header_generation_is_inert() {
+        let current_peer = libp2p::PeerId::random();
+        let old_peer = libp2p::PeerId::random();
+        let mut pipeline = SnapshotHeaderPipeline::new(8, current_peer, 1, 5_000);
+        assert_eq!(pipeline.refill_plan(), vec![(1, 4_096), (4_097, 904)]);
+        assert!(!pipeline.matches_session(7, old_peer));
+        assert!(!pipeline.matches_session(7, current_peer));
+        assert!(pipeline.matches_session(8, current_peer));
+        assert!(
+            pipeline.contains_outstanding(1, 4_096),
+            "stale response filtering cannot consume the active window"
+        );
+    }
+
+    #[test]
+    fn snapshot_segment_pipeline_keeps_one_response_ahead_without_redownload() {
+        assert_eq!(snapshot_segment_request_capacity(0, false, false), 2);
+        assert_eq!(snapshot_segment_request_capacity(0, true, false), 1);
+        assert_eq!(snapshot_segment_request_capacity(0, true, true), 0);
+        assert_eq!(snapshot_segment_request_capacity(1, true, false), 0);
+        assert_eq!(snapshot_segment_request_capacity(2, false, false), 0);
+
+        let mut pending = std::collections::HashSet::from([3u16, 7u16]);
+        let mut queue = std::collections::VecDeque::from([11u16, 13u16]);
+        assert_eq!(
+            admit_snapshot_segment_response(7, false, false, &mut pending, &mut queue),
+            SnapshotSegmentResponseAdmission::StageNow
+        );
+        assert_eq!(
+            admit_snapshot_segment_response(3, true, false, &mut pending, &mut queue),
+            SnapshotSegmentResponseAdmission::BufferOne
+        );
+        assert!(
+            pending.is_empty(),
+            "both out-of-order responses are consumed exactly once"
+        );
+        assert_eq!(
+            admit_snapshot_segment_response(3, true, true, &mut pending, &mut queue),
+            SnapshotSegmentResponseAdmission::Stale,
+            "a delayed duplicate is never downloaded or staged twice"
+        );
+
+        let mut impossible_pending = std::collections::HashSet::from([17u16]);
+        assert_eq!(
+            admit_snapshot_segment_response(17, true, true, &mut impossible_pending, &mut queue,),
+            SnapshotSegmentResponseAdmission::RetryOverflow
+        );
+        assert_eq!(queue.front(), Some(&17));
     }
 
     #[test]
@@ -2774,6 +3174,48 @@ async fn handle_p2p_events(
         result: Result<SnapshotTailStaging, String>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct SnapshotBoundaryTerminalKey {
+        generation: u64,
+        manifest_from: libp2p::PeerId,
+        requests: TerminalRequestRace,
+        height: u64,
+        block_hash: [u8; 32],
+    }
+    struct PrefetchedHistoryStepTerminal {
+        from: libp2p::PeerId,
+        terminal_bytes: Vec<u8>,
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    }
+    struct PendingRecentSuffix {
+        generation: u64,
+        peer: libp2p::PeerId,
+        base_height: u64,
+        base_hash: [u8; 32],
+        target_height: u64,
+        target_hash: [u8; 32],
+        expected_headers: Vec<noid_chain::BlockHeader>,
+        staging: Option<SnapshotTailStaging>,
+        body_request_active: bool,
+        append_active: bool,
+        terminal_requests: TerminalRequestRace,
+        terminal_payload: Option<PrefetchedHistoryStepTerminal>,
+    }
+    struct RecentSuffixAppendCompletion {
+        generation: u64,
+        result: Result<SnapshotTailStaging, String>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct RecentSuffixApplyKey {
+        generation: u64,
+        peer: libp2p::PeerId,
+        base_height: u64,
+        target_height: u64,
+    }
+    struct RecentSuffixApplyCompletion {
+        key: RecentSuffixApplyKey,
+        result: Result<AppliedCompactSuffix, String>,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct SnapshotTailTerminalKey {
         generation: u64,
         manifest_from: libp2p::PeerId,
@@ -2794,6 +3236,7 @@ async fn handle_p2p_events(
     }
     let mut pending_manifest: Option<PendingManifest> = None;
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
+    let mut snapshot_header_pipeline: Option<SnapshotHeaderPipeline> = None;
     let (snapshot_header_staging_tx, mut snapshot_header_staging_rx) =
         tokio::sync::mpsc::channel::<SnapshotHeaderStagingCompletion>(1);
     let mut snapshot_header_staging_inflight: Option<SnapshotHeaderStagingOperationKey> = None;
@@ -2813,9 +3256,18 @@ async fn handle_p2p_events(
     let mut snapshot_tail_staging: Option<SnapshotTailStaging> = None;
     let mut snapshot_tail_request_inflight: Option<SnapshotTailAppendKey> = None;
     let mut snapshot_tail_append_inflight: Option<SnapshotTailAppendKey> = None;
+    let mut snapshot_boundary_terminal_inflight: Option<SnapshotBoundaryTerminalKey> = None;
+    let mut prefetched_snapshot_boundary_terminal: Option<PrefetchedHistoryStepTerminal> = None;
     let mut snapshot_tail_terminal_inflight: Option<SnapshotTailTerminalKey> = None;
+    let mut prefetched_snapshot_tail_terminal: Option<PrefetchedHistoryStepTerminal> = None;
+    let (recent_suffix_append_tx, mut recent_suffix_append_rx) =
+        tokio::sync::mpsc::channel::<RecentSuffixAppendCompletion>(1);
+    let (recent_suffix_apply_tx, mut recent_suffix_apply_rx) =
+        tokio::sync::mpsc::channel::<RecentSuffixApplyCompletion>(1);
+    let mut pending_recent_suffix: Option<PendingRecentSuffix> = None;
+    let mut recent_suffix_apply_inflight: Option<RecentSuffixApplyKey> = None;
+    let mut recent_suffix_generation = 0u64;
     let mut history_step_request_token = 0u64;
-    let mut snapshot_tail_state_download_started = false;
     let mut finalized_snapshot_waiting: Option<(FinalizedSnapshotStaging, usize, libp2p::PeerId)> =
         None;
     let mut snapshot_tail_install_target: Option<u64> = None;
@@ -2868,6 +3320,13 @@ async fn handle_p2p_events(
     // Payloads are authenticated one at a time and sealed to disk.  The
     // session retains only compact descriptors and a received bitset.
     let mut snapshot_staging: Option<SnapshotStagingSession> = None;
+    // One complete response may wait behind the single disk/authentication
+    // worker. Together they form a strict two-segment pipeline; no response is
+    // discarded and downloaded again merely because the worker is busy.
+    let mut queued_segment_response: Option<(
+        libp2p::PeerId,
+        noid_p2p::protocol::GetStateSegmentResponse,
+    )> = None;
     // Segment IDs still outstanding.
     let mut pending_segment_ids: std::collections::HashSet<u16> = std::collections::HashSet::new();
     // Segment IDs queued but not yet requested (concurrency cap).
@@ -2906,14 +3365,18 @@ async fn handle_p2p_events(
             if let Some(stale_headers) = pending_snapshot_header_sync.take() {
                 cleanup_snapshot_header_staging_offthread(stale_headers.staging);
             }
+            snapshot_header_pipeline = None;
             clear_manifest_round_state!();
             if let Some(stale_staging) = snapshot_staging.take() {
                 cleanup_snapshot_staging_session_offthread(stale_staging);
             }
+            queued_segment_response = None;
             drop(snapshot_tail_staging.take());
             snapshot_tail_request_inflight = None;
+            snapshot_boundary_terminal_inflight = None;
+            prefetched_snapshot_boundary_terminal = None;
             snapshot_tail_terminal_inflight = None;
-            snapshot_tail_state_download_started = false;
+            prefetched_snapshot_tail_terminal = None;
             snapshot_tail_install_target = None;
             if let Some((finalized, _, _)) = finalized_snapshot_waiting.take() {
                 cleanup_finalized_snapshot_staging_offthread(finalized);
@@ -3023,6 +3486,33 @@ async fn handle_p2p_events(
             sync_phase_telemetry.begin_snapshot();
             let from = $from;
             let manifest = $manifest;
+            let terminal_height = manifest.tip_height;
+            let terminal_hash = manifest.tip_hash;
+            history_step_request_token = history_step_request_token.wrapping_add(1);
+            let terminal_key = SnapshotBoundaryTerminalKey {
+                generation: snapshot_sync_generation,
+                manifest_from: from,
+                requests: TerminalRequestRace::new(
+                    from,
+                    history_step_request_token,
+                    Instant::now(),
+                ),
+                height: terminal_height,
+                block_hash: terminal_hash,
+            };
+            snapshot_boundary_terminal_inflight = Some(terminal_key);
+            if p2p_cmd
+                .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                    token: terminal_key.requests.primary.token,
+                    peer: from,
+                    height: terminal_height,
+                    block_hash: terminal_hash,
+                })
+                .await
+                .is_err()
+            {
+                snapshot_boundary_terminal_inflight = None;
+            }
             snapshot_header_staging_token = snapshot_header_staging_token.wrapping_add(1);
             let key = SnapshotHeaderStagingOperationKey::Prepare {
                 generation: snapshot_sync_generation,
@@ -3048,6 +3538,237 @@ async fn handle_p2p_events(
                     result,
                 });
             });
+            tracing::info!(
+                peer = %from,
+                target_height = terminal_height,
+                "snapshot: prefetching exact HistoryStep boundary alongside headers"
+            );
+        }};
+    }
+
+    macro_rules! spawn_snapshot_header_append {
+        ($sync:expr, $headers:expr) => {{
+            let sync = $sync;
+            let headers = $headers;
+            let from = sync.from;
+            snapshot_header_staging_token = snapshot_header_staging_token.wrapping_add(1);
+            let key = SnapshotHeaderStagingOperationKey::Append {
+                generation: snapshot_sync_generation,
+                token: snapshot_header_staging_token,
+                from,
+                start_height: sync.next_height,
+            };
+            snapshot_header_staging_inflight = Some(key);
+            let completion = snapshot_header_staging_tx.clone();
+            let store = snapshot_header_store.clone();
+            let staging_path = sync.staging.path().to_owned();
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let mut sync = sync;
+                    let next = sync
+                        .staging
+                        .append_batch(&store, &headers)
+                        .map_err(|error| error.to_string())?;
+                    sync.next_height = next;
+                    Ok(sync)
+                }))
+                .map_err(|_| "snapshot header append worker panicked".to_owned())
+                .and_then(|result| result);
+                if result.is_err() {
+                    let _ = std::fs::remove_file(staging_path);
+                }
+                let _ = completion.blocking_send(SnapshotHeaderStagingCompletion {
+                    key,
+                    work_elapsed: started.elapsed(),
+                    result,
+                });
+            });
+        }};
+    }
+
+    macro_rules! start_snapshot_boundary_verification {
+        ($sync:expr, $payload:expr) => {{
+            let sync = $sync;
+            let payload = $payload;
+            let terminal_from = payload.from;
+            let Some(runtime) = history_step_runtime.clone() else {
+                tracing::error!(
+                    from = %sync.from,
+                    tip = sync.manifest.tip_height,
+                    "snapshot rejected: HistoryStep verifier unavailable"
+                );
+                cleanup_snapshot_header_staging_offthread(sync.staging);
+                drop(payload);
+                reset_sync_state!();
+                continue;
+            };
+            let expected_height = sync.manifest.tip_height;
+            let expected_hash = sync.manifest.tip_hash;
+            let manifest_from = sync.from;
+            history_step_verification_token =
+                history_step_verification_token.wrapping_add(1);
+            let key = HistoryStepVerificationKey {
+                token: history_step_verification_token,
+                from: manifest_from,
+                terminal_from,
+                height: expected_height,
+                block_hash: expected_hash,
+            };
+            let generation = snapshot_sync_generation;
+            let completion = history_step_verification_tx.clone();
+            let generation_guard = Arc::clone(&snapshot_sync_generation_guard);
+            let store = snapshot_header_store.clone();
+            let verification_chain = Arc::clone(&chain);
+            let manifest = sync.manifest;
+            let staging = sync.staging;
+            let staged_header_count = staging.staged_len();
+            let staging_path = staging.path().to_owned();
+            let terminal_bytes = payload.terminal_bytes;
+            let inbound_memory_permit = payload.inbound_memory_permit;
+            history_step_verification_inflight = Some(key);
+            tokio::task::spawn_blocking(move || {
+                let mut header_validation_elapsed = std::time::Duration::ZERO;
+                let mut terminal_measurement = None;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if generation_guard.load(std::sync::atomic::Ordering::Acquire) != generation {
+                        return Err("HistoryStep verification superseded before start".to_owned());
+                    }
+                    let header_started = Instant::now();
+                    let validated_headers = staging
+                        .validate_complete(
+                            &store,
+                            expected_height,
+                            expected_hash,
+                            manifest.cumulative_chainwork,
+                        )
+                        .map_err(|error| error.to_string())?;
+                    let boundary = validated_headers.boundary();
+                    validate_snapshot_staged_header_boundary(&manifest, &boundary)?;
+                    validate_history_step_tip_future_drift(&boundary, unix_now())?;
+                    header_validation_elapsed = header_started.elapsed();
+                    if generation_guard.load(std::sync::atomic::Ordering::Acquire) != generation {
+                        let _ = validated_headers.discard();
+                        return Err(
+                            "HistoryStep verification superseded before completion".to_owned(),
+                        );
+                    }
+
+                    let terminal_len = terminal_bytes.len() as u64;
+                    let terminal_started = Instant::now();
+                    let terminal_result = {
+                        let ctx = verification_chain.blocking_read();
+                        ctx.verify_snapshot_boundary(
+                            boundary.tip_header,
+                            boundary.epoch_anchor_header,
+                            terminal_bytes,
+                            |claim| verify_history_step_terminal(claim, Some(runtime.as_ref())),
+                        )
+                        .map_err(|error| {
+                            format!("verify snapshot HistoryStep boundary: {error}")
+                        })
+                    };
+                    terminal_measurement = Some(SyncPhaseMeasurement::new(
+                        SyncPhase::HistoryStepTerminal,
+                        1,
+                        terminal_len,
+                        terminal_started.elapsed(),
+                        terminal_result.is_ok(),
+                    ));
+                    let verified_boundary = terminal_result?;
+                    Ok(VerifiedHistoryStepSnapshot {
+                        height: expected_height,
+                        block_hash: expected_hash,
+                        boundary: verified_boundary,
+                        headers: validated_headers,
+                        inbound_memory_permit,
+                    })
+                }))
+                .map_err(|_| "HistoryStep verifier worker panicked".to_owned())
+                .and_then(|result| result);
+                if result.is_err() {
+                    let _ = std::fs::remove_file(staging_path);
+                }
+                let _ = completion.blocking_send(HistoryStepVerificationCompletion {
+                    key,
+                    generation,
+                    manifest,
+                    header_validation_elapsed,
+                    terminal_measurement,
+                    staged_header_count,
+                    result,
+                });
+            });
+            tracing::info!(
+                from = %manifest_from,
+                terminal_from = %terminal_from,
+                tip = expected_height,
+                "snapshot HistoryStep verification started off-thread"
+            );
+        }};
+    }
+
+    macro_rules! stage_snapshot_segment_response {
+        ($from:expr, $response:expr) => {{
+            let from = $from;
+            let response = $response;
+            let Some(mut staging) = snapshot_staging.take() else {
+                tracing::warn!(
+                    from = %from,
+                    segment = response.segment_id,
+                    "segment received without snapshot staging session"
+                );
+                drop(response);
+                reset_sync_state!();
+                continue;
+            };
+            let key = SnapshotStagingOperationKey::Accept {
+                generation: snapshot_sync_generation,
+                from,
+                segment_id: response.segment_id,
+            };
+            snapshot_staging_inflight = Some(key);
+            let completion = snapshot_staging_completion_tx.clone();
+            let response_effective_log = response.eff_log;
+            let segment_id = response.segment_id;
+            let payload_bytes = response
+                .data
+                .as_ref()
+                .map_or(0u64, |data| data.len() as u64);
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                        let result = staging
+                            .accept_segment(
+                                segment_id,
+                                response_effective_log,
+                                response
+                                    .data
+                                    .as_deref()
+                                    .expect("present segment payload moved intact"),
+                            )
+                            .map(|()| staging)
+                            .map_err(|error| error.to_string());
+                        // The wire allocation and inbound permit stay charged
+                        // until authentication and atomic disk publication.
+                        drop(response);
+                        result
+                    }))
+                    .map_err(|_| "snapshot segment staging worker panicked".to_owned())
+                    .and_then(|result| result);
+                let _ = completion.blocking_send(SnapshotStagingCompletion::Accepted {
+                    key,
+                    payload_bytes,
+                    work_elapsed: started.elapsed(),
+                    result,
+                });
+            });
+            tracing::debug!(
+                from = %from,
+                segment = segment_id,
+                "snapshot segment queued for bounded authentication/staging"
+            );
         }};
     }
 
@@ -3091,13 +3812,13 @@ async fn handle_p2p_events(
         ($from:expr) => {{
             let from = $from;
             if snapshot_tail_terminal_inflight.is_none()
-                && snapshot_tail_request_inflight.is_none()
-                && snapshot_tail_append_inflight.is_none()
-                && finalized_snapshot_waiting.is_some()
+                && prefetched_snapshot_tail_terminal.is_none()
             {
-                if let Some(tail) = snapshot_tail_staging.as_ref() {
-                    let target = snapshot_tail_install_target.unwrap_or(tail.tip_height());
-                    if tail.tip_height() >= target && tail.block_count() != 0 {
+                if let Some(pending) = pending_manifest.as_ref().filter(|pending| pending.from == from)
+                {
+                    let height = pending.manifest.bridge_tip_height;
+                    let block_hash = pending.manifest.bridge_tip_hash;
+                    if height > pending.manifest.tip_height {
                         history_step_request_token = history_step_request_token.wrapping_add(1);
                         let key = SnapshotTailTerminalKey {
                             generation: snapshot_sync_generation,
@@ -3107,16 +3828,16 @@ async fn handle_p2p_events(
                                 history_step_request_token,
                                 Instant::now(),
                             ),
-                            height: tail.tip_height(),
-                            block_hash: tail.tip_hash(),
+                            height,
+                            block_hash,
                         };
                         snapshot_tail_terminal_inflight = Some(key);
                         if p2p_cmd
                             .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
                                 token: key.requests.primary.token,
                                 peer: from,
-                                height: key.height,
-                                block_hash: key.block_hash,
+                                height,
+                                block_hash,
                             })
                             .await
                             .is_err()
@@ -3125,10 +3846,8 @@ async fn handle_p2p_events(
                         } else {
                             tracing::info!(
                                 peer = %from,
-                                height = key.height,
-                                blocks = tail.block_count(),
-                                bytes = tail.payload_bytes(),
-                                "snapshot compact suffix sealed — requesting one final HistoryStep terminal"
+                                height,
+                                "snapshot: prefetching immutable bridge terminal in parallel"
                             );
                         }
                     }
@@ -3142,7 +3861,7 @@ async fn handle_p2p_events(
             let finalized = $finalized;
             let segment_count = $segment_count;
             let from = $from;
-            let tail = $tail;
+            let tail: Option<FinalizedSnapshotTail> = $tail;
             let Some(mut pending) = pending_manifest.take() else {
                 tracing::warn!(from = %from, "snapshot finalized without selected manifest");
                 cleanup_finalized_snapshot_staging_offthread(finalized);
@@ -3166,15 +3885,26 @@ async fn handle_p2p_events(
             };
 
             let manifest = *pending.manifest;
-            if tail.boundary_height() != manifest.tip_height
-                || tail.boundary_hash() != manifest.tip_hash
-                || tail.tip_height() < manifest.bridge_tip_height
+            let tail_matches_manifest = if snapshot_bridge_requires_tail(
+                manifest.tip_height,
+                manifest.bridge_tip_height,
+            ) == Some(false)
             {
+                tail.is_none()
+            } else {
+                tail.as_ref().is_some_and(|tail| {
+                    tail.boundary_height() == manifest.tip_height
+                        && tail.boundary_hash() == manifest.tip_hash
+                        && tail.tip_height() == manifest.bridge_tip_height
+                        && tail.tip_hash() == manifest.bridge_tip_hash
+                })
+            };
+            if !tail_matches_manifest {
                 tracing::error!(
                     from = %from,
                     snapshot = manifest.tip_height,
                     bridge_tip = manifest.bridge_tip_height,
-                    staged_tip = tail.tip_height(),
+                    staged_tip = tail.as_ref().map(FinalizedSnapshotTail::tip_height),
                     "snapshot tail does not cover the immutable bridge"
                 );
                 cleanup_finalized_snapshot_staging_offthread(finalized);
@@ -3197,8 +3927,12 @@ async fn handle_p2p_events(
             let install_external_mining_attempts = external_mining_attempts.clone();
             let install_history_step_runtime = history_step_runtime.clone();
             let completion = snapshot_install_completion_tx.clone();
-            let staged_tail_blocks = tail.block_count();
-            let staged_tail_bytes = tail.payload_bytes();
+            let staged_tail_blocks = tail
+                .as_ref()
+                .map_or(0, FinalizedSnapshotTail::block_count);
+            let staged_tail_bytes = tail
+                .as_ref()
+                .map_or(0, FinalizedSnapshotTail::payload_bytes);
             let install_task = tokio::spawn(async move {
                 apply_verified_snapshot(
                     &install_chain,
@@ -3234,26 +3968,223 @@ async fn handle_p2p_events(
         }};
     }
 
+    macro_rules! try_start_ready_snapshot_install {
+        () => {{
+            let bridge_is_empty = pending_manifest.as_ref().is_some_and(|pending| {
+                snapshot_bridge_requires_tail(
+                    pending.manifest.tip_height,
+                    pending.manifest.bridge_tip_height,
+                ) == Some(false)
+            });
+            let bridge_is_ready = bridge_is_empty
+                || (prefetched_snapshot_tail_terminal.is_some()
+                    && snapshot_tail_request_inflight.is_none()
+                    && snapshot_tail_append_inflight.is_none()
+                    && snapshot_tail_staging.as_ref().is_some_and(|tail| {
+                        snapshot_tail_install_target == Some(tail.tip_height())
+                    }));
+            let ready = finalized_snapshot_waiting.is_some() && bridge_is_ready;
+            if ready {
+                let (finalized, segment_count, finalized_from) =
+                    finalized_snapshot_waiting
+                        .take()
+                        .expect("checked finalized snapshot state");
+                let tail = if bridge_is_empty {
+                    None
+                } else {
+                    let staging = snapshot_tail_staging
+                        .take()
+                        .expect("checked complete snapshot bridge");
+                    let payload = prefetched_snapshot_tail_terminal
+                        .take()
+                        .expect("checked prefetched bridge terminal");
+                    match staging.finalize(
+                        payload.terminal_bytes,
+                        payload.inbound_memory_permit,
+                    ) {
+                        Ok(tail) => Some(tail),
+                        Err(error) => {
+                            cleanup_finalized_snapshot_staging_offthread(finalized);
+                            tracing::warn!(
+                                from = %finalized_from,
+                                err = %error,
+                                "snapshot bridge terminal rejected"
+                            );
+                            reset_sync_state!();
+                            request_bounded_manifest_failover!(finalized_from, false);
+                            continue;
+                        }
+                    }
+                };
+                start_snapshot_install!(finalized, segment_count, finalized_from, tail);
+            }
+        }};
+    }
+
+    // General header request deduplication is shared with compact-suffix
+    // recovery, whose macro is defined below.
+    let mut fetch_in_progress: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+    let mut recent_header_fetches: HashMap<(libp2p::PeerId, u64, u16), Instant> = HashMap::new();
+    // One bounded hint retained while compact catch-up owns canonical
+    // mutation. It preserves an equal-height competing-fork signal without
+    // retaining or validating payloads concurrently with the active suffix.
+    let mut deferred_sync_peer: Option<libp2p::PeerId> = None;
+
+    macro_rules! fallback_recent_suffix_to_full_bundles {
+        ($reason:expr) => {{
+            if let Some(pending) = pending_recent_suffix.take() {
+                recent_suffix_generation = recent_suffix_generation.wrapping_add(1);
+                let count = u16::try_from(
+                    pending.target_height.saturating_sub(pending.base_height),
+                )
+                .expect("recent suffix span fits retained depth");
+                let alternate = deferred_sync_peer
+                    .take()
+                    .filter(|peer| *peer != pending.peer && manifest_peers.contains(peer))
+                    .or_else(|| {
+                        manifest_peers
+                            .iter()
+                            .copied()
+                            .filter(|peer| *peer != pending.peer)
+                            .min_by_key(|peer| peer.to_bytes())
+                    });
+                if let Some(peer) = alternate {
+                    let header_count = count.saturating_add(1);
+                    fetch_in_progress.insert(peer);
+                    recent_header_fetches
+                        .insert((peer, pending.base_height, header_count), Instant::now());
+                    tracing::warn!(
+                        failed_peer = %pending.peer,
+                        alternate = %peer,
+                        base = pending.base_height,
+                        target = pending.target_height,
+                        reason = $reason,
+                        "compact recent suffix abandoned — probing an alternate peer"
+                    );
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::FetchHeaders {
+                            peer,
+                            start_height: pending.base_height,
+                            count: header_count,
+                        })
+                        .await;
+                } else {
+                    tracing::warn!(
+                        peer = %pending.peer,
+                        base = pending.base_height,
+                        target = pending.target_height,
+                        reason = $reason,
+                        "compact recent suffix abandoned — no alternate peer, requesting complete bundles"
+                    );
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                            peer: pending.peer,
+                            from_height: pending.base_height.saturating_add(1),
+                            count,
+                        })
+                        .await;
+                }
+            }
+        }};
+    }
+
+    macro_rules! try_start_recent_suffix_apply {
+        () => {{
+            let ready = pending_recent_suffix.as_ref().is_some_and(|pending| {
+                !pending.body_request_active
+                    && !pending.append_active
+                    && pending.staging.is_some()
+                    && pending.terminal_payload.is_some()
+            });
+            if ready {
+                let mut pending = pending_recent_suffix
+                    .take()
+                    .expect("checked complete recent suffix");
+                let staging = pending
+                    .staging
+                    .take()
+                    .expect("checked staged recent suffix bodies");
+                let payload = pending
+                    .terminal_payload
+                    .take()
+                    .expect("checked recent suffix terminal");
+                if staging.tip_height() != pending.target_height
+                    || staging.tip_hash() != pending.target_hash
+                {
+                    drop(staging);
+                    drop(payload);
+                    let reason = "staged compact suffix does not match advertised tip";
+                    pending_recent_suffix = Some(pending);
+                    fallback_recent_suffix_to_full_bundles!(reason);
+                    continue;
+                }
+                let tail = match staging.finalize(
+                    payload.terminal_bytes,
+                    payload.inbound_memory_permit,
+                ) {
+                    Ok(tail) => tail,
+                    Err(error) => {
+                        let reason = format!("compact suffix terminal binding failed: {error}");
+                        pending_recent_suffix = Some(pending);
+                        fallback_recent_suffix_to_full_bundles!(&reason);
+                        continue;
+                    }
+                };
+                let key = RecentSuffixApplyKey {
+                    generation: pending.generation,
+                    peer: pending.peer,
+                    base_height: pending.base_height,
+                    target_height: pending.target_height,
+                };
+                recent_suffix_apply_inflight = Some(key);
+                let apply_chain = Arc::clone(&chain);
+                let apply_mempool = mempool.clone();
+                let apply_wallet = Arc::clone(&wallet);
+                let apply_gate = Arc::clone(&wallet_operation_gate);
+                let apply_runtime = history_step_runtime.clone();
+                let completion = recent_suffix_apply_tx.clone();
+                tokio::spawn(async move {
+                    let result = apply_compact_suffix_offthread(
+                        &apply_chain,
+                        &apply_mempool,
+                        &apply_wallet,
+                        tail,
+                        key.base_height,
+                        pending.base_hash,
+                        apply_runtime,
+                        &apply_gate,
+                    )
+                    .await;
+                    let _ = completion
+                        .send(RecentSuffixApplyCompletion { key, result })
+                        .await;
+                });
+                tracing::info!(
+                    peer = %key.peer,
+                    base = key.base_height,
+                    target = key.target_height,
+                    blocks = key.target_height - key.base_height,
+                    "applying exact compact recent suffix with one terminal"
+                );
+            }
+        }};
+    }
+
     // --- FetchHeaders in-progress guard ---
     //
     // Prevents FetchHeaders from being sent to the same peer thousands of
     // times during a block burst.  Entry is removed when HeadersBatch arrives
     // from that peer (or on disconnect).  Without this guard, 10 peers each
     // sending 40 blocks/s = 400 redundant FetchHeaders/s.
-    let mut fetch_in_progress: std::collections::HashSet<libp2p::PeerId> =
-        std::collections::HashSet::new();
-
     // --- Per-peer tx rate limiter ---
     //
     // Sliding-window rate limiter: tracks (tx_count_in_window, window_start) per peer.
     // Prevents a single peer from flooding the proof-verification semaphore queue.
-    use std::time::{Duration, Instant};
-
     // Short-lived dedup for fork-recovery pulls. During two-miner races the same
     // orphan/fork announcement can be observed many times before the local node
     // reorganizes. Without this, each observation re-sends identical header/block
     // requests and floods logs/P2P with no extra safety.
-    let mut recent_header_fetches: HashMap<(libp2p::PeerId, u64, u16), Instant> = HashMap::new();
     let mut recent_block_fetches: HashMap<(libp2p::PeerId, u64), Instant> = HashMap::new();
     const FETCH_DEDUP_TTL: Duration = Duration::from_secs(15);
 
@@ -3321,6 +4252,8 @@ async fn handle_p2p_events(
                 && snapshot_tail_request_inflight.is_none()
                 && snapshot_tail_append_inflight.is_none()
                 && snapshot_tail_terminal_inflight.is_none()
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
                 && pending_segment_ids.is_empty()
                 && segment_queue.is_empty()
             {
@@ -3359,25 +4292,14 @@ async fn handle_p2p_events(
                     sync_phase_telemetry.extend_suffix_target(height);
                     last_announcement_peer = Some(from);
                 }
-                if pending_manifest.is_some()
-                    && (snapshot_tail_staging.is_some()
-                        || snapshot_tail_append_inflight.is_some())
-                {
-                    if snapshot_tail_install_target.is_none()
-                        && snapshot_tail_terminal_inflight.is_none()
-                        && snapshot_tail_request_inflight.is_none()
-                        && snapshot_tail_append_inflight.is_none()
-                    {
-                        if let Some(staging) = snapshot_tail_staging.as_ref() {
-                            let expected = staging.next_height();
-                            if height >= expected {
-                                let peer = pending_manifest
-                                    .as_ref()
-                                    .map_or(from, |pending| pending.from);
-                                request_snapshot_tail_blocks!(peer, expected, 1);
-                            }
-                        }
-                    }
+                if pending_recent_suffix.is_some() || recent_suffix_apply_inflight.is_some() {
+                    deferred_sync_peer = Some(from);
+                    continue;
+                }
+                if pending_manifest.is_some() {
+                    // The authenticated manifest owns one immutable bridge.
+                    // Do not chase a moving live tip while state is staging;
+                    // post-install compact catch-up handles newer blocks.
                     continue;
                 }
                 if snapshot_install_inflight.is_some() {
@@ -3388,7 +4310,6 @@ async fn handle_p2p_events(
                     );
                     continue;
                 }
-
                 // Compact block announcement: validate the advertised header before
                 // downloading a potentially large accepted bundle. Direct-next
                 // headers can be fully checked against the current tip; larger recent
@@ -3560,6 +4481,77 @@ async fn handle_p2p_events(
             }) => {
                 let advertised_count = u16::try_from(block_bodies.len())
                     .expect("P2P codec bounds snapshot block-body batch count");
+                if let Some(pending) = pending_recent_suffix.as_mut() {
+                    let expected_count =
+                        u16::try_from(pending.target_height - pending.base_height)
+                            .expect("recent suffix span fits u16");
+                    let matches = pending.generation == recent_suffix_generation
+                        && pending.peer == from
+                        && pending.body_request_active
+                        && !pending.append_active
+                        && pending.staging.is_some()
+                        && advertised_height == pending.base_height.saturating_add(1)
+                        && advertised_count == expected_count;
+                    if !matches {
+                        drop(block_bodies);
+                        drop(inbound_memory_permit.take());
+                        tracing::debug!(
+                            peer = %from,
+                            advertised_height,
+                            advertised_count,
+                            "dropping stale or mismatched compact recent body batch"
+                        );
+                        continue;
+                    }
+                    let staging = pending
+                        .staging
+                        .take()
+                        .expect("matched recent suffix owns body staging");
+                    let expected_headers = pending.expected_headers.clone();
+                    let generation = pending.generation;
+                    pending.body_request_active = false;
+                    pending.append_active = true;
+                    let completion = recent_suffix_append_tx.clone();
+                    let inbound_permit = inbound_memory_permit.take();
+                    tokio::task::spawn_blocking(move || {
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                                if block_bodies.len() != expected_headers.len() {
+                                    drop(inbound_permit);
+                                    return Err(
+                                        "compact suffix body/header count mismatch".to_owned()
+                                    );
+                                }
+                                for (body, expected_header) in
+                                    block_bodies.iter().zip(&expected_headers)
+                                {
+                                    let block = noid_chain::Block::from_bytes(body).map_err(
+                                        |error| {
+                                            format!(
+                                                "decode compact suffix body for header match: {error:?}"
+                                            )
+                                        },
+                                    )?;
+                                    if block.header != *expected_header {
+                                        return Err(
+                                            "compact suffix body differs from authenticated header"
+                                                .to_owned(),
+                                        );
+                                    }
+                                }
+                                let result = staging.append_batch(block_bodies);
+                                drop(inbound_permit);
+                                result
+                            }))
+                            .map_err(|_| "compact suffix append worker panicked".to_owned())
+                            .and_then(|result| result);
+                        let _ = completion.blocking_send(RecentSuffixAppendCompletion {
+                            generation,
+                            result,
+                        });
+                    });
+                    continue;
+                }
                 let request_matches = snapshot_tail_request_inflight.is_some_and(|request| {
                     request.generation == snapshot_sync_generation
                         && request.from == from
@@ -3635,6 +4627,17 @@ async fn handle_p2p_events(
                     tracing::debug!(
                         peer = %from,
                         "snapshot install active — released block response for post-install retry"
+                    );
+                    continue;
+                }
+                if pending_recent_suffix.is_some() || recent_suffix_apply_inflight.is_some() {
+                    deferred_sync_peer = Some(from);
+                    drop(bundle);
+                    drop(inbound_memory_permit.take());
+                    tracing::debug!(
+                        peer = %from,
+                        height = advertised_height,
+                        "compact recent suffix owns canonical mutation — releasing full bundle"
                     );
                     continue;
                 }
@@ -4458,6 +5461,19 @@ async fn handle_p2p_events(
                     } => (from, height, payload_kind),
                     _ => unreachable!("matched retained-block availability event"),
                 };
+                let unavailable_recent = pending_recent_suffix.as_ref().is_some_and(|pending| {
+                    pending.peer == from
+                        && pending.body_request_active
+                        && height == pending.base_height.saturating_add(1)
+                        && payload_kind
+                            == noid_p2p::protocol::RecentBlockPayloadKind::BlockBody
+                });
+                if unavailable_recent {
+                    fallback_recent_suffix_to_full_bundles!(
+                        "compact suffix body batch unavailable"
+                    );
+                    continue;
+                }
                 let unavailable_shallow = pending_shallow_fork
                     .as_ref()
                     .filter(|pending| pending.peer == from)
@@ -4514,23 +5530,12 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    // Beyond the generation's immutable bridge the pull is only
-                    // a best-effort live-tail probe.  Unavailable means that the
-                    // selected source is caught up; it does not invalidate the
-                    // already authenticated snapshot generation.
-                    let staged_tip = snapshot_tail_staging
-                        .as_ref()
-                        .map_or(bridge_tip, SnapshotTailStaging::tip_height);
-                    highest_announced = staged_tip;
-                    snapshot_tail_install_target = Some(staged_tip);
                     tracing::debug!(
                         peer = %from,
                         height,
-                        staged_tip,
                         request_failed,
-                        "optional snapshot live-tail exhausted"
+                        "ignoring stale block-body availability beyond immutable bridge"
                     );
-                    request_snapshot_tail_terminal!(from);
                     continue;
                 }
                 if payload_kind == noid_p2p::protocol::RecentBlockPayloadKind::BlockBody {
@@ -4715,7 +5720,11 @@ async fn handle_p2p_events(
                 mining_peer_quorum.connect(peer);
                 manifest_peers.insert(peer);
 
-                if snapshot_install_inflight.is_some() || selected_snapshot_peer!().is_some() {
+                if snapshot_install_inflight.is_some()
+                    || selected_snapshot_peer!().is_some()
+                    || pending_recent_suffix.is_some()
+                    || recent_suffix_apply_inflight.is_some()
+                {
                     tracing::debug!(
                         peer = %peer,
                         "snapshot session active — deferring peer sync probes"
@@ -4736,7 +5745,6 @@ async fn handle_p2p_events(
                 // do this because it intentionally describes finalized F, not
                 // the live peer tip; for chains shorter than finality it is
                 // empty even though direct blocks are available.
-                const CONNECTED_TIP_PROBE_HEADERS: u16 = 512;
                 let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
                 if fetch_in_progress.insert(peer) {
                     recent_header_fetches.insert(request_key, Instant::now());
@@ -4763,14 +5771,155 @@ async fn handle_p2p_events(
                     .await
                     .ok();
             }
+            Ok(NetworkEvent::SnapshotHeadersBatch {
+                generation,
+                from,
+                start_height,
+                requested_count,
+                headers,
+            }) => {
+                let Some(pipeline) = snapshot_header_pipeline.as_mut() else {
+                    tracing::debug!(
+                        peer = %from,
+                        generation,
+                        start_height,
+                        "dropping snapshot headers without an active pipeline"
+                    );
+                    continue;
+                };
+                if !pipeline.matches_session(generation, from) {
+                    tracing::debug!(
+                        peer = %from,
+                        generation,
+                        active_generation = pipeline.generation,
+                        start_height,
+                        "dropping delayed snapshot headers from a superseded session"
+                    );
+                    continue;
+                }
+                if let Err(error) = pipeline.accept(
+                    generation,
+                    from,
+                    start_height,
+                    requested_count,
+                    headers,
+                ) {
+                    tracing::warn!(
+                        peer = %from,
+                        generation,
+                        start_height,
+                        requested_count,
+                        err = %error,
+                        "snapshot header response failed exact correlation"
+                    );
+                    reset_sync_state!();
+                    request_bounded_manifest_failover!(from, true);
+                    continue;
+                }
+
+                if snapshot_header_staging_inflight.is_some() {
+                    tracing::debug!(
+                        peer = %from,
+                        start_height,
+                        requested_count,
+                        buffered = pipeline.ready.len(),
+                        "snapshot header response retained in bounded reorder window"
+                    );
+                    continue;
+                }
+
+                let Some(sync) = pending_snapshot_header_sync.take() else {
+                    tracing::warn!(
+                        peer = %from,
+                        start_height,
+                        "snapshot header pipeline lost its disk staging session"
+                    );
+                    reset_sync_state!();
+                    continue;
+                };
+                let Some(headers) = pipeline.take_ready(sync.next_height) else {
+                    pending_snapshot_header_sync = Some(sync);
+                    continue;
+                };
+                if let Err(error) = validate_snapshot_header_batch_admission(
+                    sync.next_height,
+                    sync.target_height,
+                    headers.len(),
+                ) {
+                    tracing::warn!(
+                        peer = %from,
+                        headers = headers.len(),
+                        err = %error,
+                        "snapshot header batch failed bounded staging admission"
+                    );
+                    cleanup_snapshot_header_staging_offthread(sync.staging);
+                    reset_sync_state!();
+                    continue;
+                }
+                let refill = pipeline.refill_plan();
+                for (next_start, count) in refill {
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
+                            generation: snapshot_sync_generation,
+                            peer: from,
+                            start_height: next_start,
+                            count,
+                        })
+                        .await;
+                }
+                spawn_snapshot_header_append!(sync, headers);
+                continue;
+            }
+            Ok(NetworkEvent::SnapshotHeadersRequestFailed {
+                generation,
+                from,
+                start_height,
+                count,
+            }) => {
+                let correlated = snapshot_header_pipeline.as_ref().is_some_and(|pipeline| {
+                    pipeline.generation == generation
+                        && pipeline.from == from
+                        && pipeline.contains_outstanding(start_height, count)
+                });
+                if !correlated {
+                    tracing::debug!(
+                        peer = %from,
+                        generation,
+                        start_height,
+                        count,
+                        "ignoring stale snapshot header request failure"
+                    );
+                    continue;
+                }
+                if let Some(sync) = pending_snapshot_header_sync.take() {
+                    tracing::warn!(
+                        peer = %from,
+                        start_height,
+                        count,
+                        staged_headers = sync.staging.staged_len(),
+                        "snapshot header request failed — retaining exact stage for failover"
+                    );
+                    drop(sync);
+                } else {
+                    tracing::warn!(
+                        peer = %from,
+                        start_height,
+                        count,
+                        "snapshot header request failed during bounded disk append"
+                    );
+                }
+                reset_sync_state!();
+                request_bounded_manifest_failover!(from, true);
+                continue;
+            }
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
-                if selected_snapshot_peer!().is_some_and(|selected| selected != from) {
+                if selected_snapshot_peer!().is_some() {
                     tracing::debug!(
                         peer = %from,
                         headers = headers.len(),
-                        "snapshot session pinned to another peer — dropping header batch"
+                        "snapshot session active — dropping unrelated general header batch"
                     );
                     continue;
                 }
@@ -4782,95 +5931,13 @@ async fn handle_p2p_events(
                     );
                     continue;
                 }
-
-                if snapshot_header_staging_inflight.as_ref().is_some_and(|key| {
-                    matches!(
-                        key,
-                        SnapshotHeaderStagingOperationKey::Append {
-                            from: active_from,
-                            ..
-                        } if *active_from == from
-                    )
-                }) {
+                if pending_recent_suffix.is_some() || recent_suffix_apply_inflight.is_some() {
+                    deferred_sync_peer = Some(from);
                     tracing::debug!(
                         peer = %from,
                         headers = headers.len(),
-                        "snapshot header staging busy — dropping duplicate batch"
+                        "compact recent suffix active — dropping redundant header batch"
                     );
-                    continue;
-                }
-
-                if pending_snapshot_header_sync.as_ref().is_some_and(|sync| {
-                    sync.from == from && sync.next_height > sync.target_height
-                }) {
-                    tracing::debug!(
-                        peer = %from,
-                        headers = headers.len(),
-                        "snapshot exact header target already staged — dropping late batch"
-                    );
-                    continue;
-                }
-
-                if pending_snapshot_header_sync
-                    .as_ref()
-                    .is_some_and(|sync| sync.from == from)
-                {
-                    let sync = pending_snapshot_header_sync
-                        .take()
-                        .expect("checked pending snapshot header sync");
-                    let remaining = sync.target_height - sync.next_height + 1;
-                    if let Err(error) = validate_snapshot_header_batch_admission(
-                        sync.next_height,
-                        sync.target_height,
-                        headers.len(),
-                    ) {
-                        tracing::warn!(
-                            peer = %from,
-                            headers = headers.len(),
-                            remaining,
-                            err = %error,
-                            "snapshot header sync returned an invalid batch size"
-                        );
-                        cleanup_snapshot_header_staging_offthread(sync.staging);
-                        reset_sync_state!();
-                        continue;
-                    }
-
-                    snapshot_header_staging_token = snapshot_header_staging_token.wrapping_add(1);
-                    let key = SnapshotHeaderStagingOperationKey::Append {
-                        generation: snapshot_sync_generation,
-                        token: snapshot_header_staging_token,
-                        from,
-                        start_height: sync.next_height,
-                    };
-                    snapshot_header_staging_inflight = Some(key);
-                    let completion = snapshot_header_staging_tx.clone();
-                    let store = snapshot_header_store.clone();
-                    let staging_path = sync.staging.path().to_owned();
-                    tokio::task::spawn_blocking(move || {
-                        let started = Instant::now();
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                            move || {
-                                let mut sync = sync;
-                                let next = sync
-                                    .staging
-                                    .append_batch(&store, &headers)
-                                    .map_err(|error| error.to_string())?;
-                                sync.next_height = next;
-                                Ok(sync)
-                            },
-                        ))
-                        .map_err(|_| "snapshot header append worker panicked".to_owned())
-                        .and_then(|result| result);
-                        if result.is_err() {
-                            let _ = std::fs::remove_file(staging_path);
-                        }
-                        let _ = completion.blocking_send(SnapshotHeaderStagingCompletion {
-                            key,
-                            work_elapsed: started.elapsed(),
-                            result,
-                        });
-                    });
                     continue;
                 }
 
@@ -4964,26 +6031,127 @@ async fn handle_p2p_events(
                         }
 
                         // The batch contains our exact current tip followed by
-                        // one linked extension. Pull it sequentially through
-                        // SyncBlocksFrom; that path keeps only one large
-                        // accepted bundle in flight and auto-continues after
-                        // each successful commit.
+                        // one linked extension. A one-block gap keeps the normal
+                        // complete-bundle path. For 2..18 blocks, stage only
+                        // bodies and authenticate the fixed tip once.
                         if ancestor_height == our_tip {
                             let gap = new_tip_height - our_tip;
-                            tracing::info!(
-                                peer = %from,
+                            if compact_suffix_eligible(
                                 our_tip,
-                                peer_tip = new_tip_height,
-                                gap,
-                                "connected header probe found recent extension — starting direct sync"
-                            );
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                ancestor_height,
+                                new_tip_height,
+                            ) {
+                                let (base_hash, base_work) = {
+                                    let ctx = chain.read().await;
+                                    if ctx.tip_height() != our_tip
+                                        || ctx.tip_hash() != ancestor_hash
+                                    {
+                                        tracing::debug!(
+                                            peer = %from,
+                                            our_tip,
+                                            "canonical tip changed before compact suffix admission"
+                                        );
+                                        continue;
+                                    }
+                                    (ctx.tip_hash(), *ctx.tip_chain_work())
+                                };
+                                let expected_headers: Vec<noid_chain::BlockHeader> =
+                                    competing.iter().map(|header| **header).collect();
+                                let target_header = *expected_headers
+                                    .last()
+                                    .expect("recent extension is non-empty");
+                                let target_hash =
+                                    noid_chain::consensus::pow::block_id(&target_header);
+                                let tail = match SnapshotTailStaging::create(
+                                    &snapshot_staging_root.join("recent-tail"),
+                                    our_tip,
+                                    base_hash,
+                                    base_work,
+                                ) {
+                                    Ok(tail) => tail,
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            peer = %from,
+                                            err = %error,
+                                            "compact recent suffix staging initialization failed"
+                                        );
+                                        let _ = p2p_cmd
+                                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                                peer: from,
+                                                from_height: our_tip + 1,
+                                                count: gap as u16,
+                                            })
+                                            .await;
+                                        continue;
+                                    }
+                                };
+                                // A compact suffix owns canonical catch-up until
+                                // its exact terminal/body pair is resolved.
+                                // Discard any unselected manifest round so a
+                                // delayed response cannot start a competing
+                                // snapshot FSM over this session.
+                                clear_manifest_round_state!();
+                                recent_suffix_generation =
+                                    recent_suffix_generation.wrapping_add(1);
+                                history_step_request_token =
+                                    history_step_request_token.wrapping_add(1);
+                                let terminal_requests = TerminalRequestRace::new(
+                                    from,
+                                    history_step_request_token,
+                                    Instant::now(),
+                                );
+                                pending_recent_suffix = Some(PendingRecentSuffix {
+                                    generation: recent_suffix_generation,
                                     peer: from,
-                                    from_height: our_tip + 1,
-                                    count: gap as u16,
-                                })
-                                .await;
+                                    base_height: our_tip,
+                                    base_hash,
+                                    target_height: new_tip_height,
+                                    target_hash,
+                                    expected_headers,
+                                    staging: Some(tail),
+                                    body_request_active: true,
+                                    append_active: false,
+                                    terminal_requests,
+                                    terminal_payload: None,
+                                });
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestBlockBodies {
+                                        peer: from,
+                                        height: our_tip + 1,
+                                        count: gap as u16,
+                                    })
+                                    .await;
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                                        token: history_step_request_token,
+                                        peer: from,
+                                        height: new_tip_height,
+                                        block_hash: target_hash,
+                                    })
+                                    .await;
+                                tracing::info!(
+                                    peer = %from,
+                                    our_tip,
+                                    peer_tip = new_tip_height,
+                                    gap,
+                                    "connected header probe found exact recent extension — fetching compact suffix"
+                                );
+                            } else {
+                                tracing::info!(
+                                    peer = %from,
+                                    our_tip,
+                                    peer_tip = new_tip_height,
+                                    gap,
+                                    "connected header probe found one-block extension — starting direct sync"
+                                );
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
+                                        peer: from,
+                                        from_height: our_tip + 1,
+                                        count: gap as u16,
+                                    })
+                                    .await;
+                            }
                             continue;
                         }
 
@@ -5156,42 +6324,12 @@ async fn handle_p2p_events(
             }) => {
                 fetch_in_progress.remove(&from);
                 recent_header_fetches.remove(&(from, start_height, count));
-
-                let snapshot_correlated = pending_snapshot_header_sync
-                    .as_ref()
-                    .is_some_and(|sync| {
-                        sync.from == from
-                            && snapshot_header_next_action(sync.next_height, sync.target_height)
-                                == Ok(SnapshotHeaderNextAction::Fetch {
-                                    start_height,
-                                    count,
-                                })
-                    });
-                if !snapshot_correlated {
-                    tracing::debug!(
-                        peer = %from,
-                        start_height,
-                        count,
-                        "header request failed outside the active snapshot session"
-                    );
-                    continue;
-                }
-
-                // Keep the exact partial header stage on disk. A manifest for
-                // the same boundary can reopen it, while a different boundary
-                // is pruned by prepare_snapshot_header_sync.
-                if let Some(sync) = pending_snapshot_header_sync.take() {
-                    tracing::warn!(
-                        peer = %from,
-                        start_height,
-                        count,
-                        staged_headers = sync.staging.staged_len(),
-                        "snapshot header request failed — retaining exact stage and failing over"
-                    );
-                    drop(sync);
-                }
-                reset_sync_state!();
-                request_bounded_manifest_failover!(from, true);
+                tracing::debug!(
+                    peer = %from,
+                    start_height,
+                    count,
+                    "general header request failed"
+                );
             }
             Ok(NetworkEvent::StateManifest { from, manifest }) => {
                 if snapshot_install_inflight.is_some() {
@@ -5199,6 +6337,14 @@ async fn handle_p2p_events(
                         from = %from,
                         tip = manifest.tip_height,
                         "snapshot install active — dropping stale manifest response"
+                    );
+                    continue;
+                }
+                if pending_recent_suffix.is_some() || recent_suffix_apply_inflight.is_some() {
+                    tracing::debug!(
+                        from = %from,
+                        tip = manifest.tip_height,
+                        "compact recent suffix active — dropping stale manifest response"
                     );
                     continue;
                 }
@@ -5397,6 +6543,8 @@ async fn handle_p2p_events(
                     && history_step_verification_inflight.is_none()
                     && snapshot_staging_inflight.is_none()
                     && snapshot_install_inflight.is_none()
+                    && pending_recent_suffix.is_none()
+                    && recent_suffix_apply_inflight.is_none()
                     && !manifest_candidates.is_empty()
                 {
                     let all_responded = manifest_response_count >= manifest_requested_peers.len();
@@ -5483,129 +6631,71 @@ async fn handle_p2p_events(
                     drop(response);
                     continue;
                 }
-                if pending_segment_ids.contains(&response.segment_id) {
-                    if pending_manifest
-                        .as_ref()
-                        .is_some_and(|pending| pending.from != from)
-                    {
-                        tracing::warn!(from = %from, segment = response.segment_id, "ignoring snapshot segment from non-selected peer");
-                        continue;
-                    }
-                    if response.data.is_some() {
-                        if let Some(active) = snapshot_staging_inflight {
-                            // At most one 8 MiB payload is decoded at a time.
-                            // Responses for other already-requested IDs are
-                            // released immediately and re-requested after the
-                            // active operation, rather than retained in RAM.
-                            let duplicate_of_active = matches!(
-                                active,
-                                SnapshotStagingOperationKey::Accept {
-                                    from: active_from,
-                                    segment_id: active_segment,
-                                    ..
-                                } if active_from == from && active_segment == response.segment_id
-                            );
-                            if !duplicate_of_active
-                                && pending_segment_ids.remove(&response.segment_id)
-                                && !segment_queue.contains(&response.segment_id)
-                            {
-                                segment_queue.push_back(response.segment_id);
-                            }
-                            tracing::debug!(
-                                from = %from,
-                                segment = response.segment_id,
-                                duplicate_of_active,
-                                "snapshot staging busy — released payload for bounded retry"
-                            );
-                            // Drop the complete response so its process-global
-                            // inbound permit follows the payload allocation.
-                            drop(response);
-                            continue;
-                        }
+                if response.data.is_none() {
+                    // The selected immutable generation could not serve an
+                    // advertised segment. Restart from a fresh manifest.
+                    let requester_height = {
+                        let ctx = chain.read().await;
+                        ctx.tip_height()
+                    };
+                    tracing::warn!(
+                        from = %from,
+                        segment = response.segment_id,
+                        requester_height,
+                        "snapshot segment unavailable or stale — retrying fresh manifest"
+                    );
+                    reset_sync_state!();
+                    manifest_requested_peers.insert(from);
+                    let _ = p2p_cmd
+                        .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                            peer: from,
+                            requester_height,
+                        })
+                        .await;
+                    continue;
+                }
 
-                        let Some(mut staging) = snapshot_staging.take() else {
-                            tracing::warn!(from = %from, "segment received without snapshot staging session");
-                            reset_sync_state!();
-                            continue;
-                        };
-                        let key = SnapshotStagingOperationKey::Accept {
-                            generation: snapshot_sync_generation,
-                            from,
-                            segment_id: response.segment_id,
-                        };
-                        snapshot_staging_inflight = Some(key);
-                        let completion = snapshot_staging_completion_tx.clone();
-                        let response_effective_log = response.eff_log;
+                match admit_snapshot_segment_response(
+                    response.segment_id,
+                    snapshot_staging_inflight.is_some(),
+                    queued_segment_response.is_some(),
+                    &mut pending_segment_ids,
+                    &mut segment_queue,
+                ) {
+                    SnapshotSegmentResponseAdmission::StageNow => {
+                        stage_snapshot_segment_response!(from, response);
+                    }
+                    SnapshotSegmentResponseAdmission::BufferOne => {
                         let segment_id = response.segment_id;
-                        let payload_bytes = response
-                            .data
-                            .as_ref()
-                            .map_or(0u64, |data| data.len() as u64);
-                        tokio::task::spawn_blocking(move || {
-                            let started = Instant::now();
-                            let result = std::panic::catch_unwind(
-                                std::panic::AssertUnwindSafe(move || {
-                                    let result = staging
-                                        .accept_segment(
-                                            segment_id,
-                                            response_effective_log,
-                                            response
-                                                .data
-                                                .as_deref()
-                                                .expect("present segment payload moved intact"),
-                                        )
-                                        .map(|()| staging)
-                                        .map_err(|error| error.to_string());
-                                    // The wire allocation and its inbound
-                                    // permit are released together only after
-                                    // authentication and atomic publication.
-                                    drop(response);
-                                    result
-                                }),
-                            )
-                            .map_err(|_| "snapshot segment staging worker panicked".to_owned())
-                            .and_then(|result| result);
-                            let _ = completion.blocking_send(
-                                SnapshotStagingCompletion::Accepted {
-                                    key,
-                                    payload_bytes,
-                                    work_elapsed: started.elapsed(),
-                                    result,
-                                },
-                            );
-                        });
+                        queued_segment_response = Some((from, response));
                         tracing::debug!(
                             from = %from,
                             segment = segment_id,
-                            "snapshot segment queued for bounded authentication/staging"
+                            "snapshot segment retained in the one-response staging buffer"
                         );
-                    } else {
-                        // Peer couldn't serve this exact snapshot segment. Most commonly
-                        // the peer mined/applied a newer tip after serving the manifest,
-                        // so the old segment no longer matches the authenticated root.
-                        // Restart immediately from a fresh manifest instead of waiting for
-                        // the next block announcement/peer event.
-                        let requester_height = {
-                            let ctx = chain.read().await;
-                            ctx.tip_height()
-                        };
+                    }
+                    SnapshotSegmentResponseAdmission::RetryOverflow => {
+                        // With a two-wide request window this path is
+                        // unreachable. Keep a bounded recovery path if a stale
+                        // transport violates that invariant.
+                        let segment_id = response.segment_id;
+                        drop(response);
                         tracing::warn!(
                             from = %from,
-                            segment = response.segment_id,
-                            requester_height,
-                            "snapshot segment unavailable or stale — retrying fresh manifest"
+                            segment = segment_id,
+                            "snapshot segment response exceeded bounded staging pipeline"
                         );
-                        reset_sync_state!();
-                        manifest_requested_peers.insert(from);
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                peer: from,
-                                requester_height,
-                            })
-                            .await;
-                        continue;
+                    }
+                    SnapshotSegmentResponseAdmission::Stale => {
+                        tracing::debug!(
+                            from = %from,
+                            segment = response.segment_id,
+                            "dropping stale or duplicate snapshot segment response"
+                        );
+                        drop(response);
                     }
                 }
+                continue;
             }
 
             Ok(NetworkEvent::StateSegmentRequestFailed {
@@ -5647,6 +6737,42 @@ async fn handle_p2p_events(
                 terminal_bytes,
                 inbound_memory_permit,
             }) => {
+                let recent_correlated = pending_recent_suffix.as_ref().is_some_and(|pending| {
+                    pending.generation == recent_suffix_generation
+                        && pending.terminal_requests.matches(from, token)
+                        && pending.target_height == height
+                        && pending.target_hash == block_hash
+                });
+                if recent_correlated {
+                    if terminal_bytes.is_empty() {
+                        drop(inbound_memory_permit);
+                        fallback_recent_suffix_to_full_bundles!(
+                            "compact suffix terminal unavailable"
+                        );
+                        continue;
+                    }
+                    let pending = pending_recent_suffix
+                        .as_mut()
+                        .expect("correlated compact suffix is present");
+                    // First exact success wins. Close both sides of the race
+                    // before retaining the payload so the heartbeat cannot
+                    // launch a late hedge and a losing response cannot replace
+                    // already accepted terminal bytes.
+                    let won = pending.terminal_requests.mark_succeeded(from, token);
+                    debug_assert!(won, "correlated compact terminal must win its race");
+                    pending.terminal_payload = Some(PrefetchedHistoryStepTerminal {
+                        from,
+                        terminal_bytes,
+                        inbound_memory_permit,
+                    });
+                    tracing::info!(
+                        peer = %from,
+                        height,
+                        "compact recent suffix terminal received"
+                    );
+                    try_start_recent_suffix_apply!();
+                    continue;
+                }
                 let tail_key = snapshot_tail_terminal_inflight.filter(|pending| {
                         pending.generation == snapshot_sync_generation
                             && pending.requests.matches(from, token)
@@ -5655,79 +6781,38 @@ async fn handle_p2p_events(
                     });
                 if let Some(tail_key) = tail_key {
                     snapshot_tail_terminal_inflight = None;
-                    let Some((finalized, segment_count, finalized_from)) =
-                        finalized_snapshot_waiting.take()
-                    else {
-                        drop(terminal_bytes);
+                    if terminal_bytes.is_empty() {
                         drop(inbound_memory_permit);
                         tracing::warn!(
                             from = %from,
                             height,
-                            "snapshot suffix terminal arrived without finalized state"
+                            "snapshot bridge terminal is unavailable"
                         );
                         reset_sync_state!();
-                        continue;
-                    };
-                    let Some(staging) = snapshot_tail_staging.take() else {
-                        drop(terminal_bytes);
-                        drop(inbound_memory_permit);
-                        cleanup_finalized_snapshot_staging_offthread(finalized);
-                        tracing::warn!(
-                            from = %from,
-                            height,
-                            "snapshot suffix terminal arrived without compact tail"
-                        );
-                        reset_sync_state!();
-                        continue;
-                    };
-                    if finalized_from != tail_key.manifest_from
-                        || staging.tip_height() != height
-                        || staging.tip_hash() != block_hash
-                    {
-                        drop(terminal_bytes);
-                        drop(inbound_memory_permit);
-                        drop(staging);
-                        cleanup_finalized_snapshot_staging_offthread(finalized);
-                        tracing::warn!(
-                            from = %from,
-                            height,
-                            "snapshot suffix terminal no longer matches sealed tail"
-                        );
-                        reset_sync_state!();
+                        request_bounded_manifest_failover!(tail_key.manifest_from, false);
                         continue;
                     }
-                    let tail = match staging.finalize(terminal_bytes, inbound_memory_permit) {
-                        Ok(tail) => tail,
-                        Err(error) => {
-                            cleanup_finalized_snapshot_staging_offthread(finalized);
-                            tracing::warn!(
-                                from = %from,
-                                height,
-                                err = %error,
-                                "snapshot suffix terminal rejected"
-                            );
-                            reset_sync_state!();
-                            request_bounded_manifest_failover!(from, false);
-                            continue;
-                        }
-                    };
-                    start_snapshot_install!(finalized, segment_count, finalized_from, tail);
+                    prefetched_snapshot_tail_terminal = Some(PrefetchedHistoryStepTerminal {
+                        from,
+                        terminal_bytes,
+                        inbound_memory_permit,
+                    });
+                    tracing::info!(
+                        from = %from,
+                        height,
+                        "snapshot bridge terminal prefetched — waiting for state and bodies"
+                    );
+                    try_start_ready_snapshot_install!();
                     continue;
                 }
 
-                let snapshot_correlated = pending_snapshot_header_sync
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending
-                            .terminal_requests
-                            .is_some_and(|requests| requests.matches(from, token))
-                            && pending.next_height
-                                == pending.target_height.saturating_add(1)
-                            && pending.manifest.tip_height == height
-                            && pending.manifest.tip_hash == block_hash
-                    });
-
-                if !snapshot_correlated {
+                let boundary_key = snapshot_boundary_terminal_inflight.filter(|pending| {
+                    pending.generation == snapshot_sync_generation
+                        && pending.requests.matches(from, token)
+                        && pending.height == height
+                        && pending.block_hash == block_hash
+                });
+                let Some(boundary_key) = boundary_key else {
                     drop(terminal_bytes);
                     drop(inbound_memory_permit);
                     tracing::debug!(
@@ -5736,175 +6821,43 @@ async fn handle_p2p_events(
                         "dropping stale or mismatched HistoryStep terminal response"
                     );
                     continue;
-                }
-
-                if snapshot_install_inflight.is_some() {
-                    // Drop terminal bytes and their process-global admission as
-                    // one response; the installed boundary starts a fresh
-                    // suffix sync on completion.
-                    drop(terminal_bytes);
+                };
+                snapshot_boundary_terminal_inflight = None;
+                if terminal_bytes.is_empty() {
                     drop(inbound_memory_permit);
-                    tracing::debug!(
+                    tracing::warn!(
                         from = %from,
                         height,
-                        "snapshot install active — releasing stale HistoryStep terminal"
+                        "snapshot boundary terminal is unavailable"
                     );
-                    continue;
-                }
-                // Terminal decoding and every streamed matrix check
-                // run on the blocking pool with no chain lock held. The
-                // private header staging file travels with the terminal.
-
-                // If segment collection is already in progress (pending_segment_ids non-empty),
-                // a second HistoryStep terminal would corrupt the active session.
-                // Ignore it to protect the in-flight segment download.
-                if !pending_segment_ids.is_empty() || !segment_queue.is_empty() {
-                    tracing::debug!(
-                        from = %from,
-                        "ignoring HistoryStep terminal — segment collection already in progress"
-                    );
-                    continue;
-                }
-
-                let sync = match pending_snapshot_header_sync.take() {
-                    Some(sync)
-                        if sync
-                            .terminal_requests
-                            .is_some_and(|requests| requests.matches(from, token)) =>
-                    {
-                        sync
-                    }
-                    Some(sync) => {
-                        tracing::warn!(
-                            terminal_from = %from, manifest_from = %sync.from,
-                            "HistoryStep terminal from unexpected peer, preserving staged headers"
-                        );
-                        pending_snapshot_header_sync = Some(sync);
-                        continue;
-                    }
-                    None => {
-                        tracing::debug!(from = %from, "unexpected HistoryStep terminal, no staged headers");
-                        continue;
-                    }
-                };
-
-                let Some(runtime) = history_step_runtime.clone() else {
-                    tracing::error!(
-                        from = %from,
-                        tip = sync.manifest.tip_height,
-                        "snapshot rejected: HistoryStep verifier unavailable"
-                    );
-                    cleanup_snapshot_header_staging_offthread(sync.staging);
                     reset_sync_state!();
+                    request_bounded_manifest_failover!(boundary_key.manifest_from, false);
                     continue;
+                }
+                let payload = PrefetchedHistoryStepTerminal {
+                    from,
+                    terminal_bytes,
+                    inbound_memory_permit,
                 };
-                let expected_height = sync.manifest.tip_height;
-                let expected_hash = sync.manifest.tip_hash;
-                let manifest_from = sync.from;
-                history_step_verification_token =
-                    history_step_verification_token.wrapping_add(1);
-                let key = HistoryStepVerificationKey {
-                    token: history_step_verification_token,
-                    from: manifest_from,
-                    terminal_from: from,
-                    height: expected_height,
-                    block_hash: expected_hash,
-                };
-                let generation = snapshot_sync_generation;
-                let completion = history_step_verification_tx.clone();
-                let generation_guard = Arc::clone(&snapshot_sync_generation_guard);
-                let store = snapshot_header_store.clone();
-                let verification_chain = Arc::clone(&chain);
-                let manifest = sync.manifest;
-                let staging = sync.staging;
-                let staged_header_count = staging.staged_len();
-                let staging_path = staging.path().to_owned();
-                history_step_verification_inflight = Some(key);
-                tokio::task::spawn_blocking(move || {
-                    let mut header_validation_elapsed = std::time::Duration::ZERO;
-                    let mut terminal_measurement = None;
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if generation_guard.load(std::sync::atomic::Ordering::Acquire)
-                            != generation
-                        {
-                            return Err(
-                                "HistoryStep verification superseded before start".to_owned(),
-                            );
-                        }
-                        let header_started = Instant::now();
-                        let validated_headers = staging
-                            .validate_complete(
-                                &store,
-                                expected_height,
-                                expected_hash,
-                                manifest.cumulative_chainwork,
-                            )
-                            .map_err(|error| error.to_string())?;
-                        let boundary = validated_headers.boundary();
-                        validate_snapshot_staged_header_boundary(&manifest, &boundary)?;
-                        validate_history_step_tip_future_drift(&boundary, unix_now())?;
-                        header_validation_elapsed = header_started.elapsed();
-                        if generation_guard.load(std::sync::atomic::Ordering::Acquire)
-                            != generation
-                        {
-                            let _ = validated_headers.discard();
-                            return Err(
-                                "HistoryStep verification superseded before completion"
-                                    .to_owned(),
-                            );
-                        }
-
-                        let terminal_len = terminal_bytes.len() as u64;
-                        let terminal_started = Instant::now();
-                        let terminal_result = {
-                            let ctx = verification_chain.blocking_read();
-                            ctx.verify_snapshot_boundary(
-                                boundary.tip_header,
-                                boundary.epoch_anchor_header,
-                                terminal_bytes,
-                                |claim| verify_history_step_terminal(claim, Some(runtime.as_ref())),
-                            )
-                            .map_err(|error| {
-                                format!("verify snapshot HistoryStep boundary: {error}")
-                            })
-                        };
-                        terminal_measurement = Some(SyncPhaseMeasurement::new(
-                            SyncPhase::HistoryStepTerminal,
-                            1,
-                            terminal_len,
-                            terminal_started.elapsed(),
-                            terminal_result.is_ok(),
-                        ));
-                        let verified_boundary = terminal_result?;
-                        Ok(VerifiedHistoryStepSnapshot {
-                            height: expected_height,
-                            block_hash: expected_hash,
-                            boundary: verified_boundary,
-                            headers: validated_headers,
-                            inbound_memory_permit,
-                        })
-                    }))
-                    .map_err(|_| "HistoryStep verifier worker panicked".to_owned())
-                    .and_then(|result| result);
-                    if result.is_err() {
-                        let _ = std::fs::remove_file(staging_path);
-                    }
-                    let _ = completion.blocking_send(HistoryStepVerificationCompletion {
-                        key,
-                        generation,
-                        manifest,
-                        header_validation_elapsed,
-                        terminal_measurement,
-                        staged_header_count,
-                        result,
+                let headers_ready = snapshot_header_staging_inflight.is_none()
+                    && pending_snapshot_header_sync.as_ref().is_some_and(|sync| {
+                        sync.from == boundary_key.manifest_from
+                            && sync.next_height == sync.target_height.saturating_add(1)
                     });
-                });
-                tracing::info!(
-                    from = %manifest_from,
-                    terminal_from = %from,
-                    tip = expected_height,
-                    "snapshot HistoryStep verification started off-thread"
-                );
+                if headers_ready {
+                    let sync = pending_snapshot_header_sync
+                        .take()
+                        .expect("checked completed snapshot header staging");
+                    start_snapshot_boundary_verification!(sync, payload);
+                } else {
+                    prefetched_snapshot_boundary_terminal = Some(payload);
+                    tracing::info!(
+                        from = %from,
+                        height,
+                        "snapshot boundary terminal prefetched — waiting for staged headers"
+                    );
+                }
+                continue;
             }
             Ok(NetworkEvent::HistoryStepTerminalRequestFailed {
                 token,
@@ -5913,6 +6866,57 @@ async fn handle_p2p_events(
                 block_hash,
                 kind,
             }) => {
+                let recent_correlated = pending_recent_suffix.as_ref().is_some_and(|pending| {
+                    pending.generation == recent_suffix_generation
+                        && pending.terminal_requests.matches(from, token)
+                        && pending.target_height == height
+                        && pending.target_hash == block_hash
+                });
+                if recent_correlated {
+                    let pending = pending_recent_suffix
+                        .as_mut()
+                        .expect("correlated compact suffix is present");
+                    let marked = pending.terminal_requests.mark_failed(from, token);
+                    debug_assert!(marked, "correlated compact terminal request must be active");
+                    if pending.terminal_requests.has_active() {
+                        continue;
+                    }
+                    let alternate = (pending.terminal_requests.hedge.is_none())
+                        .then(|| {
+                            terminal_alternate_peer(
+                                &manifest_peers,
+                                &pending.terminal_requests,
+                            )
+                        })
+                        .flatten();
+                    if let Some(alternate) = alternate {
+                        let request_token = pending.terminal_requests.primary.token;
+                        pending.terminal_requests.install_hedge(alternate);
+                        if p2p_cmd
+                            .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                                token: request_token,
+                                peer: alternate,
+                                height,
+                                block_hash,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            tracing::warn!(
+                                peer = %from,
+                                alternate = %alternate,
+                                height,
+                                ?kind,
+                                "compact suffix terminal failed — trying one alternate peer"
+                            );
+                            continue;
+                        }
+                    }
+                    fallback_recent_suffix_to_full_bundles!(
+                        "compact suffix terminal transport exhausted"
+                    );
+                    continue;
+                }
                 let tail_correlated = snapshot_tail_terminal_inflight.is_some_and(|pending| {
                     pending.generation == snapshot_sync_generation
                         && pending.requests.matches(from, token)
@@ -5979,18 +6983,14 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                let correlated = pending_snapshot_header_sync
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending
-                            .terminal_requests
-                            .is_some_and(|requests| requests.matches(from, token))
-                            && pending.next_height
-                                == pending.target_height.saturating_add(1)
-                            && pending.manifest.tip_height == height
-                            && pending.manifest.tip_hash == block_hash
+                let boundary_correlated =
+                    snapshot_boundary_terminal_inflight.is_some_and(|pending| {
+                        pending.generation == snapshot_sync_generation
+                            && pending.requests.matches(from, token)
+                            && pending.height == height
+                            && pending.block_hash == block_hash
                     });
-                if !correlated {
+                if !boundary_correlated {
                     tracing::debug!(
                         peer = %from,
                         height,
@@ -6000,23 +7000,18 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                let manifest_lease_was_lost = pending_snapshot_header_sync
-                    .as_ref()
+                let manifest_lease_was_lost = snapshot_boundary_terminal_inflight
                     .is_some_and(|pending| {
                         matches!(kind, noid_p2p::RequestFailureKind::ConnectionClosed)
-                            && pending.from == from
+                            && pending.manifest_from == from
                     });
                 if !manifest_lease_was_lost {
-                    let pending = pending_snapshot_header_sync
+                    let pending = snapshot_boundary_terminal_inflight
                         .as_mut()
-                        .expect("correlated header terminal is present");
-                    let requests = pending
-                        .terminal_requests
-                        .as_mut()
-                        .expect("correlated terminal race is present");
-                    let marked = requests.mark_failed(from, token);
+                        .expect("correlated boundary terminal is present");
+                    let marked = pending.requests.mark_failed(from, token);
                     debug_assert!(marked, "correlated HistoryStep request must be active");
-                    if requests.has_active() {
+                    if pending.requests.has_active() {
                         tracing::warn!(
                             peer = %from,
                             height,
@@ -6027,29 +7022,17 @@ async fn handle_p2p_events(
                     }
                 }
 
-                let alternate = pending_snapshot_header_sync.as_ref().and_then(|pending| {
-                    (!manifest_lease_was_lost)
-                        .then(|| {
-                            pending
-                                .terminal_requests
-                                .as_ref()
-                                .filter(|requests| requests.hedge.is_none())
-                                .and_then(|requests| {
-                                    terminal_alternate_peer(&manifest_peers, requests)
-                                })
-                        })
+                let alternate = snapshot_boundary_terminal_inflight.as_ref().and_then(|pending| {
+                    (!manifest_lease_was_lost && pending.requests.hedge.is_none())
+                        .then(|| terminal_alternate_peer(&manifest_peers, &pending.requests))
                         .flatten()
                 });
                 if let Some(alternate) = alternate {
-                    let pending = pending_snapshot_header_sync
+                    let pending = snapshot_boundary_terminal_inflight
                         .as_mut()
-                        .expect("correlated header terminal is present");
-                    let requests = pending
-                        .terminal_requests
-                        .as_mut()
-                        .expect("correlated terminal race is present");
-                    let request_token = requests.primary.token;
-                    requests.install_hedge(alternate);
+                        .expect("correlated boundary terminal is present");
+                    let request_token = pending.requests.primary.token;
+                    pending.requests.install_hedge(alternate);
                     if p2p_cmd
                         .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
                             token: request_token,
@@ -6069,6 +7052,17 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
+                }
+
+                if !manifest_lease_was_lost {
+                    snapshot_boundary_terminal_inflight = None;
+                    tracing::warn!(
+                        peer = %from,
+                        height,
+                        ?kind,
+                        "prefetched HistoryStep transport exhausted — continuing headers before one bounded retry"
+                    );
+                    continue;
                 }
 
                 // Keep the validated native header file on disk. A fresh
@@ -6185,7 +7179,7 @@ async fn handle_p2p_events(
                 continue;
             }
             sync_phase_telemetry.record_header_work(completed.work_elapsed);
-            let mut sync = match completed.result {
+            let sync = match completed.result {
                 Ok(sync) => sync,
                 Err(error) => {
                     tracing::warn!(
@@ -6216,48 +7210,300 @@ async fn handle_p2p_events(
             match action {
                 SnapshotHeaderNextAction::Fetch {
                     start_height,
-                    count,
+                    count: _,
                 } => {
                     let target_height = sync.target_height;
-                    pending_snapshot_header_sync = Some(sync);
-                    fetch_in_progress.insert(from);
-                    let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::FetchHeaders {
-                            peer: from,
+                    if snapshot_header_pipeline.is_none() {
+                        snapshot_header_pipeline = Some(SnapshotHeaderPipeline::new(
+                            generation,
+                            from,
                             start_height,
-                            count,
-                        })
-                        .await;
+                            target_height,
+                        ));
+                    }
+                    let pipeline = snapshot_header_pipeline
+                        .as_mut()
+                        .expect("snapshot header pipeline was initialized");
+                    if pipeline.generation != generation || pipeline.from != from {
+                        cleanup_snapshot_header_staging_offthread(sync.staging);
+                        tracing::warn!(
+                            peer = %from,
+                            generation,
+                            "snapshot header pipeline changed during disk staging"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+
+                    if let Some(headers) = pipeline.take_ready(sync.next_height) {
+                        if let Err(error) = validate_snapshot_header_batch_admission(
+                            sync.next_height,
+                            sync.target_height,
+                            headers.len(),
+                        ) {
+                            cleanup_snapshot_header_staging_offthread(sync.staging);
+                            tracing::warn!(
+                                peer = %from,
+                                err = %error,
+                                "buffered snapshot header batch failed staging admission"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+                        let refill = pipeline.refill_plan();
+                        for (next_start, count) in refill {
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
+                                    generation,
+                                    peer: from,
+                                    start_height: next_start,
+                                    count,
+                                })
+                                .await;
+                        }
+                        spawn_snapshot_header_append!(sync, headers);
+                        continue;
+                    }
+
+                    let refill = pipeline.refill_plan();
+                    pending_snapshot_header_sync = Some(sync);
+                    for (next_start, count) in refill {
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
+                                generation,
+                                peer: from,
+                                start_height: next_start,
+                                count,
+                            })
+                            .await;
+                    }
                     tracing::info!(
                         peer = %from,
                         next_height = start_height,
                         target_height,
-                        "snapshot: fetching headers into isolated disk staging"
+                        window = SNAPSHOT_HEADER_REQUEST_WINDOW,
+                        "snapshot: pipelining exactly correlated headers into disk staging"
                     );
                 }
                 SnapshotHeaderNextAction::RequestTerminal => {
+                    if snapshot_header_pipeline
+                        .as_ref()
+                        .is_some_and(|pipeline| !pipeline.is_drained())
+                    {
+                        cleanup_snapshot_header_staging_offthread(sync.staging);
+                        tracing::warn!(
+                            peer = %from,
+                            "snapshot header target reached with an undrained request window"
+                        );
+                        reset_sync_state!();
+                        continue;
+                    }
+                    snapshot_header_pipeline = None;
                     let terminal_height = sync.manifest.tip_height;
                     let terminal_hash = sync.manifest.tip_hash;
-                    history_step_request_token = history_step_request_token.wrapping_add(1);
-                    sync.terminal_requests = Some(TerminalRequestRace::new(
-                        from,
-                        history_step_request_token,
-                        Instant::now(),
-                    ));
-                    pending_snapshot_header_sync = Some(sync);
-                    let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
-                            token: history_step_request_token,
-                            peer: from,
-                            height: terminal_height,
-                            block_hash: terminal_hash,
-                        })
-                        .await;
+                    if let Some(payload) = prefetched_snapshot_boundary_terminal.take() {
+                        start_snapshot_boundary_verification!(sync, payload);
+                    } else {
+                        if snapshot_boundary_terminal_inflight.is_none() {
+                            history_step_request_token =
+                                history_step_request_token.wrapping_add(1);
+                            let key = SnapshotBoundaryTerminalKey {
+                                generation,
+                                manifest_from: from,
+                                requests: TerminalRequestRace::new(
+                                    from,
+                                    history_step_request_token,
+                                    Instant::now(),
+                                ),
+                                height: terminal_height,
+                                block_hash: terminal_hash,
+                            };
+                            snapshot_boundary_terminal_inflight = Some(key);
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                                    token: key.requests.primary.token,
+                                    peer: from,
+                                    height: terminal_height,
+                                    block_hash: terminal_hash,
+                                })
+                                .await;
+                            tracing::info!(
+                                peer = %from,
+                                target_height = terminal_height,
+                                "snapshot: exact headers staged — retrying HistoryStep terminal"
+                            );
+                        } else {
+                            tracing::info!(
+                                peer = %from,
+                                target_height = terminal_height,
+                                "snapshot: exact headers staged — waiting for prefetched HistoryStep terminal"
+                            );
+                        }
+                        pending_snapshot_header_sync = Some(sync);
+                    }
+                }
+            }
+        }
+
+        completed = recent_suffix_append_rx.recv() => {
+            let Some(completed) = completed else {
+                continue;
+            };
+            let correlated = pending_recent_suffix.as_ref().is_some_and(|pending| {
+                pending.generation == completed.generation
+                    && pending.generation == recent_suffix_generation
+                    && pending.append_active
+            });
+            if !correlated {
+                drop(completed.result);
+                tracing::debug!(
+                    generation = completed.generation,
+                    "discarding superseded compact suffix append"
+                );
+                continue;
+            }
+            match completed.result {
+                Ok(staging) => {
+                    let pending = pending_recent_suffix
+                        .as_mut()
+                        .expect("correlated compact suffix is present");
+                    pending.append_active = false;
+                    if staging.tip_height() != pending.target_height
+                        || staging.tip_hash() != pending.target_hash
+                    {
+                        drop(staging);
+                        fallback_recent_suffix_to_full_bundles!(
+                            "compact suffix body batch ended at the wrong tip"
+                        );
+                        continue;
+                    }
+                    pending.staging = Some(staging);
                     tracing::info!(
-                        peer = %from,
-                        target_height = terminal_height,
-                        "snapshot: exact staged header target reached — requesting HistoryStep terminal"
+                        peer = %pending.peer,
+                        base = pending.base_height,
+                        target = pending.target_height,
+                        "compact recent suffix bodies sealed on disk"
                     );
+                    try_start_recent_suffix_apply!();
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        generation = completed.generation,
+                        err = %error,
+                        "compact recent suffix body staging failed"
+                    );
+                    fallback_recent_suffix_to_full_bundles!(
+                        "compact suffix body/header validation failed"
+                    );
+                }
+            }
+        }
+
+        completed = recent_suffix_apply_rx.recv() => {
+            let Some(completed) = completed else {
+                continue;
+            };
+            if recent_suffix_apply_inflight != Some(completed.key) {
+                tracing::debug!(
+                    ?completed.key,
+                    "discarding superseded compact suffix apply completion"
+                );
+                continue;
+            }
+            recent_suffix_apply_inflight = None;
+            match completed.result {
+                Ok(mut applied) => {
+                    let (advanced, complete) = compact_apply_signals(
+                        applied.applied_blocks,
+                        applied.height,
+                        completed.key.target_height,
+                        applied.trailing_error.is_some(),
+                    );
+                    if advanced {
+                        external_mining_attempts
+                            .invalidate_for_tip(applied.height, applied.block_hash);
+                        last_tip_advance = Instant::now();
+                        mark_initial_sync_ready(&initial_sync_ready);
+                        let _ = template_changes.send(());
+                    }
+                    if complete {
+                        mining_peer_quorum.confirm(completed.key.peer);
+                    }
+                    tracing::info!(
+                        peer = %completed.key.peer,
+                        base = completed.key.base_height,
+                        target = completed.key.target_height,
+                        height = applied.height,
+                        blocks = applied.applied_blocks,
+                        bytes = applied.payload_bytes,
+                        elapsed_ms = applied.apply_elapsed.as_millis(),
+                        complete,
+                        "compact recent suffix application completed"
+                    );
+                    if let Some(error) = applied.trailing_error.take() {
+                        tracing::warn!(
+                            peer = %completed.key.peer,
+                            height = applied.height,
+                            err = %error,
+                            "compact suffix stopped after a valid committed prefix"
+                        );
+                    }
+                    if complete {
+                        mark_bootstrap_complete_if_caught_up!(applied.height);
+                    }
+                    let probe_peer = deferred_sync_peer
+                        .take()
+                        .filter(|peer| manifest_peers.contains(peer))
+                        .or_else(|| {
+                            (highest_announced > applied.height)
+                                .then_some(last_announcement_peer)
+                                .flatten()
+                                .filter(|peer| manifest_peers.contains(peer))
+                        });
+                    if let Some(peer) = probe_peer {
+                        let count = if highest_announced > applied.height {
+                            (highest_announced - applied.height + 1)
+                                .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
+                                as u16
+                        } else {
+                            CONNECTED_TIP_PROBE_HEADERS
+                        };
+                        if fetch_in_progress.insert(peer) {
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                    peer,
+                                    start_height: applied.height,
+                                    count,
+                                })
+                                .await;
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        peer = %completed.key.peer,
+                        base = completed.key.base_height,
+                        target = completed.key.target_height,
+                        err = %error,
+                        "compact recent suffix apply rejected before mutation"
+                    );
+                    let our_height = {
+                        let ctx = chain.read().await;
+                        ctx.tip_height()
+                    };
+                    let peer = deferred_sync_peer
+                        .take()
+                        .filter(|peer| manifest_peers.contains(peer))
+                        .unwrap_or(completed.key.peer);
+                    if fetch_in_progress.insert(peer) {
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                peer,
+                                start_height: our_height,
+                                count: CONNECTED_TIP_PROBE_HEADERS,
+                            })
+                            .await;
+                    }
                 }
             }
         }
@@ -6327,123 +7573,26 @@ async fn handle_p2p_events(
                 reset_sync_state!();
                 continue;
             }
-            if staging.tip_height() > bridge_tip && !snapshot_tail_state_download_started {
+            if staging.tip_height() != bridge_tip {
                 drop(staging);
                 tracing::warn!(
                     from = %from,
                     from_height = completed.key.height,
                     to_height = completed.key.end_height(),
                     bridge_tip,
-                    "snapshot tail crossed bridge before state download started"
+                    "snapshot body batch did not end at the immutable bridge"
                 );
                 reset_sync_state!();
                 continue;
             }
             snapshot_tail_staging = Some(staging);
-
-            if !snapshot_tail_state_download_started
-                && snapshot_tail_staging
-                    .as_ref()
-                    .is_some_and(|tail| tail.tip_height() == bridge_tip)
-            {
-                let boundary_header = *pending_manifest
-                    .as_ref()
-                    .and_then(|pending| pending.history_step.as_ref())
-                    .expect("verified HistoryStep is retained through snapshot install")
-                    .boundary
-                    .header();
-                let manifest = pending_manifest
-                    .as_ref()
-                    .expect("selected manifest is retained")
-                    .manifest
-                    .clone();
-                let staging = begin_snapshot_state_download(
-                    &p2p_cmd,
-                    &snapshot_staging_root,
-                    from,
-                    &manifest,
-                    boundary_header,
-                    &mut pending_segment_ids,
-                    &mut segment_queue,
-                )
-                .await;
-                let staging = match staging {
-                    Ok(staging) => staging,
-                    Err(error) => {
-                        tracing::warn!(
-                            peer = %from,
-                            err = %error,
-                            "snapshot state staging initialization failed"
-                        );
-                        reset_sync_state!();
-                        continue;
-                    }
-                };
-                snapshot_staging = Some(staging);
-                snapshot_tail_state_download_started = true;
-                tracing::info!(
-                    from = %from,
-                    bridge_tip,
-                    blocks = snapshot_tail_staging.as_ref().map_or(0, SnapshotTailStaging::block_count),
-                    "immutable snapshot bridge sealed — downloading state"
-                );
-                if pending_segment_ids.is_empty() && segment_queue.is_empty() {
-                    let staging = snapshot_staging
-                        .take()
-                        .expect("snapshot staging exists before empty finalization");
-                    let segment_count = staging.descriptors().len();
-                    let key = SnapshotStagingOperationKey::Finalize {
-                        generation: snapshot_sync_generation,
-                        from,
-                    };
-                    snapshot_staging_inflight = Some(key);
-                    let completion = snapshot_staging_completion_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let started = Instant::now();
-                        let result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(move || {
-                                staging.finalize().map_err(|error| error.to_string())
-                            }),
-                        )
-                        .map_err(|_| "snapshot finalization worker panicked".to_owned())
-                        .and_then(|result| result);
-                        let _ = completion.blocking_send(
-                            SnapshotStagingCompletion::Finalized {
-                                key,
-                                segment_count,
-                                work_elapsed: started.elapsed(),
-                                result,
-                            },
-                        );
-                    });
-                }
-            }
-
-            let install_ready = snapshot_tail_install_target.is_some_and(|target| {
-                snapshot_tail_staging
-                    .as_ref()
-                    .is_some_and(|tail| tail.tip_height() >= target)
-            }) && finalized_snapshot_waiting.is_some();
-            if install_ready {
-                request_snapshot_tail_terminal!(from);
-                continue;
-            }
-
-            let next_target = if !snapshot_tail_state_download_started {
-                bridge_tip
-            } else {
-                snapshot_tail_install_target.unwrap_or(highest_announced)
-            };
-            if snapshot_tail_staging
-                .as_ref()
-                .is_some_and(|tail| tail.tip_height() < next_target)
-            {
-                let height = snapshot_tail_staging
-                    .as_ref()
-                    .expect("tail target comparison retained staging")
-                    .next_height();
-                request_snapshot_tail_blocks!(from, height, 1);
-            }
+            tracing::info!(
+                from = %from,
+                bridge_tip,
+                blocks = snapshot_tail_staging.as_ref().map_or(0, SnapshotTailStaging::block_count),
+                "immutable snapshot bridge sealed on disk"
+            );
+            try_start_ready_snapshot_install!();
         }
 
         completed = snapshot_staging_completion_rx.recv() => {
@@ -6511,13 +7660,11 @@ async fn handle_p2p_events(
                         }
                     };
                     sync_phase_telemetry.record_state_segment(payload_bytes, work_elapsed);
-                    if !pending_manifest.as_ref().is_some_and(|pending| pending.from == from)
-                        || !pending_segment_ids.remove(&segment_id)
-                    {
+                    if !pending_manifest.as_ref().is_some_and(|pending| pending.from == from) {
                         tracing::warn!(
                             from = %from,
                             segment = segment_id,
-                            "snapshot staging completion lost its selected manifest/request"
+                            "snapshot staging completion lost its selected manifest"
                         );
                         cleanup_snapshot_staging_session_offthread(staging);
                         reset_sync_state!();
@@ -6525,12 +7672,28 @@ async fn handle_p2p_events(
                     }
                     snapshot_staging = Some(staging);
 
+                    if let Some((queued_from, response)) = queued_segment_response.take() {
+                        if queued_from != from {
+                            drop(response);
+                            tracing::warn!(
+                                from = %queued_from,
+                                expected = %from,
+                                "buffered snapshot segment changed peer"
+                            );
+                            reset_sync_state!();
+                            continue;
+                        }
+                        stage_snapshot_segment_response!(queued_from, response);
+                    }
+
                     if let Some(pending) = pending_manifest.as_ref() {
                         dispatch_queued_snapshot_segments(
                             &p2p_cmd,
                             pending.from,
                             pending.manifest.tip_height,
                             pending.manifest.tip_hash,
+                            snapshot_staging_inflight.is_some(),
+                            queued_segment_response.is_some(),
                             &mut pending_segment_ids,
                             &mut segment_queue,
                         )
@@ -6547,7 +7710,11 @@ async fn handle_p2p_events(
                     // reconstruct the exact root in the same one-operation
                     // blocking lane.  `pending_manifest` continues to own the
                     // authenticated HistoryStep boundary and inbound permit during this pass.
-                    if pending_segment_ids.is_empty() && segment_queue.is_empty() {
+                    if snapshot_staging_inflight.is_none()
+                        && queued_segment_response.is_none()
+                        && pending_segment_ids.is_empty()
+                        && segment_queue.is_empty()
+                    {
                         let staging = snapshot_staging
                             .take()
                             .expect("accepted snapshot session is available for finalization");
@@ -6622,30 +7789,15 @@ async fn handle_p2p_events(
                         reset_sync_state!();
                         continue;
                     }
-                    let staged_tip = snapshot_tail_staging
-                        .as_ref()
-                        .map_or(pending.manifest.bridge_tip_height, SnapshotTailStaging::tip_height);
-                    let target = snapshot_tail_request_inflight
-                        .map_or(staged_tip, |request| staged_tip.max(request.end_height()));
-                    let target = snapshot_tail_append_inflight
-                        .map_or(target, |append| target.max(append.end_height()))
-                        .max(pending.manifest.bridge_tip_height);
+                    let target = pending.manifest.bridge_tip_height;
                     snapshot_tail_install_target = Some(target);
-                    let tail_ready = snapshot_tail_request_inflight.is_none()
-                        && snapshot_tail_append_inflight.is_none()
-                        && snapshot_tail_staging
-                            .as_ref()
-                            .is_some_and(|tail| tail.tip_height() >= target);
                     finalized_snapshot_waiting = Some((finalized, segment_count, from));
-                    if tail_ready {
-                        request_snapshot_tail_terminal!(from);
-                    } else {
-                        tracing::info!(
-                            from = %from,
-                            target,
-                            "snapshot state finalized — waiting for disk live-tail"
-                        );
-                    }
+                    tracing::info!(
+                        from = %from,
+                        target,
+                        "snapshot state finalized — waiting for fixed bridge prerequisites"
+                    );
+                    try_start_ready_snapshot_install!();
                 }
             }
         }
@@ -6688,21 +7840,24 @@ async fn handle_p2p_events(
                     let _ = template_changes.send(());
                     if highest_announced > height {
                         let peer = last_announcement_peer.unwrap_or(completed.key.from);
-                        let count = (highest_announced - height)
-                            .min(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH)
+                        let count = (highest_announced - height + 1)
+                            .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
                             as u16;
-                        let _ = p2p_cmd
-                            .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                peer,
-                                from_height: height.saturating_add(1),
-                                count,
-                            })
-                            .await;
+                        if fetch_in_progress.insert(peer) {
+                            recent_header_fetches.insert((peer, height, count), Instant::now());
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                    peer,
+                                    start_height: height,
+                                    count,
+                                })
+                                .await;
+                        }
                         tracing::debug!(
                             peer = %peer,
-                            from_height = height.saturating_add(1),
+                            from_height = height,
                             highest_announced,
-                            "requested fresh retained suffix after snapshot install"
+                            "requested authenticated retained suffix after snapshot install"
                         );
                     }
                 }
@@ -6785,21 +7940,30 @@ async fn handle_p2p_events(
                 tip = completed.manifest.tip_height,
                 bridge_tip = completed.manifest.bridge_tip_height,
                 segments = completed.manifest.segment_ids.len(),
-                "snapshot manifest accepted — staging immutable bridge before state"
+                "snapshot manifest accepted — starting bounded payload work"
             );
-            let tail_root = snapshot_staging_root.join("tail");
-            let tail = match SnapshotTailStaging::create(
-                &tail_root,
+            let boundary_header = *verified_history_step.boundary.header();
+            let bridge_is_empty = snapshot_bridge_requires_tail(
                 completed.manifest.tip_height,
-                completed.manifest.tip_hash,
-                completed.manifest.cumulative_chainwork,
-            ) {
-                Ok(tail) => tail,
-                Err(error) => {
-                    tracing::warn!(peer = %from, err = %error, "snapshot tail staging initialization failed");
-                    drop_verified_history_step(verified_history_step);
-                    reset_sync_state!();
-                    continue;
+                completed.manifest.bridge_tip_height,
+            ) == Some(false);
+            let tail = if bridge_is_empty {
+                None
+            } else {
+                let tail_root = snapshot_staging_root.join("tail");
+                match SnapshotTailStaging::create(
+                    &tail_root,
+                    completed.manifest.tip_height,
+                    completed.manifest.tip_hash,
+                    completed.manifest.cumulative_chainwork,
+                ) {
+                    Ok(tail) => Some(tail),
+                    Err(error) => {
+                        tracing::warn!(peer = %from, err = %error, "snapshot tail staging initialization failed");
+                        drop_verified_history_step(verified_history_step);
+                        reset_sync_state!();
+                        continue;
+                    }
                 }
             };
             // The terminal allocation and inbound permit remain owned by the
@@ -6815,28 +7979,78 @@ async fn handle_p2p_events(
                 manifest: completed.manifest,
                 history_step: Some(verified_history_step),
             });
-            snapshot_tail_staging = Some(tail);
-            let bridge_tip = pending_manifest
+            snapshot_tail_staging = tail;
+            let manifest = pending_manifest
                 .as_ref()
                 .expect("selected snapshot manifest is installed")
                 .manifest
-                .bridge_tip_height;
-            if bridge_tip
-                > pending_manifest
-                    .as_ref()
-                    .expect("selected snapshot manifest is installed")
-                    .manifest
-                    .tip_height
-            {
-                let height = pending_manifest
-                    .as_ref()
-                    .expect("selected snapshot manifest is installed")
-                    .manifest
-                    .tip_height
-                    .saturating_add(1);
+                .clone();
+            let bridge_tip = manifest.bridge_tip_height;
+            snapshot_tail_install_target = Some(bridge_tip);
+            let staging = begin_snapshot_state_download(
+                &p2p_cmd,
+                &snapshot_staging_root,
+                from,
+                &manifest,
+                boundary_header,
+                &mut pending_segment_ids,
+                &mut segment_queue,
+            )
+            .await;
+            let staging = match staging {
+                Ok(staging) => staging,
+                Err(error) => {
+                    tracing::warn!(
+                        peer = %from,
+                        err = %error,
+                        "snapshot state staging initialization failed"
+                    );
+                    reset_sync_state!();
+                    continue;
+                }
+            };
+            snapshot_staging = Some(staging);
+
+            if bridge_tip > manifest.tip_height {
+                let height = manifest.tip_height.saturating_add(1);
                 let count = u16::try_from(bridge_tip.saturating_sub(height).saturating_add(1))
                     .expect("manifest codec bounds the immutable bridge span");
                 request_snapshot_tail_blocks!(from, height, count);
+                request_snapshot_tail_terminal!(from);
+            } else {
+                tracing::info!(
+                    peer = %from,
+                    bridge_tip,
+                    "snapshot boundary is current — no immutable bridge replay required"
+                );
+            }
+
+            if pending_segment_ids.is_empty() && segment_queue.is_empty() {
+                let staging = snapshot_staging
+                    .take()
+                    .expect("snapshot staging exists before empty finalization");
+                let segment_count = staging.descriptors().len();
+                let key = SnapshotStagingOperationKey::Finalize {
+                    generation: snapshot_sync_generation,
+                    from,
+                };
+                snapshot_staging_inflight = Some(key);
+                let completion = snapshot_staging_completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                            staging.finalize().map_err(|error| error.to_string())
+                        }))
+                        .map_err(|_| "snapshot finalization worker panicked".to_owned())
+                        .and_then(|result| result);
+                    let _ = completion.blocking_send(SnapshotStagingCompletion::Finalized {
+                        key,
+                        segment_count,
+                        work_elapsed: started.elapsed(),
+                        result,
+                    });
+                });
             }
         }
 
@@ -6849,24 +8063,59 @@ async fn handle_p2p_events(
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
 
-            let header_terminal_hedge = pending_snapshot_header_sync
+            let recent_terminal_hedge = pending_recent_suffix.as_ref().and_then(|pending| {
+                pending
+                    .terminal_requests
+                    .hedge_due(now)
+                    .then(|| {
+                        terminal_alternate_peer(&manifest_peers, &pending.terminal_requests)
+                            .map(|peer| (peer, pending.target_height, pending.target_hash))
+                    })
+                    .flatten()
+            });
+            if let Some((peer, height, block_hash)) = recent_terminal_hedge {
+                let requests = &mut pending_recent_suffix
+                    .as_mut()
+                    .expect("hedged compact suffix is present")
+                    .terminal_requests;
+                let token = requests.primary.token;
+                requests.install_hedge(peer);
+                if p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestHistoryStepTerminal {
+                        token,
+                        peer,
+                        height,
+                        block_hash,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    tracing::info!(
+                        peer = %peer,
+                        height,
+                        "compact suffix terminal still pending — requesting one alternate"
+                    );
+                }
+            }
+
+            let header_terminal_hedge = snapshot_boundary_terminal_inflight
                 .as_ref()
                 .and_then(|pending| {
-                    let requests = pending.terminal_requests.as_ref()?;
-                    requests
+                    pending
+                        .requests
                         .hedge_due(now)
                         .then(|| {
-                            terminal_alternate_peer(&manifest_peers, requests).map(|peer| {
-                                (peer, pending.manifest.tip_height, pending.manifest.tip_hash)
+                            terminal_alternate_peer(&manifest_peers, &pending.requests).map(|peer| {
+                                (peer, pending.height, pending.block_hash)
                             })
                         })
                         .flatten()
-            });
+                });
             if let Some((peer, height, block_hash)) = header_terminal_hedge {
-                let requests = pending_snapshot_header_sync
+                let requests = &mut snapshot_boundary_terminal_inflight
                     .as_mut()
-                    .and_then(|pending| pending.terminal_requests.as_mut())
-                    .expect("hedged header terminal race is present");
+                    .expect("hedged boundary terminal race is present")
+                    .requests;
                 let token = requests.primary.token;
                 requests.install_hedge(peer);
                 if p2p_cmd
@@ -6936,7 +8185,7 @@ async fn handle_p2p_events(
                     let ctx = chain.read().await;
                     ctx.tip_height()
                 };
-                const MINING_QUORUM_TIP_PROBE_HEADERS: u16 = 512;
+                const MINING_QUORUM_TIP_PROBE_HEADERS: u16 = CONNECTED_TIP_PROBE_HEADERS;
                 for peer in mining_peer_quorum.unconfirmed_connected() {
                     let request_key = (peer, our_height, MINING_QUORUM_TIP_PROBE_HEADERS);
                     let recently_requested = recent_header_fetches
@@ -6985,6 +8234,8 @@ async fn handle_p2p_events(
                 && history_step_verification_inflight.is_none()
                 && snapshot_staging_inflight.is_none()
                 && snapshot_install_inflight.is_none()
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
                 && pending_segment_ids.is_empty()
                 && segment_queue.is_empty()
             {
@@ -7008,6 +8259,8 @@ async fn handle_p2p_events(
                 && snapshot_staging.is_none()
                 && snapshot_staging_inflight.is_none()
                 && snapshot_install_inflight.is_none()
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
                 && pending_segment_ids.is_empty()
                 && segment_queue.is_empty()
             {
@@ -7059,7 +8312,10 @@ async fn handle_p2p_events(
             // This handles the case where all initial block requests failed (peer
             // didn't have the block yet, stream capacity hit, etc.) in large networks.
             let stale_secs = last_tip_advance.elapsed().as_secs();
-            if stale_secs >= 30 {
+            if stale_secs >= 30
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
+            {
                 let our_height = {
                     let ctx = chain.read().await;
                     ctx.tip_height()
@@ -7094,19 +8350,26 @@ async fn handle_p2p_events(
                                 );
                             }
                         } else {
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::SyncBlocksFrom {
-                                    peer,
-                                    from_height: our_height + 1,
-                                    count: gap as u16,
-                                })
-                                .await;
+                            let count = (gap + 1)
+                                .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
+                                as u16;
+                            if fetch_in_progress.insert(peer) {
+                                recent_header_fetches
+                                    .insert((peer, our_height, count), Instant::now());
+                                let _ = p2p_cmd
+                                    .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                        peer,
+                                        start_height: our_height,
+                                        count,
+                                    })
+                                    .await;
+                            }
                             tracing::info!(
                                 our_height,
                                 highest_announced,
                                 stale_secs,
                                 peer = %peer,
-                                "stale recent gap — re-requesting accepted bundles"
+                                "stale recent gap — re-requesting authenticated headers"
                             );
                         }
                         last_tip_advance = Instant::now();
@@ -7121,6 +8384,8 @@ async fn handle_p2p_events(
                 && history_step_verification_inflight.is_none()
                 && snapshot_staging_inflight.is_none()
                 && snapshot_install_inflight.is_none()
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
                 && !manifest_candidates.is_empty()
             {
                 let timed_out = manifest_first_candidate_at
@@ -7263,6 +8528,8 @@ async fn queue_snapshot_segment_download(
         peer,
         manifest.tip_height,
         manifest.tip_hash,
+        false,
+        false,
         pending_segment_ids,
         segment_queue,
     )
@@ -7284,6 +8551,49 @@ async fn begin_snapshot_state_download(
     Ok(staging)
 }
 
+fn snapshot_segment_request_capacity(
+    outstanding_requests: usize,
+    staging_active: bool,
+    response_buffered: bool,
+) -> usize {
+    const SNAPSHOT_SEGMENT_PIPELINE_WIDTH: usize = 2;
+    SNAPSHOT_SEGMENT_PIPELINE_WIDTH.saturating_sub(
+        outstanding_requests
+            .saturating_add(usize::from(staging_active))
+            .saturating_add(usize::from(response_buffered)),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnapshotSegmentResponseAdmission {
+    StageNow,
+    BufferOne,
+    RetryOverflow,
+    Stale,
+}
+
+fn admit_snapshot_segment_response(
+    segment_id: u16,
+    staging_active: bool,
+    response_buffered: bool,
+    pending_segment_ids: &mut std::collections::HashSet<u16>,
+    segment_queue: &mut std::collections::VecDeque<u16>,
+) -> SnapshotSegmentResponseAdmission {
+    if !pending_segment_ids.remove(&segment_id) {
+        return SnapshotSegmentResponseAdmission::Stale;
+    }
+    if !staging_active {
+        return SnapshotSegmentResponseAdmission::StageNow;
+    }
+    if !response_buffered {
+        return SnapshotSegmentResponseAdmission::BufferOne;
+    }
+    if !segment_queue.contains(&segment_id) {
+        segment_queue.push_front(segment_id);
+    }
+    SnapshotSegmentResponseAdmission::RetryOverflow
+}
+
 /// Fill only the already-admitted network request window.  Snapshot payload
 /// authentication itself remains single-operation; this helper never creates
 /// another decoder or retains response bytes in the node event loop.
@@ -7292,10 +8602,17 @@ async fn dispatch_queued_snapshot_segments(
     peer: libp2p::PeerId,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
+    staging_active: bool,
+    response_buffered: bool,
     pending_segment_ids: &mut std::collections::HashSet<u16>,
     segment_queue: &mut std::collections::VecDeque<u16>,
 ) {
-    while pending_segment_ids.len() < MAX_INFLIGHT_SEGMENTS {
+    let capacity = snapshot_segment_request_capacity(
+        pending_segment_ids.len(),
+        staging_active,
+        response_buffered,
+    );
+    for _ in 0..capacity {
         if let Some(seg_id) = segment_queue.pop_front() {
             if !pending_segment_ids.insert(seg_id) {
                 continue;
@@ -7420,7 +8737,7 @@ async fn apply_verified_snapshot(
     manifest: noid_p2p::protocol::GetStateManifestResponse,
     staging: FinalizedSnapshotStaging,
     history_step: VerifiedHistoryStepSnapshot,
-    tail: FinalizedSnapshotTail,
+    tail: Option<FinalizedSnapshotTail>,
     history_step_runtime: Option<Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>>,
     wallet_operation_gate: &WalletOperationGate,
     external_mining_attempts: &ExternalMiningAttemptInvalidator,
@@ -7431,18 +8748,35 @@ async fn apply_verified_snapshot(
     }
     let snapshot_height = manifest.tip_height;
     let segment_count = staging.descriptors().len();
-    if tail.boundary_height() != snapshot_height
-        || tail.boundary_hash() != manifest.tip_hash
-        || tail.tip_height() < manifest.bridge_tip_height
+    let tail_matches_manifest = if snapshot_bridge_requires_tail(
+        snapshot_height,
+        manifest.bridge_tip_height,
+    ) == Some(false)
     {
+        tail.is_none()
+    } else {
+        tail.as_ref().is_some_and(|tail| {
+            tail.boundary_height() == snapshot_height
+                && tail.boundary_hash() == manifest.tip_hash
+                && tail.tip_height() == manifest.bridge_tip_height
+                && tail.tip_hash() == manifest.bridge_tip_hash
+        })
+    };
+    if !tail_matches_manifest {
         drop_verified_history_step(history_step);
         drop(tail);
         return Err("snapshot tail does not cover the authenticated manifest bridge".into());
     }
-    let expected_tail_tip = tail.tip_height();
-    let expected_tail_hash = tail.tip_hash();
-    let expected_tail_blocks = tail.block_count();
-    let expected_tail_bytes = tail.payload_bytes();
+    let expected_tail_tip = tail
+        .as_ref()
+        .map_or(snapshot_height, FinalizedSnapshotTail::tip_height);
+    let expected_tail_hash = tail
+        .as_ref()
+        .map_or(manifest.tip_hash, FinalizedSnapshotTail::tip_hash);
+    let expected_tail_blocks = tail.as_ref().map_or(0, FinalizedSnapshotTail::block_count);
+    let expected_tail_bytes = tail
+        .as_ref()
+        .map_or(0, FinalizedSnapshotTail::payload_bytes);
     let VerifiedHistoryStepSnapshot {
         boundary,
         mut headers,
@@ -7479,110 +8813,112 @@ async fn apply_verified_snapshot(
         let mut applied_tail_blocks = 0u64;
         let mut tail_error = None;
 
-        let suffix_tip_header = tail.tip_header();
-        let suffix_authority = suffix_tip_header.and_then(|tip_header| {
-            let epoch_height =
-                noid_chain::consensus::tx_epoch_anchor_height_for_child(tip_header.height);
-            let epoch_anchor_header = if epoch_height <= ctx.tip_height() {
-                ctx.get_header_from_store(epoch_height)
-                    .map_err(|error| {
-                        format!("load recursive suffix epoch anchor: {error}")
-                    })?
-                    .ok_or_else(|| {
-                        "recursive suffix epoch anchor is missing from snapshot headers".to_string()
-                    })?
-            } else {
-                tail.header_at(epoch_height)?
-                    .ok_or_else(|| {
+        if let Some(tail) = tail.as_mut() {
+            let suffix_tip_header = tail.tip_header();
+            let suffix_authority = suffix_tip_header.and_then(|tip_header| {
+                let epoch_height =
+                    noid_chain::consensus::tx_epoch_anchor_height_for_child(tip_header.height);
+                let epoch_anchor_header = if epoch_height <= ctx.tip_height() {
+                    ctx.get_header_from_store(epoch_height)
+                        .map_err(|error| {
+                            format!("load recursive suffix epoch anchor: {error}")
+                        })?
+                        .ok_or_else(|| {
+                            "recursive suffix epoch anchor is missing from snapshot headers"
+                                .to_string()
+                        })?
+                } else {
+                    tail.header_at(epoch_height)?.ok_or_else(|| {
                         "recursive suffix epoch anchor is missing from compact tail".to_string()
                     })?
-            };
-            let terminal_bytes = tail.take_terminal_bytes();
-            let terminal_len = terminal_bytes.len();
-            let terminal_started = Instant::now();
-            let result = ctx
-                .verify_recursive_suffix(
-                    tip_header,
-                    epoch_anchor_header,
-                    terminal_bytes,
-                    |claim| {
-                        verify_history_step_terminal(claim, history_step_runtime.as_deref())
-                    },
-                )
-                .map_err(|error| format!("verify recursive snapshot suffix: {error}"));
-            tracing::info!(
-                height = tip_header.height,
-                terminal_bytes = terminal_len,
-                elapsed_ms = terminal_started.elapsed().as_millis(),
-                accepted = result.is_ok(),
-                "snapshot compact suffix terminal verification completed"
-            );
-            result
-        });
+                };
+                let terminal_bytes = tail.take_terminal_bytes();
+                let terminal_len = terminal_bytes.len();
+                let terminal_started = Instant::now();
+                let result = ctx
+                    .verify_recursive_suffix(
+                        tip_header,
+                        epoch_anchor_header,
+                        terminal_bytes,
+                        |claim| {
+                            verify_history_step_terminal(claim, history_step_runtime.as_deref())
+                        },
+                    )
+                    .map_err(|error| format!("verify recursive snapshot suffix: {error}"));
+                tracing::info!(
+                    height = tip_header.height,
+                    terminal_bytes = terminal_len,
+                    elapsed_ms = terminal_started.elapsed().as_millis(),
+                    accepted = result.is_ok(),
+                    "snapshot compact suffix terminal verification completed"
+                );
+                result
+            });
 
-        if let Err(error) = &suffix_authority {
-            tail_error = Some(error.clone());
-        }
-        if let Ok(mut authority) = suffix_authority {
-            let mut tail_reader = match tail.reader() {
-                Ok(reader) => Some(reader),
-                Err(error) => {
-                    tail_error = Some(error);
-                    None
-                }
-            };
-            while tail_error.is_none() {
-                let block_bytes = match tail_reader
-                    .as_mut()
-                    .expect("tail reader exists while no error is recorded")
-                    .next_block()
-                {
-                    Ok(Some(block_bytes)) => block_bytes,
-                    Ok(None) => break,
+            if let Err(error) = &suffix_authority {
+                tail_error = Some(error.clone());
+            }
+            if let Ok(mut authority) = suffix_authority {
+                let mut tail_reader = match tail.reader() {
+                    Ok(reader) => Some(reader),
                     Err(error) => {
                         tail_error = Some(error);
-                        break;
+                        None
                     }
                 };
-                let block = match noid_chain::Block::from_bytes(&block_bytes) {
-                    Ok(block) => block,
-                    Err(error) => {
+                while tail_error.is_none() {
+                    let block_bytes = match tail_reader
+                        .as_mut()
+                        .expect("tail reader exists while no error is recorded")
+                        .next_block()
+                    {
+                        Ok(Some(block_bytes)) => block_bytes,
+                        Ok(None) => break,
+                        Err(error) => {
+                            tail_error = Some(error);
+                            break;
+                        }
+                    };
+                    let block = match noid_chain::Block::from_bytes(&block_bytes) {
+                        Ok(block) => block,
+                        Err(error) => {
+                            tail_error = Some(format!(
+                                "decode staged tail block: {error:?}"
+                            ));
+                            break;
+                        }
+                    };
+                    let block_height = block.header.height;
+                    let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
+                        Ok(txids) => txids,
+                        Err(error) => {
+                            tail_error = Some(format!(
+                                "staged tail block {block_height} has invalid logical transactions: {error}"
+                            ));
+                            break;
+                        }
+                    };
+                    if let Err(error) = ctx.apply_verified_recursive_suffix_block(
+                        &mut authority,
+                        &block_bytes,
+                        unix_now(),
+                        |block, state| {
+                            noid_chain::materialize_accepted_block_state(state, block)
+                                .map_err(|error| format!("{error:?}"))
+                        },
+                    ) {
                         tail_error = Some(format!(
-                            "decode staged tail block: {error:?}"
+                            "apply staged tail block {block_height}: {error}"
                         ));
                         break;
                     }
-                };
-                let block_height = block.header.height;
-                let txids = match noid_chain::try_compute_logical_txids(&block.transactions) {
-                    Ok(txids) => txids,
-                    Err(error) => {
-                        tail_error = Some(format!(
-                            "staged tail block {block_height} has invalid logical transactions: {error}"
-                        ));
-                        break;
-                    }
-                };
-                if let Err(error) = ctx.apply_verified_recursive_suffix_block(
-                    &mut authority,
-                    &block_bytes,
-                    unix_now(),
-                    |block, state| {
-                        noid_chain::materialize_accepted_block_state(state, block)
-                            .map_err(|error| format!("{error:?}"))
-                    },
-                ) {
-                    tail_error = Some(format!(
-                        "apply staged tail block {block_height}: {error}"
-                    ));
-                    break;
+                    confirmed_tx_hashes.extend(txids);
+                    applied_tail_blocks = applied_tail_blocks.saturating_add(1);
                 }
-                confirmed_tx_hashes.extend(txids);
-                applied_tail_blocks = applied_tail_blocks.saturating_add(1);
-            }
-            if tail_error.is_none() && !authority.is_complete() {
-                tail_error =
-                    Some("recursive snapshot suffix ended before its verified tip".to_string());
+                if tail_error.is_none() && !authority.is_complete() {
+                    tail_error =
+                        Some("recursive snapshot suffix ended before its verified tip".to_string());
+                }
             }
         }
         let view = ChainView::from_mdbx(&ctx);

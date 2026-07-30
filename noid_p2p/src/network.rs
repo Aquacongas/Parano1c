@@ -679,6 +679,23 @@ struct PendingHeaderRequest {
     peer: PeerId,
     start_height: u64,
     count: u16,
+    kind: HeaderRequestKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeaderRequestKind {
+    General,
+    Snapshot { generation: u64 },
+}
+
+fn header_request_survives_snapshot_generation(
+    kind: HeaderRequestKind,
+    active_generation: u64,
+) -> bool {
+    !matches!(
+        kind,
+        HeaderRequestKind::Snapshot { generation } if generation != active_generation
+    )
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1083,6 +1100,18 @@ pub enum NetworkCommand {
         start_height: u64,
         count: u16, // bounded by the fixed header codec
     },
+    /// Fetch one exactly correlated header range for snapshot disk staging.
+    ///
+    /// Unlike `FetchHeaders`, two ranges from the same peer may be in flight.
+    /// `generation`, `start_height`, and `count` are returned unchanged so the
+    /// node can reject stale or out-of-order responses without confusing them
+    /// with reorg/tip probes.
+    FetchSnapshotHeaders {
+        generation: u64,
+        peer: PeerId,
+        start_height: u64,
+        count: u16,
+    },
     /// Request the state manifest from a peer (step 1 of snapshot sync).
     /// Returns metadata + active segment IDs. Emits `NetworkEvent::StateManifest`.
     RequestStateManifest { peer: PeerId, requester_height: u64 },
@@ -1168,6 +1197,21 @@ pub enum NetworkEvent {
     },
     /// Transport or decoding failed for one exact header request.
     HeadersRequestFailed {
+        from: PeerId,
+        start_height: u64,
+        count: u16,
+    },
+    /// Exactly correlated response for snapshot header staging.
+    SnapshotHeadersBatch {
+        generation: u64,
+        from: PeerId,
+        start_height: u64,
+        requested_count: u16,
+        headers: Vec<noid_chain::block_header::BlockHeader>,
+    },
+    /// Transport or decoding failed for one exact snapshot header range.
+    SnapshotHeadersRequestFailed {
+        generation: u64,
         from: PeerId,
         start_height: u64,
         count: u16,
@@ -2663,7 +2707,9 @@ async fn handle_network_command(
             // Node-side fetch state is per peer. Retire an older request from
             // the same peer before issuing its replacement so a delayed stream
             // cannot consume correlation capacity or reset a newer session.
-            pending_header_requests.retain(|_, pending| pending.peer != peer);
+            pending_header_requests.retain(|_, pending| {
+                pending.peer != peer || pending.kind != HeaderRequestKind::General
+            });
             if !pending_header_requests.has_capacity() {
                 let _ = required_event_tx
                     .send(NetworkEvent::HeadersRequestFailed {
@@ -2687,9 +2733,57 @@ async fn handle_network_command(
                     peer,
                     start_height,
                     count,
+                    kind: HeaderRequestKind::General,
                 },
             );
             debug_assert!(inserted, "fresh header request ID must be unique");
+        }
+        NetworkCommand::FetchSnapshotHeaders {
+            generation,
+            peer,
+            start_height,
+            count,
+        } => {
+            let count = count.min(
+                crate::header_sync_codec::MAX_HEADERS_PER_BATCH
+                    .try_into()
+                    .expect("header batch cap fits u16"),
+            );
+            // The node owns a single snapshot-header FSM. Once it advances to
+            // a new generation, delayed requests from every older generation
+            // are inert and must not consume the bounded correlation table.
+            // Keep both current-window requests and unrelated general probes.
+            pending_header_requests.retain(|_, pending| {
+                header_request_survives_snapshot_generation(pending.kind, generation)
+            });
+            if !pending_header_requests.has_capacity() {
+                let _ = required_event_tx
+                    .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                        generation,
+                        from: peer,
+                        start_height,
+                        count,
+                    })
+                    .await;
+                return;
+            }
+            let request_id = swarm.behaviour_mut().chain_sync.send_request(
+                &peer,
+                crate::protocol::GetHeadersRequest {
+                    start_height,
+                    count,
+                },
+            );
+            let inserted = pending_header_requests.try_insert(
+                request_id,
+                PendingHeaderRequest {
+                    peer,
+                    start_height,
+                    count,
+                    kind: HeaderRequestKind::Snapshot { generation },
+                },
+            );
+            debug_assert!(inserted, "fresh snapshot header request ID must be unique");
         }
         NetworkCommand::RequestMempoolSync { peer } => {
             const MEMPOOL_SYNC_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
@@ -3170,35 +3264,78 @@ async fn handle_swarm_event(
                 return;
             };
             if pending.peer != peer {
-                let _ = required_event_tx
-                    .send(NetworkEvent::HeadersRequestFailed {
-                        from: pending.peer,
-                        start_height: pending.start_height,
-                        count: pending.count,
-                    })
-                    .await;
+                match pending.kind {
+                    HeaderRequestKind::General => {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::HeadersRequestFailed {
+                                from: pending.peer,
+                                start_height: pending.start_height,
+                                count: pending.count,
+                            })
+                            .await;
+                    }
+                    HeaderRequestKind::Snapshot { generation } => {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                                generation,
+                                from: pending.peer,
+                                start_height: pending.start_height,
+                                count: pending.count,
+                            })
+                            .await;
+                    }
+                }
                 return;
             }
             let decoded = match decode_linked_header_batch(response.headers) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
-                    let _ = required_event_tx
-                        .send(NetworkEvent::HeadersRequestFailed {
-                            from: pending.peer,
-                            start_height: pending.start_height,
-                            count: pending.count,
-                        })
-                        .await;
+                    match pending.kind {
+                        HeaderRequestKind::General => {
+                            let _ = required_event_tx
+                                .send(NetworkEvent::HeadersRequestFailed {
+                                    from: pending.peer,
+                                    start_height: pending.start_height,
+                                    count: pending.count,
+                                })
+                                .await;
+                        }
+                        HeaderRequestKind::Snapshot { generation } => {
+                            let _ = required_event_tx
+                                .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                                    generation,
+                                    from: pending.peer,
+                                    start_height: pending.start_height,
+                                    count: pending.count,
+                                })
+                                .await;
+                        }
+                    }
                     return;
                 }
             };
-            let _ = required_event_tx
-                .send(NetworkEvent::HeadersBatch {
-                    from: peer,
-                    headers: decoded,
-                })
-                .await;
+            match pending.kind {
+                HeaderRequestKind::General => {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::HeadersBatch {
+                            from: peer,
+                            headers: decoded,
+                        })
+                        .await;
+                }
+                HeaderRequestKind::Snapshot { generation } => {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::SnapshotHeadersBatch {
+                            generation,
+                            from: peer,
+                            start_height: pending.start_height,
+                            requested_count: pending.count,
+                            headers: decoded,
+                        })
+                        .await;
+                }
+            }
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
@@ -3222,13 +3359,27 @@ async fn handle_swarm_event(
                 err = %error,
                 "header request transport failed"
             );
-            let _ = required_event_tx
-                .send(NetworkEvent::HeadersRequestFailed {
-                    from: pending.peer,
-                    start_height: pending.start_height,
-                    count: pending.count,
-                })
-                .await;
+            match pending.kind {
+                HeaderRequestKind::General => {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::HeadersRequestFailed {
+                            from: pending.peer,
+                            start_height: pending.start_height,
+                            count: pending.count,
+                        })
+                        .await;
+                }
+                HeaderRequestKind::Snapshot { generation } => {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                            generation,
+                            from: pending.peer,
+                            start_height: pending.start_height,
+                            count: pending.count,
+                        })
+                        .await;
+                }
+            }
         }
 
         // --- Request-Response: headers server side ---
@@ -4329,13 +4480,27 @@ async fn handle_swarm_event(
                 let failed_headers =
                     pending_header_requests.take_where(|pending| pending.peer == peer_id);
                 for pending in failed_headers {
-                    let _ = required_event_tx
-                        .send(NetworkEvent::HeadersRequestFailed {
-                            from: pending.peer,
-                            start_height: pending.start_height,
-                            count: pending.count,
-                        })
-                        .await;
+                    match pending.kind {
+                        HeaderRequestKind::General => {
+                            let _ = required_event_tx
+                                .send(NetworkEvent::HeadersRequestFailed {
+                                    from: pending.peer,
+                                    start_height: pending.start_height,
+                                    count: pending.count,
+                                })
+                                .await;
+                        }
+                        HeaderRequestKind::Snapshot { generation } => {
+                            let _ = required_event_tx
+                                .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                                    generation,
+                                    from: pending.peer,
+                                    start_height: pending.start_height,
+                                    count: pending.count,
+                                })
+                                .await;
+                        }
+                    }
                 }
                 let failed_segments =
                     pending_state_segment_requests.take_where(|pending| pending.peer == peer_id);
@@ -5057,6 +5222,51 @@ mod tests {
         assert_eq!(unavailable.segment_id, request.segment_id);
         assert_eq!(unavailable.expected_tip_height, request.expected_tip_height);
         assert_eq!(unavailable.expected_tip_hash, request.expected_tip_hash);
+    }
+
+    #[test]
+    fn new_snapshot_header_generation_retires_only_stale_snapshot_requests() {
+        let peer = PeerId::random();
+        let mut registry = BoundedPendingRequests::new(4);
+        assert!(registry.try_insert(
+            1u64,
+            PendingHeaderRequest {
+                peer,
+                start_height: 1,
+                count: 512,
+                kind: HeaderRequestKind::Snapshot { generation: 7 },
+            }
+        ));
+        assert!(registry.try_insert(
+            2u64,
+            PendingHeaderRequest {
+                peer,
+                start_height: 513,
+                count: 512,
+                kind: HeaderRequestKind::Snapshot { generation: 8 },
+            }
+        ));
+        assert!(registry.try_insert(
+            3u64,
+            PendingHeaderRequest {
+                peer,
+                start_height: 99,
+                count: 20,
+                kind: HeaderRequestKind::General,
+            }
+        ));
+
+        registry.retain(|_, pending| header_request_survives_snapshot_generation(pending.kind, 8));
+        assert_eq!(registry.len(), 2);
+        assert!(
+            registry.remove(&1).is_none(),
+            "delayed old-generation response is inert"
+        );
+        assert!(registry.remove(&2).is_some());
+        assert!(
+            registry.remove(&3).is_some(),
+            "general tip probes are independent"
+        );
     }
 
     #[test]

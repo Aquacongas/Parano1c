@@ -267,6 +267,16 @@ def sync_counts(text):
             'phase="history_step_terminal"'
         ),
         "applied_p2p_blocks": text.count("applied P2P block"),
+        "compact_suffixes": text.count(
+            "compact recent suffix application completed"
+        ),
+        "compact_suffix_blocks": [
+            int(value)
+            for value in re.findall(
+                r"compact recent suffix application completed[^\n]* blocks=(\d+)",
+                text,
+            )
+        ],
         "manifest_requests": text.count("requesting state manifest"),
         "suffix_measurements": [
             int(value)
@@ -368,7 +378,7 @@ def main():
     try:
         # First prove that a fresh node discovers a short, already-idle chain.
         # Its finalized snapshot manifest is empty, so this must use the
-        # anchored-header/direct-block path rather than waiting for gossip.
+        # anchored-header/compact-suffix path rather than waiting for gossip.
         summary["phases"]["genesis_to_short_tip_mining"] = mine_phase(
             primary, "01-primary-genesis-to-h5-mining", 0, 5, genesis=True
         )
@@ -381,9 +391,16 @@ def main():
         fresh_short = sync_counts(short_secondary.log_text())
         assert_no_sync_failures("fresh-h5", short_secondary.log_text())
         require(fresh_short["snapshot_installs"] == 0, f"fresh h5 used snapshot: {fresh_short}")
-        require(fresh_short["applied_p2p_blocks"] == 5, f"fresh h5 direct count is not 5: {fresh_short}")
+        require(
+            fresh_short["compact_suffix_blocks"] == [5],
+            f"fresh h5 compact suffix is not exactly five blocks: {fresh_short}",
+        )
+        require(
+            fresh_short["applied_p2p_blocks"] == 0,
+            f"fresh h5 unexpectedly downloaded per-block terminals: {fresh_short}",
+        )
         compare_hashes(primary, short_secondary, 0, 5)
-        summary["phases"]["fresh_short_direct_sync"] = {
+        summary["phases"]["fresh_short_compact_sync"] = {
             "source_height": 5,
             "source_startup_s": round(startup, 3),
             "elapsed_s": round(elapsed, 3),
@@ -437,9 +454,16 @@ def main():
         gap5 = sync_counts(secondary.log_text())
         assert_no_sync_failures("gap5", secondary.log_text())
         require(gap5["snapshot_installs"] == 0, f"gap5 unexpectedly used snapshot: {gap5}")
-        require(gap5["applied_p2p_blocks"] == 5, f"gap5 direct count is not 5: {gap5}")
+        require(
+            gap5["compact_suffix_blocks"] == [5],
+            f"gap5 compact suffix is not exactly five blocks: {gap5}",
+        )
+        require(
+            gap5["applied_p2p_blocks"] == 0,
+            f"gap5 unexpectedly downloaded per-block terminals: {gap5}",
+        )
         compare_hashes(primary, secondary, 0, 24)
-        summary["phases"]["gap5_direct_sync"] = {
+        summary["phases"]["gap5_compact_sync"] = {
             "from_height": 19,
             "to_height": 24,
             "gap": 5,
