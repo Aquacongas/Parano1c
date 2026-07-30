@@ -322,22 +322,22 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(8),
         );
 
-        // Mempool sync v2 declares and validates every intent length before
-        // allocation and streams payload slices without a duplicate CBOR Vec.
+        // Mempool exchange v3 keeps the bounded pull used on peer connect and
+        // adds one length-delimited direct push for reliable transaction relay
+        // before a small network's gossipsub mesh has formed.
         let mempool_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/mempool/2", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/mempool/3", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
                 // A full bounded response is 16 MiB; permit ordinary
                 // residential links to complete without weakening byte caps.
                 .with_request_timeout(Duration::from_secs(30))
-                // Both peers request the other's pre-existing pool on first
-                // connection. Two streams permit that symmetric exchange;
-                // response preparation and bytes remain process-globally
-                // serialized by the network-layer semaphore and budget.
-                .with_max_concurrent_streams(2),
+                // Pulls and a small bounded direct relay fanout may overlap.
+                // Request decoding and response bytes remain process-globally
+                // governed by the shared inbound/outbound budgets.
+                .with_max_concurrent_streams(8),
         );
 
         // ----------------------------------------------------------------

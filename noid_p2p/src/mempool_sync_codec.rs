@@ -20,11 +20,14 @@ use noid_chain::consensus::wire_limits::{
 use crate::{
     inbound_budget::process_global_inbound_budget,
     outbound_budget::OutboundResponseBudget,
-    protocol::{GetMempoolRequest, GetMempoolResponse},
+    protocol::{GetMempoolResponse, MempoolRequest},
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"NMR2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NMS2";
+const REQUEST_MAGIC: [u8; 4] = *b"NMR3";
+const RESPONSE_MAGIC: [u8; 4] = *b"NMS3";
+const REQUEST_PREFIX_BYTES: usize = 12;
+const REQUEST_KIND_PULL: u8 = 0;
+const REQUEST_KIND_PUSH: u8 = 1;
 const RESPONSE_PREFIX_BYTES: usize = 8;
 const LENGTH_BYTES: usize = 4;
 const MAX_LENGTH_TABLE_BYTES: usize = MAX_MEMPOOL_SYNC_TXS * LENGTH_BYTES;
@@ -75,7 +78,7 @@ impl MempoolSyncCodec {
 #[async_trait]
 impl request_response::Codec for MempoolSyncCodec {
     type Protocol = StreamProtocol;
-    type Request = GetMempoolRequest;
+    type Request = MempoolRequest;
     type Response = GetMempoolResponse;
 
     async fn read_request<T>(
@@ -86,13 +89,42 @@ impl request_response::Codec for MempoolSyncCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut magic = [0u8; 4];
-        io.read_exact(&mut magic).await?;
-        if magic != REQUEST_MAGIC {
+        let mut prefix = [0u8; REQUEST_PREFIX_BYTES];
+        io.read_exact(&mut prefix).await?;
+        if prefix[..4] != REQUEST_MAGIC {
             return Err(invalid_data("invalid mempool-sync request magic/version"));
         }
+        if prefix[5..8] != [0, 0, 0] {
+            return Err(invalid_data("non-zero mempool-sync request reserved bytes"));
+        }
+        let payload_len =
+            u32::from_le_bytes(prefix[8..12].try_into().expect("fixed request length")) as usize;
+        let request = match prefix[4] {
+            REQUEST_KIND_PULL if payload_len == 0 => MempoolRequest::Pull,
+            REQUEST_KIND_PULL => {
+                return Err(invalid_data("mempool pull request carries a payload"));
+            }
+            REQUEST_KIND_PUSH => {
+                validate_intent_length(payload_len)?;
+                let inbound_memory_permit = self.acquire_inbound(payload_len).await?;
+                let mut intent_bytes = Vec::new();
+                intent_bytes.try_reserve_exact(payload_len).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::OutOfMemory,
+                        "pushed mempool intent allocation failed",
+                    )
+                })?;
+                intent_bytes.resize(payload_len, 0);
+                io.read_exact(&mut intent_bytes).await?;
+                MempoolRequest::Push {
+                    intent_bytes,
+                    inbound_memory_permit,
+                }
+            }
+            _ => return Err(invalid_data("unknown mempool-sync request kind")),
+        };
         ensure_eof(io).await?;
-        Ok(GetMempoolRequest)
+        Ok(request)
     }
 
     async fn read_response<T>(
@@ -148,12 +180,34 @@ impl request_response::Codec for MempoolSyncCodec {
         &mut self,
         _protocol: &Self::Protocol,
         io: &mut T,
-        _request: Self::Request,
+        request: Self::Request,
     ) -> io::Result<()>
     where
         T: AsyncWrite + Unpin + Send,
     {
-        io.write_all(&REQUEST_MAGIC).await
+        let (kind, intent_bytes) = match request {
+            MempoolRequest::Pull => (REQUEST_KIND_PULL, None),
+            MempoolRequest::Push {
+                intent_bytes,
+                inbound_memory_permit,
+            } => {
+                drop(inbound_memory_permit);
+                validate_intent_length(intent_bytes.len())?;
+                (REQUEST_KIND_PUSH, Some(intent_bytes))
+            }
+        };
+        let payload_len = intent_bytes.as_ref().map_or(0, Vec::len);
+        let payload_len = u32::try_from(payload_len)
+            .map_err(|_| invalid_data("mempool request length does not fit u32"))?;
+        let mut prefix = [0u8; REQUEST_PREFIX_BYTES];
+        prefix[..4].copy_from_slice(&REQUEST_MAGIC);
+        prefix[4] = kind;
+        prefix[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        io.write_all(&prefix).await?;
+        if let Some(intent_bytes) = intent_bytes {
+            io.write_all(&intent_bytes).await?;
+        }
+        Ok(())
     }
 
     async fn write_response<T>(
@@ -293,7 +347,16 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/mempool/2")
+        StreamProtocol::new("/noid/test/sync/mempool/3")
+    }
+
+    fn request_wire(kind: u8, payload_len: u32, payload: &[u8]) -> Vec<u8> {
+        let mut wire = vec![0u8; REQUEST_PREFIX_BYTES];
+        wire[..4].copy_from_slice(&REQUEST_MAGIC);
+        wire[4] = kind;
+        wire[8..12].copy_from_slice(&payload_len.to_le_bytes());
+        wire.extend_from_slice(payload);
+        wire
     }
 
     fn response_wire(lengths: &[u32], payload: &[u8]) -> Vec<u8> {
@@ -365,21 +428,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_is_exact_magic_only() {
+    async fn pull_request_is_exact_fixed_frame() {
         let mut wire = Cursor::new(Vec::new());
         MempoolSyncCodec::default()
-            .write_request(&protocol(), &mut wire, GetMempoolRequest)
+            .write_request(&protocol(), &mut wire, MempoolRequest::Pull)
             .await
             .unwrap();
-        assert_eq!(wire.get_ref(), &REQUEST_MAGIC);
+        assert_eq!(wire.get_ref(), &request_wire(REQUEST_KIND_PULL, 0, &[]));
         wire.set_position(0);
-        MempoolSyncCodec::default()
+        let decoded = MempoolSyncCodec::default()
             .read_request(&protocol(), &mut wire)
             .await
             .unwrap();
+        assert!(matches!(decoded, MempoolRequest::Pull));
 
-        let mut trailing = REQUEST_MAGIC.to_vec();
-        trailing.push(0);
+        let trailing = request_wire(REQUEST_KIND_PULL, 0, &[0]);
         assert_eq!(
             MempoolSyncCodec::default()
                 .read_request(&protocol(), &mut Cursor::new(trailing))
@@ -388,6 +451,56 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[tokio::test]
+    async fn pushed_intent_round_trips_and_retains_inbound_budget() {
+        let source = vec![0x5a; 31];
+        let mut wire = Cursor::new(Vec::new());
+        MempoolSyncCodec::default()
+            .write_request(
+                &protocol(),
+                &mut wire,
+                MempoolRequest::Push {
+                    intent_bytes: source.clone(),
+                    inbound_memory_permit: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wire.get_ref(),
+            &request_wire(REQUEST_KIND_PUSH, source.len() as u32, &source)
+        );
+        wire.set_position(0);
+        let decoded = MempoolSyncCodec::default()
+            .read_request(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        let MempoolRequest::Push {
+            intent_bytes,
+            inbound_memory_permit,
+        } = decoded
+        else {
+            panic!("push decoded as pull");
+        };
+        assert_eq!(intent_bytes, source);
+        assert!(inbound_memory_permit.is_some());
+    }
+
+    #[tokio::test]
+    async fn pushed_intent_length_is_bounded_before_allocation() {
+        let oversized = request_wire(
+            REQUEST_KIND_PUSH,
+            (MAX_TX_INTENT_BYTES_GLOBAL + 1) as u32,
+            &[],
+        );
+        let error = MempoolSyncCodec::default()
+            .read_request(&protocol(), &mut Cursor::new(oversized))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("intent length"));
     }
 
     #[tokio::test]

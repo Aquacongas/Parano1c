@@ -41,8 +41,8 @@ use crate::peer_diversity::{PeerDiversity, PublicNetworkGroup};
 use crate::protocol::{
     BlockGossipMsg, GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse,
     GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
-    GetStateSegmentResponse, NetworkTopics, RecentBlockPayload, RecentBlockPayloadKind,
-    BLOCK_GOSSIP_FIXED_BYTES, MAX_BLOCK_BODY_BATCH,
+    GetStateSegmentResponse, MempoolRequest, NetworkTopics, RecentBlockPayload,
+    RecentBlockPayloadKind, BLOCK_GOSSIP_FIXED_BYTES, MAX_BLOCK_BODY_BATCH,
 };
 
 struct PendingStateSegmentResponse {
@@ -111,6 +111,15 @@ const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
 const MAX_PENDING_HEADER_REQUESTS: usize = 64;
 const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
 const MAX_PENDING_HISTORY_STEP_REQUESTS: usize = 8;
+/// In a small network, direct-push to every connected peer so an edge wallet
+/// cannot depend on an already-formed gossipsub mesh to reach the miner.
+const TX_DIRECT_SMALL_NETWORK_MAX_PEERS: usize = 8;
+/// At scale gossipsub remains primary, while a constant direct fanout gives
+/// every newly admitted transaction independent first-hop paths without
+/// flooding all connections.
+const TX_DIRECT_LARGE_NETWORK_FANOUT: usize = 4;
+const TX_RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
+const TX_RELAY_RATE_MAX: u32 = 50;
 const AUTOMATIC_OUTBOUND_TARGET: usize = 12;
 // The shipped topology contains six individual DNS seeds plus one aggregate
 // dnsaddr source. Probe all of them when necessary, but leave room in the
@@ -131,6 +140,14 @@ const MAX_AUTOMATIC_ADDRS_PER_PEER: usize = 8;
 const AUTOMATIC_PEER_HEALTHY_AFTER: Duration = Duration::from_secs(30);
 const DISCOVERY_RETRY_MIN: Duration = Duration::from_secs(10);
 const DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+fn direct_tx_relay_limit(connected_peers: usize) -> usize {
+    if connected_peers <= TX_DIRECT_SMALL_NETWORK_MAX_PEERS {
+        connected_peers
+    } else {
+        connected_peers.min(TX_DIRECT_LARGE_NETWORK_FANOUT)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct BootstrapCandidate {
@@ -1188,7 +1205,13 @@ pub enum NetworkEvent {
         payload_kind: RecentBlockPayloadKind,
     },
     /// A new TxIntent arrived from a peer.
-    NewTx { from: PeerId, intent_bytes: Vec<u8> },
+    NewTx {
+        from: PeerId,
+        intent_bytes: Vec<u8>,
+        /// Direct-push requests reserve their decoded bytes process-globally
+        /// until node-side admission finishes. Gossip messages carry `None`.
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    },
     /// Response to FetchHeaders: decoded headers from the peer.
     /// Used by reorg detection to find the common ancestor quickly.
     HeadersBatch {
@@ -1990,7 +2013,7 @@ async fn run_swarm(
                     let _ = swarm
                         .behaviour_mut()
                         .mempool_sync
-                        .send_request(&peer, crate::protocol::GetMempoolRequest);
+                        .send_request(&peer, MempoolRequest::Pull);
                     mempool_sync_last_request.insert(peer, mempool_now);
                     if let Some(retry) = mempool_sync_retries.get_mut(&peer) {
                         // Do not issue a duplicate while the request-response
@@ -2426,12 +2449,33 @@ async fn handle_network_command(
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
             let topic = gossipsub::IdentTopic::new(topics.txs.clone());
-            if let Err(e) = swarm
+            let gossip_result = swarm
                 .behaviour_mut()
                 .gossipsub
-                .publish(topic, intent_bytes.as_ref().to_vec())
-            {
-                tracing::debug!("gossipsub: {e} (block delivered via direct peer connections)");
+                .publish(topic, intent_bytes.as_ref().to_vec());
+            if let Err(error) = &gossip_result {
+                tracing::debug!(err = %error, "gossipsub: transaction publish");
+            }
+
+            let mut connected: Vec<_> = swarm.connected_peers().copied().collect();
+            let direct_limit = direct_tx_relay_limit(connected.len());
+            if direct_limit > 0 {
+                connected.shuffle(&mut rand::thread_rng());
+                connected.truncate(direct_limit);
+                for peer in connected {
+                    let _ = swarm.behaviour_mut().mempool_sync.send_request(
+                        &peer,
+                        MempoolRequest::Push {
+                            intent_bytes: intent_bytes.as_ref().to_vec(),
+                            inbound_memory_permit: None,
+                        },
+                    );
+                }
+                tracing::debug!(
+                    peers = direct_limit,
+                    gossip_ok = gossip_result.is_ok(),
+                    "direct transaction relay queued"
+                );
             }
         }
         NetworkCommand::Dial { addr } => {
@@ -2799,7 +2843,7 @@ async fn handle_network_command(
             let _ = swarm
                 .behaviour_mut()
                 .mempool_sync
-                .send_request(&peer, crate::protocol::GetMempoolRequest);
+                .send_request(&peer, MempoolRequest::Pull);
             tracing::debug!(peer = %peer, "requesting mempool sync");
         }
     }
@@ -2937,13 +2981,11 @@ async fn handle_swarm_event(
                 if message.data.len() > MAX_TX_INTENT_BYTES_GLOBAL {
                     tracing::warn!(peer = %propagation_source, len = message.data.len(), "tx gossip too large — dropped");
                 } else {
-                    const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
-                    const TX_RATE_MAX: u32 = 50;
                     if !allow_peer_rate(
                         tx_gossip_rate,
                         propagation_source,
-                        TX_RATE_MAX,
-                        TX_RATE_WINDOW,
+                        TX_RELAY_RATE_MAX,
+                        TX_RELAY_RATE_WINDOW,
                     ) {
                         tracing::debug!(peer = %propagation_source, "tx gossip rate limit exceeded — dropped before event channel");
                         return;
@@ -2951,6 +2993,7 @@ async fn handle_swarm_event(
                     let _ = gossip_event_tx.send(NetworkEvent::NewTx {
                         from: propagation_source,
                         intent_bytes: message.data,
+                        inbound_memory_permit: None,
                     });
                 }
             }
@@ -4290,59 +4333,104 @@ async fn handle_swarm_event(
                 .await;
         }
 
-        // --- Mempool sync: server side (peer requests our mempool) ---
+        // --- Mempool exchange: pull existing entries or push one new TX ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
             request_response::Event::Message {
-                message: request_response::Message::Request { channel, .. },
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
                 peer,
             },
-        )) => {
-            let Ok(preparation_permit) =
-                Arc::clone(mempool_response_prepare_semaphore).try_acquire_owned()
-            else {
-                // Mempool state is recoverable through gossip and a later sync.
-                // Dropping the channel rejects excess preparation without ever
-                // stalling the swarm task or cloning payload bytes.
-                tracing::debug!(peer = %peer, "mempool sync preparation already occupied");
-                return;
-            };
-            let budget = outbound_response_budget.clone();
-            let mempool = mempool.clone();
-            let completion = mempool_response_tx.clone();
-            tokio::spawn(async move {
-                // Reserve the maximum legal response before taking the mempool
-                // lock or cloning the first retained intent. The same permit is
-                // carried by the response until the codec's final write.
-                let response = match prepare_mempool_response_after_admission(budget, || async {
-                    mempool
-                        .intent_bytes_prefix(
-                            MAX_MEMPOOL_SYNC_TXS,
-                            MAX_MEMPOOL_SYNC_BYTES,
-                            MAX_TX_INTENT_BYTES_GLOBAL,
-                        )
-                        .await
-                })
-                .await
-                {
-                    Ok(response) => response,
-                    Err(error) => {
-                        tracing::debug!(peer = %peer, err = %error, "mempool sync byte admission failed");
-                        return;
-                    }
+        )) => match request {
+            MempoolRequest::Pull => {
+                let Ok(preparation_permit) =
+                    Arc::clone(mempool_response_prepare_semaphore).try_acquire_owned()
+                else {
+                    // Mempool state is recoverable through gossip and a later
+                    // sync. Dropping the channel rejects excess preparation
+                    // without stalling the swarm task or cloning payload bytes.
+                    tracing::debug!(peer = %peer, "mempool sync preparation already occupied");
+                    return;
                 };
-                let total_bytes: usize = response.txs.iter().map(Vec::len).sum();
-                tracing::debug!(
-                    peer = %peer,
-                    tx_count = response.txs.len(),
-                    total_bytes,
-                    "serving mempool sync request"
-                );
-                let _preparation_permit = preparation_permit;
-                let _ = completion
-                    .send(PendingMempoolResponse { channel, response })
-                    .await;
-            });
-        }
+                let budget = outbound_response_budget.clone();
+                let mempool = mempool.clone();
+                let completion = mempool_response_tx.clone();
+                tokio::spawn(async move {
+                    // Reserve the maximum legal response before taking the
+                    // mempool lock or cloning the first retained intent.
+                    let response = match prepare_mempool_response_after_admission(
+                        budget,
+                        || async {
+                            mempool
+                                .intent_bytes_prefix(
+                                    MAX_MEMPOOL_SYNC_TXS,
+                                    MAX_MEMPOOL_SYNC_BYTES,
+                                    MAX_TX_INTENT_BYTES_GLOBAL,
+                                )
+                                .await
+                        },
+                    )
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(error) => {
+                            tracing::debug!(peer = %peer, err = %error, "mempool sync byte admission failed");
+                            return;
+                        }
+                    };
+                    let total_bytes: usize = response.txs.iter().map(Vec::len).sum();
+                    tracing::debug!(
+                        peer = %peer,
+                        tx_count = response.txs.len(),
+                        total_bytes,
+                        "serving mempool sync request"
+                    );
+                    let _preparation_permit = preparation_permit;
+                    let _ = completion
+                        .send(PendingMempoolResponse { channel, response })
+                        .await;
+                });
+            }
+            MempoolRequest::Push {
+                intent_bytes,
+                inbound_memory_permit,
+            } => {
+                let response = GetMempoolResponse {
+                    txs: Vec::new(),
+                    inbound_memory_permit: None,
+                    outbound_memory_permit: None,
+                };
+                let _ = swarm
+                    .behaviour_mut()
+                    .mempool_sync
+                    .send_response(channel, response);
+                if !allow_peer_rate(
+                    tx_gossip_rate,
+                    peer,
+                    TX_RELAY_RATE_MAX,
+                    TX_RELAY_RATE_WINDOW,
+                ) {
+                    tracing::debug!(peer = %peer, "direct tx relay rate limit exceeded");
+                    return;
+                }
+                let len = intent_bytes.len();
+                if let Err(error) = required_event_tx.try_send(NetworkEvent::NewTx {
+                    from: peer,
+                    intent_bytes,
+                    inbound_memory_permit,
+                }) {
+                    tracing::debug!(
+                        peer = %peer,
+                        len,
+                        err = %error,
+                        "direct tx relay dropped under node backpressure"
+                    );
+                } else {
+                    tracing::debug!(peer = %peer, len, "received direct transaction relay");
+                }
+            }
+        },
 
         // --- Mempool sync: client side (response to our request) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::MempoolSync(
@@ -4719,6 +4807,21 @@ mod tests {
             1,
             MAX_HISTORY_STEP_TERMINAL_BYTES - noid_chain::HISTORY_STEP_TERMINAL_BINDING_BYTES,
         )));
+    }
+
+    #[test]
+    fn direct_tx_relay_covers_small_networks_and_stays_bounded_at_scale() {
+        assert_eq!(direct_tx_relay_limit(0), 0);
+        assert_eq!(direct_tx_relay_limit(3), 3);
+        assert_eq!(
+            direct_tx_relay_limit(TX_DIRECT_SMALL_NETWORK_MAX_PEERS),
+            TX_DIRECT_SMALL_NETWORK_MAX_PEERS
+        );
+        assert_eq!(
+            direct_tx_relay_limit(TX_DIRECT_SMALL_NETWORK_MAX_PEERS + 1),
+            TX_DIRECT_LARGE_NETWORK_FANOUT
+        );
+        assert_eq!(direct_tx_relay_limit(1_000), TX_DIRECT_LARGE_NETWORK_FANOUT);
     }
 
     #[test]

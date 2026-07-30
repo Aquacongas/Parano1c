@@ -233,13 +233,22 @@ pub struct GetStateSegmentResponse {
 // Mempool sync — request-response on peer connect
 // ---------------------------------------------------------------------------
 
-/// Request all pending transactions from a peer.
-/// Sent immediately when a new peer connects to ensure both sides have
-/// each other's mempool. This is necessary because gossipsub only propagates
-/// NEW events — existing mempool entries are not retransmitted to late-joining
-/// peers via gossipsub (which would be deduplicated away).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GetMempoolRequest;
+/// One bounded mempool exchange request.
+///
+/// `Pull` fills the late-join gap on peer connect. `Push` gives a newly
+/// admitted transaction bounded independent first-hop paths; ordinary
+/// propagation still uses gossipsub.
+#[derive(Debug, Clone)]
+pub enum MempoolRequest {
+    Pull,
+    Push {
+        intent_bytes: Vec<u8>,
+        /// Process-wide inbound byte admission retained until node-side
+        /// submission has consumed the pushed intent. Local flow-control
+        /// state; never serialized.
+        inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    },
+}
 
 /// Response: raw TxIntent bytes for every pending transaction.
 ///

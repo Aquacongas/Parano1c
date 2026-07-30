@@ -230,6 +230,10 @@ fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     }
 }
 
+fn initial_sync_may_skip_peer_confirmation(isolated_genesis: bool) -> bool {
+    isolated_genesis
+}
+
 const MINING_PEER_QUORUM: usize = 2;
 const CONNECTED_TIP_PROBE_HEADERS: u16 =
     noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2;
@@ -1020,19 +1024,9 @@ async fn main() -> anyhow::Result<()> {
     // Extminer mode owns one prepared/proving attempt. P2P canonical advances
     // use this same handle to invalidate stale ready capabilities immediately.
     let external_mining_attempts = ExternalMiningAttemptInvalidator::new();
-    {
-        let ctx = chain.read().await;
-        let h = ctx.tip_height();
-        let ts = ctx.tip_header().timestamp;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if h > 0 && ts > 0 && now.saturating_sub(ts) < 60 * 3 {
-            mark_initial_sync_ready(&initial_sync_ready_tx);
-            tracing::info!(height = h, "chain state is current");
-        }
-    }
+    // A recent local timestamp is not evidence that the durable tip is the
+    // network tip. Ordinary restarts remain unready until an authenticated
+    // peer confirms the exact tip or the sync pipeline applies its extension.
 
     // --- Mempool ---
     let view = ChainView::from_mdbx(&*chain.read().await);
@@ -1162,7 +1156,7 @@ async fn main() -> anyhow::Result<()> {
     // --genesis is an explicit isolated-mining override for network bootstrap
     // and local-chain tests. It remains valid after restart at any local height.
     // Normal miners require confirmed ordinary P2P nodes; peers need not mine.
-    if cli.genesis {
+    if initial_sync_may_skip_peer_confirmation(cli.genesis) {
         tracing::debug!("genesis mode: marking initial sync ready immediately");
         mark_initial_sync_ready(&initial_sync_ready_tx);
     }
@@ -2354,7 +2348,8 @@ fn state_segment_response_matches_snapshot_boundary(
 mod tests {
     use super::{
         admit_snapshot_segment_response, compact_apply_signals, compact_suffix_eligible,
-        compare_manifest_fork_choice, gap_requires_snapshot_sync, load_or_create_config,
+        compare_manifest_fork_choice, gap_requires_snapshot_sync,
+        initial_sync_may_skip_peer_confirmation, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         next_block_has_competing_parent, p2p_listen_to_multiaddr,
         prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
@@ -2378,6 +2373,12 @@ mod tests {
         assert!(*first.borrow());
         assert!(*second.borrow());
         assert!(*late.borrow());
+    }
+
+    #[test]
+    fn durable_tip_needs_peer_confirmation_outside_genesis_mode() {
+        assert!(!initial_sync_may_skip_peer_confirmation(false));
+        assert!(initial_sync_may_skip_peer_confirmation(true));
     }
 
     #[test]
@@ -5664,7 +5665,11 @@ async fn handle_p2p_events(
                     drop(inbound_memory_permit);
                 });
             }
-            Ok(NetworkEvent::NewTx { from, intent_bytes }) => {
+            Ok(NetworkEvent::NewTx {
+                from,
+                intent_bytes,
+                inbound_memory_permit,
+            }) => {
                 // Hard cap: reject oversized payloads before any processing.
                 if intent_bytes.len() > MAX_TX_INTENT_BYTES_GLOBAL {
                     tracing::debug!(
@@ -5726,6 +5731,9 @@ async fn handle_p2p_events(
                             }
                         }
                     }
+                    // A direct relay owns one process-global inbound byte
+                    // reservation. Gossip messages carry `None`.
+                    drop(inbound_memory_permit);
                 });
             }
             Ok(NetworkEvent::PeerConnected(peer)) => {
