@@ -793,7 +793,9 @@ mod tests {
             let mut bad = cols.kid[0].clone();
             bad[3] += F128::ONE;
             assert!(
-                run(&code_cols[0], &code_cols[1], &bad, &cols.kid[1], &cols.c).is_err(),
+                crate::dishonest_fixture_rejected(|| {
+                    run(&code_cols[0], &code_cols[1], &bad, &cols.kid[1], &cols.c)
+                }),
                 "corrupted KID lane accepted"
             );
         }
@@ -802,14 +804,15 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][5] += F128::ONE;
             assert!(
-                run(
-                    &code_cols[0],
-                    &code_cols[1],
-                    &cols.kid[0],
-                    &cols.kid[1],
-                    &bad
-                )
-                .is_err(),
+                crate::dishonest_fixture_rejected(|| {
+                    run(
+                        &code_cols[0],
+                        &code_cols[1],
+                        &cols.kid[0],
+                        &cols.kid[1],
+                        &bad,
+                    )
+                }),
                 "corrupted C lane accepted"
             );
         }
@@ -819,7 +822,9 @@ mod tests {
             let leaf_slot = 2 * (tree.leaf_count()) + 1; // first leaf odd slot
             bad[leaf_slot] += F128::ONE;
             assert!(
-                run(&bad, &code_cols[1], &cols.kid[0], &cols.kid[1], &cols.c).is_err(),
+                crate::dishonest_fixture_rejected(|| {
+                    run(&bad, &code_cols[1], &cols.kid[0], &cols.kid[1], &cols.c)
+                }),
                 "corrupted CODE lane accepted"
             );
         }

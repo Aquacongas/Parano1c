@@ -1054,7 +1054,7 @@ mod tests {
             let mut bad = cols.in_[0].clone();
             bad[5] += F128::ONE;
             assert!(
-                run(&bad, &cols.in_[1], &cols.c).is_err(),
+                crate::dishonest_fixture_rejected(|| run(&bad, &cols.in_[1], &cols.c)),
                 "corrupted input symbol accepted"
             );
         }
@@ -1062,7 +1062,7 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][5] += F128::ONE;
             assert!(
-                run(&cols.in_[0], &cols.in_[1], &bad).is_err(),
+                crate::dishonest_fixture_rejected(|| run(&cols.in_[0], &cols.in_[1], &bad)),
                 "corrupted digest accepted"
             );
         }
@@ -1328,7 +1328,7 @@ mod tests {
             let mut bad = cols.in_[0].clone();
             bad[2 * stride + 4] += F128::ONE;
             assert!(
-                run_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_leaf_dag(
                     &chain,
                     &bad,
                     &cols.in_[1],
@@ -1336,9 +1336,8 @@ mod tests {
                     &cols.s0,
                     &cols.s_out,
                     &pins,
-                    global_w_log
-                )
-                .is_err(),
+                    global_w_log,
+                )),
                 "corrupted tile symbol accepted"
             );
         }
@@ -1424,7 +1423,7 @@ mod tests {
             let mut bad = cols.in_[0].clone();
             bad[4] += F128::ONE; // first column hash_pair input
             assert!(
-                run_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_leaf_dag(
                     &chain,
                     &bad,
                     &cols.in_[1],
@@ -1432,9 +1431,8 @@ mod tests {
                     &cols.s0,
                     &cols.s_out,
                     &[(chain.digest_slot(), cols.digest)],
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted IN accepted"
             );
         }
@@ -1443,7 +1441,7 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][chain.digest_slot()] += F128::ONE;
             assert!(
-                run_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_leaf_dag(
                     &chain,
                     &cols.in_[0],
                     &cols.in_[1],
@@ -1451,9 +1449,8 @@ mod tests {
                     &cols.s0,
                     &cols.s_out,
                     &[(chain.digest_slot(), cols.digest)],
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted C accepted"
             );
         }
@@ -1533,7 +1530,7 @@ mod tests {
             let mut bad = cols.in_[1].clone();
             bad[1] += F128::ONE; // s0 in the meta hash_pair
             assert!(
-                run_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_leaf_dag(
                     &chain,
                     &cols.in_[0],
                     &bad,
@@ -1541,9 +1538,8 @@ mod tests {
                     &cols.s0,
                     &cols.s_out,
                     &[(chain.digest_slot(), cols.digest)],
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted meta symbol accepted"
             );
         }
@@ -1551,7 +1547,7 @@ mod tests {
             let mut bad = cols.in_[1].clone();
             bad[4] += F128::ONE; // s1 in the pair hash_pair
             assert!(
-                run_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_leaf_dag(
                     &chain,
                     &cols.in_[0],
                     &bad,
@@ -1559,9 +1555,8 @@ mod tests {
                     &cols.s0,
                     &cols.s_out,
                     &[(chain.digest_slot(), cols.digest)],
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted pair symbol accepted"
             );
         }
@@ -1569,7 +1564,7 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[1][chain.digest_slot()] += F128::ONE;
             assert!(
-                run_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_leaf_dag(
                     &chain,
                     &cols.in_[0],
                     &cols.in_[1],
@@ -1577,9 +1572,8 @@ mod tests {
                     &cols.s0,
                     &cols.s_out,
                     &[(chain.digest_slot(), cols.digest)],
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted digest accepted"
             );
         }
@@ -1882,16 +1876,15 @@ mod tests {
             let mut bad = cols.in_[0].clone();
             bad[SPONGE_LEAF_SLOTS * 2] += F128::ONE;
             assert!(
-                run_sponge_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_sponge_leaf_dag(
                     &bad,
                     &cols.in_[1],
                     &cols.c,
                     &cols.s0,
                     &cols.s_out,
                     &pins,
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted amount accepted"
             );
         }
@@ -1900,16 +1893,15 @@ mod tests {
             let mut bad = cols.in_[1].clone();
             bad[SPONGE_LEAF_SLOTS * 1] += F128::ONE;
             assert!(
-                run_sponge_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_sponge_leaf_dag(
                     &cols.in_[0],
                     &bad,
                     &cols.c,
                     &cols.s0,
                     &cols.s_out,
                     &pins,
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted owner accepted"
             );
         }
@@ -1918,16 +1910,15 @@ mod tests {
             let mut bad = cols.c.clone();
             bad[0][SPONGE_LEAF_SLOTS * 3 + SPONGE_LEAF_DIGEST_SLOT] += F128::ONE;
             assert!(
-                run_sponge_leaf_dag(
+                crate::dishonest_fixture_rejected(|| run_sponge_leaf_dag(
                     &cols.in_[0],
                     &cols.in_[1],
                     &bad,
                     &cols.s0,
                     &cols.s_out,
                     &pins,
-                    w_log
-                )
-                .is_err(),
+                    w_log,
+                )),
                 "corrupted digest accepted"
             );
         }

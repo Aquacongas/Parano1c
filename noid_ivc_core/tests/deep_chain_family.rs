@@ -7,6 +7,26 @@ use noid_ivc_core::deep_chain::family::{
 };
 use noid_ivc_core::field::F128;
 
+fn catch_expected_prover_rejection<T>(f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or_default();
+            if message.contains("prover-side round mismatch")
+                || message.contains("prover-side final mismatch")
+            {
+                None
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
 #[test]
 fn honest_family_end_to_end() {
     let fam = build_family(0xFA111);
@@ -44,7 +64,12 @@ fn corrupted_columns_rejected() {
 
         let mut proofs = FamilyProofs::default();
         let mut ch_p = FsLaneChallenger::new(b"deep-chain-family");
-        let Ok(_) = run_family(&bad, true, &mut ch_p, &mut proofs) else {
+        let Some(prover_result) =
+            catch_expected_prover_rejection(|| run_family(&bad, true, &mut ch_p, &mut proofs))
+        else {
+            continue;
+        };
+        let Ok(_) = prover_result else {
             continue; // prover-side assert tripped — also a catch
         };
 

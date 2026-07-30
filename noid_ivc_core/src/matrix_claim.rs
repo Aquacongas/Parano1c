@@ -2056,22 +2056,28 @@ mod tests {
         fresh.value += F128::ONE;
         let acc_in = random_true_acc(&mut rng, &r1cs);
         let mut ch = FsLaneChallenger::new(b"fold-false-v");
-        let (proof, _) = prove_matrix_claim_fold(&r1cs, &fresh, &acc_in, true, &mut ch);
-        assert!(
-            caught(&r1cs, &fresh, &acc_in, true, &proof),
-            "false fresh claim accepted with a true accumulator"
-        );
+        if let Some((proof, _)) = crate::catch_expected_prover_rejection(|| {
+            prove_matrix_claim_fold(&r1cs, &fresh, &acc_in, true, &mut ch)
+        }) {
+            assert!(
+                caught(&r1cs, &fresh, &acc_in, true, &proof),
+                "false fresh claim accepted with a true accumulator"
+            );
+        }
 
         // False incoming value under an honest fresh claim.
         let fresh = random_fresh(&mut rng, &r1cs);
         let mut acc_bad = random_true_acc(&mut rng, &r1cs);
         acc_bad.value += F128::ONE;
         let mut ch = FsLaneChallenger::new(b"fold-false-v");
-        let (proof, _) = prove_matrix_claim_fold(&r1cs, &fresh, &acc_bad, true, &mut ch);
-        assert!(
-            caught(&r1cs, &fresh, &acc_bad, true, &proof),
-            "false incoming claim accepted with a true accumulator"
-        );
+        if let Some((proof, _)) = crate::catch_expected_prover_rejection(|| {
+            prove_matrix_claim_fold(&r1cs, &fresh, &acc_bad, true, &mut ch)
+        }) {
+            assert!(
+                caught(&r1cs, &fresh, &acc_bad, true, &proof),
+                "false incoming claim accepted with a true accumulator"
+            );
+        }
 
         // The same false incoming with gate = 0 is EXCUSED (genesis): the
         // verifier accepts and the accumulator is TRUE.

@@ -40,6 +40,46 @@ pub mod tuple_permutation;
 pub mod verifier;
 pub mod zerocheck;
 
+/// Run a deliberately dishonest prover fixture in both debug and release
+/// test profiles.
+///
+/// The prover carries debug-only algebraic consistency assertions.  An
+/// adversarial fixture may therefore be rejected immediately in a debug
+/// build, before it can hand an invalid proof to the verifier.  Release
+/// tests continue past these assertions and exercise the verifier/decider
+/// rejection path.  Only the known consistency assertions count as an
+/// expected early rejection; every other panic remains a test failure.
+#[cfg(test)]
+pub(crate) fn catch_expected_prover_rejection<T>(f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(value) => Some(value),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                .unwrap_or_default();
+            let expected = message.contains("prover-side final mismatch")
+                || message.contains("prover-side round mismatch")
+                || message.contains("phase-1 terminal mismatch")
+                || message.contains("phase-2 terminal mismatch");
+            if expected {
+                None
+            } else {
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn dishonest_fixture_rejected(f: impl FnOnce() -> Result<(), String>) -> bool {
+    match catch_expected_prover_rejection(f) {
+        None => true,
+        Some(result) => result.is_err(),
+    }
+}
+
 /// Configure rayon's global thread pool to use only performance cores on
 /// Apple silicon (excluding efficiency cores).
 ///

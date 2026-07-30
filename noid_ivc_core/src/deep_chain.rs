@@ -998,7 +998,11 @@ pub fn prove_deep_chain_walk<Ch: Challenger>(
                     },
                 );
             let full = reduce_round_coeffs(full);
-            debug_assert_eq!(full[0] + horner(&full, F128::ONE), claim);
+            debug_assert_eq!(
+                full[0] + horner(&full, F128::ONE),
+                claim,
+                "walk prover-side round mismatch at layer {layer}"
+            );
             let wire = compress(&full);
             challenger.observe_f128_slice(&wire);
             let r = challenger.sample_f128();
@@ -2947,7 +2951,11 @@ mod tests {
         let groups = [LaneClaimGroup { point, values }];
 
         let mut ch_p = FsLaneChallenger::new(b"deep-chain-test");
-        let (proof, _) = prove_deep_chain_walk(&s0, &groups, &mut ch_p);
+        let Some((proof, _)) = crate::catch_expected_prover_rejection(|| {
+            prove_deep_chain_walk(&s0, &groups, &mut ch_p)
+        }) else {
+            return;
+        };
         let mut ch_v = FsLaneChallenger::new(b"deep-chain-test");
         match verify_deep_chain_walk(w_log, &groups, &proof, &mut ch_v) {
             // The layer chain catches the forged batched claim directly...

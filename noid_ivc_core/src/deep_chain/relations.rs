@@ -527,7 +527,11 @@ pub fn prove_column_relation<Ch: Challenger>(
                 },
             );
         let full = interpolate_round(&evals);
-        debug_assert_eq!(full[0] + horner_round(&full, F128::ONE), claim);
+        debug_assert_eq!(
+            full[0] + horner_round(&full, F128::ONE),
+            claim,
+            "relation prover-side round mismatch"
+        );
         let mut wire = [F128::ZERO; RELATION_DEGREE];
         wire[0] = full[0];
         wire[1..].copy_from_slice(&full[2..]);
@@ -1904,8 +1908,11 @@ mod tests {
             fixed: &[],
         };
         let mut ch_p = FsLaneChallenger::new(b"bool-test");
-        let (proof, _, _) =
-            prove_column_relation(F128::ZERO, &eq_point, &terms, &columns, &mut ch_p);
+        let Some((proof, _, _)) = crate::catch_expected_prover_rejection(|| {
+            prove_column_relation(F128::ZERO, &eq_point, &terms, &columns, &mut ch_p)
+        }) else {
+            return;
+        };
         let mut ch_v = FsLaneChallenger::new(b"bool-test");
         match verify_column_relation(w_log, F128::ZERO, &eq_point, &terms, &[], &proof, &mut ch_v) {
             Err(_) => {}

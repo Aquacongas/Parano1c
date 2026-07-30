@@ -996,7 +996,7 @@ mod tests {
         let mut bad = build_duplex_columns(&layout, iv, &data, w_log);
         bad.c[0][3] += F128::ONE;
         assert!(
-            run(&bad).is_err(),
+            crate::dishonest_fixture_rejected(|| run(&bad)),
             "corrupted carry lane slipped through the duplex DAG"
         );
     }
@@ -1251,19 +1251,28 @@ mod tests {
         // Corrupted sibling lane.
         let mut bad = build_merkle_path_columns(&family, iv_flat, &paths, w_log);
         bad.sib[0][2] += F128::ONE;
-        assert!(run(&bad).is_err(), "corrupted sibling slipped through");
+        assert!(
+            crate::dishonest_fixture_rejected(|| run(&bad)),
+            "corrupted sibling slipped through"
+        );
 
         // Flipped direction bit (column only — the chains no longer match
         // the wiring).
         let mut bad = build_merkle_path_columns(&family, iv_flat, &paths, w_log);
         bad.d[0] += F128::ONE;
-        assert!(run(&bad).is_err(), "flipped direction slipped through");
+        assert!(
+            crate::dishonest_fixture_rejected(|| run(&bad)),
+            "flipped direction slipped through"
+        );
 
         // Corrupted carry (root forgery attempt).
         let mut bad = build_merkle_path_columns(&family, iv_flat, &paths, w_log);
         let last = 2 * depth - 1;
         bad.c[0][last] += F128::ONE;
-        assert!(run(&bad).is_err(), "forged root digest slipped through");
+        assert!(
+            crate::dishonest_fixture_rejected(|| run(&bad)),
+            "forged root digest slipped through"
+        );
     }
 
     /// Challenge cells read from the carry columns equal the values the
