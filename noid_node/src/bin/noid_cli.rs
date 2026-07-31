@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
-//! noid-cli — Paranoid full node CLI client.
+//! parano1d-cli — Paranoid full node CLI client.
 //!
-//! Connects to a running `paranoid` daemon via JSON-RPC (no local keys, no crypto).
+//! Connects to a running `parano1d` daemon via JSON-RPC (no local keys, no crypto).
 //! All operations happen inside the daemon; the CLI is a thin terminal UI.
 //!
 //! Quick start:
-//!   noid-cli status            — node health at a glance
-//!   noid-cli balance           — wallet balance
-//!   noid-cli send <addr> 10.5  — send 10.5 NOID
-//!   noid-cli help              — full command list
+//!   parano1d-cli status            — node health at a glance
+//!   parano1d-cli balance           — wallet balance
+//!   parano1d-cli send <addr> 10.5  — send 10.5 NOID
+//!   parano1d-cli help              — full command list
 
 #![allow(clippy::format_in_format_args, clippy::print_literal)]
 
@@ -120,29 +120,29 @@ fn fmt_hash(h: &str) -> &str {
 
 #[derive(Parser)]
 #[command(
-    name = "noid-cli",
-    about = "Paranoid thin client — control a running paranoid daemon",
+    name = "parano1d-cli",
+    about = "ParanO(1)d thin client — control a running parano1d daemon",
     version = env!("CARGO_PKG_VERSION"),
     long_about = "\
-Paranoid thin client. Connects to a running paranoid daemon via JSON-RPC.
+ParanO(1)d thin client. Connects to a running parano1d daemon via JSON-RPC.
 
 QUICK START:
-  noid-cli status              Node info (height, hash, slots)
-  noid-cli balance             Wallet balance
-  noid-cli send <addr> 10.5   Send 10.5 NOID to address
-  noid-cli history             Transaction history
-  noid-cli mempool             Pending transactions
-  noid-cli help                All commands
+  parano1d-cli status              Node info (height, hash, slots)
+  parano1d-cli balance             Wallet balance
+  parano1d-cli send <addr> 10.5   Send 10.5 NOID to address
+  parano1d-cli history             Transaction history
+  parano1d-cli mempool             Pending transactions
+  parano1d-cli help                All commands
 
 AMOUNT FORMAT:
   Amounts are in NOID (e.g. 10.5, 0.000001).
   1 NOID = 1,000,000 μNOID — the CLI converts automatically.
 
 DAEMON:
-  The daemon must be running: paranoid --mode miner --data-dir ~/.paranoid",
+  The daemon must be running: parano1d --mode miner --data-dir ~/.parano1d",
 )]
 struct Cli {
-    /// JSON-RPC endpoint of the running paranoid daemon.
+    /// JSON-RPC endpoint of the running parano1d daemon.
     #[arg(
         long,
         short = 'r',
@@ -294,8 +294,8 @@ enum Command {
     /// Fee is auto-computed if not specified (recommended).
     ///
     /// Examples:
-    ///   noid-cli send f784...b61e 10.5
-    ///   noid-cli send f784...b61e 10.5 --fee 0.01
+    ///   parano1d-cli send f784...b61e 10.5
+    ///   parano1d-cli send f784...b61e 10.5 --fee 0.01
     Send {
         /// Recipient address (32-byte hex, 64 characters).
         #[arg(value_name = "ADDRESS")]
@@ -328,7 +328,7 @@ enum Command {
     Scan,
 
     /// Export a Merkle payment receipt for a confirmed transaction.
-    /// Redirect output to a file: noid-cli receipt <hash> > receipt.hex
+    /// Redirect output to a file: parano1d-cli receipt <hash> > receipt.hex
     Receipt {
         /// Transaction hash (64-char hex).
         #[arg(value_name = "TX_HASH")]
@@ -344,7 +344,7 @@ enum Command {
     },
 
     // ---- Node control ---------------------------------------------------------
-    /// Gracefully stop the paranoid daemon.
+    /// Gracefully stop the Parano1d daemon.
     Stop,
 
     // ---- Mining (external miner API) ------------------------------------------
@@ -375,7 +375,7 @@ enum Command {
 #[tokio::main]
 async fn main() {
     // Suppress broken-pipe panics: happen when stdout is piped to `head`, etc.
-    // Without this, `noid-cli utxos | head -5` prints a Rust panic traceback.
+    // Without this, `parano1d-cli utxos | head -5` prints a Rust panic traceback.
     // The payload can be either &str or String depending on the panic site.
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -406,7 +406,7 @@ async fn main() {
 
 async fn run(cli: Cli) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
-        .user_agent(concat!("noid-cli/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("parano1d-cli/", env!("CARGO_PKG_VERSION")))
         .timeout(std::time::Duration::from_secs(60))
         .build()?;
 
@@ -491,7 +491,7 @@ fn print_error(msg: &str) {
         || msg.contains("Node is not responding")
     {
         "Node is not responding.\n\
-             Is the paranoid daemon running?  Try: paranoid --mode miner\n\
+             Is the parano1d daemon running?  Try: parano1d --mode miner\n\
              Default RPC: http://127.0.0.1:9401  (override with --rpc)"
             .to_string()
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
@@ -503,7 +503,7 @@ fn print_error(msg: &str) {
         || msg.contains("invalid address")
         || msg.contains("WrongHrp")
     {
-        "Invalid address.\nUse a bech32m address (o1…).\nExample: noid-cli send o1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
+        "Invalid address.\nUse a bech32m address (o1…).\nExample: parano1d-cli send o1q9gnyj0zwhqj9tm5sf… 10.5".to_string()
     } else {
         msg.to_string()
     };
@@ -854,7 +854,7 @@ async fn cmd_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
     }
     if result.is_null() {
         warn_msg(&format!("Transaction {txhash} not found (not confirmed)"));
-        println!("  Use 'noid-cli mempool-tx {txhash}' to check if it is pending.");
+        println!("  Use 'parano1d-cli mempool-tx {txhash}' to check if it is pending.");
         return Ok(());
     }
     section("Transaction");
@@ -1074,7 +1074,7 @@ async fn cmd_mempool_tx(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
     }
     if result.is_null() {
         warn_msg(&format!("Transaction {txhash} is not in the mempool."));
-        println!("  It may have been confirmed. Use 'noid-cli tx {txhash}' to check.");
+        println!("  It may have been confirmed. Use 'parano1d-cli tx {txhash}' to check.");
         return Ok(());
     }
     section("Mempool transaction");
@@ -1427,7 +1427,7 @@ async fn cmd_balance(ctx: &Ctx<'_>) -> anyhow::Result<()> {
         warn_msg("No UTXOs found on the active address.");
         println!(
             "       Run {} to reload the active address; use {} to switch accounts.",
-            c!(BOLD, "'noid-cli scan'"),
+            c!(BOLD, "'parano1d-cli scan'"),
             c!(BOLD, "'address --list'")
         );
     }
@@ -1451,7 +1451,7 @@ async fn cmd_utxos(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     if utxos.is_empty() {
         println!(
             "  {}",
-            c!(DIM, "(no UTXOs — run 'noid-cli scan' to discover)")
+            c!(DIM, "(no UTXOs — run 'parano1d-cli scan' to discover)")
         );
         return Ok(());
     }
@@ -1674,7 +1674,7 @@ async fn cmd_send(
             println!(
                 "  {} Use {} to check your balance after confirmation.",
                 c!(DIM, "Tip:"),
-                c!(BOLD, "'noid-cli balance'")
+                c!(BOLD, "'parano1d-cli balance'")
             );
         }
         Err(e) => {
@@ -1688,11 +1688,11 @@ async fn cmd_send(
                 format!(
                     "Insufficient funds.\n\
                      \t  Requested: {} NOID  ({amount_micro} μNOID)\n\
-                     \t  Run 'noid-cli balance' to check your current balance.",
+                     \t  Run 'parano1d-cli balance' to check your current balance.",
                     noid_str(amount_micro)
                 )
             } else if msg.contains("no UTXO") || msg.contains("no utxo") {
-                "No UTXOs available. Run 'noid-cli scan' to discover your coins.".into()
+                "No UTXOs available. Run 'parano1d-cli scan' to discover your coins.".into()
             } else if msg.contains("no empty slot hints") {
                 "No empty output slots are currently available. This is usually transient; wait for the next block and retry."
                     .into()
@@ -1911,12 +1911,12 @@ async fn cmd_receipt(ctx: &Ctx<'_>, txhash: &str) -> anyhow::Result<()> {
         // If outputting to terminal, also show a tip
         eprintln!();
         eprintln!(
-            "  {} Redirect to a file: noid-cli receipt {} > receipt.hex",
+            "  {} Redirect to a file: parano1d-cli receipt {} > receipt.hex",
             c!(DIM, "Tip:"),
             txhash
         );
         eprintln!(
-            "  {} Verify:              noid-cli verify $(cat receipt.hex)",
+            "  {} Verify:              parano1d-cli verify $(cat receipt.hex)",
             c!(DIM, "Tip:")
         );
     }
@@ -2089,7 +2089,7 @@ async fn cmd_block_template(ctx: &Ctx<'_>, miner_addr: &str) -> anyhow::Result<(
     }
     println!();
     println!(
-        "  {} Search the nonce, then run `noid-cli submit-block {template_id} <32-char-lowercase-nonce-hex>`.",
+        "  {} Search the nonce, then run `parano1d-cli submit-block {template_id} <32-char-lowercase-nonce-hex>`.",
         c!(DIM, "PoW:")
     );
     if !pow_fields.is_empty() {
@@ -2168,7 +2168,7 @@ async fn rpc(ctx: &Ctx<'_>, method: &str, params: &[Value]) -> anyhow::Result<Va
             if e.is_connect() || e.is_timeout() {
                 anyhow::anyhow!(
                     "Node is not responding.\n\
-                     \tIs the paranoid daemon running?  Try: paranoid --mode miner\n\
+                     \tIs the parano1d daemon running?  Try: parano1d --mode miner\n\
                      \tRPC endpoint: {}\n\
                      \tOverride with --rpc <URL> or NOID_RPC env var",
                     ctx.rpc

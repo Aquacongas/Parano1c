@@ -5,7 +5,7 @@
 //!
 //! Format: `noid_plain_key_1` (16 bytes magic) + secret (32 bytes) = 48 bytes.
 //!
-//! Security model: the file is stored at `~/.paranoid/data/wallet.key` with
+//! Security model: the file is stored at `~/.parano1d/data/wallet.key` with
 //! permissions 0o600 (owner-only). No encryption — the OS filesystem is the
 //! security boundary during development. Future versions will derive the
 //! master secret from a user-chosen file (photo, document, etc.) instead of

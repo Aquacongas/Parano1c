@@ -42,6 +42,6 @@ benchmark harness for the preserved comparison, not a replacement for the
 deployed commitment layer.
 
 Published artifact URL:
-<https://github.com/ignotusnemo/paranoid/tree/main/research/frost_gkr>
+<https://github.com/ignotusnemo/parano1d/tree/main/research/frost_gkr>
 
 Reference run: [Intel Core i7-1365U, 20 samples](results/2026-07-17-i7-1365u-20-sample.md).

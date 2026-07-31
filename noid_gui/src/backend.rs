@@ -4,7 +4,7 @@
 //! Native GUI boundary around the production node.
 //!
 //! The GUI never implements consensus, wallet proving, mining, or networking.
-//! It supervises the `paranoid` daemon and talks to its loopback JSON-RPC
+//! It supervises the `parano1d` daemon and talks to its loopback JSON-RPC
 //! endpoint. This keeps one production path for both headless and graphical
 //! users while still allowing the GUI to own the daemon lifecycle.
 
@@ -305,7 +305,7 @@ impl Backend {
     }
 
     pub async fn node_log_tail(&self, max_bytes: u64, max_lines: usize) -> Result<String, String> {
-        let log_path = self.config_snapshot()?.data_dir.join("paranoid-node.log");
+        let log_path = self.config_snapshot()?.data_dir.join("parano1d-node.log");
         read_node_log_tail(&log_path, max_bytes, max_lines).await
     }
 
@@ -1315,8 +1315,8 @@ impl Backend {
                 config.data_dir.display()
             )
         })?;
-        let config_path = config.data_dir.join("paranoid-gui.toml");
-        let log_path = config.data_dir.join("paranoid-node.log");
+        let config_path = config.data_dir.join("parano1d-gui.toml");
+        let log_path = config.data_dir.join("parano1d-node.log");
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1395,7 +1395,7 @@ impl Backend {
                         state.owned = false;
                         return Err(format!(
                             "production node exited with {status}; see {}",
-                            config.data_dir.join("paranoid-node.log").display()
+                            config.data_dir.join("parano1d-node.log").display()
                         ));
                     }
                 }
@@ -1622,7 +1622,7 @@ async fn run_node_maintenance(
     let mut command = tokio::process::Command::new(&config.node_binary);
     command
         .arg("--config")
-        .arg(config.data_dir.join("paranoid-gui.toml"))
+        .arg(config.data_dir.join("parano1d-gui.toml"))
         .arg("--data-dir")
         .arg(&config.data_dir)
         .arg("--log")
@@ -1683,7 +1683,7 @@ async fn run_node_maintenance(
 
 fn default_data_dir() -> PathBuf {
     let mut home = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.push(".paranoid");
+    home.push(".parano1d");
     #[cfg(feature = "dev-genesis")]
     home.push("gui-dev");
     home.push("data");
@@ -1692,7 +1692,7 @@ fn default_data_dir() -> PathBuf {
 
 fn default_gui_settings_path() -> PathBuf {
     let mut path = home_dir().unwrap_or_else(|| PathBuf::from("."));
-    path.push(".paranoid");
+    path.push(".parano1d");
     #[cfg(feature = "dev-genesis")]
     path.push("gui-dev");
     path.push("gui-settings.json");
@@ -1790,9 +1790,9 @@ fn home_dir() -> Option<PathBuf> {
 
 fn find_node_binary() -> PathBuf {
     let executable_name = if cfg!(target_os = "windows") {
-        "paranoid.exe"
+        "parano1d.exe"
     } else {
-        "paranoid"
+        "parano1d"
     };
     if let Ok(current) = std::env::current_exe() {
         if let Some(parent) = current.parent() {
@@ -3104,7 +3104,7 @@ mod tests {
     #[tokio::test]
     async fn node_log_tail_reads_only_the_latest_complete_lines() {
         let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("paranoid-node.log");
+        let path = directory.path().join("parano1d-node.log");
         let contents = (0..120)
             .map(|line| format!("node-log-line-{line:03}\n"))
             .collect::<String>();
@@ -3168,7 +3168,7 @@ mod tests {
             rpc_listen: DEFAULT_RPC_LISTEN.into(),
             p2p_listen: "127.0.0.1:19400".into(),
             data_dir: directory.path().join("node-data"),
-            node_binary: PathBuf::from("paranoid"),
+            node_binary: PathBuf::from("parano1d"),
             seeds: vec!["seed-a.example:9400".into(), "dnsaddr:noid.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
@@ -3202,7 +3202,7 @@ mod tests {
     fn legacy_gui_settings_require_a_one_time_language_choice() {
         let decoded: PersistedGuiSettings = serde_json::from_str(
             r#"{
-                "data_dir": "/tmp/paranoid",
+                "data_dir": "/tmp/parano1d",
                 "p2p_listen": "127.0.0.1:9400",
                 "seeds": [],
                 "log_level": "info"
@@ -3223,7 +3223,7 @@ mod tests {
                     rpc_listen: DEFAULT_RPC_LISTEN.into(),
                     p2p_listen: DEFAULT_P2P_LISTEN.into(),
                     data_dir: directory.path().join("node-data"),
-                    node_binary: PathBuf::from("paranoid"),
+                    node_binary: PathBuf::from("parano1d"),
                     seeds: Vec::new(),
                     log_level: LogLevel::Info,
                     language: None,

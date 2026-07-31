@@ -62,7 +62,7 @@ impl Default for NodeConfig {
             },
             storage: StorageConfig {
                 backend: "mdbx".into(),
-                path: PathBuf::from("~/.paranoid/data"), // sentinel — overridden by network
+                path: PathBuf::from("~/.parano1d/data"), // sentinel — overridden by network
             },
             rpc: RpcConfig {
                 listen: None, // determined by --network at runtime

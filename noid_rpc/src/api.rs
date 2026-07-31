@@ -205,7 +205,7 @@ pub trait ParanoidApi {
     // Node control
     // =========================================================================
 
-    /// Gracefully stop the paranoid daemon.
+    /// Gracefully stop the Parano1d daemon.
     #[method(name = "stop")]
     async fn stop(&self) -> RpcResult<String>;
 

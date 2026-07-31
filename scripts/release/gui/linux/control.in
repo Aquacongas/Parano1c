@@ -1,11 +1,11 @@
-Package: paranoid-wallet
+Package: parano1d-gui
 Version: @VERSION@
 Section: utils
 Priority: optional
 Architecture: @ARCHITECTURE@
 Maintainer: Paranoid Zero <ignotus.nemo@proton.me>
 Depends: libc6 (>= 2.35), libgcc-s1, xdg-desktop-portal
-Homepage: https://noid.network/
+Homepage: https://parano1d.org/
 Description: Native ParanO(1)d wallet
  ParanO(1)d wallet with its private, locally supervised full node.
  Wallet data remains in the user's home directory when the package is removed.

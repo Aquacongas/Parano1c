@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! # noid-extminer — External Poseidon2b PoW miner for the Paranoid blockchain.
+//! # parano1d-miner — External Poseidon2b PoW miner for the ParanO(1)d.
 //!
-//! Connects to any `paranoid` full node via JSON-RPC, fetches a block template,
+//! Connects to any `parano1d` full node via JSON-RPC, fetches a block template,
 //! searches for a valid PoW nonce using all available CPU cores (rayon), and
 //! returns only that nonce to the node-owned template.
 //!
@@ -11,13 +11,13 @@
 //!
 //! ```bash
 //! # Solo (node on localhost, no auth)
-//! noid-extminer --rpc http://127.0.0.1:9401
+//! parano1d-miner --rpc http://127.0.0.1:9401
 //!
 //! # Pool (remote node with bearer token)
-//! noid-extminer --rpc https://pool.example.com:9401 --key my-secret-token
+//! parano1d-miner --rpc https://pool.example.com:9401 --key my-secret-token
 //!
 //! # Limit threads
-//! noid-extminer --rpc http://127.0.0.1:9401 --threads 4
+//! parano1d-miner --rpc http://127.0.0.1:9401 --threads 4
 //! ```
 //!
 //! ## Template protocol
@@ -51,10 +51,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "noid-extminer",
+    name = "parano1d-miner",
     version,
-    about = "External Poseidon2b PoW miner for the Paranoid blockchain",
-    long_about = "Fetches block templates from a paranoid node and mines blocks \
+    about = "External Poseidon2b PoW miner for ParanO(1)d",
+    long_about = "Fetches block templates from a ParanO(1)d node and mines blocks \
                   using all available CPU cores.\n\n\
                   The node builds the proven template; this worker only does PoW.\n\
                   Coinbase is the node payout address unless the node enables \
@@ -65,7 +65,7 @@ struct Cli {
     #[arg(long, exclusive = true)]
     check_hardware: bool,
 
-    /// JSON-RPC endpoint of the paranoid node or pool.
+    /// JSON-RPC endpoint of the ParanO(1)d node or pool.
     #[arg(long, default_value = "http://127.0.0.1:9401", value_name = "URL")]
     rpc: String,
 
@@ -308,7 +308,7 @@ fn mine(cli: &Cli) -> Result<()> {
     let threads = rayon::current_num_threads();
 
     eprintln!(
-        "noid-extminer  rpc={}  threads={}  backend={}  poll={}ms",
+        "parano1d-miner  rpc={}  threads={}  backend={}  poll={}ms",
         cli.rpc,
         threads,
         noid_core::cpu::selected_backend(),

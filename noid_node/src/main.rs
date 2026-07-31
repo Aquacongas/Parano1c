@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! # paranoid — Paranoid Full Node Binary
+//! # parano1d — ParanO(1)d Full Node Binary
 //!
 //! Startup sequence:
 //! 1. Load config + init tracing
@@ -492,14 +492,14 @@ impl HistoryStepCacheClass {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "paranoid",
-    about = "Paranoid full node daemon — HistoryStep UTXO blockchain",
+    name = "parano1d",
+    about = "ParanO(1)d full node daemon — HistoryStep UTXO statechain",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a Paranoid node and wallet.\n\nExample:\n  paranoid --miner --data-dir ~/.paranoid\n  paranoid --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
+    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  parano1d --miner --data-dir ~/.parano1d\n  parano1d --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
-    /// Default: ~/.paranoid/paranoid.toml
+    /// Default: ~/.parano1d/parano1d.toml
     #[arg(short = 'c', long, value_name = "FILE")]
     config: Option<PathBuf>,
 
@@ -534,7 +534,7 @@ struct Cli {
     cpu_threads: Option<usize>,
 
     /// Data directory for the MDBX database and wallet key.
-    /// Default: ~/.paranoid/data
+    /// Default: ~/.parano1d/data
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
@@ -567,7 +567,7 @@ struct Cli {
     /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
     ///
     /// Pool example:
-    ///   paranoid --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t
+    ///   parano1d --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t
     ///   # External miner: Authorization: Bearer s3cr3t
     #[arg(long, value_name = "TOKEN")]
     mining_key: Option<String>,
@@ -582,7 +582,7 @@ struct Cli {
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
     /// Example:
-    ///   paranoid --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t --allow-custom-coinbase
+    ///   parano1d --rpc-listen 0.0.0.0:9401 --mining-key s3cr3t --allow-custom-coinbase
     ///   # Miner: getBlockTemplate("o1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
@@ -833,7 +833,7 @@ async fn main() -> anyhow::Result<()> {
     // --- Config file ---
     let config_path = cli
         .config
-        .unwrap_or_else(|| expand_tilde(&PathBuf::from("~/.paranoid/paranoid.toml")));
+        .unwrap_or_else(|| expand_tilde(&PathBuf::from("~/.parano1d/parano1d.toml")));
     let mut config_defaults = NodeConfig::default();
     config_defaults.network.listen = Some(format!("0.0.0.0:{}", net.default_p2p_port));
     config_defaults.rpc.listen = Some(net.default_rpc_listen());
@@ -902,9 +902,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.network.seeds.push(ma.to_string());
     }
 
-    // --- Data directory: ~/.paranoid/data by default (no network subdir) ---
-    let data_dir = if cfg.storage.path == Path::new("~/.paranoid/data") {
-        expand_tilde(Path::new("~/.paranoid/data"))
+    // --- Data directory: ~/.parano1d/data by default (no network subdir) ---
+    let data_dir = if cfg.storage.path == Path::new("~/.parano1d/data") {
+        expand_tilde(Path::new("~/.parano1d/data"))
     } else {
         expand_tilde(&cfg.storage.path)
     };
@@ -2558,7 +2558,7 @@ mod tests {
     #[test]
     fn first_start_creates_and_reuses_default_config() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("nested/paranoid.toml");
+        let path = temp.path().join("nested/parano1d.toml");
         let mut defaults = NodeConfig::default();
         defaults.network.listen = Some("0.0.0.0:9400".into());
         defaults.rpc.listen = Some("127.0.0.1:9401".into());
@@ -2578,7 +2578,7 @@ mod tests {
     #[test]
     fn malformed_config_is_reported_instead_of_silently_ignored() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("paranoid.toml");
+        let path = temp.path().join("parano1d.toml");
         std::fs::write(&path, "[network\n").unwrap();
 
         let error = load_or_create_config(&path, &NodeConfig::default()).unwrap_err();

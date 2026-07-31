@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Paranoid Zero.
 
 fn main() {
-    println!("cargo:rerun-if-changed=assets/app-icons/ParanO1d.ico");
+    println!("cargo:rerun-if-changed=assets/app-icons/Parano1d.ico");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -10,7 +10,7 @@ fn main() {
 
     let manifest_directory =
         std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
-    let icon = manifest_directory.join("assets/app-icons/ParanO1d.ico");
+    let icon = manifest_directory.join("assets/app-icons/Parano1d.ico");
     let version = std::env::var("CARGO_PKG_VERSION").unwrap();
 
     let mut resource = winresource::WindowsResource::new();
@@ -20,8 +20,8 @@ fn main() {
         .set("ProductName", "ParanO(1)d")
         .set("ProductVersion", &version)
         .set("FileVersion", &version)
-        .set("InternalName", "ParanO1d")
-        .set("OriginalFilename", "paranoid-gui.exe")
+        .set("InternalName", "Parano1d")
+        .set("OriginalFilename", "parano1d-gui.exe")
         .set("LegalCopyright", "Copyright © 2026 Paranoid Zero")
         .set_manifest(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

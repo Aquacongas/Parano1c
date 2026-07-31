@@ -24,7 +24,7 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "paranoid"
+NODE_BIN = ROOT / "target" / "release" / "parano1d"
 BASE = ROOT / "target" / "live-tests" / "slot-mempool-wallet"
 LOGS = BASE / "logs"
 
@@ -285,7 +285,7 @@ def wait_tx_confirmed(nodes, tx_hash, timeout=480):
 def main():
     if not NODE_BIN.exists():
         raise LiveTestError(
-            f"release binary missing: {NODE_BIN}; run cargo build --release -p noid_node --bin paranoid"
+            f"release binary missing: {NODE_BIN}; run cargo build --release -p noid_node --bin parano1d"
         )
     if BASE.exists():
         shutil.rmtree(BASE)

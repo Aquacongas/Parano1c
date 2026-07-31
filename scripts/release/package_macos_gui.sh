@@ -47,37 +47,37 @@ done
 BIN_DIR="$(CDPATH='' cd -- "$BIN_DIR" && pwd -P)"
 mkdir -p -- "$OUTPUT_DIR"
 OUTPUT_DIR="$(CDPATH='' cd -- "$OUTPUT_DIR" && pwd -P)"
-for binary in paranoid-gui paranoid; do
+for binary in parano1d-gui parano1d; do
   [[ -f $BIN_DIR/$binary && -x $BIN_DIR/$binary ]] || {
     echo "release binary is missing or not executable: $BIN_DIR/$binary" >&2
     exit 1
   }
 done
 
-TEMPORARY=$(mktemp -d "${TMPDIR:-/tmp}/paranoid-macos-gui.XXXXXX")
+TEMPORARY=$(mktemp -d "${TMPDIR:-/tmp}/parano1d-macos-gui.XXXXXX")
 MOUNTED=0
 cleanup() {
   local status=$?
   if [[ $MOUNTED == 1 ]]; then
     hdiutil detach "$TEMPORARY/mount" -quiet || true
   fi
-  if [[ -d $TEMPORARY && $TEMPORARY == "${TMPDIR:-/tmp}"/paranoid-macos-gui.* ]]; then
+  if [[ -d $TEMPORARY && $TEMPORARY == "${TMPDIR:-/tmp}"/parano1d-macos-gui.* ]]; then
     rm -r -- "$TEMPORARY" || true
   fi
   exit "$status"
 }
 trap cleanup EXIT
 
-APP="$TEMPORARY/ParanO1d.app"
+APP="$TEMPORARY/Parano1d.app"
 CONTENTS="$APP/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
-ICONSET="$TEMPORARY/ParanO1d.iconset"
+ICONSET="$TEMPORARY/Parano1d.iconset"
 DMG_ROOT="$TEMPORARY/dmg"
 mkdir -p -- "$MACOS" "$RESOURCES" "$ICONSET" "$DMG_ROOT"
 
-install -m 0755 "$BIN_DIR/paranoid-gui" "$MACOS/ParanO1d"
-install -m 0755 "$BIN_DIR/paranoid" "$MACOS/paranoid"
+install -m 0755 "$BIN_DIR/parano1d-gui" "$MACOS/Parano1d"
+install -m 0755 "$BIN_DIR/parano1d" "$MACOS/parano1d"
 install -m 0644 "$RELEASE_ROOT_DIR/LICENSE" "$RESOURCES/LICENSE.txt"
 install -m 0644 "$RELEASE_ROOT_DIR/NOTICE" "$RESOURCES/NOTICE.txt"
 
@@ -103,32 +103,32 @@ for specification in \
 do
   size=${specification%% *}
   name=${specification#* }
-  icon="$RELEASE_ROOT_DIR/noid_gui/assets/app-icons/ParanO1d-${size}.png"
+  icon="$RELEASE_ROOT_DIR/noid_gui/assets/app-icons/Parano1d-${size}.png"
   [[ -f $icon ]] || {
     echo "macOS icon source is missing: $icon" >&2
     exit 1
   }
   install -m 0644 "$icon" "$ICONSET/$name"
 done
-iconutil -c icns "$ICONSET" -o "$RESOURCES/ParanO1d.icns"
+iconutil -c icns "$ICONSET" -o "$RESOURCES/Parano1d.icns"
 
 xattr -cr "$APP"
 SIGN_IDENTITY=${NOID_MACOS_SIGN_IDENTITY:--}
 if [[ $SIGN_IDENTITY == - ]]; then
-  codesign --force --sign - --timestamp=none "$MACOS/paranoid"
-  codesign --force --sign - --timestamp=none "$MACOS/ParanO1d"
+  codesign --force --sign - --timestamp=none "$MACOS/parano1d"
+  codesign --force --sign - --timestamp=none "$MACOS/Parano1d"
   codesign --force --deep --sign - --timestamp=none "$APP"
 else
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/paranoid"
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/ParanO1d"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/parano1d"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/Parano1d"
   codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 fi
 codesign --verify --deep --strict "$APP"
-"$MACOS/ParanO1d" --release-self-check >/dev/null
+"$MACOS/Parano1d" --release-self-check >/dev/null
 
-cp -R "$APP" "$DMG_ROOT/ParanO1d.app"
+cp -R "$APP" "$DMG_ROOT/Parano1d.app"
 ln -s /Applications "$DMG_ROOT/Applications"
-ARTIFACT="$OUTPUT_DIR/paranoid-gui-v${VERSION}-${PLATFORM}.dmg"
+ARTIFACT="$OUTPUT_DIR/parano1d-gui-v${VERSION}-${PLATFORM}.dmg"
 hdiutil create \
   -volname "ParanO(1)d" \
   -srcfolder "$DMG_ROOT" \
@@ -139,12 +139,12 @@ hdiutil verify "$ARTIFACT" >/dev/null
 mkdir "$TEMPORARY/mount"
 hdiutil attach -readonly -nobrowse -mountpoint "$TEMPORARY/mount" "$ARTIFACT" >/dev/null
 MOUNTED=1
-"$TEMPORARY/mount/ParanO1d.app/Contents/MacOS/ParanO1d" \
+"$TEMPORARY/mount/Parano1d.app/Contents/MacOS/Parano1d" \
   --release-self-check >/dev/null
-[[ -s $TEMPORARY/mount/ParanO1d.app/Contents/Resources/LICENSE.txt ]]
-[[ -s $TEMPORARY/mount/ParanO1d.app/Contents/Resources/NOTICE.txt ]]
-[[ ! -e $TEMPORARY/mount/ParanO1d.app/Contents/MacOS/noid-cli ]]
-[[ ! -e $TEMPORARY/mount/ParanO1d.app/Contents/MacOS/noid-extminer ]]
+[[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/LICENSE.txt ]]
+[[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/NOTICE.txt ]]
+[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-cli ]]
+[[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-miner ]]
 hdiutil detach "$TEMPORARY/mount" -quiet
 MOUNTED=0
 printf '%s\n' "$ARTIFACT"

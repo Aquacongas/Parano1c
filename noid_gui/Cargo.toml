@@ -12,7 +12,7 @@ default = []
 dev-genesis = []
 
 [[bin]]
-name = "paranoid-gui"
+name = "parano1d-gui"
 path = "src/main.rs"
 
 [dependencies]

@@ -103,7 +103,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-linux-x86_64.deb"
+    GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-linux-x86_64.deb"
     ;;
   aarch64-unknown-linux-gnu)
     PLATFORM=linux-aarch64
@@ -111,7 +111,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable AArch64 control path; runtime NEON+PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-linux-aarch64.deb"
+    GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-linux-aarch64.deb"
     ;;
   x86_64-pc-windows-msvc)
     PLATFORM=windows-x86_64
@@ -119,7 +119,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ / AVX-512'
     BINARY_SUFFIX=.exe
     ARCHIVE_KIND=zip
-    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
+    GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-windows-x86_64-setup.exe"
     ;;
   aarch64-apple-darwin)
     PLATFORM=macos-aarch64
@@ -127,7 +127,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable Apple Silicon control path; runtime NEON+PMULL'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-macos-aarch64.dmg"
+    GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-macos-aarch64.dmg"
     ;;
   x86_64-apple-darwin)
     PLATFORM=macos-x86_64
@@ -135,7 +135,7 @@ case "$HOST_TRIPLE" in
     ISA_PROFILE='portable Intel x86-64 control path; runtime PCLMULQDQ / AVX2+VPCLMULQDQ'
     BINARY_SUFFIX=
     ARCHIVE_KIND=tar
-    GUI_ARTIFACT_NAME="paranoid-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
+    GUI_ARTIFACT_NAME="parano1d-gui-v$RELEASE_VERSION-macos-x86_64.dmg"
     ;;
   *) release_die "unsupported release host: $HOST_TRIPLE" ;;
 esac
@@ -145,10 +145,10 @@ if [[ $PLATFORM == macos-* ]]; then
 fi
 
 if [[ $ARCHIVE_KIND == zip ]]; then
-  ARCHIVE_NAME="paranoid-v$RELEASE_VERSION-$PLATFORM.zip"
+  ARCHIVE_NAME="parano1d-core-v$RELEASE_VERSION-$PLATFORM.zip"
   release_require_command 7z
 else
-  ARCHIVE_NAME="paranoid-v$RELEASE_VERSION-$PLATFORM.tar.gz"
+  ARCHIVE_NAME="parano1d-core-v$RELEASE_VERSION-$PLATFORM.tar.gz"
 fi
 
 RELEASE_PARENT=$(dirname -- "$RELEASE_DIR")
@@ -243,9 +243,9 @@ CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'
 cargo build --locked --release --target "$HOST_TRIPLE" -p noid_node --bins
 cargo build --locked --release --target "$HOST_TRIPLE" \
-  -p noid-extminer --bin noid-extminer
+  -p noid-extminer --bin parano1d-miner
 cargo build --locked --release --target "$HOST_TRIPLE" \
-  -p noid_gui --bin paranoid-gui
+  -p noid_gui --bin parano1d-gui
 
 if [[ $SKIP_TESTS == 1 ]]; then
   printf '\n==> Skipping repeated release tests; source gates must already be green\n'
@@ -263,26 +263,26 @@ else
 fi
 
 TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"
-for binary in paranoid noid-cli noid-extminer; do
+for binary in parano1d parano1d-cli parano1d-miner; do
   [[ -f $TARGET_BIN_DIR/$binary$BINARY_SUFFIX ]] || \
     release_die "release binary is missing: $TARGET_BIN_DIR/$binary$BINARY_SUFFIX"
 done
-[[ -f $TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX ]] || \
-  release_die "release GUI is missing: $TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX"
+[[ -f $TARGET_BIN_DIR/parano1d-gui$BINARY_SUFFIX ]] || \
+  release_die "release GUI is missing: $TARGET_BIN_DIR/parano1d-gui$BINARY_SUFFIX"
 
 CURRENT_STAGE='native smoke test'
 printf '\n==> Smoke-testing native executables\n'
-"$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" --check-hardware >/dev/null
-"$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" --help >/dev/null
-"$TARGET_BIN_DIR/noid-cli$BINARY_SUFFIX" --help >/dev/null
-"$TARGET_BIN_DIR/noid-extminer$BINARY_SUFFIX" --check-hardware >/dev/null
-"$TARGET_BIN_DIR/noid-extminer$BINARY_SUFFIX" --help >/dev/null
-"$TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX" --release-self-check >/dev/null
+"$TARGET_BIN_DIR/parano1d$BINARY_SUFFIX" --check-hardware >/dev/null
+"$TARGET_BIN_DIR/parano1d$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/parano1d-cli$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/parano1d-miner$BINARY_SUFFIX" --check-hardware >/dev/null
+"$TARGET_BIN_DIR/parano1d-miner$BINARY_SUFFIX" --help >/dev/null
+"$TARGET_BIN_DIR/parano1d-gui$BINARY_SUFFIX" --release-self-check >/dev/null
 
 CURRENT_STAGE='binary packaging'
 printf '\n==> Packaging %s\n' "$ARCHIVE_NAME"
 mkdir -- "$BIN_DIR"
-for binary in paranoid noid-cli noid-extminer; do
+for binary in parano1d parano1d-cli parano1d-miner; do
   cp -- "$TARGET_BIN_DIR/$binary$BINARY_SUFFIX" "$BIN_DIR/$binary$BINARY_SUFFIX"
   chmod 0755 "$BIN_DIR/$binary$BINARY_SUFFIX" 2>/dev/null || true
 done
@@ -290,12 +290,12 @@ done
 CURRENT_STAGE='GUI wallet packaging'
 printf '\n==> Packaging %s\n' "$GUI_ARTIFACT_NAME"
 mkdir -- "$GUI_BIN_DIR"
-cp -- "$TARGET_BIN_DIR/paranoid-gui$BINARY_SUFFIX" \
-  "$GUI_BIN_DIR/paranoid-gui$BINARY_SUFFIX"
-cp -- "$TARGET_BIN_DIR/paranoid$BINARY_SUFFIX" \
-  "$GUI_BIN_DIR/paranoid$BINARY_SUFFIX"
-chmod 0755 "$GUI_BIN_DIR/paranoid-gui$BINARY_SUFFIX" 2>/dev/null || true
-chmod 0755 "$GUI_BIN_DIR/paranoid$BINARY_SUFFIX" 2>/dev/null || true
+cp -- "$TARGET_BIN_DIR/parano1d-gui$BINARY_SUFFIX" \
+  "$GUI_BIN_DIR/parano1d-gui$BINARY_SUFFIX"
+cp -- "$TARGET_BIN_DIR/parano1d$BINARY_SUFFIX" \
+  "$GUI_BIN_DIR/parano1d$BINARY_SUFFIX"
+chmod 0755 "$GUI_BIN_DIR/parano1d-gui$BINARY_SUFFIX" 2>/dev/null || true
+chmod 0755 "$GUI_BIN_DIR/parano1d$BINARY_SUFFIX" 2>/dev/null || true
 case "$PLATFORM" in
   linux-*)
     "$RELEASE_ROOT_DIR/scripts/release/package_linux_gui.sh" \
@@ -327,9 +327,9 @@ archive_entries=(
   README.txt
   LICENSE
   NOTICE
-  "paranoid$BINARY_SUFFIX"
-  "noid-cli$BINARY_SUFFIX"
-  "noid-extminer$BINARY_SUFFIX"
+  "parano1d$BINARY_SUFFIX"
+  "parano1d-cli$BINARY_SUFFIX"
+  "parano1d-miner$BINARY_SUFFIX"
 )
 
 if [[ $ARCHIVE_KIND == zip ]]; then

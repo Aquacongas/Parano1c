@@ -231,10 +231,10 @@ def main() -> int:
         rgba = render(size)
         png = encode_png(size, rgba)
         encoded[size] = png
-        (OUTPUT / f"ParanO1d-{size}.png").write_bytes(png)
+        (OUTPUT / f"Parano1d-{size}.png").write_bytes(png)
 
     ico = encode_ico([(size, encoded[size]) for size in ICO_SIZES])
-    (OUTPUT / "ParanO1d.ico").write_bytes(ico)
+    (OUTPUT / "Parano1d.ico").write_bytes(ico)
     print(f"generated application icons in {OUTPUT}")
     return 0
 

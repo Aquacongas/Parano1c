@@ -6,12 +6,12 @@ license.workspace = true
 
 # --- Daemon ---
 [[bin]]
-name = "paranoid"
+name = "parano1d"
 path = "src/main.rs"
 
 # --- CLI client ---
 [[bin]]
-name = "noid-cli"
+name = "parano1d-cli"
 path = "src/bin/noid_cli.rs"
 
 [dependencies]

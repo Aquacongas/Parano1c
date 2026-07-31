@@ -7,11 +7,11 @@
   <key>CFBundleDisplayName</key>
   <string>ParanO(1)d</string>
   <key>CFBundleExecutable</key>
-  <string>ParanO1d</string>
+  <string>Parano1d</string>
   <key>CFBundleIconFile</key>
-  <string>ParanO1d</string>
+  <string>Parano1d</string>
   <key>CFBundleIdentifier</key>
-  <string>network.noid.paranoid</string>
+  <string>org.parano1d.wallet</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>

@@ -101,24 +101,24 @@ jobs:
         include:
           - name: Linux x86-64
             runner: ubuntu-22.04
-            artifact: paranoid-${{ inputs.tag }}-linux-x86_64.tar.gz
-            gui_artifact: paranoid-gui-${{ inputs.tag }}-linux-x86_64.deb
+            artifact: parano1d-core-${{ inputs.tag }}-linux-x86_64.tar.gz
+            gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-x86_64.deb
           - name: Linux ARM64
             runner: ubuntu-22.04-arm
-            artifact: paranoid-${{ inputs.tag }}-linux-aarch64.tar.gz
-            gui_artifact: paranoid-gui-${{ inputs.tag }}-linux-aarch64.deb
+            artifact: parano1d-core-${{ inputs.tag }}-linux-aarch64.tar.gz
+            gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-aarch64.deb
           - name: Windows x86-64
             runner: windows-2025
-            artifact: paranoid-${{ inputs.tag }}-windows-x86_64.zip
-            gui_artifact: paranoid-gui-${{ inputs.tag }}-windows-x86_64-setup.exe
+            artifact: parano1d-core-${{ inputs.tag }}-windows-x86_64.zip
+            gui_artifact: parano1d-gui-${{ inputs.tag }}-windows-x86_64-setup.exe
           - name: macOS Apple Silicon
             runner: macos-15
-            artifact: paranoid-${{ inputs.tag }}-macos-aarch64.tar.gz
-            gui_artifact: paranoid-gui-${{ inputs.tag }}-macos-aarch64.dmg
+            artifact: parano1d-core-${{ inputs.tag }}-macos-aarch64.tar.gz
+            gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-aarch64.dmg
           - name: macOS Intel
             runner: macos-15-intel
-            artifact: paranoid-${{ inputs.tag }}-macos-x86_64.tar.gz
-            gui_artifact: paranoid-gui-${{ inputs.tag }}-macos-x86_64.dmg
+            artifact: parano1d-core-${{ inputs.tag }}-macos-x86_64.tar.gz
+            gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-x86_64.dmg
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -232,16 +232,16 @@ jobs:
           set -Eeuo pipefail
           mkdir release-assets
           for asset in \
-            "paranoid-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "paranoid-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "paranoid-$RELEASE_TAG-windows-x86_64.zip" \
-            "paranoid-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "paranoid-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "paranoid-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "paranoid-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "paranoid-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "paranoid-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "paranoid-gui-$RELEASE_TAG-macos-x86_64.dmg" \
+            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
+            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz
           do
             gh release download "$RELEASE_TAG" \
@@ -260,16 +260,16 @@ jobs:
           set -Eeuo pipefail
           cd release-assets
           sha256sum \
-            "paranoid-$RELEASE_TAG-linux-x86_64.tar.gz" \
-            "paranoid-$RELEASE_TAG-linux-aarch64.tar.gz" \
-            "paranoid-$RELEASE_TAG-windows-x86_64.zip" \
-            "paranoid-$RELEASE_TAG-macos-aarch64.tar.gz" \
-            "paranoid-$RELEASE_TAG-macos-x86_64.tar.gz" \
-            "paranoid-gui-$RELEASE_TAG-linux-x86_64.deb" \
-            "paranoid-gui-$RELEASE_TAG-linux-aarch64.deb" \
-            "paranoid-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
-            "paranoid-gui-$RELEASE_TAG-macos-aarch64.dmg" \
-            "paranoid-gui-$RELEASE_TAG-macos-x86_64.dmg" \
+            "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
+            "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
+            "parano1d-core-$RELEASE_TAG-windows-x86_64.zip" \
+            "parano1d-core-$RELEASE_TAG-macos-aarch64.tar.gz" \
+            "parano1d-core-$RELEASE_TAG-macos-x86_64.tar.gz" \
+            "parano1d-gui-$RELEASE_TAG-linux-x86_64.deb" \
+            "parano1d-gui-$RELEASE_TAG-linux-aarch64.deb" \
+            "parano1d-gui-$RELEASE_TAG-windows-x86_64-setup.exe" \
+            "parano1d-gui-$RELEASE_TAG-macos-aarch64.dmg" \
+            "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
             > SHA256SUMS
           gh release upload "$RELEASE_TAG" SHA256SUMS --clobber

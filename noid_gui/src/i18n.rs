@@ -1143,9 +1143,9 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         ),
         "Node data directory" => ("Каталог данных узла", "节点数据目录"),
         "LOG LEVEL" => ("УРОВЕНЬ ЛОГОВ", "日志级别"),
-        "Written locally to paranoid-node.log" => (
-            "Записываются локально в paranoid-node.log",
-            "在本机写入 paranoid-node.log",
+        "Written locally to parano1d-node.log" => (
+            "Записываются локально в parano1d-node.log",
+            "在本机写入 parano1d-node.log",
         ),
         "ERROR" => ("ОШИБКИ", "错误"),
         "WARN" => ("ПРЕДУПР.", "警告"),
@@ -1156,9 +1156,9 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "READ ERROR" => ("ОШИБКА ЧТЕНИЯ", "读取错误"),
         "WAITING FOR OUTPUT" => ("ОЖИДАНИЕ ДАННЫХ", "等待日志输出"),
         "SELECT TEXT · CTRL+C TO COPY" => ("ВЫДЕЛИТЕ ТЕКСТ · CTRL+C — КОПИРОВАТЬ", "选择文本 · CTRL+C 复制"),
-        "Waiting for paranoid-node.log output…" => (
-            "Ожидание данных из paranoid-node.log…",
-            "正在等待 paranoid-node.log 输出…",
+        "Waiting for parano1d-node.log output…" => (
+            "Ожидание данных из parano1d-node.log…",
+            "正在等待 parano1d-node.log 输出…",
         ),
         "P2P LISTEN" => ("P2P-АДРЕС", "P2P 监听地址"),
         "Address used for inbound peer connections" => (

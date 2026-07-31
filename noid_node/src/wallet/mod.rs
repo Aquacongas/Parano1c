@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Built-in wallet for the `paranoid` daemon.
+//! Built-in wallet for the `parano1d` daemon.
 //!
 //! The wallet lives inside the daemon process. The master secret is generated
 //! once and stored by the keystore; the active address's `SpendSecret` is

@@ -1,6 +1,6 @@
 # ParanO(1)d
 
-**Proof-Native transparent statechain (L1 PoW blockchain).**
+**Proof-native L1 Statechain secured by proof of work**
 
 Blockchains have a fundamental architectural flaw: to validate the present,
 you must replay the past. Bitcoin, Ethereum, and nearly every major network
@@ -175,9 +175,10 @@ protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
 Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
 relation without a trusted setup. The two authenticated launch matrices — B64
 at `m=23` and B255 at `m=24` — are embedded in the official binary and can be
-regenerated from source. The public [FROST-GKR research
-artifact](https://github.com/ignotusnemo/frost-gkr) contains the paper's
-reference implementation, comparison harness and complete measurement report.
+regenerated from source. The O(1) Lab [FROST-GKR research
+article](https://research.parano1d.org/research/frost-gkr-global-trace-protocol/)
+links the paper, reference implementation, comparison harness and complete
+measurement record.
 
 This common arithmetic is what lets wallet authorization, exact state and
 recursive chain verification compose as one protocol instead of independent
@@ -257,27 +258,27 @@ Official binaries discover the public network through the built-in DNS seeds.
 Run an ordinary node or an internal miner:
 
 ```sh
-paranoid
-paranoid --miner
+parano1d
+parano1d --miner
 ```
 
 An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
 ```sh
-paranoid --seed <host>:9400
+parano1d --seed <host>:9400
 ```
 
 External nonce search keeps transaction selection and proving inside the node:
 
 ```sh
-paranoid --extminer --mining-key <token>
-noid-extminer --key <token>
+parano1d --extminer --mining-key <token>
+parano1d-miner --key <token>
 ```
 
 Default ports are `9400` for P2P and `127.0.0.1:9401` for JSON-RPC. First start
-creates `~/.paranoid/paranoid.toml`, the MDBX state and the built-in wallet
-under `~/.paranoid/data/`.
+creates `~/.parano1d/parano1d.toml`, the MDBX state and the built-in wallet
+under `~/.parano1d/data/`.
 
 The current `wallet.key` is not password-encrypted. It is created with
 owner-only permissions; back it up and protect it.
@@ -285,26 +286,27 @@ owner-only permissions; back it up and protect it.
 ### CLI
 
 Addresses use bech32m and begin with `o1`. `1 NOID = 1,000,000 μNOID`.
+`NOID` is the ticker; the wallet uses `①` as its interface symbol.
 
 ```sh
-noid-cli status
-noid-cli peers
-noid-cli state
-noid-cli mining
-noid-cli address
-noid-cli address --new
-noid-cli balance
-noid-cli utxos
-noid-cli send <o1-address> 10.5 --dry-run
-noid-cli send <o1-address> 10.5
-noid-cli mempool
-noid-cli history
-noid-cli receipt <txid> > receipt.hex
-noid-cli verify "$(tr -d '\n' < receipt.hex)"
-noid-cli stop
+parano1d-cli status
+parano1d-cli peers
+parano1d-cli state
+parano1d-cli mining
+parano1d-cli address
+parano1d-cli address --new
+parano1d-cli balance
+parano1d-cli utxos
+parano1d-cli send <o1-address> 10.5 --dry-run
+parano1d-cli send <o1-address> 10.5
+parano1d-cli mempool
+parano1d-cli history
+parano1d-cli receipt <txid> > receipt.hex
+parano1d-cli verify "$(tr -d '\n' < receipt.hex)"
+parano1d-cli stop
 ```
 
-Run `paranoid --help`, `noid-cli help` or `noid-extminer --help` for the full
+Run `parano1d --help`, `parano1d-cli help` or `parano1d-miner --help` for the full
 interface.
 
 ## Building from Source
@@ -319,7 +321,7 @@ the host before entering proof code. Production requires SSE4.1 and
 PCLMULQDQ on x86-64, or NEON and PMULL on ARM64. Each binary then selects
 PCLMULQDQ, AVX2+VPCLMULQDQ, AVX-512 or NEON+PMULL kernels at runtime. The
 scalar implementation is a differential-test oracle and is never used by a
-production node. Run `paranoid --check-hardware` before installation to see
+production node. Run `parano1d --check-hardware` before installation to see
 the selected backend without creating configuration, wallet or chain data.
 
 To reproduce a published release, check out the tag shown on its GitHub release
@@ -329,12 +331,12 @@ matrix bytes supplied by the project. Keep the pack outside the repository's
 disposable `target/` tree:
 
 ```sh
-git clone https://github.com/ignotusnemo/paranoid.git
-cd paranoid
+git clone https://github.com/ignotusnemo/parano1d.git
+cd parano1d
 
-mkdir -p ../paranoid-artifacts
+mkdir -p ../parano1d-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../paranoid-artifacts/history-step-v1
+  ../parano1d-artifacts/history-step-v1
 ```
 
 Generation is expensive but only needs to be performed once.
@@ -342,13 +344,13 @@ Generation is expensive but only needs to be performed once.
 Build for the current machine. The script authenticates the pack, embeds it
 into the node and produces two independent deliverables:
 
-- a Core archive containing `paranoid`, `noid-cli` and `noid-extminer`;
-- a native GUI Wallet package containing `paranoid-gui` and its private,
-  locally supervised `paranoid` node.
+- a Core archive containing `parano1d`, `parano1d-cli` and `parano1d-miner`;
+- a native GUI Wallet package containing `parano1d-gui` and its private,
+  locally supervised `parano1d` node.
 
 ```sh
 ./scripts/build_release.sh \
-  --pack ../paranoid-artifacts/history-step-pack-v1
+  --pack ../parano1d-artifacts/history-step-pack-v1
 
 cat target/release-builds/LAST_RELEASE
 ```

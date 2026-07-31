@@ -26,7 +26,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "paranoid"
+NODE_BIN = ROOT / "target" / "release" / "parano1d"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 SCENARIO = os.environ.get("NOID_LIVE_TX_SCENARIO", "single-input").strip()
@@ -104,7 +104,7 @@ class Node:
     def __init__(self):
         self.root = BASE / "node"
         self.data_dir = self.root / "data"
-        self.config = self.root / "paranoid.toml"
+        self.config = self.root / "parano1d.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None

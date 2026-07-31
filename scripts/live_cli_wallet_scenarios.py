@@ -9,8 +9,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "paranoid"
-CLI_BIN = ROOT / "target" / "release" / "noid-cli"
+NODE_BIN = ROOT / "target" / "release" / "parano1d"
+CLI_BIN = ROOT / "target" / "release" / "parano1d-cli"
 BASE = ROOT / "target" / "live-tests" / "cli-wallet"
 LOGS = BASE / "logs"
 
@@ -230,7 +230,7 @@ def cleanup(nodes):
 def main():
     if not NODE_BIN.exists() or not CLI_BIN.exists():
         raise LiveTestError(
-            "release binaries missing; run cargo build --release -p noid_node --bin paranoid --bin noid-cli"
+            "release binaries missing; run cargo build --release -p noid_node --bin parano1d --bin parano1d-cli"
         )
     if BASE.exists():
         shutil.rmtree(BASE)

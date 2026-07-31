@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>network.noid.paranoid</id>
+  <id>org.parano1d.wallet</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>Apache-2.0</project_license>
   <name>ParanO(1)d</name>
@@ -12,21 +12,20 @@
       or a separately managed daemon.
     </p>
   </description>
-  <launchable type="desktop-id">network.noid.paranoid.desktop</launchable>
-  <icon type="stock">network.noid.paranoid</icon>
+  <launchable type="desktop-id">org.parano1d.wallet.desktop</launchable>
+  <icon type="stock">org.parano1d.wallet</icon>
   <provides>
-    <binary>paranoid-gui</binary>
+    <binary>parano1d-gui</binary>
   </provides>
   <categories>
     <category>Finance</category>
     <category>Network</category>
   </categories>
-  <developer id="network.noid">
+  <developer id="org.parano1d">
     <name>Paranoid Zero</name>
   </developer>
-  <developer_name>Paranoid Zero</developer_name>
-  <url type="homepage">https://noid.network/</url>
-  <url type="bugtracker">https://github.com/ignotusnemo/paranoid/issues</url>
+  <url type="homepage">https://parano1d.org/</url>
+  <url type="bugtracker">https://github.com/ignotusnemo/parano1d/issues</url>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="@VERSION@" date="@RELEASE_DATE@"/>

@@ -16,7 +16,7 @@ mod widgets;
 use iced::{window, Size};
 
 #[cfg(target_os = "linux")]
-const LINUX_APPLICATION_ID: &str = "network.noid.paranoid";
+const LINUX_APPLICATION_ID: &str = "org.parano1d.wallet";
 
 fn app_theme(_: &app::App) -> iced::Theme {
     theme::paranoid_theme()
@@ -56,9 +56,9 @@ fn handle_process_command() -> bool {
     }
 
     let node_name = if cfg!(target_os = "windows") {
-        "paranoid.exe"
+        "parano1d.exe"
     } else {
-        "paranoid"
+        "parano1d"
     };
     let node = std::env::current_exe()
         .ok()

@@ -38,7 +38,7 @@ BASE_PORT = int(os.environ.get("NOID_LIVE_RECEIPT_BASE_PORT", "22900"))
 PAYMENT_MICRONOID = int(os.environ.get("NOID_LIVE_RECEIPT_PAYMENT", "1000000"))
 FUNDING_HEIGHT = int(os.environ.get("NOID_LIVE_RECEIPT_FUNDING_HEIGHT", "3"))
 RECENT_BLOCK_RETENTION_DEPTH = 18
-CLI_BIN = ROOT / "target" / "release" / "noid-cli"
+CLI_BIN = ROOT / "target" / "release" / "parano1d-cli"
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT

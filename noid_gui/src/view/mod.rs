@@ -1540,7 +1540,7 @@ fn node_log_terminal(app: &App) -> Element<'_, Message> {
     }
 
     let output = text_editor(&app.node_log)
-        .placeholder(translate("Waiting for paranoid-node.log output…"))
+        .placeholder(translate("Waiting for parano1d-node.log output…"))
         .on_action(Message::EditNodeLog)
         .font(theme::TECH_FONT)
         .size(12)
@@ -1553,7 +1553,7 @@ fn node_log_terminal(app: &App) -> Element<'_, Message> {
     let mut body = column![
         row![
             text("LOGS").size(13).color(theme::CYAN),
-            text("paranoid-node.log").size(12).color(theme::DIM),
+            text("parano1d-node.log").size(12).color(theme::DIM),
             Space::new().width(Length::Fill),
             text(status).size(12).color(status_color),
             refresh,
@@ -1633,7 +1633,7 @@ fn node_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
             ),
             settings_field(
                 "LOG LEVEL",
-                "Written locally to paranoid-node.log",
+                "Written locally to parano1d-node.log",
                 levels.into(),
             ),
         ]

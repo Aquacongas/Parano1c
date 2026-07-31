@@ -21,7 +21,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "paranoid"
+NODE_BIN = ROOT / "target" / "release" / "parano1d"
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
@@ -95,7 +95,7 @@ class Node:
         self.p2p_host = p2p_host
         self.root = BASE / name
         self.data_dir = self.root / "data"
-        self.config = self.root / "paranoid.toml"
+        self.config = self.root / "parano1d.toml"
         self.proc = None
         self.log_handle = None
         self.log_path = None

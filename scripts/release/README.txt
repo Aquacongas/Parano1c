@@ -5,9 +5,9 @@ Each GitHub release contains two independent product lines.
 
 GUI Wallet packages (ordinary users):
 
-  Linux:   paranoid-gui-vVERSION-linux-ARCH.deb
-  Windows: paranoid-gui-vVERSION-windows-x86_64-setup.exe
-  macOS:   paranoid-gui-vVERSION-macos-ARCH.dmg
+  Linux:   parano1d-gui-vVERSION-linux-ARCH.deb
+  Windows: parano1d-gui-vVERSION-windows-x86_64-setup.exe
+  macOS:   parano1d-gui-vVERSION-macos-ARCH.dmg
 
 The GUI package exposes only the ParanO(1)d wallet application. Its full node
 is bundled as a private application component and is supervised by the wallet.
@@ -15,9 +15,9 @@ The user does not need to start a daemon or use a terminal.
 
 Core archives (node operators and miners):
 
-  paranoid        full node and built-in miner
-  noid-cli        wallet and node command-line client
-  noid-extminer   external proof-of-work miner
+  parano1d        full node and built-in miner
+  parano1d-cli    wallet and node command-line client
+  parano1d-miner  external proof-of-work miner
   LICENSE/NOTICE  Apache-2.0 distribution terms and project notices
 
 Hardware check
@@ -25,7 +25,7 @@ Hardware check
 
 Before creating node or wallet data, run:
 
-  paranoid --check-hardware
+  parano1d --check-hardware
 
 Production requires SSE4.1 and PCLMULQDQ on x86-64, or NEON and PMULL on
 ARM64. The executable selects wider AVX2+VPCLMULQDQ or AVX-512 kernels
@@ -37,7 +37,7 @@ Verify the download
 
 Download SHA256SUMS from the same GitHub release as this archive:
 
-  https://github.com/ignotusnemo/paranoid/releases
+  https://github.com/ignotusnemo/parano1d/releases
 
 Before extracting or running anything, compute the archive's SHA-256 digest
 and compare it with the matching line in SHA256SUMS.
@@ -62,7 +62,7 @@ GUI Wallet — Linux
 Open the downloaded .deb in the system Software application, or install it
 from a terminal:
 
-  sudo apt install ./paranoid-gui-vVERSION-linux-ARCH.deb
+  sudo apt install ./parano1d-gui-vVERSION-linux-ARCH.deb
 
 Launch ParanO(1)d from the desktop application menu. Removing the package does
 not remove wallet data from the user's home directory.
@@ -81,11 +81,11 @@ SmartScreen may display a warning. After verifying SHA256SUMS, select
 GUI Wallet — macOS
 ------------------
 
-Open the downloaded DMG and drag ParanO1d.app to Applications. Launch it from
+Open the downloaded DMG and drag Parano1d.app to Applications. Launch it from
 Applications like any other app.
 
 Until the project uses an Apple Developer ID certificate, macOS may block the
-first launch. After verifying SHA256SUMS, Control-click ParanO1d, choose Open,
+first launch. After verifying SHA256SUMS, Control-click Parano1d, choose Open,
 and confirm. If necessary, use Privacy & Security -> Open Anyway.
 
 Core archive — Linux
@@ -93,9 +93,9 @@ Core archive — Linux
 
 Open a terminal in the extracted directory:
 
-  ./paranoid --help
-  ./noid-cli --help
-  ./noid-extminer --help
+  ./parano1d --help
+  ./parano1d-cli --help
+  ./parano1d-miner --help
 
 Core archive — macOS
 --------------------
@@ -103,14 +103,14 @@ Core archive — macOS
 If Gatekeeper blocks a verified download, remove only the quarantine
 attributes from the three extracted binaries:
 
-  xattr -d com.apple.quarantine ./paranoid
-  xattr -d com.apple.quarantine ./noid-cli
-  xattr -d com.apple.quarantine ./noid-extminer
+  xattr -d com.apple.quarantine ./parano1d
+  xattr -d com.apple.quarantine ./parano1d-cli
+  xattr -d com.apple.quarantine ./parano1d-miner
 
 If xattr reports that an attribute does not exist, no action is required.
 Then run:
 
-  ./paranoid --help
+  ./parano1d --help
 
 Core archive — Windows
 ----------------------
@@ -121,18 +121,18 @@ PowerShell can unblock all three verified extracted executables at once:
 
 Then run:
 
-  .\paranoid.exe --help
+  .\parano1d.exe --help
 
 Node data
 ---------
 
 The first node start creates its configuration and persistent data under:
 
-  Linux/macOS:  ~/.paranoid/
-  Windows:      %USERPROFILE%\.paranoid\
+  Linux/macOS:  ~/.parano1d/
+  Windows:      %USERPROFILE%\.parano1d\
 
 The wallet key is stored in data/wallet.key and is not password-encrypted.
 Back it up and protect it before receiving funds.
 
-Documentation: https://noid.network/
-Source:        https://github.com/ignotusnemo/paranoid
+Documentation: https://docs.parano1d.org/
+Source:        https://github.com/ignotusnemo/parano1d

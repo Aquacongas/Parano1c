@@ -29,10 +29,10 @@ AppName=ParanO(1)d
 AppVersion={#MyAppVersion}
 AppVerName=ParanO(1)d {#MyAppVersion}
 AppPublisher=Paranoid Zero
-AppPublisherURL=https://noid.network/
-AppSupportURL=https://github.com/ignotusnemo/paranoid/issues
-AppUpdatesURL=https://github.com/ignotusnemo/paranoid/releases
-DefaultDirName={localappdata}\Programs\ParanO1d
+AppPublisherURL=https://parano1d.org/
+AppSupportURL=https://github.com/ignotusnemo/parano1d/issues
+AppUpdatesURL=https://github.com/ignotusnemo/parano1d/releases
+DefaultDirName={localappdata}\Programs\Parano1d
 DefaultGroupName=ParanO(1)d
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
@@ -44,7 +44,7 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseFilename}
 SetupIconFile={#IconFile}
 LicenseFile={#LicenseFile}
-UninstallDisplayIcon={app}\ParanO1d.exe
+UninstallDisplayIcon={app}\Parano1d.exe
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
@@ -66,14 +66,14 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\paranoid-gui.exe"; DestDir: "{app}"; DestName: "ParanO1d.exe"; Flags: ignoreversion
-Source: "{#SourceDir}\paranoid.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\parano1d-gui.exe"; DestDir: "{app}"; DestName: "Parano1d.exe"; Flags: ignoreversion
+Source: "{#SourceDir}\parano1d.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#LicenseFile}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "{#NoticeFile}"; DestDir: "{app}"; DestName: "NOTICE.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\ParanO(1)d"; Filename: "{app}\ParanO1d.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\ParanO(1)d"; Filename: "{app}\ParanO1d.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\ParanO(1)d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\ParanO(1)d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\ParanO1d.exe"; Description: "{cm:LaunchProgram,ParanO(1)d}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Parano1d.exe"; Description: "{cm:LaunchProgram,ParanO(1)d}"; Flags: nowait postinstall skipifsilent
