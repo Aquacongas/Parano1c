@@ -139,7 +139,7 @@ AMOUNT FORMAT:
   1 NOID = 1,000,000 μNOID — the CLI converts automatically.
 
 DAEMON:
-  The daemon must be running: parano1d --mode miner --data-dir ~/.parano1d",
+  The daemon must be running: parano1d --mode miner --data-dir ~/.parano1d/data",
 )]
 struct Cli {
     /// JSON-RPC endpoint of the running parano1d daemon.
@@ -297,7 +297,7 @@ enum Command {
     ///   parano1d-cli send f784...b61e 10.5
     ///   parano1d-cli send f784...b61e 10.5 --fee 0.01
     Send {
-        /// Recipient address (32-byte hex, 64 characters).
+        /// Recipient address (canonical bech32m o1...).
         #[arg(value_name = "ADDRESS")]
         to: String,
         /// Amount in NOID  (1 NOID = 1 000 000 μNOID).
@@ -351,8 +351,8 @@ enum Command {
     /// Get a block template for an external Poseidon2b PoW miner.
     #[command(name = "block-template", alias = "template")]
     BlockTemplate {
-        /// Coinbase address for this template (hex). Defaults to wallet address.
-        #[arg(long, value_name = "HEX", default_value = "")]
+        /// Coinbase address for this template (bech32m o1...). Defaults to wallet address.
+        #[arg(long, value_name = "ADDRESS", default_value = "")]
         miner_addr: String,
     },
 

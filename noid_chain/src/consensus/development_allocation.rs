@@ -4,7 +4,7 @@
 //! Deterministic launch-period development allocation.
 //!
 //! For the first three target-time years after genesis, miners receive 90% of
-//! each block subsidy. O(1) Network Fund and O(1) Lab each receive one
+//! each block subsidy. O(1) Network Fund and ParanO(1)d Lab each receive one
 //! mandatory daily payout calculated from the reward tier active in the payout
 //! block. A state expansion during that day can therefore make the effective
 //! fund share smaller than 5%; the difference is never issued. Fees remain
@@ -33,8 +33,8 @@ pub const O1_NETWORK_FUND_ADDRESS: Address = Address([
     0xa3, 0x1b, 0xc0, 0x1d, 0x54, 0xd1, 0x2e, 0xc1, 0x75, 0x4a, 0x89, 0x45, 0x16, 0x89, 0x47, 0x25,
 ]);
 
-/// O(1) Lab recipient.
-pub const O1_LAB_ADDRESS: Address = Address([
+/// ParanO(1)d Lab recipient.
+pub const PARANO1D_LAB_ADDRESS: Address = Address([
     0xd3, 0xa5, 0xc2, 0x08, 0x45, 0x2b, 0x52, 0xe5, 0xaa, 0x7c, 0x9a, 0x79, 0x8f, 0xb7, 0xb5, 0x52,
     0xac, 0xf3, 0x96, 0xb1, 0xdd, 0x1e, 0x48, 0xdd, 0xf3, 0xc0, 0x0c, 0xc8, 0x34, 0xf9, 0x90, 0x96,
 ]);

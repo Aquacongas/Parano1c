@@ -495,7 +495,7 @@ impl HistoryStepCacheClass {
     name = "parano1d",
     about = "ParanO(1)d full node daemon — HistoryStep UTXO statechain",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  parano1d --miner --data-dir ~/.parano1d\n  parano1d --p2p-listen 0.0.0.0:9301 --seed 1.2.3.4:9301",
+    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  parano1d --miner --data-dir ~/.parano1d/data\n  parano1d --p2p-listen 0.0.0.0:9400 --seed 1.2.3.4:9400",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
@@ -524,8 +524,9 @@ struct Cli {
     #[arg(long)]
     genesis: bool,
 
-    /// Miner coinbase address (32-byte hex). Defaults to the wallet's ACTIVE address.
-    #[arg(long, value_name = "HEX")]
+    /// Miner payout address (canonical bech32m, beginning with `o1`).
+    /// Defaults to the wallet's active address.
+    #[arg(long, value_name = "ADDRESS")]
     miner_address: Option<String>,
 
     /// Logical CPU threads used by the built-in miner and its proof phases.
@@ -547,7 +548,7 @@ struct Cli {
     rpc_listen: Option<String>,
 
     /// Seed peer address (HOST:PORT). Repeat for multiple seeds.
-    /// Example: --seed 1.2.3.4:9301 --seed 5.6.7.8:9301
+    /// Example: --seed 1.2.3.4:9400 --seed 5.6.7.8:9400
     #[arg(long, value_name = "HOST:PORT", action = clap::ArgAction::Append)]
     seed: Vec<String>,
 
@@ -587,9 +588,9 @@ struct Cli {
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
 
-    /// Force-clear all volatile state on startup (segments, undo logs).
-    /// The node will re-sync from peers via snapshot. Use after consensus upgrades
-    /// or to recover from suspected data corruption.
+    /// Clear the complete chain database on startup and synchronize it again.
+    /// Wallet files, receipts and the P2P identity are stored separately and remain.
+    /// Use after an incompatible chain-data upgrade or suspected corruption.
     #[arg(long)]
     purge_state: bool,
 
@@ -625,8 +626,8 @@ struct Cli {
 /// easy multi-node seed rotation via DNS.
 ///
 /// DNS setup for format 4:
-///   _dnsaddr.noid.network  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9400/p2p/12D3KooW..."
-///   _dnsaddr.noid.network  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9400/p2p/12D3KooW..."
+///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9400/p2p/12D3KooW..."
+///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9400/p2p/12D3KooW..."
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
     let seed = s.trim();
 
@@ -670,7 +671,7 @@ fn split_host_port(addr: &str) -> anyhow::Result<(&str, &str)> {
     }
     addr.rsplit_once(':').with_context(|| {
         format!(
-            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9301)",
+            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9400)",
             addr
         )
     })
@@ -693,8 +694,8 @@ fn seed_host_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> 
 
 /// Convert a user-friendly "HOST:PORT" string into a libp2p Multiaddr.
 ///
-/// Users type:  `127.0.0.1:9301`  or  `0.0.0.0:9301`
-/// libp2p needs: `/ip4/127.0.0.1/tcp/9301`
+/// Users type:  `127.0.0.1:9400`  or  `0.0.0.0:9400`
+/// libp2p needs: `/ip4/127.0.0.1/tcp/9400`
 ///
 /// This conversion is purely internal — users never see multiaddrs.
 fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {

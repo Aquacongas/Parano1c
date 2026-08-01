@@ -484,7 +484,7 @@ mod tests {
                 TxOutput {
                     slot_index: slot_index + 1,
                     amount: 500,
-                    owner: noid_chain::consensus::O1_LAB_ADDRESS,
+                    owner: noid_chain::consensus::PARANO1D_LAB_ADDRESS,
                 },
             ],
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),

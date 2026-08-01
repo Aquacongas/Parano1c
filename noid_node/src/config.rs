@@ -18,29 +18,28 @@ pub struct NodeConfig {
 pub struct NetworkConfig {
     /// P2P listen address.
     /// Config file: HOST:PORT or libp2p multiaddr ("/ip4/...").
-    /// CLI flag: --p2p-listen HOST:PORT  (e.g. 0.0.0.0:9301)
-    /// Defaults to network-specific port (9301 mainnet, 19301 testnet).
+    /// CLI flag: --p2p-listen HOST:PORT  (e.g. 0.0.0.0:9400)
+    /// Defaults to the compiled network's P2P port (9400 on mainnet).
     pub listen: Option<String>,
     /// Bootstrap seed peers.
-    /// Config file: list of HOST:PORT strings (e.g. ["1.2.3.4:9301"]).
+    /// Config file: list of HOST:PORT strings (e.g. ["1.2.3.4:9400"]).
     /// CLI flag: --seed HOST:PORT  (repeat for multiple seeds).
     pub seeds: Vec<String>,
-    /// Maximum connected peers. Default: 50.
-    pub max_peers: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Storage backend: "mdbx" or "ram".
     pub backend: String,
-    /// Data directory override. Default: ~/.noid/<network>/data.
+    /// Data directory override. Default: ~/.parano1d/data.
     pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RpcConfig {
     /// JSON-RPC listen address.
-    /// Defaults to network-specific port (9401 mainnet, 19401 testnet).
+    /// Defaults to the compiled network's local RPC address
+    /// (127.0.0.1:9401 on mainnet).
     pub listen: Option<String>,
 }
 
@@ -58,7 +57,6 @@ impl Default for NodeConfig {
             network: NetworkConfig {
                 listen: None, // determined by --network at runtime
                 seeds: vec![],
-                max_peers: 50,
             },
             storage: StorageConfig {
                 backend: "mdbx".into(),

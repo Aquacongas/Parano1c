@@ -736,7 +736,7 @@ mod tests {
                 TxOutput {
                     slot_index: 202,
                     amount: 17,
-                    owner: crate::consensus::development_allocation::O1_LAB_ADDRESS,
+                    owner: crate::consensus::development_allocation::PARANO1D_LAB_ADDRESS,
                 },
             ],
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),

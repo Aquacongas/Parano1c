@@ -825,7 +825,7 @@ fn transaction_details<'a>(
     let flow = if transaction.development_payout {
         column![
             text("REWARD SHARE").size(12).color(theme::DIM),
-            text("Block-reward shares paid to O(1) Network Fund and O(1) Lab. This protocol payout has no spend inputs.")
+            text("Block-reward shares paid to O(1) Network Fund and ParanO(1)d Lab. This protocol payout has no spend inputs.")
                 .size(13)
                 .color(theme::PROOF),
         ]

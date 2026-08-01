@@ -1,6 +1,6 @@
 # ParanO(1)d
 
-**Proof-native L1 Statechain secured by proof of work**
+**A proof-native L1 statechain secured by proof of work.**
 
 Blockchains have a fundamental architectural flaw: to validate the present,
 you must replay the past. Bitcoin, Ethereum, and nearly every major network
@@ -40,26 +40,6 @@ verify the network without replaying the chain's lifetime.
 | Spent outputs | Remain part of required history | Slots are cleared and safely reused |
 | Proof of work | Orders an execution log | Orders proof-valid state transitions |
 | Post-quantum migration | Replace the ownership scheme | No elliptic-curve transaction scheme to replace |
-
-### A Quantified Post-Quantum Floor
-
-ParanO(1)d treats post-quantum security as a property of the complete protocol,
-not a label inherited from one signature scheme or proof primitive. The wallet
-authorization, recursive `HistoryStep`, and shared Poseidon2b assumptions are
-accounted for separately and then composed by taking the weakest bound:
-
-| Component | Post-quantum security |
-|---|---:|
-| Wallet authorization | 79 bits |
-| Recursive `HistoryStep` | 83 bits |
-| Poseidon2b collision resistance | 85 bits |
-| Poseidon2b preimage resistance | 128 bits |
-| **Complete protocol floor** | **79 bits** |
-
-The result is a **proven 79-bit post-quantum engineering security floor across
-the complete consensus proof pipeline**. The calculation is pinned in the executable
-[soundness ledger](noid_gkr/src/zk_auth_qrom.rs) so changes to protocol
-parameters cannot silently change the published figure.
 
 ParanO(1)d is transparent, not a privacy chain. Current values and owners are
 public, and transactions are visible when relayed. The protocol turns history
@@ -175,8 +155,8 @@ protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
 Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
 relation without a trusted setup. The two authenticated launch matrices — B64
 at `m=23` and B255 at `m=24` — are embedded in the official binary and can be
-regenerated from source. The O(1) Lab [FROST-GKR research
-article](https://research.parano1d.org/research/frost-gkr-global-trace-protocol/)
+regenerated from source. The ParanO(1)d Lab [FROST-GKR research
+article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
 
@@ -220,6 +200,33 @@ reference 12-thread Intel Core i7-1365U, saturated B64 preparation measures
 hardware may qualify B255; every node verifies both classes. Full measurements
 are in the [two-class benchmark](research/two_class/results/2026-07-17-history-step-lto-20-sample.md).
 
+## Proof Security Profile
+
+ParanO(1)d reports proof security using the same scoped metrics published by
+established FRI and STARK projects. Under the literal Toy Problem convention
+used by Plonky2 and RISC Zero, the production wallet and `HistoryStep`
+parameters each reach the `GF(2^128)` field cap: **128 bits of conjectured FRI
+security**.
+
+| Published system and metric | Published value | ParanO(1)d under the corresponding metric |
+|---|---:|---:|
+| [Plonky2 default FRI](https://github.com/0xPolygonZero/plonky2#security), Toy Problem conjecture | **100 bits conjectured**; default Poseidon estimated at about **95 bits** | **128 bits conjectured**, using the literal Plonky2 formula and production field cap |
+| [RISC Zero soundness calculator](https://github.com/risc0/risc0/blob/release-3.0/risc0/zkp/src/prove/soundness.rs#L15-L35), Toy Problem conjecture | **97 bits conjectured** at `2^20`; **95 bits conjectured** at `2^24` | **128 bits conjectured**, using the corresponding rate/query calculation |
+| [ethSTARK / StarkWare](https://www.starknet.io/blog/safe-and-sound-a-deep-dive-into-stark-security/), round-by-round and `t/e(t)` analysis | **96-bit RBR** IOP premise; **95-bit** compiled-STARK result under its stated operation-count definition | **96.047-bit** wallet generalized-RBR knowledge bound; **95.022-bit** fixed-invalid-block work-accounted finite composition |
+
+These are corresponding scalar conventions, not interchangeable security
+games. The exact production inputs, formulas and regression tests are published
+in the [ParanO(1)d soundness workbench](https://github.com/ignotusnemo/parano1d-soundness).
+The corresponding ParanO(1)d Lab
+[analysis](https://lab.parano1d.org/research/parano1d-soundness-industry-metrics/)
+defines the metrics and comparison in full.
+In the terminology used for transparent STARK and FRI systems, ParanO(1)d has
+a post-quantum-resistant transaction proof stack: it is transparent and
+hash-based, requires no trusted setup and places no elliptic-curve signature
+in transaction consensus. The numerical claims above remain attached to their
+exact published conventions rather than being collapsed into a different
+end-to-end metric.
+
 ### Development Allocation
 
 ParanO(1)d has no premine. For blocks 1 through 6,307,200 — exactly three
@@ -227,14 +234,14 @@ ParanO(1)d has no premine. For blocks 1 through 6,307,200 — exactly three
 
 - 90% to the miner;
 - 5% to the O(1) Network Fund;
-- 5% to O(1) Lab.
+- 5% to ParanO(1)d Lab.
 
 Transaction fees remain entirely miner-claimable after the existing
 state-growth burn. Beginning with block 6,307,201, the development allocation
 ends and 100% of every new block reward goes to miners.
 
 The O(1) Network Fund finances operation, maintenance, security and adoption
-of the live network. O(1) Lab supports the founders, core developers,
+of the live network. ParanO(1)d Lab supports the founders, core developers,
 researchers and contributors advancing the protocol. Both will publish
 periodic reports covering funds received, major expenditures, completed work
 and current priorities.
@@ -336,7 +343,7 @@ cd parano1d
 
 mkdir -p ../parano1d-artifacts
 ./scripts/generate_history_step_pack.sh \
-  ../parano1d-artifacts/history-step-v1
+  ../parano1d-artifacts/history-step-pack-v1
 ```
 
 Generation is expensive but only needs to be performed once.
@@ -366,10 +373,6 @@ tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
 ./scripts/build_release.sh \
   --pack ../release-pack/history-step-pack-v1
 ```
-
-## Status
-
-ParanO(1)d is pre-genesis. No public network has launched.
 
 Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the

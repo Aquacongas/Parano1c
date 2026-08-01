@@ -295,7 +295,7 @@ pub fn validate_mandatory_coinbase(
             let first = &payout.body.outputs[0];
             let second = &payout.body.outputs[1];
             if first.owner != crate::consensus::development_allocation::O1_NETWORK_FUND_ADDRESS
-                || second.owner != crate::consensus::development_allocation::O1_LAB_ADDRESS
+                || second.owner != crate::consensus::development_allocation::PARANO1D_LAB_ADDRESS
                 || first.amount != expected_amount
                 || second.amount != expected_amount
             {
@@ -600,7 +600,7 @@ mod tests {
                 TxOutput {
                     slot_index: 15_000_002,
                     amount,
-                    owner: crate::consensus::development_allocation::O1_LAB_ADDRESS,
+                    owner: crate::consensus::development_allocation::PARANO1D_LAB_ADDRESS,
                 },
             ],
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
