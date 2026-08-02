@@ -493,7 +493,7 @@ impl HistoryStepCacheClass {
 #[derive(Parser, Debug)]
 #[command(
     name = "parano1d",
-    about = "ParanO(1)d full node daemon — HistoryStep UTXO statechain",
+    about = "ParanO(1)d full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
     long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  parano1d --miner --data-dir ~/.parano1d/data\n  parano1d --p2p-listen 0.0.0.0:9400 --seed 1.2.3.4:9400",
 )]

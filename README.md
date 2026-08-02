@@ -1,6 +1,6 @@
 # Parano1d
 
-**A proof-native L1 statechain secured by proof of work.**
+**A proof-native Layer 1 network secured by proof of work**
 
 Blockchains have a fundamental architectural flaw: to validate the present,
 you must replay the past. Bitcoin, Ethereum, and nearly every major network
@@ -16,10 +16,10 @@ witness — the wallet owner. The miner proves the public transaction logic and
 the exact state transition. The network verifies those proofs instead of
 repeating the same execution.
 
-Every accepted block carries a recursive `HistoryStep` that binds the block,
-its new UTXO root, and the validity of the preceding statechain. A new node can
-therefore authenticate the current state and verify the recent reorg suffix
-without executing the chain from genesis.
+Every accepted block carries a recursive `HistoryStep` that proves the block's
+exact state transition, including its new UTXO root, and verifies the preceding
+`HistoryStep` terminal. A new node can therefore authenticate the current state
+and verify the recent reorg suffix without executing the chain from genesis.
 
 Once the present state carries its own proof, a different architecture becomes
 possible. Spent state can be deleted and reused. Ownership no longer needs a
