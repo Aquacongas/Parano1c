@@ -1,4 +1,4 @@
-# ParanO(1)d
+# Parano1d
 
 **A proof-native L1 statechain secured by proof of work.**
 
@@ -8,9 +8,9 @@ inherit this property. A new full node downloads the chain from genesis and
 re-executes every transaction because the current state does not prove itself.
 This is not a temporary limitation. It is baked into the model.
 
-ParanO(1)d is designed to remove this requirement.
+Parano1d is designed to remove this requirement.
 
-In ParanO(1)d, validity is established once, where the complete information
+In Parano1d, validity is established once, where the complete information
 already exists. Authorization is proved locally by the party with the private
 witness — the wallet owner. The miner proves the public transaction logic and
 the exact state transition. The network verifies those proofs instead of
@@ -31,7 +31,7 @@ verify the network without replaying the chain's lifetime.
 
 ## The Fundamental Shift
 
-| | Conventional blockchain | ParanO(1)d |
+| | Conventional blockchain | Parano1d |
 |---|---|---|
 | Validation | Every full node re-executes | The witness holder proves; the network verifies |
 | Bootstrap | Rebuild state from genesis | Authenticate current state and verify the recent suffix |
@@ -41,7 +41,7 @@ verify the network without replaying the chain's lifetime.
 | Proof of work | Orders an execution log | Orders proof-valid state transitions |
 | Post-quantum migration | Replace the ownership scheme | No elliptic-curve transaction scheme to replace |
 
-ParanO(1)d is transparent, not a privacy chain. Current values and owners are
+Parano1d is transparent, not a privacy chain. Current values and owners are
 public, and transactions are visible when relayed. The protocol turns history
 into proof: every node carries an authenticated present instead of an
 ever-growing transaction graph. Anyone may build an external tracer, but it
@@ -92,7 +92,7 @@ and the latest 18 complete blocks for competing miners and reorgs. A joining
 node authenticates a finalized current state with its matching terminal, then
 verifies that recent suffix normally.
 
-ParanO(1)d is history-stateless, not state-free. State transfer scales with the
+Parano1d is history-stateless, not state-free. State transfer scales with the
 live UTXO set. What no longer scales with chain age is the execution required
 to prove why that state is valid.
 
@@ -146,7 +146,7 @@ The protocol is built over the binary tower field `GF(2^128)`. Poseidon2b is
 the common permutation for addresses, transactions, Merkle trees, state roots,
 transcripts, block identifiers and PoW.
 
-For ParanO(1)d, we developed FROST-GKR (Frobenius Reduction Over Shifted
+For Parano1d, we developed FROST-GKR (Frobenius Reduction Over Shifted
 Tables). It packs entire Poseidon2b batches and Merkle paths into direct
 degree-seven relations over shared Boolean hypercubes instead of running a
 low-degree sumcheck chain for every permutation. In a like-for-like
@@ -155,7 +155,7 @@ protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
 Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
 relation without a trusted setup. The two authenticated launch matrices — B64
 at `m=23` and B255 at `m=24` — are embedded in the official binary and can be
-regenerated from source. The ParanO(1)d Lab [FROST-GKR research
+regenerated from source. The Parano1d Lab [FROST-GKR research
 article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
@@ -202,13 +202,13 @@ are in the [two-class benchmark](research/two_class/results/2026-07-17-history-s
 
 ## Proof Security Profile
 
-ParanO(1)d reports proof security using the same scoped metrics published by
+Parano1d reports proof security using the same scoped metrics published by
 established FRI and STARK projects. Under the literal Toy Problem convention
 used by Plonky2 and RISC Zero, the production wallet and `HistoryStep`
 parameters each reach the `GF(2^128)` field cap: **128 bits of conjectured FRI
 security**.
 
-| Published system and metric | Published value | ParanO(1)d under the corresponding metric |
+| Published system and metric | Published value | Parano1d under the corresponding metric |
 |---|---:|---:|
 | [Plonky2 default FRI](https://github.com/0xPolygonZero/plonky2#security), Toy Problem conjecture | **100 bits conjectured**; default Poseidon estimated at about **95 bits** | **128 bits conjectured**, using the literal Plonky2 formula and production field cap |
 | [RISC Zero soundness calculator](https://github.com/risc0/risc0/blob/release-3.0/risc0/zkp/src/prove/soundness.rs#L15-L35), Toy Problem conjecture | **97 bits conjectured** at `2^20`; **95 bits conjectured** at `2^24` | **128 bits conjectured**, using the corresponding rate/query calculation |
@@ -216,11 +216,11 @@ security**.
 
 These are corresponding scalar conventions, not interchangeable security
 games. The exact production inputs, formulas and regression tests are published
-in the [ParanO(1)d soundness workbench](https://github.com/ignotusnemo/parano1d-soundness).
-The corresponding ParanO(1)d Lab
+in the [Parano1d soundness workbench](https://github.com/ignotusnemo/parano1d-soundness).
+The corresponding Parano1d Lab
 [analysis](https://lab.parano1d.org/research/parano1d-soundness-industry-metrics/)
 defines the metrics and comparison in full.
-In the terminology used for transparent STARK and FRI systems, ParanO(1)d has
+In the terminology used for transparent STARK and FRI systems, Parano1d has
 a post-quantum-resistant transaction proof stack: it is transparent and
 hash-based, requires no trusted setup and places no elliptic-curve signature
 in transaction consensus. The numerical claims above remain attached to their
@@ -229,26 +229,26 @@ end-to-end metric.
 
 ### Development Allocation
 
-ParanO(1)d has no premine. For blocks 1 through 6,307,200 — exactly three
+Parano1d has no premine. For blocks 1 through 6,307,200 — exactly three
 365-day target-time years — each block reward is divided by consensus:
 
 - 90% to the miner;
 - 5% to the O(1) Network Fund;
-- 5% to ParanO(1)d Lab.
+- 5% to Parano1d Lab.
 
 Transaction fees remain entirely miner-claimable after the existing
 state-growth burn. Beginning with block 6,307,201, the development allocation
 ends and 100% of every new block reward goes to miners.
 
 The O(1) Network Fund finances operation, maintenance, security and adoption
-of the live network. ParanO(1)d Lab supports the founders, core developers,
+of the live network. Parano1d Lab supports the founders, core developers,
 researchers and contributors advancing the protocol. Both will publish
 periodic reports covering funds received, major expenditures, completed work
 and current priorities.
 
 ## Network
 
-ParanO(1)d uses libp2p GossipSub for blocks and transaction intents, typed
+Parano1d uses libp2p GossipSub for blocks and transaction intents, typed
 request-response protocols for synchronization, Kademlia and DNS seeds for
 discovery, and mDNS for local networks. Persistent peers, connection limits,
 and IPv4/IPv6 network-group diversity reduce simple eclipse and connection
@@ -259,7 +259,7 @@ ordinary recent-block sync. Finalized transaction bodies are not required by
 active consensus. Exportable Merkle receipts preserve proof of inclusion after
 a body leaves the recent suffix.
 
-## Running ParanO(1)d
+## Running Parano1d
 
 Official binaries discover the public network through the built-in DNS seeds.
 Run an ordinary node or an internal miner:
