@@ -8,21 +8,22 @@
 //! recordings region Walk L-C.  Each proof is a sibling field, never data
 //! recorded into another vertical's committed columns.
 //!
-//! Since V4, walk L-C hosts THREE recorded transcript roles per link: the
-//! block-sidecar child transcript, the `[R]_B` replay's complete outer
-//! Fiat-Shamir channel and the `[R]_prev` replay's complete outer channel
-//! (which itself contains the previous link's full sidecar verify).  The
+//! In V5, walk L-C hosts the two transcripts needed by the authenticated
+//! parent arm: its block-sidecar child and the `[R]_prev` replay's complete
+//! outer Fiat-Shamir channel (which itself contains the previous link's full
+//! sidecar verify). One transcript selector is committed and constrained to
+//! the same one-hot parent selector used by the recursive verifier. The
 //! resulting trust chain, link by link:
 //!
-//! 1. Link N's CIRCUIT runs both `[R]` replays' verifier algebra inline but
-//!    commits their Fiat-Shamir traffic as walk L-C columns: every absorbed
+//! 1. Link N's CIRCUIT runs both parent verifier arms inline but commits the
+//!    selected arm's two Fiat-Shamir transcripts as walk L-C columns: every absorbed
 //!    witness lane is pinned to an A-cell, every squeezed challenge to the
 //!    carry cell the chain produces it in, and every protocol-constant lane
 //!    is a VK fixed pattern.  Nothing about the transcript is proven by the
 //!    circuit itself beyond these bindings.
 //! 2. Link N's post-commit SIDECAR (proven by link N's prover, bound to
 //!    link N's own Field transcript through the post-commit context) proves
-//!    the three walks over those committed columns — i.e. that every
+//!    L-A, L-B and L-C walks over those committed columns, proving that every
 //!    recorded Poseidon chain actually permutes as recorded, from the
 //!    capacity IV through every absorb to every challenge cell.
 //! 3. Link N+1's `[R]_prev` replay verifies link N's Field proof AND its
@@ -32,8 +33,8 @@
 //! 4. The induction closes at the tip: the terminal decider natively
 //!    verifies the tip link's Field proof and its FULL sidecar
 //!    ([`verify_link_region_sidecar_post_commit`], no recording anywhere in
-//!    the native path), which covers all three verticals including both
-//!    recorded `[R]` channels.  A sound tip sidecar makes the tip's recorded
+//!    the native path), which covers all three verticals including the two
+//!    selected L-C transcripts. A sound tip sidecar makes the tip's recorded
 //!    challenges sound, which makes the tip's in-circuit verification of
 //!    link N−1 sound, and so on down to genesis.
 //!
@@ -71,6 +72,7 @@ use super::bounded_decode::{
     merkle_shape_for_vk, multi_walk_proof_shape, preflight_composite_proof, record_serde_attempt,
     SidecarProofShape,
 };
+use super::c1_repeat::{WideResponseLowChallenger, SIDECAR_C1_REPETITIONS};
 use super::combined_duplex::{
     combined_walk_deferred_bounded_shape, preflight_combined_duplex_region_walk_deferred_trace,
     verify_combined_duplex_region_walk_deferred_prefix,
@@ -81,21 +83,26 @@ use super::recording_duplex::{
     preflight_recording_duplex_region_walk_deferred, recording_duplex_bounded_shape,
     validate_recording_endpoints, verify_recording_duplex_region_walk_deferred_prefix,
     verify_recording_duplex_region_walk_deferred_prefix_trace, RecordingDuplexRegionProverPlan,
-    RecordingDuplexRegionVk,
+    RecordingDuplexRegionVk, RecordingDuplexRegionWalkDeferredProof,
 };
 use super::{
     preflight_merkle_region_walk_deferred_trace, verify_merkle_region_walk_deferred_prefix,
     verify_merkle_region_walk_deferred_prefix_trace, CombinedDuplexRegionProverPlan,
-    CombinedDuplexRegionVk, DuplexRegionWalkDeferredProof, MerkleRegionProverPlan, MerkleRegionVk,
-    MerkleRegionWalkDeferredProof, RegionSidecarError, RegionWalkEndpoints,
+    CombinedDuplexRegionVk, MerkleRegionProverPlan, MerkleRegionVk, MerkleRegionWalkDeferredProof,
+    RegionSidecarError, RegionWalkEndpoints,
 };
 
-pub const LINK_REGION_SIDECAR_VERSION: u8 = 4;
+pub const LINK_REGION_SIDECAR_VERSION: u8 = 5;
 
-const LINK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/LINK-VK/V4";
+const LINK_REGION_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/LINK-VK/V5";
 const LINK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"NOID/REGION-SIDECAR/LINK-POST-COMMIT-CLASS/V4";
-const LINK_REGION_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-link-v4";
+    b"NOID/REGION-SIDECAR/LINK-POST-COMMIT-CLASS/V5";
+const LINK_REGION_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-link-v5";
+const LINK_C1_REPETITION_LABEL: &[u8] = b"history-region-sidecar-link-c1-repeat-v1";
+const LINK_C1_REPETITION_LABELS: [&[u8]; SIDECAR_C1_REPETITIONS] = [
+    b"history-region-sidecar-link-c1-repeat-0",
+    b"history-region-sidecar-link-c1-repeat-1",
+];
 
 /// Canonical key for the three mandatory link-region verticals.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -260,11 +267,12 @@ impl<'a> LinkRegionProverPlan<'a> {
         Ok(Self { vk, input })
     }
 
-    fn prove<Ch: Challenger>(
+    fn prove_repetition<Ch: Challenger>(
         &self,
         z: &[F128],
         challenger: &mut Ch,
-    ) -> Result<(LinkRegionSidecarProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
+    ) -> Result<(LinkRegionSidecarRepetitionProof, Vec<QuirkyDirectClaim>), RegionSidecarError>
+    {
         // Env-gated stage timing, mirroring the Block sidecar.  Keeping this
         // local to the prover plan makes the production transcript and proof
         // bytes completely independent of whether diagnostics are enabled.
@@ -324,8 +332,7 @@ impl<'a> LinkRegionProverPlan<'a> {
         lap("rec-C finish", &mut t);
 
         Ok((
-            LinkRegionSidecarProof {
-                version: LINK_REGION_SIDECAR_VERSION,
+            LinkRegionSidecarRepetitionProof {
                 leaf_a,
                 path_b,
                 rec_c,
@@ -342,22 +349,44 @@ impl<'a> LinkRegionProverPlan<'a> {
         context: &mut FieldPostCommitProverContext<'_, Ch>,
     ) -> Result<LinkRegionSidecarProof, RegionSidecarError> {
         let witness = context.witness();
-        let (proof, claims) = self.prove(witness, context)?;
-        context.append_claims(claims);
-        Ok(proof)
+        context.observe_label(LINK_C1_REPETITION_LABEL);
+        let mut repetitions = Vec::with_capacity(SIDECAR_C1_REPETITIONS);
+        for label in LINK_C1_REPETITION_LABELS {
+            context.observe_label(label);
+            let (proof, claims) = {
+                let mut channel = WideResponseLowChallenger::new(context);
+                self.prove_repetition(witness, &mut channel)?
+            };
+            context.append_claims(claims);
+            repetitions.push(proof);
+        }
+        Ok(LinkRegionSidecarProof {
+            version: LINK_REGION_SIDECAR_VERSION,
+            repetitions: repetitions
+                .try_into()
+                .expect("fixed C1 link-sidecar repetition count"),
+        })
     }
 }
 
-/// Fixed V4 link sidecar.  All three children retain their complete
+/// One algebraic repetition of the link authority.  It is private so no
+/// caller can present a single base-field transcript as a production proof.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LinkRegionSidecarRepetitionProof {
+    leaf_a: CombinedDuplexRegionWalkDeferredProof,
+    path_b: MerkleRegionWalkDeferredProof,
+    rec_c: RecordingDuplexRegionWalkDeferredProof,
+    walk: MultiDeepChainWalkProof,
+}
+
+/// Fixed V5 link sidecar.  All three children retain their complete
 /// role-local prefix/suffix authority; only their deep-chain walks are
-/// reduced by one mandatory ragged-domain multi-instance proof.
+/// reduced by one mandatory ragged-domain multi-instance proof.  Two
+/// sequential repetitions consume independent C1-wide response streams.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LinkRegionSidecarProof {
     version: u8,
-    leaf_a: CombinedDuplexRegionWalkDeferredProof,
-    path_b: MerkleRegionWalkDeferredProof,
-    rec_c: DuplexRegionWalkDeferredProof,
-    walk: MultiDeepChainWalkProof,
+    repetitions: [LinkRegionSidecarRepetitionProof; SIDECAR_C1_REPETITIONS],
 }
 
 impl LinkRegionSidecarProof {
@@ -373,7 +402,7 @@ pub(crate) fn encode_link_region_sidecar_canonical(
 ) -> Result<Vec<u8>, RegionSidecarError> {
     use super::canonical_codec as canonical;
 
-    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::RecordingDeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
         link_bounded_shapes(vk, total_vars)?
     else {
         return Err(RegionSidecarError::UnsupportedVkShape);
@@ -384,25 +413,29 @@ pub(crate) fn encode_link_region_sidecar_canonical(
     }
     let mut out = Vec::with_capacity(expected);
     out.push(proof.version);
-    canonical::encode_duplex_deferred(
-        &mut out,
-        proof.leaf_a.version(),
-        proof.leaf_a.authority(),
-        &leaf_shape,
-    )?;
-    canonical::encode_merkle_deferred(
-        &mut out,
-        proof.path_b.version(),
-        proof.path_b.authority(),
-        &path_shape,
-    )?;
-    canonical::encode_duplex_deferred(
-        &mut out,
-        proof.rec_c.version(),
-        proof.rec_c.authority(),
-        &rec_shape,
-    )?;
-    canonical::encode_multi_walk(&mut out, &proof.walk, &walk_shape)?;
+    for repetition in &proof.repetitions {
+        canonical::encode_duplex_deferred(
+            &mut out,
+            repetition.leaf_a.version(),
+            repetition.leaf_a.authority(),
+            &leaf_shape,
+        )?;
+        canonical::encode_merkle_deferred(
+            &mut out,
+            repetition.path_b.version(),
+            repetition.path_b.authority(),
+            &path_shape,
+        )?;
+        preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &repetition.rec_c)?;
+        canonical::put_f128(&mut out, repetition.rec_c.selector());
+        canonical::encode_duplex_deferred(
+            &mut out,
+            repetition.rec_c.version(),
+            repetition.rec_c.authority(),
+            &rec_shape,
+        )?;
+        canonical::encode_multi_walk(&mut out, &repetition.walk, &walk_shape)?;
+    }
     if out.len() != expected {
         return Err(RegionSidecarError::InvalidProof);
     }
@@ -416,7 +449,7 @@ pub(crate) fn decode_link_region_sidecar_canonical(
 ) -> Result<LinkRegionSidecarProof, RegionSidecarError> {
     use super::canonical_codec as canonical;
 
-    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::RecordingDeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
         link_bounded_shapes(vk, total_vars)?
     else {
         return Err(RegionSidecarError::UnsupportedVkShape);
@@ -426,26 +459,36 @@ pub(crate) fn decode_link_region_sidecar_canonical(
     if reader.u8()? != LINK_REGION_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
-    let leaf_a = CombinedDuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
-        &mut reader,
-        &leaf_shape,
-    )?);
-    let path_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
-        &mut reader,
-        &path_shape,
-    )?);
-    let rec_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
-        &mut reader,
-        &rec_shape,
-    )?);
-    let walk = canonical::decode_multi_walk(&mut reader, &walk_shape)?;
+    let mut repetitions = Vec::with_capacity(SIDECAR_C1_REPETITIONS);
+    for _ in 0..SIDECAR_C1_REPETITIONS {
+        let leaf_a = CombinedDuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+            &mut reader,
+            &leaf_shape,
+        )?);
+        let path_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
+            &mut reader,
+            &path_shape,
+        )?);
+        let rec_selector = reader.f128()?;
+        let rec_c = RecordingDuplexRegionWalkDeferredProof::new(
+            rec_selector,
+            canonical::decode_duplex_deferred(&mut reader, &rec_shape)?,
+        );
+        preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &rec_c)?;
+        let walk = canonical::decode_multi_walk(&mut reader, &walk_shape)?;
+        repetitions.push(LinkRegionSidecarRepetitionProof {
+            leaf_a,
+            path_b,
+            rec_c,
+            walk,
+        });
+    }
     reader.finish()?;
     Ok(LinkRegionSidecarProof {
         version: LINK_REGION_SIDECAR_VERSION,
-        leaf_a,
-        path_b,
-        rec_c,
-        walk,
+        repetitions: repetitions
+            .try_into()
+            .expect("fixed C1 link-sidecar repetition count"),
     })
 }
 
@@ -455,44 +498,59 @@ pub(crate) fn canonical_link_region_sidecar_len(
 ) -> Result<usize, RegionSidecarError> {
     use super::canonical_codec as canonical;
 
-    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::RecordingDeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
         link_bounded_shapes(vk, total_vars)?
     else {
         return Err(RegionSidecarError::UnsupportedVkShape);
     };
-    [
+    let repetition_len = [
         canonical::deferred_fixed_len(&leaf_shape)?,
         canonical::deferred_merkle_len(&path_shape)?,
-        canonical::deferred_fixed_len(&rec_shape)?,
+        canonical::deferred_fixed_len(&rec_shape)?
+            .checked_add(16)
+            .ok_or(RegionSidecarError::InvalidProof)?,
         canonical::multi_walk_len(&walk_shape)?,
     ]
     .into_iter()
-    .try_fold(1usize, |sum, len| {
+    .try_fold(0usize, |sum, len| {
         sum.checked_add(len).ok_or(RegionSidecarError::InvalidProof)
-    })
+    })?;
+    repetition_len
+        .checked_mul(SIDECAR_C1_REPETITIONS)
+        .and_then(|len| len.checked_add(1))
+        .ok_or(RegionSidecarError::InvalidProof)
 }
 
-/// Decode the mandatory V4 link envelope only after all three deferred
-/// children and their shared multi-walk have passed one allocation-free,
-/// class-aware bincode scan.
+/// Decode the mandatory V5 link envelope only after both repetitions of all
+/// three deferred children and their shared multi-walk have passed one
+/// allocation-free, class-aware bincode scan.
 pub fn decode_link_region_sidecar_bounded(
     vk: &LinkRegionSidecarVk,
     total_vars: usize,
     bytes: &[u8],
 ) -> Result<LinkRegionSidecarProof, RegionSidecarError> {
     let shapes = link_bounded_shapes(vk, total_vars)?;
-    preflight_composite_proof(bytes, LINK_REGION_SIDECAR_VERSION, &shapes)?;
+    let repeated_shapes = (0..SIDECAR_C1_REPETITIONS)
+        .flat_map(|_| shapes.iter().cloned())
+        .collect::<Vec<_>>();
+    preflight_composite_proof(bytes, LINK_REGION_SIDECAR_VERSION, &repeated_shapes)?;
     record_serde_attempt();
     let proof: LinkRegionSidecarProof =
         bincode::deserialize(bytes).map_err(|_| RegionSidecarError::InvalidProof)?;
     if proof.version != LINK_REGION_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
-    preflight_combined_duplex_region_walk_deferred_trace(vk.leaf_a(), total_vars, &proof.leaf_a)?;
-    preflight_merkle_region_walk_deferred_trace(vk.path_b(), total_vars, &proof.path_b)?;
-    preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &proof.rec_c)?;
     let w_logs = link_w_logs(vk);
-    preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
+    for repetition in &proof.repetitions {
+        preflight_combined_duplex_region_walk_deferred_trace(
+            vk.leaf_a(),
+            total_vars,
+            &repetition.leaf_a,
+        )?;
+        preflight_merkle_region_walk_deferred_trace(vk.path_b(), total_vars, &repetition.path_b)?;
+        preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &repetition.rec_c)?;
+        preflight_multi_walk(&repetition.walk, max_w_log(&w_logs), w_logs.len())?;
+    }
     Ok(proof)
 }
 
@@ -510,7 +568,7 @@ fn link_bounded_shapes(
         SidecarProofShape::DeferredMerkle(
             merkle_shape_for_vk(vk.path_b(), total_vars)?.walk_deferred(),
         ),
-        SidecarProofShape::DeferredFixed(
+        SidecarProofShape::RecordingDeferredFixed(
             recording_duplex_bounded_shape(vk.rec_c(), total_vars)?.walk_deferred(),
         ),
         SidecarProofShape::MultiWalk(multi_walk_proof_shape(max_w_log(&w_logs), w_logs.len())?),
@@ -549,7 +607,7 @@ pub(crate) fn shape_only_link_region_sidecar_proof(
     };
 
     let shapes = link_bounded_shapes(vk, total_vars)?;
-    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::DeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
+    let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::RecordingDeferredFixed(rec_shape), SidecarProofShape::MultiWalk(walk_shape)] =
         shapes
     else {
         return Err(RegionSidecarError::UnsupportedVkShape);
@@ -578,15 +636,15 @@ pub(crate) fn shape_only_link_region_sidecar_proof(
         substitution: relation(path_shape.w_log, path_shape.substitution_values),
         shifts: shifts(path_shape.shifts, path_shape.w_log),
     });
-    let rec_c = DuplexRegionWalkDeferredProof::new(
+    let rec_c = RecordingDuplexRegionWalkDeferredProof::new(
+        F128::ZERO,
         crate::acceptance::trace::region_source_binding::DuplexUnionWalkDeferredProof {
             selection: relation(rec_shape.w_log, rec_shape.selection_values),
             substitution: relation(rec_shape.w_log, rec_shape.substitution_values),
             shifts: shifts(rec_shape.shifts, rec_shape.w_log),
         },
     );
-    Ok(LinkRegionSidecarProof {
-        version: LINK_REGION_SIDECAR_VERSION,
+    let repetition = LinkRegionSidecarRepetitionProof {
         leaf_a,
         path_b,
         rec_c,
@@ -598,51 +656,86 @@ pub(crate) fn shape_only_link_region_sidecar_proof(
                 })
                 .collect(),
         },
+    };
+    Ok(LinkRegionSidecarProof {
+        version: LINK_REGION_SIDECAR_VERSION,
+        repetitions: [repetition.clone(), repetition],
     })
 }
 
-fn verify_link_region_sidecar<Ch: Challenger>(
+fn verify_link_region_sidecar_repetition<Ch: Challenger>(
     vk: &LinkRegionSidecarVk,
     total_vars: usize,
-    proof: &LinkRegionSidecarProof,
+    proof: &LinkRegionSidecarRepetitionProof,
     challenger: &mut Ch,
 ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-    vk.validate_roles()?;
-    if proof.version != LINK_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
+    macro_rules! verify_stage {
+        ($label:literal, $expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => {
+                    if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+                        eprintln!("[link-sidecar verify] {}: {error:?}", $label);
+                    }
+                    return Err(error);
+                }
+            }
+        };
     }
+
+    vk.validate_roles()?;
     bind_link_vk(challenger, vk);
-    let leaf_a_prefix = verify_combined_duplex_region_walk_deferred_prefix(
-        vk.leaf_a(),
-        total_vars,
-        &proof.leaf_a,
-        challenger,
-    )?;
-    let path_b_prefix = verify_merkle_region_walk_deferred_prefix(
-        vk.path_b(),
-        total_vars,
-        &proof.path_b,
-        challenger,
-    )?;
-    let rec_c_prefix = verify_recording_duplex_region_walk_deferred_prefix(
-        vk.rec_c(),
-        total_vars,
-        &proof.rec_c,
-        challenger,
-    )?;
+    let leaf_a_prefix = verify_stage!(
+        "leaf-A prefix",
+        verify_combined_duplex_region_walk_deferred_prefix(
+            vk.leaf_a(),
+            total_vars,
+            &proof.leaf_a,
+            challenger,
+        )
+    );
+    let path_b_prefix = verify_stage!(
+        "path-B prefix",
+        verify_merkle_region_walk_deferred_prefix(
+            vk.path_b(),
+            total_vars,
+            &proof.path_b,
+            challenger,
+        )
+    );
+    let rec_c_prefix = verify_stage!(
+        "recording-C prefix",
+        verify_recording_duplex_region_walk_deferred_prefix(
+            vk.rec_c(),
+            total_vars,
+            &proof.rec_c,
+            challenger,
+        )
+    );
     let groups = vec![
         vec![leaf_a_prefix.group().clone()],
         vec![path_b_prefix.group().clone()],
         vec![rec_c_prefix.group().clone()],
     ];
-    let [leaf_a_terminal, path_b_terminal, rec_c_terminal]: [_; 3] =
-        verify_ragged_multi_deep_chain_walk(&link_w_logs(vk), &groups, &proof.walk, challenger)
-            .map_err(|_| RegionSidecarError::InvalidProof)?
-            .try_into()
-            .expect("verified leaf-A/path-B/rec-C terminal count");
-    let mut claims = leaf_a_prefix.finish(&leaf_a_terminal, challenger)?;
-    claims.extend(path_b_prefix.finish(&path_b_terminal, challenger)?);
-    claims.extend(rec_c_prefix.finish(&rec_c_terminal, challenger)?);
+    let [leaf_a_terminal, path_b_terminal, rec_c_terminal]: [_; 3] = verify_stage!(
+        "three-child multi-walk",
+        verify_ragged_multi_deep_chain_walk(&link_w_logs(vk), &groups, &proof.walk, challenger,)
+            .map_err(|_| RegionSidecarError::InvalidProof)
+    )
+    .try_into()
+    .expect("verified leaf-A/path-B/rec-C terminal count");
+    let mut claims = verify_stage!(
+        "leaf-A finish",
+        leaf_a_prefix.finish(&leaf_a_terminal, challenger)
+    );
+    claims.extend(verify_stage!(
+        "path-B finish",
+        path_b_prefix.finish(&path_b_terminal, challenger)
+    ));
+    claims.extend(verify_stage!(
+        "recording-C finish",
+        rec_c_prefix.finish(&rec_c_terminal, challenger)
+    ));
     Ok(claims)
 }
 
@@ -652,15 +745,29 @@ pub fn verify_link_region_sidecar_post_commit<Ch: Challenger>(
     proof: &LinkRegionSidecarProof,
     context: &mut FieldPostCommitVerifierContext<'_, Ch>,
 ) -> Result<(), RegionSidecarError> {
-    let claims = verify_link_region_sidecar(vk, context.total_vars(), proof, context)?;
-    context.append_claims(claims);
+    if proof.version != LINK_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    context.observe_label(LINK_C1_REPETITION_LABEL);
+    for (label, repetition) in LINK_C1_REPETITION_LABELS
+        .into_iter()
+        .zip(&proof.repetitions)
+    {
+        context.observe_label(label);
+        let claims = {
+            let total_vars = context.total_vars();
+            let mut channel = WideResponseLowChallenger::new(context);
+            verify_link_region_sidecar_repetition(vk, total_vars, repetition, &mut channel)?
+        };
+        context.append_claims(claims);
+    }
     Ok(())
 }
 
-/// Recursive trace verifier for the mandatory V4 link sidecar. All three
-/// deferred children and the ragged multi-walk are shape-preflighted before
-/// the first proof witness is allocated. Prefix, walk, and suffix order
-/// exactly matches the native prover/verifier transcript.
+/// Recursive trace verifier for the mandatory V5 link sidecar. Both complete
+/// repetitions are shape-preflighted before the first proof witness is
+/// allocated. Each repetition then runs against C1-wide responses projected
+/// to their uniform low coordinate.
 pub fn verify_link_region_sidecar_trace_post_commit<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     context: &mut FieldPostCommitTraceContext<'_, C>,
@@ -673,11 +780,38 @@ pub fn verify_link_region_sidecar_trace_post_commit<C: FsChannelOps>(
     }
     let total_vars = context.total_vars();
     let w_logs = link_w_logs(vk);
-    preflight_combined_duplex_region_walk_deferred_trace(vk.leaf_a(), total_vars, &proof.leaf_a)?;
-    preflight_merkle_region_walk_deferred_trace(vk.path_b(), total_vars, &proof.path_b)?;
-    preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &proof.rec_c)?;
-    preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
+    for repetition in &proof.repetitions {
+        preflight_combined_duplex_region_walk_deferred_trace(
+            vk.leaf_a(),
+            total_vars,
+            &repetition.leaf_a,
+        )?;
+        preflight_merkle_region_walk_deferred_trace(vk.path_b(), total_vars, &repetition.path_b)?;
+        preflight_recording_duplex_region_walk_deferred(vk.rec_c(), total_vars, &repetition.rec_c)?;
+        preflight_multi_walk(&repetition.walk, max_w_log(&w_logs), w_logs.len())?;
+    }
 
+    context.observe_label(b, LINK_C1_REPETITION_LABEL);
+    for (label, repetition) in LINK_C1_REPETITION_LABELS
+        .into_iter()
+        .zip(&proof.repetitions)
+    {
+        context.observe_label(b, label);
+        context.set_wide_response_low(true);
+        let result = verify_link_region_sidecar_repetition_trace(b, context, vk, repetition);
+        context.set_wide_response_low(false);
+        result?;
+    }
+    Ok(())
+}
+
+fn verify_link_region_sidecar_repetition_trace<C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    context: &mut FieldPostCommitTraceContext<'_, C>,
+    vk: &LinkRegionSidecarVk,
+    proof: &LinkRegionSidecarRepetitionProof,
+) -> Result<(), RegionSidecarError> {
+    let w_logs = link_w_logs(vk);
     context.observe_label(b, LINK_REGION_TRANSCRIPT_LABEL);
     crate::acceptance::trace::self_verify::observe_pinned_digest(
         b,
@@ -778,15 +912,17 @@ mod tests {
 
     /// Minimal recording vertical fixture: two ghost blocks and a zero-valued
     /// walk-deferred authority of the exact canonical shape.
-    fn recording_fixture() -> (
+    fn recording_fixture_for_selector(
+        selector: Option<F128>,
+    ) -> (
         RecordingDuplexRegionVk,
         usize,
-        super::super::DuplexRegionWalkDeferredProof,
+        RecordingDuplexRegionWalkDeferredProof,
         DeepChainWalkProof,
     ) {
         let layout = || {
             compile_duplex(&[
-                TranscriptOp::Absorb(vec![None, None]),
+                TranscriptOp::Absorb(vec![None, None, None, None]),
                 TranscriptOp::Squeeze(1),
             ])
         };
@@ -796,12 +932,20 @@ mod tests {
             log2_len: w_log,
             index: 64 + column,
         });
-        let vk = RecordingDuplexRegionVk::new(
-            link_recordings_purpose(),
-            w_log,
-            slices,
-            vec![(layout(), 0), (layout(), block)],
-        )
+        let blocks = vec![(layout(), 0), (layout(), block)];
+        let vk = match selector {
+            Some(_) => RecordingDuplexRegionVk::new_selected(
+                link_recordings_purpose(),
+                w_log,
+                slices,
+                WitnessSlice {
+                    log2_len: 0,
+                    index: 900,
+                },
+                [blocks.clone(), blocks],
+            ),
+            None => RecordingDuplexRegionVk::new(link_recordings_purpose(), w_log, slices, blocks),
+        }
         .expect("minimal recording vertical fixture");
         let relation = |values: usize| ColumnRelationProof {
             rounds: vec![[noid_ivc_core::field::F128::ZERO; RELATION_DEGREE]; w_log],
@@ -813,7 +957,8 @@ mod tests {
                 final_value: noid_ivc_core::field::F128::ZERO,
             })
             .collect();
-        let proof = super::super::DuplexRegionWalkDeferredProof::new(
+        let proof = RecordingDuplexRegionWalkDeferredProof::new(
+            selector.unwrap_or(F128::ZERO),
             crate::acceptance::trace::region_source_binding::DuplexUnionWalkDeferredProof {
                 selection: relation(8),
                 substitution: relation(6),
@@ -829,6 +974,15 @@ mod tests {
                 .collect(),
         };
         (vk, 10, proof, walk)
+    }
+
+    fn recording_fixture() -> (
+        RecordingDuplexRegionVk,
+        usize,
+        RecordingDuplexRegionWalkDeferredProof,
+        DeepChainWalkProof,
+    ) {
+        recording_fixture_for_selector(None)
     }
 
     fn shape_only_multi_walk(walks: &[DeepChainWalkProof]) -> MultiDeepChainWalkProof {
@@ -852,7 +1006,143 @@ mod tests {
     }
 
     #[test]
-    fn link_v3_bounded_decode_preflights_children_and_multi_walk_before_serde() {
+    fn link_sidecar_trace_row_ledger() {
+        use noid_ivc_core::field_circuit::{FsChannelTrace, FsChannelUnionRecorder};
+
+        let (leaf_vk, leaf_vars, leaf_a) = combined_fixture(link_r_pcs_leaf_sidecar_purpose());
+        let (path_vk, path_vars, path_b, _) =
+            merkle_decode_fixture_with_purpose(link_r_pcs_path_sidecar_purpose());
+        let (rec_vk, rec_vars, rec_c, rec_walk) = recording_fixture();
+        let leaf_w_log = leaf_vk.w_log();
+        let path_w_log = path_vk.w_log();
+        let total_vars = leaf_vars.max(path_vars).max(rec_vars);
+        let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk).unwrap();
+        let (leaf_a, leaf_a_walk) = leaf_a.into_walk_deferred_parts();
+        let (path_b, path_b_walk) = path_b.into_walk_deferred_parts(path_w_log);
+        assert_eq!(leaf_a_walk.layers[0].round_coeffs.len(), leaf_w_log);
+        let repetition = LinkRegionSidecarRepetitionProof {
+            leaf_a,
+            path_b,
+            rec_c,
+            walk: shape_only_multi_walk(&[leaf_a_walk, path_b_walk, rec_walk]),
+        };
+        let proof = LinkRegionSidecarProof {
+            version: LINK_REGION_SIDECAR_VERSION,
+            repetitions: [repetition.clone(), repetition],
+        };
+        let mut builder = FieldR1csBuilder::new_witness_only();
+        let root = [
+            crate::acceptance::trace::LinExpr::zero(),
+            crate::acceptance::trace::LinExpr::zero(),
+        ];
+        let mut channel = FsChannelTrace::new_c1(&mut builder, b"link-sidecar-row-ledger-c1");
+        let mut context = FieldPostCommitTraceContext::detached(&root, total_vars, &mut channel);
+        let start = builder.num_wires();
+        verify_link_region_sidecar_trace_post_commit(&mut builder, &mut context, &vk, &proof)
+            .unwrap();
+        eprintln!(
+            "[sidecar-row-ledger] link: {} wires",
+            builder.num_wires() - start
+        );
+
+        let mut builder = FieldR1csBuilder::new_witness_only();
+        let root = [
+            crate::acceptance::trace::LinExpr::zero(),
+            crate::acceptance::trace::LinExpr::zero(),
+        ];
+        let mut channel = FsChannelUnionRecorder::new_c1(b"link-sidecar-recorded-row-ledger-c1");
+        let mut context = FieldPostCommitTraceContext::detached(&root, total_vars, &mut channel);
+        let start = builder.num_wires();
+        verify_link_region_sidecar_trace_post_commit(&mut builder, &mut context, &vk, &proof)
+            .unwrap();
+        eprintln!(
+            "[sidecar-row-ledger] link-recorded: {} wires, {} ops",
+            builder.num_wires() - start,
+            channel.finish().ops.len(),
+        );
+    }
+
+    #[test]
+    fn selected_recording_selector_roundtrips_and_rejects_non_boolean_values() {
+        let (leaf_vk, leaf_vars, leaf_a) = combined_fixture(link_r_pcs_leaf_sidecar_purpose());
+        let (path_vk, path_vars, path_b, _) =
+            merkle_decode_fixture_with_purpose(link_r_pcs_path_sidecar_purpose());
+        let (rec_vk, rec_vars, rec_c, rec_walk) = recording_fixture_for_selector(Some(F128::ZERO));
+        let leaf_w_log = leaf_vk.w_log();
+        let path_w_log = path_vk.w_log();
+        let total_vars = leaf_vars.max(path_vars).max(rec_vars);
+        let vk = LinkRegionSidecarVk::new(leaf_vk, path_vk, rec_vk).unwrap();
+        let (leaf_a, leaf_a_walk) = leaf_a.into_walk_deferred_parts();
+        let (path_b, path_b_walk) = path_b.into_walk_deferred_parts(path_w_log);
+        assert_eq!(leaf_a_walk.layers[0].round_coeffs.len(), leaf_w_log);
+        let walk = shape_only_multi_walk(&[leaf_a_walk, path_b_walk, rec_walk]);
+        let proof_with_selector = |selector| {
+            let repetition = LinkRegionSidecarRepetitionProof {
+                leaf_a: leaf_a.clone(),
+                path_b: path_b.clone(),
+                rec_c: RecordingDuplexRegionWalkDeferredProof::new(
+                    selector,
+                    rec_c.authority().clone(),
+                ),
+                walk: walk.clone(),
+            };
+            LinkRegionSidecarProof {
+                version: LINK_REGION_SIDECAR_VERSION,
+                repetitions: [repetition.clone(), repetition],
+            }
+        };
+
+        for selector in [F128::ZERO, F128::ONE] {
+            let proof = proof_with_selector(selector);
+            let canonical = encode_link_region_sidecar_canonical(&vk, total_vars, &proof).unwrap();
+            assert_eq!(
+                decode_link_region_sidecar_canonical(&vk, total_vars, &canonical).unwrap(),
+                proof
+            );
+            let bincode = bincode::serialize(&proof).unwrap();
+            assert_eq!(
+                decode_link_region_sidecar_bounded(&vk, total_vars, &bincode).unwrap(),
+                proof
+            );
+        }
+
+        let non_boolean = F128 { lo: 2, hi: 0 };
+        let forged = proof_with_selector(non_boolean);
+        assert_eq!(
+            encode_link_region_sidecar_canonical(&vk, total_vars, &forged).unwrap_err(),
+            RegionSidecarError::InvalidProof
+        );
+        let forged_bincode = bincode::serialize(&forged).unwrap();
+        let before = bounded_decode::serde_attempts();
+        assert_eq!(
+            decode_link_region_sidecar_bounded(&vk, total_vars, &forged_bincode).unwrap_err(),
+            RegionSidecarError::InvalidProof
+        );
+        assert_eq!(bounded_decode::serde_attempts(), before + 1);
+
+        let zero_proof = proof_with_selector(F128::ZERO);
+        let mut forged_canonical =
+            encode_link_region_sidecar_canonical(&vk, total_vars, &zero_proof).unwrap();
+        let [SidecarProofShape::DeferredFixed(leaf_shape), SidecarProofShape::DeferredMerkle(path_shape), SidecarProofShape::RecordingDeferredFixed(_), SidecarProofShape::MultiWalk(_)] =
+            link_bounded_shapes(&vk, total_vars).unwrap()
+        else {
+            panic!("canonical selected Link shape");
+        };
+        let selector_offset = 1
+            + super::super::canonical_codec::deferred_fixed_len(&leaf_shape).unwrap()
+            + super::super::canonical_codec::deferred_merkle_len(&path_shape).unwrap();
+        let mut selector_bytes = Vec::new();
+        super::super::canonical_codec::put_f128(&mut selector_bytes, non_boolean);
+        forged_canonical[selector_offset..selector_offset + selector_bytes.len()]
+            .copy_from_slice(&selector_bytes);
+        assert_eq!(
+            decode_link_region_sidecar_canonical(&vk, total_vars, &forged_canonical).unwrap_err(),
+            RegionSidecarError::InvalidProof
+        );
+    }
+
+    #[test]
+    fn link_v5_bounded_decode_preflights_both_repetitions_before_serde() {
         let (leaf_vk, leaf_vars, leaf_a) = combined_fixture(link_r_pcs_leaf_sidecar_purpose());
         let (path_vk, path_vars, path_b, _) =
             merkle_decode_fixture_with_purpose(link_r_pcs_path_sidecar_purpose());
@@ -865,13 +1155,25 @@ mod tests {
         let (path_b, path_b_walk) = path_b.into_walk_deferred_parts(path_w_log);
         assert_eq!(leaf_a_walk.layers[0].round_coeffs.len(), leaf_w_log);
         let walk = shape_only_multi_walk(&[leaf_a_walk, path_b_walk, rec_walk]);
-        let proof = LinkRegionSidecarProof {
-            version: LINK_REGION_SIDECAR_VERSION,
+        let repetition = LinkRegionSidecarRepetitionProof {
             leaf_a,
             path_b,
             rec_c,
             walk,
         };
+        let proof = LinkRegionSidecarProof {
+            version: LINK_REGION_SIDECAR_VERSION,
+            repetitions: [repetition.clone(), repetition],
+        };
+        let canonical = encode_link_region_sidecar_canonical(&vk, total_vars, &proof).unwrap();
+        assert_eq!(
+            canonical.len(),
+            canonical_link_region_sidecar_len(&vk, total_vars).unwrap()
+        );
+        assert_eq!(
+            decode_link_region_sidecar_canonical(&vk, total_vars, &canonical).unwrap(),
+            proof
+        );
         let encoded = bincode::serialize(&proof).unwrap();
 
         let before = bounded_decode::serde_attempts();
@@ -901,10 +1203,13 @@ mod tests {
         );
 
         let shapes = link_bounded_shapes(&vk, total_vars).unwrap();
+        let repeated_shapes = (0..SIDECAR_C1_REPETITIONS)
+            .flat_map(|_| shapes.iter().cloned())
+            .collect::<Vec<_>>();
         let offsets = bounded_decode::composite_layout_offsets(
             &encoded,
             LINK_REGION_SIDECAR_VERSION,
-            &shapes,
+            &repeated_shapes,
         )
         .unwrap();
         let versions = offsets
@@ -913,7 +1218,11 @@ mod tests {
                 (*field == bounded_decode::LayoutField::Version).then_some(*offset)
             })
             .collect::<Vec<_>>();
-        assert_eq!(versions.len(), 4, "envelope plus three child versions");
+        assert_eq!(
+            versions.len(),
+            1 + 3 * SIDECAR_C1_REPETITIONS,
+            "envelope plus three child versions per repetition"
+        );
         for offset in &versions[1..] {
             let mut forged = encoded.clone();
             forged[*offset] ^= 1;
@@ -922,7 +1231,7 @@ mod tests {
                 RegionSidecarError::UnsupportedVersion
             );
         }
-        for child in 0..3 {
+        for child in 0..(3 * SIDECAR_C1_REPETITIONS) {
             let start = versions[child + 1];
             let end = versions.get(child + 2).copied().unwrap_or(encoded.len());
             let offset = offsets

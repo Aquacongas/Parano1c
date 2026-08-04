@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::lincheck::{self, QuirkyPoint};
 use crate::pcs::{self, Commitment};
 use crate::proof::{R1csClaim, R1csProof, R1csProofLigerito, ZClaim};
@@ -89,6 +89,14 @@ impl<Ch: Challenger> Challenger for FieldPostCommitVerifierContext<'_, Ch> {
         self.challenger.observe_f128_slice(values);
     }
 
+    fn observe_f256(&mut self, value: F256) {
+        self.challenger.observe_f256(value);
+    }
+
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        self.challenger.observe_f256_slice(values);
+    }
+
     fn observe_bytes(&mut self, bytes: &[u8]) {
         self.challenger.observe_bytes(bytes);
     }
@@ -99,6 +107,14 @@ impl<Ch: Challenger> Challenger for FieldPostCommitVerifierContext<'_, Ch> {
 
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         self.challenger.sample_f128_vec(n)
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        self.challenger.sample_f256()
+    }
+
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        self.challenger.sample_f256_vec(n)
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -556,6 +572,96 @@ pub fn verify_field<Ch: Challenger>(
     })
 }
 
+/// Verify the closed native C1 History chain. No profile flag is accepted;
+/// the proof type, statement domain, and every algebraic transcript move are
+/// intrinsically wide.
+pub fn verify_field_c1<Ch: Challenger>(
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+    proof: &crate::proof::C1FieldR1csProof,
+    challenger: &mut Ch,
+) -> Result<crate::proof::C1R1csClaim, VerifyError> {
+    install_verifier(move || verify_field_c1_inner(r1cs, commitment, proof, challenger))
+}
+
+fn verify_field_c1_inner<Ch: Challenger>(
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+    proof: &crate::proof::C1FieldR1csProof,
+    challenger: &mut Ch,
+) -> Result<crate::proof::C1R1csClaim, VerifyError> {
+    if commitment.params.m != r1cs.m + pcs::LOG_PACKING
+        || commitment.params.log_batch_size + pcs::LOG_PACKING > commitment.params.m
+    {
+        return Err(VerifyError::ParamsMismatch);
+    }
+    crate::proof::bind_statement_field_c1(challenger, r1cs, commitment);
+
+    let zerocheck_claim = zerocheck::field_c1::verify(r1cs.m, &proof.zerocheck, challenger)
+        .map_err(VerifyError::Zerocheck)?;
+    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+    let lincheck_point = lincheck::c1::C1QuirkyPoint {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let row_circuit = crate::field_r1cs::FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
+    let lincheck_claim = lincheck::c1::verify(
+        r1cs.m,
+        r1cs.k_log,
+        r1cs.k_skip,
+        &row_circuit,
+        &lincheck_point,
+        zerocheck_claim.a_eval,
+        zerocheck_claim.b_eval,
+        &proof.lincheck,
+        challenger,
+    )
+    .map_err(VerifyError::Lincheck)?;
+
+    let ab = crate::proof::C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: lincheck_claim.r_inner_skip,
+            x_inner_rest: lincheck_claim.r_inner_rest.clone(),
+            x_outer: lincheck_point.x_outer.clone(),
+        },
+        value: lincheck_claim.w,
+    };
+    let c = crate::proof::C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: zerocheck_claim.z,
+            x_inner_rest: zerocheck_claim.r_rest[..inner_rest_len].to_vec(),
+            x_outer: zerocheck_claim.r_rest[inner_rest_len..].to_vec(),
+        },
+        value: zerocheck_claim.c_eval,
+    };
+    let x_rest = |claim: &crate::proof::C1ZClaim| {
+        let mut rest = claim.point.x_inner_rest.clone();
+        rest.extend_from_slice(&claim.point.x_outer);
+        rest
+    };
+    let ab_rest = x_rest(&ab);
+    let c_rest = x_rest(&c);
+    let refs = [
+        pcs::C1QuirkyDirectClaimRef {
+            z_skip: ab.point.z_skip,
+            k_skip: r1cs.k_skip,
+            x_rest: &ab_rest,
+            value: ab.value,
+        },
+        pcs::C1QuirkyDirectClaimRef {
+            z_skip: c.point.z_skip,
+            k_skip: r1cs.k_skip,
+            x_rest: &c_rest,
+            value: c.value,
+        },
+    ];
+    pcs::verify_opening_batch_quirky_direct_c1(commitment, &refs, &proof.pcs_open, challenger)
+        .map_err(VerifyError::PcsAb)?;
+
+    Ok(crate::proof::C1R1csClaim { ab, c })
+}
+
 /// [`verify_field`] with a public-IO envelope: mirrors
 /// `prove_field_with_public_io` — absorbs the spec + envelope lanes right
 /// after the statement binding, samples the binding point, and checks the
@@ -765,6 +871,163 @@ where
             },
         )
     })
+}
+
+/// C1 production verifier with public IO, typed post-commit sidecars and a
+/// deferred matrix terminal. The sidecar claim coordinates are F128 protocol
+/// outputs and are embedded canonically into the extension-field PCS batch.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_c1_deferred_matrix_with_post_commit_context<Ch, Aux, PostCommit>(
+    shape: &crate::proof::FieldShape,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+    proof: &crate::proof::C1FieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[crate::field::F128],
+    post_commit_class_digest: &[u8; 32],
+    auxiliary: &Aux,
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> Result<
+    (
+        crate::proof::C1R1csClaim,
+        crate::matrix_claim::c1::C1FreshLincheckClaim,
+    ),
+    VerifyError,
+>
+where
+    Ch: Challenger,
+    Aux: Sync,
+    PostCommit:
+        FnOnce(&Aux, &mut FieldPostCommitVerifierContext<'_, Ch>) -> Result<(), VerifyError> + Send,
+{
+    install_verifier(move || {
+        verify_field_c1_deferred_matrix_inner(
+            shape,
+            statement_digest,
+            commitment,
+            proof,
+            spec,
+            io,
+            challenger,
+            |commitment, challenger| {
+                bind_post_commit_class(challenger, post_commit_class_digest);
+                let mut context =
+                    FieldPostCommitVerifierContext::new(commitment, shape.m, challenger);
+                post_commit(auxiliary, &mut context)?;
+                Ok(context.finish())
+            },
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
+    shape: &crate::proof::FieldShape,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+    proof: &crate::proof::C1FieldR1csProof,
+    spec: &crate::public_io::PublicIoSpec,
+    io: &[crate::field::F128],
+    challenger: &mut Ch,
+    post_commit: impl FnOnce(&Commitment, &mut Ch) -> Result<Vec<pcs::QuirkyDirectClaim>, VerifyError>,
+) -> Result<
+    (
+        crate::proof::C1R1csClaim,
+        crate::matrix_claim::c1::C1FreshLincheckClaim,
+    ),
+    VerifyError,
+> {
+    if commitment.params.m != shape.m + pcs::LOG_PACKING
+        || commitment.params.log_batch_size + pcs::LOG_PACKING > commitment.params.m
+    {
+        return Err(VerifyError::ParamsMismatch);
+    }
+
+    crate::proof::bind_statement_field_parts_c1(challenger, statement_digest, commitment);
+    let io_claims = crate::public_io::bind_public_io_c1(challenger, spec, io, shape.m);
+    let auxiliary_claims = post_commit(commitment, challenger)?;
+
+    let zerocheck_claim = zerocheck::field_c1::verify(shape.m, &proof.zerocheck, challenger)
+        .map_err(VerifyError::Zerocheck)?;
+    let inner_rest_len = shape.k_log - shape.k_skip;
+    let lincheck_point = lincheck::c1::C1QuirkyPoint {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let (lincheck_claim, fresh) = lincheck::c1::verify_deferred(
+        shape.m,
+        shape.k_log,
+        shape.k_skip,
+        shape.const_pin,
+        &lincheck_point,
+        zerocheck_claim.a_eval,
+        zerocheck_claim.b_eval,
+        &proof.lincheck,
+        challenger,
+    )
+    .map_err(VerifyError::Lincheck)?;
+
+    let ab = crate::proof::C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: lincheck_claim.r_inner_skip,
+            x_inner_rest: lincheck_claim.r_inner_rest.clone(),
+            x_outer: lincheck_point.x_outer.clone(),
+        },
+        value: lincheck_claim.w,
+    };
+    let c = crate::proof::C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: zerocheck_claim.z,
+            x_inner_rest: zerocheck_claim.r_rest[..inner_rest_len].to_vec(),
+            x_outer: zerocheck_claim.r_rest[inner_rest_len..].to_vec(),
+        },
+        value: zerocheck_claim.c_eval,
+    };
+    let rest = |claim: &crate::proof::C1ZClaim| {
+        let mut coordinates = claim.point.x_inner_rest.clone();
+        coordinates.extend_from_slice(&claim.point.x_outer);
+        coordinates
+    };
+    let mut claims = vec![
+        pcs::C1QuirkyDirectClaim {
+            z_skip: ab.point.z_skip,
+            k_skip: shape.k_skip,
+            x_rest: rest(&ab),
+            value: ab.value,
+        },
+        pcs::C1QuirkyDirectClaim {
+            z_skip: c.point.z_skip,
+            k_skip: shape.k_skip,
+            x_rest: rest(&c),
+            value: c.value,
+        },
+    ];
+    claims.extend(io_claims);
+    claims.extend(
+        auxiliary_claims
+            .into_iter()
+            .map(|claim| pcs::C1QuirkyDirectClaim {
+                z_skip: F256::from_base(claim.z_skip),
+                k_skip: claim.k_skip,
+                x_rest: claim.x_rest.into_iter().map(F256::from_base).collect(),
+                value: F256::from_base(claim.value),
+            }),
+    );
+    let refs = claims
+        .iter()
+        .map(|claim| pcs::C1QuirkyDirectClaimRef {
+            z_skip: claim.z_skip,
+            k_skip: claim.k_skip,
+            x_rest: &claim.x_rest,
+            value: claim.value,
+        })
+        .collect::<Vec<_>>();
+    pcs::verify_opening_batch_quirky_direct_c1(commitment, &refs, &proof.pcs_open, challenger)
+        .map_err(VerifyError::PcsAb)?;
+
+    Ok((crate::proof::C1R1csClaim { ab, c }, fresh))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -76,23 +76,23 @@ pub enum ZkPhaseAError {
 
 /// The two scalar claims fixed before `gamma` is sampled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ZkPhaseARelationClaims {
+pub struct ZkPhaseARelationClaims<F = Block128> {
     /// `b = <B,t>`.
-    pub bank: Block128,
+    pub bank: F,
     /// `sigma = <C,t>`.
-    pub companion: Block128,
+    pub companion: F,
 }
 
 /// Exactly two serialized field elements for one degree-two sumcheck round.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ZkPhaseARoundProof {
+pub struct ZkPhaseARoundProof<F = Block128> {
     /// The round polynomial evaluated at one.
-    pub at_one: Block128,
+    pub at_one: F,
     /// The quadratic coefficient, equivalently the value at infinity.
-    pub at_infinity: Block128,
+    pub at_infinity: F,
 }
 
-impl ZkPhaseARoundProof {
+impl<F: TowerField> ZkPhaseARoundProof<F> {
     /// Advance one verifier claim at the caller-supplied round challenge.
     ///
     /// In characteristic two, `p(0) = claim + p(1)` and the linear
@@ -100,46 +100,46 @@ impl ZkPhaseARoundProof {
     ///
     /// `p(r) = p(0) + r*(claim + p(infinity)) + r^2*p(infinity)`.
     #[inline]
-    pub fn evaluate_from_claim(self, claim: Block128, challenge: Block128) -> Block128 {
+    pub fn evaluate_from_claim(self, claim: F, challenge: F) -> F {
         let at_zero = claim + self.at_one;
         let linear = claim + self.at_infinity;
-        at_zero + challenge * linear + challenge.square() * self.at_infinity
+        at_zero + challenge * linear + challenge * challenge * self.at_infinity
     }
 }
 
 /// The Phase-A sumcheck body. No terminal value is duplicated in this proof:
 /// production Phase B must supply the linked `O_gamma(s)` claim.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ZkPhaseAProof {
-    pub rounds: [ZkPhaseARoundProof; PHASE_A_VARS],
+pub struct ZkPhaseAProof<F = Block128> {
+    pub rounds: [ZkPhaseARoundProof<F>; PHASE_A_VARS],
 }
 
 /// Native prover result. `terminal_oracle_value` is an internal hand-off to
 /// Phase B, not an independently trusted opening.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZkPhaseAProverOutput {
-    pub proof: ZkPhaseAProof,
-    pub relation_claims: ZkPhaseARelationClaims,
-    pub initial_claim: Block128,
-    pub terminal_point: [Block128; PHASE_A_VARS],
-    pub terminal_oracle_value: Block128,
+pub struct ZkPhaseAProverOutput<F = Block128> {
+    pub proof: ZkPhaseAProof<F>,
+    pub relation_claims: ZkPhaseARelationClaims<F>,
+    pub initial_claim: F,
+    pub terminal_point: [F; PHASE_A_VARS],
+    pub terminal_oracle_value: F,
 }
 
 /// Values reconstructed by native verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ZkPhaseAVerifierOutput {
-    pub initial_claim: Block128,
-    pub terminal_point: [Block128; PHASE_A_VARS],
-    pub terminal_relation_value: Block128,
-    pub terminal_oracle_value: Block128,
+pub struct ZkPhaseAVerifierOutput<F = Block128> {
+    pub initial_claim: F,
+    pub terminal_point: [F; PHASE_A_VARS],
+    pub terminal_relation_value: F,
+    pub terminal_oracle_value: F,
 }
 
 #[inline]
-fn check_gamma(gamma: Block128) -> Result<(), ZkPhaseAError> {
-    if gamma == Block128::ZERO {
+fn check_gamma<F: TowerField>(gamma: F) -> Result<(), ZkPhaseAError> {
+    if gamma == F::ZERO {
         return Err(ZkPhaseAError::GammaZero);
     }
-    if gamma == Block128::ONE {
+    if gamma == F::ONE {
         return Err(ZkPhaseAError::GammaOne);
     }
     Ok(())
@@ -156,10 +156,10 @@ fn check_len(
     Ok(())
 }
 
-fn check_input_lengths(
+fn check_input_lengths<F>(
     bank: &[Block128],
-    companion: &[Block128],
-    relation: &[Block128],
+    companion: &[F],
+    relation: &[F],
 ) -> Result<(), ZkPhaseAError> {
     check_len(bank.len(), |expected, actual| ZkPhaseAError::BankLength {
         expected,
@@ -173,7 +173,7 @@ fn check_input_lengths(
     })
 }
 
-fn check_challenges(challenges_high_to_low: &[Block128]) -> Result<(), ZkPhaseAError> {
+fn check_challenges<F>(challenges_high_to_low: &[F]) -> Result<(), ZkPhaseAError> {
     if challenges_high_to_low.len() != PHASE_A_VARS {
         return Err(ZkPhaseAError::ChallengeCount {
             expected: PHASE_A_VARS,
@@ -184,11 +184,14 @@ fn check_challenges(challenges_high_to_low: &[Block128]) -> Result<(), ZkPhaseAE
 }
 
 /// Construct `O_gamma = B + gamma*(B+C)` in natural bank order.
-pub fn phase_a_virtual_oracle(
+pub fn phase_a_virtual_oracle<F>(
     bank: &[Block128],
-    companion: &[Block128],
-    gamma: Block128,
-) -> Result<Vec<Block128>, ZkPhaseAError> {
+    companion: &[F],
+    gamma: F,
+) -> Result<Vec<F>, ZkPhaseAError>
+where
+    F: TowerField + From<Block128>,
+{
     check_gamma(gamma)?;
     check_len(bank.len(), |expected, actual| ZkPhaseAError::BankLength {
         expected,
@@ -201,37 +204,43 @@ pub fn phase_a_virtual_oracle(
     Ok(bank
         .iter()
         .zip(companion)
-        .map(|(&b, &c)| b + gamma * (b + c))
+        .map(|(&b, &c)| {
+            let b = F::from(b);
+            b + gamma * (b + c)
+        })
         .collect())
 }
 
 /// Compute `b=<B,t>` and `sigma=<C,t>`.
-pub fn phase_a_relation_claims(
+pub fn phase_a_relation_claims<F>(
     bank: &[Block128],
-    companion: &[Block128],
-    relation: &[Block128],
-) -> Result<ZkPhaseARelationClaims, ZkPhaseAError> {
+    companion: &[F],
+    relation: &[F],
+) -> Result<ZkPhaseARelationClaims<F>, ZkPhaseAError>
+where
+    F: TowerField + From<Block128>,
+{
     check_input_lengths(bank, companion, relation)?;
     Ok(ZkPhaseARelationClaims {
-        bank: inner_product(bank, relation),
+        bank: inner_product_base(bank, relation),
         companion: inner_product(companion, relation),
     })
 }
 
 /// Combine `b` and `sigma` into `<O_gamma,t>`.
-pub fn phase_a_initial_claim(
-    claims: ZkPhaseARelationClaims,
-    gamma: Block128,
-) -> Result<Block128, ZkPhaseAError> {
+pub fn phase_a_initial_claim<F: TowerField>(
+    claims: ZkPhaseARelationClaims<F>,
+    gamma: F,
+) -> Result<F, ZkPhaseAError> {
     check_gamma(gamma)?;
     Ok(claims.bank + gamma * (claims.bank + claims.companion))
 }
 
 /// Convert caller challenge order `[s_10,...,s_0]` to the canonical MLE point
 /// `[s_0,...,s_10]`.
-pub fn phase_a_terminal_point(
-    challenges_high_to_low: &[Block128],
-) -> Result<[Block128; PHASE_A_VARS], ZkPhaseAError> {
+pub fn phase_a_terminal_point<F: Copy>(
+    challenges_high_to_low: &[F],
+) -> Result<[F; PHASE_A_VARS], ZkPhaseAError> {
     check_challenges(challenges_high_to_low)?;
     Ok(std::array::from_fn(|low_variable| {
         challenges_high_to_low[PHASE_A_VARS - 1 - low_variable]
@@ -247,13 +256,16 @@ pub fn phase_a_terminal_point(
 /// next challenge.  Keeping this sequencing inside the prover loop prevents
 /// a caller from pre-sampling all Phase-A challenges before the messages that
 /// are supposed to bind them.
-fn prove_phase_a_virtual_oracle_owned_adaptive(
-    mut oracle: Zeroizing<Vec<Block128>>,
-    relation: &[Block128],
-    relation_claims: ZkPhaseARelationClaims,
-    gamma: Block128,
-    mut challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof) -> Block128,
-) -> Result<ZkPhaseAProverOutput, ZkPhaseAError> {
+fn prove_phase_a_virtual_oracle_owned_adaptive<F>(
+    mut oracle: Zeroizing<Vec<F>>,
+    relation: &[F],
+    relation_claims: ZkPhaseARelationClaims<F>,
+    gamma: F,
+    mut challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof<F>) -> F,
+) -> Result<ZkPhaseAProverOutput<F>, ZkPhaseAError>
+where
+    F: TowerField + Zeroize,
+{
     check_len(oracle.len(), |expected, actual| ZkPhaseAError::BankLength {
         expected,
         actual,
@@ -270,13 +282,13 @@ fn prove_phase_a_virtual_oracle_owned_adaptive(
     let mut relation_folded = Zeroizing::new(relation.to_vec());
     let mut running_claim = initial_claim;
     let mut rounds = [ZkPhaseARoundProof::default(); PHASE_A_VARS];
-    let mut challenges_high_to_low = [Block128::ZERO; PHASE_A_VARS];
+    let mut challenges_high_to_low = [F::ZERO; PHASE_A_VARS];
 
     for round in 0..PHASE_A_VARS {
         let half = oracle.len() / 2;
-        let mut at_zero = Block128::ZERO;
-        let mut linear = Block128::ZERO;
-        let mut at_infinity = Block128::ZERO;
+        let mut at_zero = F::ZERO;
+        let mut linear = F::ZERO;
+        let mut at_infinity = F::ZERO;
 
         // HIGH-to-LOW binding pairs the two halves. The surviving index bits
         // remain in canonical natural order for the lower variables.
@@ -330,13 +342,16 @@ fn prove_phase_a_virtual_oracle_owned_adaptive(
 /// any round message is released, and the oracle copy is zeroized after the
 /// adaptive sumcheck.  Production authorization still reaches the same core
 /// through [`prove_phase_a_adaptive`] and its consuming PCS typestate.
-pub fn prove_phase_a_from_virtual_oracle_adaptive(
-    virtual_oracle: &[Block128],
-    relation: &[Block128],
-    relation_claims: ZkPhaseARelationClaims,
-    gamma: Block128,
-    challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof) -> Block128,
-) -> Result<ZkPhaseAProverOutput, ZkPhaseAError> {
+pub fn prove_phase_a_from_virtual_oracle_adaptive<F>(
+    virtual_oracle: &[F],
+    relation: &[F],
+    relation_claims: ZkPhaseARelationClaims<F>,
+    gamma: F,
+    challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof<F>) -> F,
+) -> Result<ZkPhaseAProverOutput<F>, ZkPhaseAError>
+where
+    F: TowerField + Zeroize,
+{
     prove_phase_a_virtual_oracle_owned_adaptive(
         Zeroizing::new(virtual_oracle.to_vec()),
         relation,
@@ -346,13 +361,16 @@ pub fn prove_phase_a_from_virtual_oracle_adaptive(
     )
 }
 
-pub fn prove_phase_a_adaptive(
+pub fn prove_phase_a_adaptive<F>(
     bank: &[Block128],
-    companion: &[Block128],
-    relation: &[Block128],
-    gamma: Block128,
-    challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof) -> Block128,
-) -> Result<ZkPhaseAProverOutput, ZkPhaseAError> {
+    companion: &[F],
+    relation: &[F],
+    gamma: F,
+    challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof<F>) -> F,
+) -> Result<ZkPhaseAProverOutput<F>, ZkPhaseAError>
+where
+    F: TowerField + From<Block128> + Zeroize,
+{
     check_input_lengths(bank, companion, relation)?;
     let relation_claims = phase_a_relation_claims(bank, companion, relation)?;
     let virtual_oracle = Zeroizing::new(phase_a_virtual_oracle(bank, companion, gamma)?);
@@ -369,13 +387,16 @@ pub fn prove_phase_a_adaptive(
 /// vector.  This transcript-free adapter is retained for algebra tests and
 /// verifier differentials; production Fiat--Shamir proving should use
 /// [`prove_phase_a_adaptive`].
-pub fn prove_phase_a(
+pub fn prove_phase_a<F>(
     bank: &[Block128],
-    companion: &[Block128],
-    relation: &[Block128],
-    gamma: Block128,
-    challenges_high_to_low: &[Block128],
-) -> Result<ZkPhaseAProverOutput, ZkPhaseAError> {
+    companion: &[F],
+    relation: &[F],
+    gamma: F,
+    challenges_high_to_low: &[F],
+) -> Result<ZkPhaseAProverOutput<F>, ZkPhaseAError>
+where
+    F: TowerField + From<Block128> + Zeroize,
+{
     check_challenges(challenges_high_to_low)?;
     prove_phase_a_adaptive(bank, companion, relation, gamma, |round, _proof| {
         challenges_high_to_low[round]
@@ -387,14 +408,17 @@ pub fn prove_phase_a(
 /// The transparent terminal `t(s)` is recomputed locally. Acceptance is the
 /// single final equality `running_claim == t(s) * O_gamma(s)` after replaying
 /// all eleven round messages.
-pub fn verify_phase_a(
-    proof: &ZkPhaseAProof,
-    relation_claims: ZkPhaseARelationClaims,
-    relation: &[Block128],
-    gamma: Block128,
-    challenges_high_to_low: &[Block128],
-    terminal_oracle_value: Block128,
-) -> Result<ZkPhaseAVerifierOutput, ZkPhaseAError> {
+pub fn verify_phase_a<F>(
+    proof: &ZkPhaseAProof<F>,
+    relation_claims: ZkPhaseARelationClaims<F>,
+    relation: &[F],
+    gamma: F,
+    challenges_high_to_low: &[F],
+    terminal_oracle_value: F,
+) -> Result<ZkPhaseAVerifierOutput<F>, ZkPhaseAError>
+where
+    F: TowerField,
+{
     check_gamma(gamma)?;
     check_len(relation.len(), |expected, actual| {
         ZkPhaseAError::RelationLength { expected, actual }
@@ -421,14 +445,23 @@ pub fn verify_phase_a(
 }
 
 #[inline]
-fn inner_product(left: &[Block128], right: &[Block128]) -> Block128 {
+fn inner_product<F: TowerField>(left: &[F], right: &[F]) -> F {
     left.iter()
         .zip(right)
-        .fold(Block128::ZERO, |sum, (&x, &y)| sum + x * y)
+        .fold(F::ZERO, |sum, (&x, &y)| sum + x * y)
+}
+
+fn inner_product_base<F>(left: &[Block128], right: &[F]) -> F
+where
+    F: TowerField + From<Block128>,
+{
+    left.iter()
+        .zip(right)
+        .fold(F::ZERO, |sum, (&x, &y)| sum + F::from(x) * y)
 }
 
 /// Bind the highest remaining natural-order MLE variable.
-fn fold_highest_variable(values: &mut Zeroizing<Vec<Block128>>, challenge: Block128) {
+fn fold_highest_variable<F: TowerField + Zeroize>(values: &mut Zeroizing<Vec<F>>, challenge: F) {
     debug_assert!(values.len().is_power_of_two() && values.len() >= 2);
     let half = values.len() / 2;
     for low_index in 0..half {

@@ -5,13 +5,16 @@
 
 use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::deep_chain::capsule_leaf::{
-    capsule_leaf_fixed_patterns, capsule_leaf_iv_flat, CAPSULE_LEAF_STRIDE,
+    c1_capsule_leaf_fixed_patterns, capsule_leaf_fixed_patterns, capsule_leaf_iv_flat,
+    C1CapsuleLeafKind, C1_CAPSULE_LEAF_STRIDE, CAPSULE_LEAF_STRIDE,
 };
 use noid_ivc_core::deep_chain::leaf_hash::{
     slot_leaf_iv_flat, sponge_leaf_fixed_patterns, SpongeLeafRefs, SPONGE_LEAF_SLOTS,
 };
 use noid_ivc_core::deep_chain::relations::{claimed_refs, ColRef, FixedPattern};
-use noid_ivc_core::deep_chain::schedule::carry_selection_terms;
+use noid_ivc_core::deep_chain::schedule::{
+    carry_selection_terms, flat_of_tower_u128, DuplexLayout, LaneSource,
+};
 use noid_ivc_core::deep_chain::source_tree::SourceTreeRefs;
 use noid_ivc_core::deep_chain::spine::{
     spine_tree_exposure_terms, spine_tree_fixed_patterns, spine_wrap_fixed_patterns,
@@ -23,14 +26,21 @@ use noid_ivc_core::pcs::QuirkyDirectClaim;
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
+use crate::acceptance::zk_auth_capsule_schedule::{
+    ZkAuthCapsuleDuplexSchedules, ZK_AUTH_MAIN_PREFIX_SLOTS, ZK_AUTH_MAIN_TAIL_SLOTS,
+    ZK_AUTH_OWNER_PREFIX_SLOTS, ZK_AUTH_OWNER_TAIL_SLOTS, ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT,
+    ZK_AUTH_WALLET_A_MAIN_TAIL_BASE, ZK_AUTH_WALLET_A_MID_BASE, ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+    ZK_AUTH_WALLET_A_OWNER_TAIL_BASE, ZK_AUTH_WALLET_A_SOURCE_BASE, ZK_AUTH_WALLET_A_TILE_LOG,
+};
+
 use crate::acceptance::trace::region_source_binding::{
     common_period_ones, common_period_pattern, dyadic_region_bits, pattern_in_dyadic_region,
     prove_walk_a_union_walk_prefix_with_challenger, prove_walk_a_union_walk_suffix_with_challenger,
     prove_walk_a_union_with_challenger, union_ref_terms,
     verify_walk_a_union_walk_prefix_with_challenger,
     verify_walk_a_union_walk_suffix_with_challenger, verify_walk_a_union_with_challenger,
-    SpineUnionSpec, WalkAColumnClaim, WalkAUnionProof, WalkAUnionProverWalkPrefix,
-    WalkAUnionVerifierWalkPrefix, WalkAUnionWalkDeferredProof,
+    SpineUnionSpec, SplitDuplexTailRefs, WalkAColumnClaim, WalkAUnionProof,
+    WalkAUnionProverWalkPrefix, WalkAUnionVerifierWalkPrefix, WalkAUnionWalkDeferredProof,
 };
 
 use super::bounded_decode::{
@@ -135,6 +145,7 @@ struct CanonicalWalkAProtocol {
     fixed: Vec<FixedPattern>,
     meta_c: [usize; 4],
     leaf_refs: Vec<(SpongeLeafRefs, usize)>,
+    split_tails: Vec<SplitDuplexTailRefs>,
     es_sponge: Option<(SpongeLeafRefs, usize)>,
     spine: Option<SpineUnionSpec>,
     spine_region_base: Option<usize>,
@@ -336,6 +347,7 @@ impl WalkARegionProverWalkContinuation<'_, '_> {
             protocol.w_log,
             &protocol.fixed,
             &protocol.leaf_refs,
+            &protocol.split_tails,
             protocol.es_sponge.as_ref(),
             protocol.spine.as_ref(),
             &committed,
@@ -373,6 +385,7 @@ impl WalkARegionVerifierWalkContinuation<'_> {
             self.protocol.w_log,
             &self.protocol.fixed,
             &self.protocol.leaf_refs,
+            &self.protocol.split_tails,
             self.protocol.es_sponge.as_ref(),
             self.protocol.spine.as_ref(),
             self.prefix,
@@ -469,6 +482,7 @@ impl<'a> WalkARegionProverPlan<'a> {
             &protocol.fixed,
             &protocol.meta_c,
             &protocol.leaf_refs,
+            &protocol.split_tails,
             protocol.es_sponge.as_ref(),
             protocol.spine.as_ref(),
             &committed,
@@ -552,6 +566,7 @@ fn walk_a_proof_shape(protocol: &CanonicalWalkAProtocol) -> FixedProofShape {
     let selection_values = claimed_refs(&carry_selection_terms(&protocol.meta_c, F128::ONE)).len();
     let substitution_refs = claimed_refs(&union_ref_terms(
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     ));
@@ -635,6 +650,7 @@ pub fn verify_walk_a_region_sidecar<Ch: Challenger>(
         &protocol.fixed,
         &protocol.meta_c,
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
         &proof.authority,
@@ -642,6 +658,92 @@ pub fn verify_walk_a_region_sidecar<Ch: Challenger>(
     )
     .map_err(|_| RegionSidecarError::InvalidProof)?;
     resolve_walk_a_terminal_claims(vk, total_vars, terminal)
+}
+
+fn push_dense_c1_leaf_family(
+    fixed: &mut Vec<FixedPattern>,
+    kind: C1CapsuleLeafKind,
+    offset: usize,
+    leaves: usize,
+    block_log: usize,
+) -> (SpongeLeafRefs, usize) {
+    let block_slots = 1usize << block_log;
+    let active_slots = kind.active_slots();
+    assert!(offset + leaves * active_slots <= block_slots);
+    let template = c1_capsule_leaf_fixed_patterns(kind);
+    let iv = [template[1].table[0], template[2].table[0]];
+    let mut region = vec![F128::ZERO; block_slots];
+    let mut carry = vec![F128::ZERO; block_slots];
+    let mut iv0 = vec![F128::ZERO; block_slots];
+    let mut iv1 = vec![F128::ZERO; block_slots];
+    for leaf in 0..leaves {
+        let base = offset + leaf * active_slots;
+        region[base..base + active_slots].fill(F128::ONE);
+        carry[base + 1..base + active_slots].fill(F128::ONE);
+        iv0[base] = iv[0];
+        iv1[base] = iv[1];
+    }
+    let base = fixed.len();
+    fixed.extend([
+        FixedPattern::new(block_log, region),
+        FixedPattern::new(block_log, carry),
+        FixedPattern::new(block_log, iv0),
+        FixedPattern::new(block_log, iv1),
+    ]);
+    (
+        SpongeLeafRefs {
+            in_: [WALLET_IN0, WALLET_IN0 + 1],
+            c: std::array::from_fn(|lane| WALLET_C0 + lane),
+            odd: base + 1,
+            iv: [base + 2, base + 3],
+        },
+        base,
+    )
+}
+
+fn push_split_duplex_tail(
+    fixed: &mut Vec<FixedPattern>,
+    layout: &DuplexLayout,
+    prefix_slots: usize,
+    expected_tail_slots: usize,
+    bridge_slot: usize,
+    tail_base: usize,
+    block_log: usize,
+) -> SplitDuplexTailRefs {
+    let block_slots = 1usize << block_log;
+    assert_eq!(tail_base, bridge_slot + 1);
+    assert_eq!(layout.slots.len() - prefix_slots, expected_tail_slots);
+    assert!(tail_base + expected_tail_slots <= block_slots);
+    let mut region = vec![F128::ZERO; block_slots];
+    let mut carry = vec![F128::ZERO; block_slots];
+    let mut first = vec![F128::ZERO; block_slots];
+    let mut consts: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; block_slots]);
+    region[tail_base..tail_base + expected_tail_slots].fill(F128::ONE);
+    carry[tail_base + 1..tail_base + expected_tail_slots].fill(F128::ONE);
+    first[tail_base] = F128::ONE;
+    for (local, slot) in layout.slots[prefix_slots..].iter().enumerate() {
+        for lane in 0..2 {
+            if let Some(LaneSource::Const(value)) = slot.lanes[lane] {
+                consts[lane][tail_base + local] = flat_of_tower_u128(value);
+            }
+        }
+    }
+    let base = fixed.len();
+    fixed.extend([
+        FixedPattern::new(block_log, region),
+        FixedPattern::new(block_log, carry),
+        FixedPattern::new(block_log, first),
+        FixedPattern::new(block_log, consts[0].clone()),
+        FixedPattern::new(block_log, consts[1].clone()),
+    ]);
+    SplitDuplexTailRefs {
+        a: [WALLET_IN0, WALLET_IN0 + 1],
+        c: std::array::from_fn(|lane| WALLET_C0 + lane),
+        region: base,
+        carry: base + 1,
+        first: base + 2,
+        consts: [base + 3, base + 4],
+    }
 }
 
 fn canonical_protocol(
@@ -657,6 +759,68 @@ fn canonical_protocol(
                 return Err(RegionSidecarError::UnsupportedVkShape);
             }
             let nq = checked_pow2(nq_log)?;
+            if nq_log == MAX_WALK_A_QUERY_LOG {
+                let block_log = ZK_AUTH_WALLET_A_TILE_LOG;
+                let block_slots = 1usize << block_log;
+                let total_slots = tx_count
+                    .checked_mul(block_slots)
+                    .ok_or(RegionSidecarError::BadVk)?;
+                let w_log = total_slots.trailing_zeros() as usize;
+                preflight_w_log(w_log)?;
+
+                let mut fixed = Vec::with_capacity(18);
+                let leaf_refs = vec![
+                    push_dense_c1_leaf_family(
+                        &mut fixed,
+                        C1CapsuleLeafKind::MixedSource,
+                        ZK_AUTH_WALLET_A_SOURCE_BASE,
+                        nq,
+                        block_log,
+                    ),
+                    push_dense_c1_leaf_family(
+                        &mut fixed,
+                        C1CapsuleLeafKind::WideMid,
+                        ZK_AUTH_WALLET_A_MID_BASE,
+                        nq,
+                        block_log,
+                    ),
+                ];
+                let schedules = ZkAuthCapsuleDuplexSchedules::selected();
+                let owner_layout = schedules.owner_layout();
+                let main_layout = schedules.main_layout();
+                let split_tails = vec![
+                    push_split_duplex_tail(
+                        &mut fixed,
+                        &owner_layout,
+                        ZK_AUTH_OWNER_PREFIX_SLOTS,
+                        ZK_AUTH_OWNER_TAIL_SLOTS,
+                        ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+                        ZK_AUTH_WALLET_A_OWNER_TAIL_BASE,
+                        block_log,
+                    ),
+                    push_split_duplex_tail(
+                        &mut fixed,
+                        &main_layout,
+                        ZK_AUTH_MAIN_PREFIX_SLOTS,
+                        ZK_AUTH_MAIN_TAIL_SLOTS,
+                        ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT,
+                        ZK_AUTH_WALLET_A_MAIN_TAIL_BASE,
+                        block_log,
+                    ),
+                ];
+                let protocol = CanonicalWalkAProtocol {
+                    w_log,
+                    fixed,
+                    meta_c: std::array::from_fn(|lane| WALLET_C0 + lane),
+                    leaf_refs,
+                    split_tails,
+                    es_sponge: None,
+                    spine: None,
+                    spine_region_base: None,
+                };
+                validate_fixed_preflight(protocol.w_log, &protocol.fixed)?;
+                return Ok(protocol);
+            }
             let family_slots = nq
                 .checked_mul(CAPSULE_LEAF_STRIDE)
                 .ok_or(RegionSidecarError::BadVk)?;
@@ -703,6 +867,7 @@ fn canonical_protocol(
                 fixed,
                 meta_c: std::array::from_fn(|lane| WALLET_C0 + lane),
                 leaf_refs,
+                split_tails: Vec::new(),
                 es_sponge: None,
                 spine: None,
                 spine_region_base: None,
@@ -761,11 +926,37 @@ fn canonical_meta_protocol(
         None => None,
     };
     let spine_slots = spine_geometry.map(|(_, _, _, slots)| slots);
-    let half = es_slots.unwrap_or(0).max(spine_slots.unwrap_or(0));
+    let both = es_slots.is_some() && spine_slots.is_some();
+    let wallet_overflow = matches!(
+        (tx_log, exact_state_region_log, spine_cap_log),
+        (6, Some(12), Some(1)) | (8, Some(13), Some(0))
+    );
+    let overflow_family_slots = if wallet_overflow {
+        tx_count
+            .checked_mul(C1_CAPSULE_LEAF_STRIDE)
+            .ok_or(RegionSidecarError::BadVk)?
+    } else {
+        0
+    };
+    let first_region_live = es_slots
+        .unwrap_or(0)
+        .checked_add(
+            overflow_family_slots
+                .checked_mul(2)
+                .ok_or(RegionSidecarError::BadVk)?,
+        )
+        .ok_or(RegionSidecarError::BadVk)?;
+    let first_region_slots = if first_region_live == 0 {
+        0
+    } else {
+        first_region_live
+            .checked_next_power_of_two()
+            .ok_or(RegionSidecarError::BadVk)?
+    };
+    let half = first_region_slots.max(spine_slots.unwrap_or(0));
     if half == 0 || !half.is_power_of_two() {
         return Err(RegionSidecarError::BadVk);
     }
-    let both = es_slots.is_some() && spine_slots.is_some();
     let total_slots = if both {
         half.checked_mul(2).ok_or(RegionSidecarError::BadVk)?
     } else {
@@ -814,6 +1005,41 @@ fn canonical_meta_protocol(
             base,
         )
     });
+
+    let mut leaf_refs = Vec::new();
+    if wallet_overflow {
+        let overflow_base = es_slots.expect("selected Meta-A includes exact state");
+        for (family, kind) in [C1CapsuleLeafKind::MixedSource, C1CapsuleLeafKind::WideMid]
+            .into_iter()
+            .enumerate()
+        {
+            let region_base = overflow_base + family * overflow_family_slots;
+            let base = fixed.len();
+            fixed.push(pattern_in_dyadic_region(
+                FixedPattern::new(0, vec![F128::ONE]),
+                region_base,
+                overflow_family_slots,
+                w_log,
+            ));
+            for pattern in c1_capsule_leaf_fixed_patterns(kind) {
+                fixed.push(pattern_in_dyadic_region(
+                    pattern,
+                    region_base,
+                    overflow_family_slots,
+                    w_log,
+                ));
+            }
+            leaf_refs.push((
+                SpongeLeafRefs {
+                    in_: [META_IN0, META_IN0 + 1],
+                    c: std::array::from_fn(|lane| META_C0 + lane),
+                    odd: base + 1,
+                    iv: [base + 2, base + 3],
+                },
+                base,
+            ));
+        }
+    }
 
     let spine = if let Some((cap_log, cap, block_slots, region_slots)) = spine_geometry {
         let base = fixed.len();
@@ -875,7 +1101,8 @@ fn canonical_meta_protocol(
         w_log,
         fixed,
         meta_c: std::array::from_fn(|lane| META_C0 + lane),
-        leaf_refs: Vec::new(),
+        leaf_refs,
+        split_tails: Vec::new(),
         es_sponge,
         spine,
         spine_region_base: spine_geometry.map(|_| spine_base),
@@ -991,6 +1218,18 @@ fn walk_a_layout_digest(
     push_usize(&mut bytes, protocol.leaf_refs.len());
     for (refs, region) in &protocol.leaf_refs {
         encode_sponge_refs(&mut bytes, refs, *region);
+    }
+    push_usize(&mut bytes, protocol.split_tails.len());
+    for refs in &protocol.split_tails {
+        for index in refs.a.into_iter().chain(refs.c).chain([
+            refs.region,
+            refs.carry,
+            refs.first,
+            refs.consts[0],
+            refs.consts[1],
+        ]) {
+            push_usize(&mut bytes, index);
+        }
     }
     match protocol.es_sponge.as_ref() {
         None => bytes.push(0),
@@ -1410,6 +1649,7 @@ pub(in crate::region_sidecar) mod tests {
             &protocol.fixed,
             &protocol.meta_c,
             &protocol.leaf_refs,
+            &protocol.split_tails,
             protocol.es_sponge.as_ref(),
             protocol.spine.as_ref(),
             &committed,
@@ -1426,6 +1666,7 @@ pub(in crate::region_sidecar) mod tests {
             &protocol.fixed,
             &protocol.meta_c,
             &protocol.leaf_refs,
+            &protocol.split_tails,
             protocol.es_sponge.as_ref(),
             protocol.spine.as_ref(),
             &proof,
@@ -1613,6 +1854,7 @@ pub(in crate::region_sidecar) mod tests {
             &protocol.fixed,
             &protocol.meta_c,
             &protocol.leaf_refs,
+            &protocol.split_tails,
             protocol.es_sponge.as_ref(),
             protocol.spine.as_ref(),
             &committed,

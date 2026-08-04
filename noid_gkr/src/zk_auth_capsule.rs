@@ -47,17 +47,17 @@ pub const ZK_AUTH_CAPSULE_STATE_VARS: usize = 9;
 pub const ZK_AUTH_CAPSULE_STATE_LEN: usize = 1 << ZK_AUTH_CAPSULE_STATE_VARS;
 pub const ZK_AUTH_CAPSULE_STATE_OFFSET: usize = 0;
 
-pub const ZK_AUTH_CAPSULE_PCS_COINS_LEN: usize = 512;
-pub const ZK_AUTH_CAPSULE_PCS_COINS_OFFSET: usize =
-    ZK_AUTH_CAPSULE_STATE_OFFSET + ZK_AUTH_CAPSULE_STATE_LEN;
-
 pub const ZK_AUTH_CAPSULE_LIBRA_MASK_LEN: usize = 256;
 pub const ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET: usize =
-    ZK_AUTH_CAPSULE_PCS_COINS_OFFSET + ZK_AUTH_CAPSULE_PCS_COINS_LEN;
+    ZK_AUTH_CAPSULE_STATE_OFFSET + ZK_AUTH_CAPSULE_STATE_LEN;
 
-pub const ZK_AUTH_CAPSULE_REMAINING_PADDING_LEN: usize = 768;
+pub const ZK_AUTH_CAPSULE_REMAINING_PADDING_LEN: usize = 256;
 pub const ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET: usize =
     ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + ZK_AUTH_CAPSULE_LIBRA_MASK_LEN;
+
+pub const ZK_AUTH_CAPSULE_PCS_COINS_LEN: usize = 1_024;
+pub const ZK_AUTH_CAPSULE_PCS_COINS_OFFSET: usize =
+    ZK_AUTH_CAPSULE_BANK_LEN - ZK_AUTH_CAPSULE_PCS_COINS_LEN;
 
 /// Five independently fresh cells reserved for the terminal operand
 /// extensions. They are outside the state, PCS-coin, and Libra-mask regions.
@@ -113,7 +113,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET + ZK_AUTH_CAPSULE_REMAINING_PADDING_LEN
-        == ZK_AUTH_CAPSULE_BANK_LEN
+        == ZK_AUTH_CAPSULE_PCS_COINS_OFFSET
 );
 const _: () = assert!(
     ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET + ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS
@@ -194,7 +194,7 @@ impl<'a> ZkAuthCapsuleBankView<'a> {
     }
 
     pub fn remaining_padding(&self) -> &'a [Block128] {
-        &self.cells[ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET..]
+        &self.cells[ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET..ZK_AUTH_CAPSULE_PCS_COINS_OFFSET]
     }
 
     pub fn libra_mask_view(&self) -> Result<ZkMleCheckMaskView<'a>, ZkAuthCapsuleError> {
@@ -295,9 +295,9 @@ fn active_state_selector_at_boolean_index(index: usize) -> bool {
 }
 
 /// Fold variable zero (the lowest-index variable) from an evaluation table.
-pub fn fold_lowest_variable_in_place(
-    values: &mut Vec<Block128>,
-    challenge: Block128,
+pub fn fold_lowest_variable_in_place<F: TowerField>(
+    values: &mut Vec<F>,
+    challenge: F,
 ) -> Result<(), ZkAuthCapsuleError> {
     if values.len() < 2 || !values.len().is_power_of_two() {
         return Err(ZkAuthCapsuleError::MleShape {
@@ -317,10 +317,13 @@ pub fn fold_lowest_variable_in_place(
 
 /// Evaluate a natural-order multilinear table with variables supplied
 /// low-to-high. Variable zero is folded first from adjacent pairs.
-pub fn evaluate_mle_low_to_high(
+pub fn evaluate_mle_low_to_high<F>(
     values: &[Block128],
-    point: &[Block128],
-) -> Result<Block128, ZkAuthCapsuleError> {
+    point: &[F],
+) -> Result<F, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
     let expected = 1usize.checked_shl(point.len() as u32).unwrap_or(usize::MAX);
     if values.len() != expected {
         return Err(ZkAuthCapsuleError::MleShape {
@@ -328,7 +331,7 @@ pub fn evaluate_mle_low_to_high(
             actual: values.len(),
         });
     }
-    let mut folded = values.to_vec();
+    let mut folded = values.iter().copied().map(F::from).collect();
     for &challenge in point {
         fold_lowest_variable_in_place(&mut folded, challenge)?;
     }
@@ -337,14 +340,14 @@ pub fn evaluate_mle_low_to_high(
 }
 
 /// Equality-tensor weights in natural low-to-high Boolean index order.
-pub fn mle_weights_low_to_high(point: &[Block128]) -> Vec<Block128> {
-    let mut weights = vec![Block128::ONE];
+pub fn mle_weights_low_to_high<F: TowerField>(point: &[F]) -> Vec<F> {
+    let mut weights = vec![F::ONE];
     for &coordinate in point {
         let old_len = weights.len();
-        weights.resize(old_len * 2, Block128::ZERO);
+        weights.resize(old_len * 2, F::ZERO);
         for index in 0..old_len {
             let prior = weights[index];
-            weights[index] = prior * (Block128::ONE - coordinate);
+            weights[index] = prior * (F::ONE - coordinate);
             weights[old_len + index] = prior * coordinate;
         }
     }
@@ -385,6 +388,13 @@ fn mds_at(round: usize, output_lane: usize, input_lane: usize) -> Block128 {
 
 #[inline]
 fn pow7(value: Block128) -> Block128 {
+    let value2 = value * value;
+    let value4 = value2 * value2;
+    value4 * value2 * value
+}
+
+#[inline]
+fn pow7_field<F: TowerField>(value: F) -> F {
     let value2 = value * value;
     let value4 = value2 * value2;
     value4 * value2 * value
@@ -483,10 +493,13 @@ impl MainTables {
         }
     }
 
-    fn terminal_value(
+    fn terminal_value<F>(
         &self,
-        point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    ) -> Result<Block128, ZkAuthCapsuleError> {
+        point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    ) -> Result<F, ZkAuthCapsuleError>
+    where
+        F: TowerField + From<Block128>,
+    {
         let active = evaluate_mle_low_to_high(&self.active, point)?;
         let increment = evaluate_mle_low_to_high(&self.increment, point)?;
         let mut q = increment;
@@ -495,20 +508,20 @@ impl MainTables {
             let mds = evaluate_mle_low_to_high(&self.mds[input_lane], point)?;
             let sigma = evaluate_mle_low_to_high(&self.sigma[input_lane], point)?;
             let rc = evaluate_mle_low_to_high(&self.rc[input_lane], point)?;
-            q += mds * (sigma * pow7(state + rc) + (Block128::ONE + sigma) * state);
+            q += mds * (sigma * pow7_field(state + rc) + (F::ONE + sigma) * state);
         }
         Ok(active * q)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthCapsuleTerminalOperandClaims {
-    pub increment: Block128,
-    pub lane: [Block128; STATE_SIZE],
+pub struct AuthCapsuleTerminalOperandClaims<F = Block128> {
+    pub increment: F,
+    pub lane: [F; STATE_SIZE],
 }
 
-impl AuthCapsuleTerminalOperandClaims {
-    pub fn ordered(self) -> [Block128; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] {
+impl<F: Copy> AuthCapsuleTerminalOperandClaims<F> {
+    pub fn ordered(self) -> [F; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] {
         [
             self.increment,
             self.lane[0],
@@ -521,27 +534,27 @@ impl AuthCapsuleTerminalOperandClaims {
 
 /// Exact rank certificate for the five terminal one-time pads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthCapsuleTerminalBlindingRankCertificate {
+pub struct AuthCapsuleTerminalBlindingRankCertificate<F = Block128> {
     pub boolean_index: usize,
-    pub common_coefficient: Block128,
+    pub common_coefficient: F,
     pub blinding_cell_indices: [usize; ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS],
     pub certified_rank: usize,
 }
 
 /// Evaluate the multilinear basis polynomial for one Boolean index.
-pub fn mle_basis_weight_at_boolean_index(
-    point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
+pub fn mle_basis_weight_at_boolean_index<F: TowerField>(
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
     boolean_index: usize,
-) -> Block128 {
+) -> F {
     debug_assert!(boolean_index < ZK_AUTH_CAPSULE_BANK_LEN);
     point
         .iter()
         .enumerate()
-        .fold(Block128::ONE, |coefficient, (variable, &coordinate)| {
+        .fold(F::ONE, |coefficient, (variable, &coordinate)| {
             if (boolean_index >> variable) & 1 == 1 {
                 coefficient * coordinate
             } else {
-                coefficient * (Block128::ONE - coordinate)
+                coefficient * (F::ONE - coordinate)
             }
         })
 }
@@ -550,12 +563,12 @@ pub fn mle_basis_weight_at_boolean_index(
 /// observations. A zero basis weight is an overwhelmingly rare transcript
 /// degeneracy; production proving retries from a fresh commitment and
 /// verification rejects it.
-pub fn certify_terminal_blinding_rank(
-    point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-) -> Result<AuthCapsuleTerminalBlindingRankCertificate, ZkAuthCapsuleError> {
+pub fn certify_terminal_blinding_rank<F: TowerField>(
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+) -> Result<AuthCapsuleTerminalBlindingRankCertificate<F>, ZkAuthCapsuleError> {
     let common_coefficient =
         mle_basis_weight_at_boolean_index(point, ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX);
-    if common_coefficient == Block128::ZERO {
+    if common_coefficient == F::ZERO {
         return Err(ZkAuthCapsuleError::ZeroTerminalBlindingWeight);
     }
     Ok(AuthCapsuleTerminalBlindingRankCertificate {
@@ -572,12 +585,12 @@ pub fn certify_terminal_blinding_rank(
 /// `[state_inc, state_lane_0, ..., state_lane_3]` operand extensions at one
 /// low-to-high terminal point. Active rows carry the real transition operands;
 /// one inactive row contributes five distinct fresh committed pads.
-pub fn terminal_operand_functional_weights(
-    point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-) -> [Vec<Block128>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] {
+pub fn terminal_operand_functional_weights<F: TowerField>(
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+) -> [Vec<F>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] {
     let eq = mle_weights_low_to_high(point);
-    let mut weights: [Vec<Block128>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] =
-        std::array::from_fn(|_| vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN]);
+    let mut weights: [Vec<F>; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS] =
+        std::array::from_fn(|_| vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN]);
 
     for (boolean_index, &coefficient) in eq.iter().enumerate() {
         if !active_state_selector_at_boolean_index(boolean_index) {
@@ -601,17 +614,23 @@ pub fn terminal_operand_functional_weights(
 }
 
 #[inline]
-fn inner_product(lhs: &[Block128], rhs: &[Block128]) -> Block128 {
+fn inner_product<F>(lhs: &[Block128], rhs: &[F]) -> F
+where
+    F: TowerField + From<Block128>,
+{
     debug_assert_eq!(lhs.len(), rhs.len());
     lhs.iter()
         .zip(rhs)
-        .fold(Block128::ZERO, |acc, (&a, &b)| acc + a * b)
+        .fold(F::ZERO, |acc, (&a, &b)| acc + F::from(a) * b)
 }
 
-pub fn compute_terminal_operand_claims(
+pub fn compute_terminal_operand_claims<F>(
     bank: ZkAuthCapsuleBankView<'_>,
-    point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-) -> AuthCapsuleTerminalOperandClaims {
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+) -> AuthCapsuleTerminalOperandClaims<F>
+where
+    F: TowerField + From<Block128>,
+{
     let weights = terminal_operand_functional_weights(point);
     AuthCapsuleTerminalOperandClaims {
         increment: inner_product(bank.cells(), &weights[0]),
@@ -624,10 +643,13 @@ pub fn compute_terminal_operand_claims(
 /// Evaluate the degree-ten main polynomial at its terminal point from exactly
 /// the five ZK-padded operand claims that the post-claim relation later binds
 /// to the bank.
-pub fn evaluate_auth_main_terminal_from_claims(
-    point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    claims: AuthCapsuleTerminalOperandClaims,
-) -> Result<Block128, ZkAuthCapsuleError> {
+pub fn evaluate_auth_main_terminal_from_claims<F>(
+    point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    claims: AuthCapsuleTerminalOperandClaims<F>,
+) -> Result<F, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
     let mut active = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
     let mut mds: [Vec<Block128>; STATE_SIZE] =
         std::array::from_fn(|_| vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN]);
@@ -658,33 +680,33 @@ pub fn evaluate_auth_main_terminal_from_claims(
         let rc_at_point = evaluate_mle_low_to_high(&rc[input_lane], point)?;
         let state = claims.lane[input_lane];
         q += mds_at_point
-            * (sigma_at_point * pow7(state + rc_at_point)
-                + (Block128::ONE + sigma_at_point) * state);
+            * (sigma_at_point * pow7_field(state + rc_at_point)
+                + (F::ONE + sigma_at_point) * state);
     }
     Ok(active_at_point * q)
 }
 
 #[derive(Clone, Copy)]
-struct FixedPolynomial {
-    coeffs: [Block128; ZK_AUTH_CAPSULE_MAIN_DEGREE + 1],
+struct FixedPolynomial<F> {
+    coeffs: [F; ZK_AUTH_CAPSULE_MAIN_DEGREE + 1],
     degree: usize,
 }
 
-impl FixedPolynomial {
+impl<F: TowerField> FixedPolynomial<F> {
     fn zero() -> Self {
         Self {
-            coeffs: [Block128::ZERO; ZK_AUTH_CAPSULE_MAIN_DEGREE + 1],
+            coeffs: [F::ZERO; ZK_AUTH_CAPSULE_MAIN_DEGREE + 1],
             degree: 0,
         }
     }
 
     fn one() -> Self {
         let mut result = Self::zero();
-        result.coeffs[0] = Block128::ONE;
+        result.coeffs[0] = F::ONE;
         result
     }
 
-    fn affine(at_zero: Block128, at_one: Block128) -> Self {
+    fn affine(at_zero: F, at_one: F) -> Self {
         let mut result = Self::zero();
         result.coeffs[0] = at_zero;
         result.coeffs[1] = at_one - at_zero;
@@ -704,7 +726,7 @@ impl FixedPolynomial {
         self
     }
 
-    fn scale(mut self, scalar: Block128) -> Self {
+    fn scale(mut self, scalar: F) -> Self {
         for coefficient in &mut self.coeffs[..=self.degree] {
             *coefficient *= scalar;
         }
@@ -735,7 +757,7 @@ impl FixedPolynomial {
         fourth.mul(square)?.mul(self)
     }
 
-    fn into_round_polynomial(self) -> RoundPolynomial<Block128> {
+    fn into_round_polynomial(self) -> RoundPolynomial<F> {
         // The ZK MLE-check combines every main round with an exact degree-ten
         // mask round, so retain all eleven coefficient positions.
         RoundPolynomial::from_coeffs(self.coeffs.to_vec())
@@ -743,17 +765,20 @@ impl FixedPolynomial {
 }
 
 #[derive(Clone)]
-struct RestrictedMainTables {
-    active: Vec<Block128>,
-    increment: Vec<Block128>,
-    lane: [Vec<Block128>; STATE_SIZE],
-    mds: [Vec<Block128>; STATE_SIZE],
-    sigma: [Vec<Block128>; STATE_SIZE],
-    rc: [Vec<Block128>; STATE_SIZE],
+struct RestrictedMainTables<F> {
+    active: Vec<F>,
+    increment: Vec<F>,
+    lane: [Vec<F>; STATE_SIZE],
+    mds: [Vec<F>; STATE_SIZE],
+    sigma: [Vec<F>; STATE_SIZE],
+    rc: [Vec<F>; STATE_SIZE],
 }
 
-fn restrict_high_variables(table: &[Block128], prior_challenges: &[Block128]) -> Vec<Block128> {
-    let mut restricted = table.to_vec();
+fn restrict_high_variables<F>(table: &[Block128], prior_challenges: &[F]) -> Vec<F>
+where
+    F: TowerField + From<Block128>,
+{
+    let mut restricted: Vec<F> = table.iter().copied().map(F::from).collect();
     for &challenge in prior_challenges {
         let half = restricted.len() / 2;
         for index in 0..half {
@@ -766,8 +791,11 @@ fn restrict_high_variables(table: &[Block128], prior_challenges: &[Block128]) ->
     restricted
 }
 
-impl RestrictedMainTables {
-    fn new(full: &MainTables, prior_challenges: &[Block128]) -> Self {
+impl<F> RestrictedMainTables<F>
+where
+    F: TowerField + From<Block128>,
+{
+    fn new(full: &MainTables, prior_challenges: &[F]) -> Self {
         Self {
             active: restrict_high_variables(&full.active, prior_challenges),
             increment: restrict_high_variables(&full.increment, prior_challenges),
@@ -787,28 +815,35 @@ impl RestrictedMainTables {
     }
 }
 
-fn endpoint_polynomial(table: &[Block128], lower_index: usize, half: usize) -> FixedPolynomial {
+fn endpoint_polynomial<F: TowerField>(
+    table: &[F],
+    lower_index: usize,
+    half: usize,
+) -> FixedPolynomial<F> {
     FixedPolynomial::affine(table[lower_index], table[lower_index + half])
 }
 
-fn boolean_eq_weight(point: &[Block128], boolean_index: usize) -> Block128 {
+fn boolean_eq_weight<F: TowerField>(point: &[F], boolean_index: usize) -> F {
     point
         .iter()
         .enumerate()
-        .fold(Block128::ONE, |weight, (variable, &coordinate)| {
+        .fold(F::ONE, |weight, (variable, &coordinate)| {
             if ((boolean_index >> variable) & 1) == 0 {
-                weight * (Block128::ONE - coordinate)
+                weight * (F::ONE - coordinate)
             } else {
                 weight * coordinate
             }
         })
 }
 
-fn auth_main_round_from_tables(
+fn auth_main_round_from_tables<F>(
     full: &MainTables,
-    input_point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    prior_challenges: &[Block128],
-) -> Result<RoundPolynomial<Block128>, ZkAuthCapsuleError> {
+    input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    prior_challenges: &[F],
+) -> Result<RoundPolynomial<F>, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
     if prior_challenges.len() >= ZK_AUTH_CAPSULE_BANK_VARS {
         return Err(ZkAuthCapsuleError::TooManyPriorChallenges {
             max: ZK_AUTH_CAPSULE_BANK_VARS - 1,
@@ -845,11 +880,14 @@ fn auth_main_round_from_tables(
 
 /// Exact degree-ten main round in high-to-low MLE-check order.
 /// `prior_challenges[0]` fixes variable ten, then variable nine, and so on.
-pub fn auth_main_round_polynomial(
+pub fn auth_main_round_polynomial<F>(
     bank: ZkAuthCapsuleBankView<'_>,
-    input_point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    prior_challenges: &[Block128],
-) -> Result<RoundPolynomial<Block128>, ZkAuthCapsuleError> {
+    input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    prior_challenges: &[F],
+) -> Result<RoundPolynomial<F>, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
     let tables = MainTables::build(bank);
     auth_main_round_from_tables(&tables, input_point, prior_challenges)
 }
@@ -995,13 +1033,13 @@ pub fn validate_sparse_boundary(
 
 /// Linear bank weights for the Libra mask's Boolean-table MLE at the input
 /// point. Padded row/stride cells have coefficient zero but remain committed.
-pub fn libra_mask_mle_functional_weights(
-    input_point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-) -> Vec<Block128> {
-    let mut weights = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
+pub fn libra_mask_mle_functional_weights<F: TowerField>(
+    input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+) -> Vec<F> {
+    let mut weights = vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
     for (variable, &coordinate) in input_point.iter().enumerate() {
         let row = ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + variable * ZK_MLECHECK_MASK_ROW_STRIDE;
-        weights[row] += Block128::ONE;
+        weights[row] += F::ONE;
         for power in 1..=ZK_MLECHECK_MASK_DEGREE {
             weights[row + power] += coordinate;
         }
@@ -1010,13 +1048,13 @@ pub fn libra_mask_mle_functional_weights(
 }
 
 /// Linear bank weights for `g(r) = sum_i g_i(r_i)` at the terminal point.
-pub fn libra_mask_final_functional_weights(
-    terminal_point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-) -> Vec<Block128> {
-    let mut weights = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
+pub fn libra_mask_final_functional_weights<F: TowerField>(
+    terminal_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+) -> Vec<F> {
+    let mut weights = vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
     for (variable, &coordinate) in terminal_point.iter().enumerate() {
         let row = ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET + variable * ZK_MLECHECK_MASK_ROW_STRIDE;
-        let mut power = Block128::ONE;
+        let mut power = F::ONE;
         for exponent in 0..=ZK_MLECHECK_MASK_DEGREE {
             weights[row + exponent] += power;
             power *= coordinate;
@@ -1026,20 +1064,23 @@ pub fn libra_mask_final_functional_weights(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AuthCapsulePostClaims {
-    pub terminal_operands: AuthCapsuleTerminalOperandClaims,
-    pub mask_mle_at_input: Block128,
-    pub mask_final_at_terminal: Block128,
+pub struct AuthCapsulePostClaims<F = Block128> {
+    pub terminal_operands: AuthCapsuleTerminalOperandClaims<F>,
+    pub mask_mle_at_input: F,
+    pub mask_final_at_terminal: F,
 }
 
-impl AuthCapsulePostClaims {
+impl<F> AuthCapsulePostClaims<F>
+where
+    F: TowerField + From<Block128>,
+{
     /// Fixed RLC order. A protocol wrapper must absorb these five prover
     /// claims and two mask claims, together with the already-bound public
     /// boundary statement, before sampling the RLC challenge.
     pub fn ordered_with_boundary(
         self,
         boundary: AuthCapsuleBoundaryPublic,
-    ) -> [Block128; ZK_AUTH_CAPSULE_POST_CLAIMS] {
+    ) -> [F; ZK_AUTH_CAPSULE_POST_CLAIMS] {
         let terminal = self.terminal_operands.ordered();
         [
             terminal[0],
@@ -1047,10 +1088,10 @@ impl AuthCapsulePostClaims {
             terminal[2],
             terminal[3],
             terminal[4],
-            boundary.capacity_iv[0],
-            boundary.capacity_iv[1],
-            boundary.expected_address[0],
-            boundary.expected_address[1],
+            F::from(boundary.capacity_iv[0]),
+            F::from(boundary.capacity_iv[1]),
+            F::from(boundary.expected_address[0]),
+            F::from(boundary.expected_address[1]),
             self.mask_mle_at_input,
             self.mask_final_at_terminal,
         ]
@@ -1058,19 +1099,22 @@ impl AuthCapsulePostClaims {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthCapsulePostClaimRelation {
-    pub weights: Vec<Block128>,
-    pub expected_inner_product: Block128,
+pub struct AuthCapsulePostClaimRelation<F = Block128> {
+    pub weights: Vec<F>,
+    pub expected_inner_product: F,
 }
 
-impl AuthCapsulePostClaimRelation {
+impl<F> AuthCapsulePostClaimRelation<F>
+where
+    F: TowerField + From<Block128>,
+{
     pub fn verify(&self, bank: ZkAuthCapsuleBankView<'_>) -> bool {
         self.weights.len() == ZK_AUTH_CAPSULE_BANK_LEN
             && inner_product(bank.cells(), &self.weights) == self.expected_inner_product
     }
 }
 
-fn accumulate_dense_relation(output: &mut [Block128], source: &[Block128], coefficient: Block128) {
+fn accumulate_dense_relation<F: TowerField>(output: &mut [F], source: &[F], coefficient: F) {
     debug_assert_eq!(output.len(), source.len());
     for (target, &weight) in output.iter_mut().zip(source) {
         *target += coefficient * weight;
@@ -1081,14 +1125,17 @@ fn accumulate_dense_relation(output: &mut [Block128], source: &[Block128], coeff
 ///
 /// The caller supplies the already-derived nonzero RLC challenge. This helper
 /// intentionally has no transcript handle and therefore cannot sample early.
-pub fn build_post_claim_relation(
-    input_point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    terminal_point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
+pub fn build_post_claim_relation<F>(
+    input_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
+    terminal_point: &[F; ZK_AUTH_CAPSULE_BANK_VARS],
     boundary: AuthCapsuleBoundaryPublic,
-    claims: AuthCapsulePostClaims,
-    post_claim_rlc_after_absorption: Block128,
-) -> Result<AuthCapsulePostClaimRelation, ZkAuthCapsuleError> {
-    if post_claim_rlc_after_absorption == Block128::ZERO {
+    claims: AuthCapsulePostClaims<F>,
+    post_claim_rlc_after_absorption: F,
+) -> Result<AuthCapsulePostClaimRelation<F>, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
+    if post_claim_rlc_after_absorption == F::ZERO {
         return Err(ZkAuthCapsuleError::ZeroPostClaimChallenge);
     }
     let terminal_weights = terminal_operand_functional_weights(terminal_point);
@@ -1097,9 +1144,9 @@ pub fn build_post_claim_relation(
     let mask_final_weights = libra_mask_final_functional_weights(terminal_point);
     let ordered_scalars = claims.ordered_with_boundary(boundary);
 
-    let mut weights = vec![Block128::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
-    let mut expected_inner_product = Block128::ZERO;
-    let mut rlc_power = Block128::ONE;
+    let mut weights = vec![F::ZERO; ZK_AUTH_CAPSULE_BANK_LEN];
+    let mut expected_inner_product = F::ZERO;
+    let mut rlc_power = F::ONE;
     let mut claim_index = 0;
 
     for relation_weights in &terminal_weights {
@@ -1110,7 +1157,7 @@ pub fn build_post_claim_relation(
     }
     for boundary_claim in &boundary_claims {
         for term in &boundary_claim.terms {
-            weights[term.bank_index] += rlc_power * term.coefficient;
+            weights[term.bank_index] += rlc_power * F::from(term.coefficient);
         }
         expected_inner_product += rlc_power * ordered_scalars[claim_index];
         rlc_power *= post_claim_rlc_after_absorption;
@@ -1131,17 +1178,17 @@ pub fn build_post_claim_relation(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthCapsuleExplicitMleCheckCarrier {
-    pub round_proofs: Vec<ZkMleCheckRoundProof>,
-    pub terminal_point: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    pub terminal_operands: AuthCapsuleTerminalOperandClaims,
-    pub mask_mle_at_input: Block128,
-    pub mask_final_at_terminal: Block128,
-    pub main_final_at_terminal: Block128,
+pub struct AuthCapsuleExplicitMleCheckCarrier<F = Block128> {
+    pub round_proofs: Vec<ZkMleCheckRoundProof<F>>,
+    pub terminal_point: [F; ZK_AUTH_CAPSULE_BANK_VARS],
+    pub terminal_operands: AuthCapsuleTerminalOperandClaims<F>,
+    pub mask_mle_at_input: F,
+    pub mask_final_at_terminal: F,
+    pub main_final_at_terminal: F,
 }
 
-impl AuthCapsuleExplicitMleCheckCarrier {
-    pub fn post_claims(&self) -> AuthCapsulePostClaims {
+impl<F: Copy> AuthCapsuleExplicitMleCheckCarrier<F> {
+    pub fn post_claims(&self) -> AuthCapsulePostClaims<F> {
         AuthCapsulePostClaims {
             terminal_operands: self.terminal_operands,
             mask_mle_at_input: self.mask_mle_at_input,
@@ -1154,20 +1201,23 @@ impl AuthCapsuleExplicitMleCheckCarrier {
 /// explicit caller-supplied challenges. This is an algebra/indexing gate, not
 /// a proof API: it performs no commitment, transcript absorption, PCS opening,
 /// serialization, recursive verification, or randomness generation.
-pub fn build_explicit_mlecheck_carrier(
+pub fn build_explicit_mlecheck_carrier<F>(
     bank: ZkAuthCapsuleBankView<'_>,
-    input_point: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-    mask_batch_challenge: Block128,
-    round_challenges_high_to_low: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-) -> Result<AuthCapsuleExplicitMleCheckCarrier, ZkAuthCapsuleError> {
-    if mask_batch_challenge == Block128::ZERO {
+    input_point: [F; ZK_AUTH_CAPSULE_BANK_VARS],
+    mask_batch_challenge: F,
+    round_challenges_high_to_low: [F; ZK_AUTH_CAPSULE_BANK_VARS],
+) -> Result<AuthCapsuleExplicitMleCheckCarrier<F>, ZkAuthCapsuleError>
+where
+    F: TowerField + From<Block128>,
+{
+    if mask_batch_challenge == F::ZERO {
         return Err(ZkAuthCapsuleError::ZeroMaskBatchChallenge);
     }
     validate_auth_main_relation(bank)?;
     let mask = bank.libra_mask_view()?;
     let tables = MainTables::build(bank);
     let mask_mle_at_input = mask.evaluate_mle(&input_point);
-    let mut main_running_claim = Block128::ZERO;
+    let mut main_running_claim = F::ZERO;
     let mut round_proofs = Vec::with_capacity(ZK_AUTH_CAPSULE_BANK_VARS);
 
     for round in 0..ZK_AUTH_CAPSULE_BANK_VARS {
@@ -1203,7 +1253,7 @@ pub fn build_explicit_mlecheck_carrier(
 
     let mut verifier = ZkMleCheckVerifierState::new(
         input_point,
-        Block128::ZERO,
+        F::ZERO,
         mask_mle_at_input,
         mask_batch_challenge,
     );
@@ -1251,14 +1301,6 @@ mod tests {
         for (index, cell) in bank
             .iter_mut()
             .enumerate()
-            .take(ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET)
-            .skip(ZK_AUTH_CAPSULE_PCS_COINS_OFFSET)
-        {
-            *cell = elem(index, 0xC01A5);
-        }
-        for (index, cell) in bank
-            .iter_mut()
-            .enumerate()
             .take(ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET)
             .skip(ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET)
         {
@@ -1267,9 +1309,17 @@ mod tests {
         for (index, cell) in bank
             .iter_mut()
             .enumerate()
+            .take(ZK_AUTH_CAPSULE_PCS_COINS_OFFSET)
             .skip(ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET)
         {
             *cell = elem(index, 0xA771A6);
+        }
+        for (index, cell) in bank
+            .iter_mut()
+            .enumerate()
+            .skip(ZK_AUTH_CAPSULE_PCS_COINS_OFFSET)
+        {
+            *cell = elem(index, 0xC01A5);
         }
         (bank, AuthCapsuleBoundaryPublic::canonical(address))
     }
@@ -1277,9 +1327,9 @@ mod tests {
     #[test]
     fn layout_and_nonwrapping_addresses_are_exact() {
         assert_eq!(ZK_AUTH_CAPSULE_STATE_OFFSET, 0);
-        assert_eq!(ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, 512);
-        assert_eq!(ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET, 1024);
-        assert_eq!(ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET, 1280);
+        assert_eq!(ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET, 512);
+        assert_eq!(ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET, 768);
+        assert_eq!(ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, 1024);
         assert_eq!(ZK_AUTH_CAPSULE_BANK_LEN, 2048);
         assert_eq!(state_cell_index(0, 0).unwrap(), 0);
         assert_eq!(state_cell_index(0, 3).unwrap(), 3);
@@ -1298,9 +1348,9 @@ mod tests {
         let (bank, _) = fixture();
         let view = ZkAuthCapsuleBankView::checked(&bank).unwrap();
         assert_eq!(view.state().len(), 512);
-        assert_eq!(view.dedicated_pcs_coins().len(), 512);
+        assert_eq!(view.dedicated_pcs_coins().len(), 1_024);
         assert_eq!(view.libra_mask().len(), 256);
-        assert_eq!(view.remaining_padding().len(), 768);
+        assert_eq!(view.remaining_padding().len(), 256);
         assert!(matches!(
             ZkAuthCapsuleBankView::checked(&bank[..2047]),
             Err(ZkAuthCapsuleError::BankLength { .. })
@@ -1382,10 +1432,7 @@ mod tests {
 
         let certificate = certify_terminal_blinding_rank(&terminal).unwrap();
         assert_eq!(certificate.certified_rank, 5);
-        assert_eq!(
-            certificate.blinding_cell_indices,
-            [1280, 1281, 1282, 1283, 1284]
-        );
+        assert_eq!(certificate.blinding_cell_indices, [768, 769, 770, 771, 772]);
         let weights = terminal_operand_functional_weights(&terminal);
         for claim in 0..ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS {
             for blinder in 0..ZK_AUTH_CAPSULE_TERMINAL_BLINDING_CELLS {
@@ -1434,8 +1481,8 @@ mod tests {
         )
         .unwrap();
         assert!(relation.verify(view));
-        assert!(relation.weights
-            [ZK_AUTH_CAPSULE_PCS_COINS_OFFSET..ZK_AUTH_CAPSULE_LIBRA_MASK_OFFSET]
+        assert!(relation.weights[ZK_AUTH_CAPSULE_PCS_COINS_OFFSET
+            ..ZK_AUTH_CAPSULE_PCS_COINS_OFFSET + ZK_AUTH_CAPSULE_PCS_COINS_LEN]
             .iter()
             .all(|&weight| weight == Block128::ZERO));
         assert!(relation.weights[ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET

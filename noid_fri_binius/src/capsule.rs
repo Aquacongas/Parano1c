@@ -60,12 +60,12 @@
 use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
 use noid_core::mle::eq::eq_ind_partial_eval;
 use noid_core::mle::evaluate::evaluate_slice;
-use noid_core::{AdditiveNTT, Block128, TowerField};
+use noid_core::{AdditiveNTT, Block128, Block256, TowerField};
 use noid_fri::hasher::{CryptographicHasher, HashOutput};
 use noid_fri::Channel;
 use noid_poseidon2b::native::compress_flat_feed_forward_with_tag;
 use noid_poseidon2b::native::compression::Poseidon2bFlatSponge;
-use noid_poseidon2b::native::domain::{TAG_CAPSLEAF, TAG_CAPSNODE};
+use noid_poseidon2b::native::domain::{TAG_CAPS256, TAG_CAPSLEAF, TAG_CAPSMIX, TAG_CAPSNODE};
 
 use crate::interleaved_commit::{
     build_source_batched_merkle_proof_to_cap, verify_source_batched_merkle_proof_to_cap,
@@ -389,6 +389,36 @@ pub fn capsule_leaf_hash(msg_log: usize, leaf_index: usize, syms: &[Block128]) -
     sponge.update(&(leaf_index as u128).to_le_bytes());
     for s in syms {
         sponge.update(&tower_to_flat_u128(s.0).to_le_bytes());
+    }
+    sponge.finalize_no_pad()
+}
+
+/// C1 leaf hash over one fixed 16-symbol GF(2^256) fold-normal coset. Each
+/// symbol is encoded as its low then high GF(2^128) coordinate in flat basis.
+/// The dedicated tag binds the leaf type and fixed length. Position is bound
+/// by the ordered Merkle path, so no redundant metadata permutation is used.
+pub fn capsule_leaf_hash_wide(syms: &[Block256]) -> SourceHash {
+    debug_assert_eq!(syms.len(), CAPSULE_LEAF_SYMBOLS);
+    let mut sponge = Poseidon2bFlatSponge::with_tag(TAG_CAPS256);
+    for symbol in syms {
+        sponge.update(&tower_to_flat_u128(symbol.lo.0).to_le_bytes());
+        sponge.update(&tower_to_flat_u128(symbol.hi.0).to_le_bytes());
+    }
+    sponge.finalize_no_pad()
+}
+
+/// C1 source-leaf hash over the canonical fold-normal base/wide
+/// representation.
+/// Each of the eight logical positions contributes the bank value followed
+/// by the low and high coordinates of its independent wide companion value.
+/// The caller supplies those 24 GF(2^128) lanes in exactly that order.
+/// The dedicated tag binds the fixed 24-lane shape; the ordered Merkle path
+/// binds position, so no redundant metadata permutation is used.
+pub fn capsule_leaf_hash_mixed(packed_lanes: &[Block128]) -> SourceHash {
+    debug_assert_eq!(packed_lanes.len(), 3 * (CAPSULE_LEAF_SYMBOLS / 2));
+    let mut sponge = Poseidon2bFlatSponge::with_tag(TAG_CAPSMIX);
+    for lane in packed_lanes {
+        sponge.update(&tower_to_flat_u128(lane.0).to_le_bytes());
     }
     sponge.finalize_no_pad()
 }

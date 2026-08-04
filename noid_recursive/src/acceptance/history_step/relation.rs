@@ -23,8 +23,8 @@ use crate::acceptance::history_step_bank::{
     HISTORY_STEP_TIER_SLOT_COUNT,
 };
 use noid_ivc_core::deep_chain::schedule::TranscriptOp;
-use noid_ivc_core::field_circuit::f128_from_u128;
-pub const HISTORY_STEP_WIRE_VERSION: u8 = 2;
+use noid_ivc_core::field_circuit::{f128_from_u128, ExtExpr};
+pub const HISTORY_STEP_WIRE_VERSION: u8 = 3;
 
 const _: () = assert!(
     HISTORY_STEP_WIRE_VERSION == noid_chain::history_step::HISTORY_STEP_TERMINAL_VERSION,
@@ -104,6 +104,13 @@ pub enum HistoryStepError {
         used: usize,
         limit: usize,
     },
+}
+
+fn auxiliary_sidecar_error(label: &str, error: RegionSidecarError) -> VerifyError {
+    if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+        eprintln!("[history-step auxiliary] {label}: {error:?}");
+    }
+    VerifyError::Auxiliary
 }
 
 impl core::fmt::Display for HistoryStepError {
@@ -491,7 +498,7 @@ pub fn derive_history_step_runtime_parts(
                 CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
             let entry = runtime.bank().entry(class_id);
             let (field_proof, commitment_root) =
-                shape_only_field_r1cs_proof(&entry.shape(), entry.pcs_params());
+                shape_only_field_r1cs_proof_c1(&entry.shape(), entry.pcs_params());
             let envelope = HistoryStepProof {
                 field_proof,
                 commitment: Commitment {
@@ -730,14 +737,14 @@ impl FrozenHistoryStep {
 
 #[derive(Clone, Debug)]
 pub struct HistoryStepProof {
-    pub(super) field_proof: FieldR1csProof,
+    pub(super) field_proof: C1FieldR1csProof,
     pub(super) commitment: Commitment,
     pub(super) io: Vec<F128>,
     pub(super) sidecar: HistoryStepCompositeSidecarProof,
 }
 
 impl HistoryStepProof {
-    pub fn field_proof(&self) -> &FieldR1csProof {
+    pub fn field_proof(&self) -> &C1FieldR1csProof {
         &self.field_proof
     }
 
@@ -962,7 +969,7 @@ pub(super) fn validate_envelope_against_runtime(
 }
 
 struct PreparedParentReplay {
-    fresh: FreshLincheckClaim,
+    fresh: C1FreshLincheckClaim,
     child_recordings: Vec<LayoutRecordedChannel>,
     r_prev_recordings: Vec<LayoutRecordedChannel>,
 }
@@ -1065,7 +1072,7 @@ fn run_scratch_parent_recording_pass(
         .copied()
         .map(|value| LinExpr::from_wire(builder.alloc_f128(value)))
         .collect::<Vec<_>>();
-    let proof = FieldR1csProofTrace::alloc_shape_mode(
+    let proof = C1FieldR1csProofTrace::alloc_shape_mode(
         &mut builder,
         &envelope.field_proof,
         &entry.shape(),
@@ -1073,10 +1080,10 @@ fn run_scratch_parent_recording_pass(
         false,
     );
     let mut obligations = PcsWalkObligations::default();
-    let mut channel = FsChannelUnionRecorder::new(HISTORY_STEP_PROOF_DOMAIN);
+    let mut channel = FsChannelUnionRecorder::new_c1(HISTORY_STEP_PROOF_DOMAIN);
     let mut child_recording = None;
     let mut sidecar_result = Ok(());
-    verify_field_trace_deferred_region_with_post_commit_context_expr(
+    verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
         &mut builder,
         &mut channel,
         &entry.shape(),
@@ -1149,7 +1156,7 @@ fn shape_only_parent_arm(
 ) -> Result<(HistoryStepProof, ScratchParentRecordingPass), HistoryStepError> {
     let entry = runtime.bank().entry(class_id);
     let (field_proof, native_root) =
-        shape_only_field_r1cs_proof(&entry.shape(), entry.pcs_params());
+        shape_only_field_r1cs_proof_c1(&entry.shape(), entry.pcs_params());
     let mut envelope = HistoryStepProof {
         field_proof,
         commitment: Commitment {
@@ -1189,7 +1196,7 @@ fn shape_only_parent_arm(
         &entry.matrix_digest(),
         &entry.post_commit_digest(),
     )?;
-    super::super::trace::self_verify::patch_shape_only_query_positions(
+    super::super::trace::self_verify::patch_shape_only_query_positions_c1(
         &mut envelope.field_proof,
         entry.pcs_params(),
         &scratch.query_lane_values,
@@ -1237,9 +1244,9 @@ fn prepare_parent_replay<'a>(
         .clone();
 
     let mut challenger =
-        LayoutRecordingChallenger::new(HISTORY_STEP_PROOF_DOMAIN, r_prev_layout.clone());
+        LayoutRecordingChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN, r_prev_layout.clone());
     let mut child_recording = None;
-    let (_claim, fresh) = verify_field_deferred_matrix_with_post_commit_context(
+    let (_claim, fresh) = verify_field_c1_deferred_matrix_with_post_commit_context(
         &entry.shape(),
         &matrix_digest,
         &envelope.commitment,
@@ -1255,7 +1262,7 @@ fn prepare_parent_replay<'a>(
                 &sidecar.parent_recursion,
                 context,
             )
-            .map_err(|_| VerifyError::Auxiliary)?;
+            .map_err(|error| auxiliary_sidecar_error("parent Link", error))?;
             let (_, recording) = verify_block_region_sidecar_post_commit_layout_captured(
                 runtime
                     .direct_block_vk(live_slot)
@@ -1264,7 +1271,7 @@ fn prepare_parent_replay<'a>(
                 context,
                 child_layout.clone(),
             )
-            .map_err(|_| VerifyError::Auxiliary)?;
+            .map_err(|error| auxiliary_sidecar_error("parent direct Block", error))?;
             child_recording = Some(recording);
             Ok(())
         },
@@ -1328,28 +1335,28 @@ struct PreparedHistoryStepParent<'a> {
     current_class: CanonicalHistoryStepClassId,
     envelopes: [PreparedParentEnvelope<'a>; HISTORY_STEP_TIER_SLOT_COUNT],
     replay: PreparedParentReplay,
-    fold_proofs: [MatrixFoldProof; HISTORY_STEP_TIER_SLOT_COUNT],
+    fold_proofs: [C1MatrixFoldProof; HISTORY_STEP_TIER_SLOT_COUNT],
     io: Vec<F128>,
 }
 
-fn zero_fresh_claim(shape: FieldShape) -> FreshLincheckClaim {
-    FreshLincheckClaim {
-        alpha: F128::ZERO,
-        z_skip: F128::ZERO,
-        x_inner_rest: vec![F128::ZERO; shape.k_log - shape.k_skip],
-        r_inner_rest: vec![F128::ZERO; shape.k_log - shape.k_skip],
-        z_partial: vec![F128::ZERO; 1usize << shape.k_skip],
-        value: F128::ZERO,
+fn zero_fresh_claim(shape: FieldShape) -> C1FreshLincheckClaim {
+    C1FreshLincheckClaim {
+        alpha: F256::ZERO,
+        z_skip: F256::ZERO,
+        x_inner_rest: vec![F256::ZERO; shape.k_log - shape.k_skip],
+        r_inner_rest: vec![F256::ZERO; shape.k_log - shape.k_skip],
+        z_partial: vec![F256::ZERO; 1usize << shape.k_skip],
+        value: F256::ZERO,
     }
 }
 
-fn zero_fold_proof(k_log: usize) -> MatrixFoldProof {
-    MatrixFoldProof {
-        phase1_rounds: vec![[F128::ZERO; 2]; k_log + 1],
-        g_v: F128::ZERO,
-        g_e: F128::ZERO,
-        phase2_rounds: vec![[F128::ZERO; 2]; k_log],
-        final_matrix_eval: F128::ZERO,
+fn zero_fold_proof(k_log: usize) -> C1MatrixFoldProof {
+    C1MatrixFoldProof {
+        phase1_rounds: vec![[F256::ZERO; 2]; k_log + 1],
+        g_v: F256::ZERO,
+        g_e: F256::ZERO,
+        phase2_rounds: vec![[F256::ZERO; 2]; k_log],
+        final_matrix_eval: F256::ZERO,
     }
 }
 
@@ -1463,7 +1470,7 @@ pub fn prove_built_history_step(
                 built.preparations.recursion.prover_input(),
             )?;
             let direct_block_plan = built.preparations.direct_block.prover_plan()?;
-            let mut challenger = FsLaneChallenger::new(HISTORY_STEP_PROOF_DOMAIN);
+            let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
             $prove(
                 $matrix,
                 &built.witness,
@@ -1485,11 +1492,11 @@ pub fn prove_built_history_step(
     }
     let (field_proof, sidecar, commitment, _) = match &built.matrix {
         HistoryStepMatrixLease::Resident(matrix) => prove_with_matrix!(
-            prove_field_with_public_io_and_post_commit_context,
+            prove_field_c1_with_public_io_and_post_commit_context,
             matrix.as_ref()
         ),
         HistoryStepMatrixLease::Compact(matrix) => prove_with_matrix!(
-            prove_field_compact_with_public_io_and_post_commit_context,
+            prove_field_compact_c1_with_public_io_and_post_commit_context,
             matrix.as_ref()
         ),
     };
@@ -1519,8 +1526,8 @@ pub fn verify_history_step_pending(
     validate_envelope_against_runtime(runtime, class_id, envelope)?;
     let bank = runtime.bank();
     let entry = bank.entry(class_id);
-    let mut challenger = FsLaneChallenger::new(HISTORY_STEP_PROOF_DOMAIN);
-    let (_claim, fresh) = verify_field_deferred_matrix_with_post_commit_context(
+    let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
+    let (_claim, fresh) = verify_field_c1_deferred_matrix_with_post_commit_context(
         &entry.shape(),
         &entry.matrix_digest(),
         &envelope.commitment,
@@ -1536,7 +1543,7 @@ pub fn verify_history_step_pending(
                 &sidecar.parent_recursion,
                 context,
             )
-            .map_err(|_| VerifyError::Auxiliary)?;
+            .map_err(|error| auxiliary_sidecar_error("tip Link", error))?;
             verify_block_region_sidecar_post_commit(
                 runtime
                     .direct_block_vk(class_id.current_slot())
@@ -1544,7 +1551,7 @@ pub fn verify_history_step_pending(
                 &sidecar.direct_block,
                 context,
             )
-            .map_err(|_| VerifyError::Auxiliary)?;
+            .map_err(|error| auxiliary_sidecar_error("tip direct Block", error))?;
             Ok(())
         },
     )?;
@@ -1703,6 +1710,18 @@ fn prepare_history_step_assembly<const TIER: usize>(
     current: HistoryStepBlockInput<TIER>,
     mode: HistoryStepAssemblyMode,
 ) -> Result<PreparedHistoryStepAssembly, HistoryStepError> {
+    let timing = std::env::var_os("NOIDH_HISTORY_ASSEMBLY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let mut stage_started = total_started;
+    let lap = |label: &str, stage_started: &mut std::time::Instant| {
+        if timing {
+            eprintln!(
+                "[history-assembly B{TIER}] {label}: {:.1} ms",
+                stage_started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        *stage_started = std::time::Instant::now();
+    };
     let bank = runtime.bank();
     let PreparedHistoryStepParent {
         base,
@@ -1748,6 +1767,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
         &io_cells[layout.tip_class],
         &LinExpr::constant(f128_from_u128(current_class.wire_id() as u128)),
     );
+    lap("matrix lease + public IO", &mut stage_started);
 
     let r_pcs = envelopes
         .iter()
@@ -1765,6 +1785,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     let r_columns = prepare_history_step_parent_columns(
         &mut builder,
         &r_pcs,
+        selected_parent_class.current_slot(),
         runtime.parent_geometry(),
         prepared_parent.child_recordings,
         prepared_parent.r_prev_recordings,
@@ -1772,6 +1793,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     .map_err(|source| {
         HistoryStepError::sidecar(HistoryStepSidecarOperation::PrepareParentColumns, source)
     })?;
+    lap("parent committed columns", &mut stage_started);
 
     // The universal parent columns above have one fixed geometry across the
     // complete two-class bank and establish the shared Link VK slices. Allocate the
@@ -1810,6 +1832,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
         &parent_seal.height,
         &block_slots.start_acc.height,
     );
+    lap("current Block trace prefix", &mut stage_started);
 
     let prev_roots = envelopes
         .iter()
@@ -1832,6 +1855,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     for index in layout.matrix_whitelist..layout.bank_digest + 2 {
         pin_eq(&mut builder, &io_cells[index], &prev_io[index]);
     }
+    lap("parent public IO + selector", &mut stage_started);
 
     let mut obligations = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
     let mut recorded_children = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
@@ -1842,7 +1866,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
         let class = CanonicalHistoryStepClassId::new(slot).expect("canonical parent arm");
         let entry = bank.entry(class);
         let arm_envelope = arm_envelope.proof();
-        let proof = FieldR1csProofTrace::alloc_shape_mode(
+        let proof = C1FieldR1csProofTrace::alloc_shape_mode(
             &mut builder,
             &arm_envelope.field_proof,
             &entry.shape(),
@@ -1857,11 +1881,11 @@ fn prepare_history_step_assembly<const TIER: usize>(
         });
         let arm_gate = mul(&mut builder, &parent_gate, &parent_selector.one_hot[slot]);
         let mut arm_obligations = PcsWalkObligations::default();
-        let mut replay_channel = BaseSelectableParentRecorder::new(HISTORY_STEP_PROOF_DOMAIN);
+        let mut replay_channel = BaseSelectableParentRecorder::new_c1(HISTORY_STEP_PROOF_DOMAIN);
         let mut recorded_child = None;
         let mut sidecar_result = Ok(());
         let (_parent_claim, fresh_parent) = with_pin_gate(&arm_gate, || {
-            verify_field_trace_deferred_region_with_post_commit_context_expr(
+            verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
                 &mut builder,
                 &mut replay_channel,
                 &entry.shape(),
@@ -1911,6 +1935,13 @@ fn prepare_history_step_assembly<const TIER: usize>(
         recorded_r_prev.push(replay_channel.finish());
         fresh_parents.push(fresh_parent);
         arm_gates.push(arm_gate);
+        if timing {
+            eprintln!(
+                "[history-assembly B{TIER}] parent verifier arm {slot}: {:.1} ms",
+                stage_started.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        stage_started = std::time::Instant::now();
     }
 
     let mut accumulated = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
@@ -1918,23 +1949,29 @@ fn prepare_history_step_assembly<const TIER: usize>(
         let class = CanonicalHistoryStepClassId::new(slot).expect("canonical parent arm");
         let shape = bank.entry(class).shape();
         let lane = layout.matrix_lanes[class.index()];
-        let incoming = MatrixAccClaimTrace {
+        let incoming = C1MatrixAccClaimTrace {
             point: (0..lane.point_len())
-                .map(|coordinate| prev_io[lane.point + coordinate].clone())
+                .map(|coordinate| {
+                    ExtExpr::new(
+                        prev_io[lane.point + 2 * coordinate].clone(),
+                        prev_io[lane.point + 2 * coordinate + 1].clone(),
+                    )
+                })
                 .collect(),
-            value: prev_io[lane.value].clone(),
+            value: ExtExpr::new(prev_io[lane.value].clone(), prev_io[lane.value + 1].clone()),
         };
         let incoming_live = prev_io[lane.live].clone();
-        let fold_trace = MatrixFoldProofTrace::alloc(&mut builder, &fold_proofs[slot], shape.k_log);
+        let fold_trace =
+            C1MatrixFoldProofTrace::alloc(&mut builder, &fold_proofs[slot], shape.k_log);
         let mut fold_channel =
-            FsChannelTrace::new(&mut builder, HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN);
+            FsChannelTrace::new_c1(&mut builder, HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN);
         observe_history_step_bank_fold_route_trace(
             &mut builder,
             &mut fold_channel,
             &parent_selector.class,
         );
         accumulated.push(with_pin_gate(&arm_gates[slot], || {
-            verify_matrix_claim_fold_trace(
+            verify_matrix_claim_fold_c1_trace(
                 &mut builder,
                 &mut fold_channel,
                 shape.k_log,
@@ -1954,24 +1991,32 @@ fn prepare_history_step_assembly<const TIER: usize>(
         // one-hot bit (and therefore the whole delta) is zero.
         let selector = &parent_selector.one_hot[class.index()];
         for coordinate in 0..lane.point_len() {
-            let previous = &prev_io[lane.point + coordinate];
-            let selected_delta = mul(
-                &mut builder,
-                selector,
-                &accumulated[index].point[coordinate].add(previous),
-            );
-            let selected = previous.add(&mul(&mut builder, &parent_gate, &selected_delta));
-            pin_eq(&mut builder, &io_cells[lane.point + coordinate], &selected);
+            for component in 0..2 {
+                let offset = lane.point + 2 * coordinate + component;
+                let previous = &prev_io[offset];
+                let accumulated_component = if component == 0 {
+                    &accumulated[index].point[coordinate].lo
+                } else {
+                    &accumulated[index].point[coordinate].hi
+                };
+                let selected_delta =
+                    mul(&mut builder, selector, &accumulated_component.add(previous));
+                let selected = previous.add(&mul(&mut builder, &parent_gate, &selected_delta));
+                pin_eq(&mut builder, &io_cells[offset], &selected);
+            }
         }
-        let previous_value = &prev_io[lane.value];
-        let selected_value_delta = mul(
-            &mut builder,
-            selector,
-            &accumulated[index].value.add(previous_value),
-        );
-        let selected_value =
-            previous_value.add(&mul(&mut builder, &parent_gate, &selected_value_delta));
-        pin_eq(&mut builder, &io_cells[lane.value], &selected_value);
+        for component in 0..2 {
+            let offset = lane.value + component;
+            let previous = &prev_io[offset];
+            let accumulated_component = if component == 0 {
+                &accumulated[index].value.lo
+            } else {
+                &accumulated[index].value.hi
+            };
+            let selected_delta = mul(&mut builder, selector, &accumulated_component.add(previous));
+            let selected = previous.add(&mul(&mut builder, &parent_gate, &selected_delta));
+            pin_eq(&mut builder, &io_cells[offset], &selected);
+        }
         let previous_live = &prev_io[lane.live];
         let selected_live_delta = mul(
             &mut builder,
@@ -1982,12 +2027,14 @@ fn prepare_history_step_assembly<const TIER: usize>(
             previous_live.add(&mul(&mut builder, &parent_gate, &selected_live_delta));
         pin_eq(&mut builder, &io_cells[lane.live], &selected_live);
     }
+    lap("matrix folds + bank lanes", &mut stage_started);
 
     let parent_region = with_pin_gate(&parent_gate, || {
         finalize_history_step_parent_region(
             &mut builder,
             r_columns,
             &obligations,
+            &parent_selector.one_hot,
             &recorded_children,
             &recorded_r_prev,
         )
@@ -1995,6 +2042,7 @@ fn prepare_history_step_assembly<const TIER: usize>(
     .map_err(|source| {
         HistoryStepError::sidecar(HistoryStepSidecarOperation::FinalizeParentRegion, source)
     })?;
+    lap("parent region source binding", &mut stage_started);
 
     // Parent-seal glue. Recursive case: the replayed header must project to
     // the verified parent terminal tip (semantic lanes of the parent public
@@ -2052,6 +2100,13 @@ fn prepare_history_step_assembly<const TIER: usize>(
             &io_cells[layout.block_accumulator + index],
         );
     }
+    if timing {
+        eprintln!(
+            "[history-assembly B{TIER}] remaining glue: {:.1} ms; prepare total: {:.1} ms",
+            stage_started.elapsed().as_secs_f64() * 1e3,
+            total_started.elapsed().as_secs_f64() * 1e3,
+        );
+    }
 
     Ok(PreparedHistoryStepAssembly {
         mode,
@@ -2074,6 +2129,9 @@ fn finish_history_step_assembly<const TIER: usize>(
     sealed_header: &BlockHeader,
     end_accumulator: &ChainAccumulator,
 ) -> Result<HistoryStepAssemblyOutput, HistoryStepError> {
+    let timing = std::env::var_os("NOIDH_HISTORY_ASSEMBLY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let mut stage_started = total_started;
     let PreparedHistoryStepAssembly {
         mode,
         mut builder,
@@ -2097,6 +2155,13 @@ fn finish_history_step_assembly<const TIER: usize>(
     block_assembly
         .seal_direct_tail(&mut builder, sealed_header, end_accumulator)
         .map_err(|_| HistoryStepError::StagedSeal)?;
+    if timing {
+        eprintln!(
+            "[history-assembly B{TIER}] finish seals: {:.1} ms",
+            stage_started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    stage_started = std::time::Instant::now();
 
     let used = builder.num_wires();
     let limit = 1usize << shape.m;
@@ -2121,6 +2186,13 @@ fn finish_history_step_assembly<const TIER: usize>(
             (None, witness)
         }
     };
+    if timing {
+        eprintln!(
+            "[history-assembly B{TIER}] builder finish + pad: {:.1} ms",
+            stage_started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    stage_started = std::time::Instant::now();
     let direct_block =
         finalize_selected_zk_block_region(block_assembly, shape.m).map_err(|source| {
             HistoryStepError::sidecar(
@@ -2128,6 +2200,13 @@ fn finish_history_step_assembly<const TIER: usize>(
                 source,
             )
         })?;
+    if timing {
+        eprintln!(
+            "[history-assembly B{TIER}] current Block sidecar finalize: {:.1} ms",
+            stage_started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    stage_started = std::time::Instant::now();
     let preparations = HistoryStepPreparations {
         recursion: parent_region,
         direct_block,
@@ -2154,6 +2233,13 @@ fn finish_history_step_assembly<const TIER: usize>(
                 preparations,
             };
             validate_built_against_bank(runtime, &built, &built.matrix)?;
+            if timing {
+                eprintln!(
+                    "[history-assembly B{TIER}] bank validation: {:.1} ms; finish total: {:.1} ms",
+                    stage_started.elapsed().as_secs_f64() * 1e3,
+                    total_started.elapsed().as_secs_f64() * 1e3,
+                );
+            }
             HistoryStepAssemblyOutput::WitnessOnly(built)
         }
     })

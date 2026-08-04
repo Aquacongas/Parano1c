@@ -20,7 +20,7 @@
 //!   constant-one column), closing the all-zero-witness gap — see
 //!   `docs/const-wire-pin.md`.
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::lincheck::LincheckCircuit;
 use std::borrow::Cow;
 use std::fmt;
@@ -5452,14 +5452,31 @@ fn compact_fold_chunk_count_for_threads(
     group_count: usize,
     threads: usize,
 ) -> usize {
+    compact_fold_chunk_count_for_element(n_cols, group_count, threads, std::mem::size_of::<F128>())
+}
+
+fn compact_fold_chunk_count_for_element(
+    n_cols: usize,
+    group_count: usize,
+    threads: usize,
+    element_bytes: usize,
+) -> usize {
     if group_count == 0 {
         return 0;
     }
-    let comb_bytes = n_cols.saturating_mul(std::mem::size_of::<F128>());
+    let comb_bytes = n_cols.saturating_mul(element_bytes);
     let budget_chunks = (FOLD_COMB_BUDGET_BYTES / comb_bytes.max(1)).max(1);
     let target_chunks = threads.max(1).min(budget_chunks).min(group_count).max(1);
     let groups_per_chunk = group_count.div_ceil(target_chunks);
     group_count.div_ceil(groups_per_chunk)
+}
+
+fn compact_c1_fold_chunk_count_for_threads(
+    n_cols: usize,
+    group_count: usize,
+    threads: usize,
+) -> usize {
+    compact_fold_chunk_count_for_element(n_cols, group_count, threads, std::mem::size_of::<F256>())
 }
 
 /// Scatter authenticated row groups into bounded private dense combs and
@@ -5507,6 +5524,52 @@ where
             accumulator
         })
         .expect("non-empty compact group range has one fold chunk")
+}
+
+/// C1 counterpart of [`parallel_compact_group_fold`]. A width-`n_cols`
+/// extension-field comb is twice as large, so the same fixed scratch budget
+/// admits at most two private combs at the B255 width instead of four base
+/// field combs. Both matrix sides must be scanned into each private comb.
+pub(crate) fn parallel_compact_group_fold_c1<F>(
+    n_cols: usize,
+    group_count: usize,
+    fold_chunk: F,
+) -> Vec<F256>
+where
+    F: Fn(std::ops::Range<usize>, &mut [F256]) + Sync,
+{
+    use rayon::prelude::*;
+
+    if group_count == 0 {
+        return vec![F256::ZERO; n_cols];
+    }
+
+    let chunk_count =
+        compact_c1_fold_chunk_count_for_threads(n_cols, group_count, rayon::current_num_threads());
+    let comb_bytes = n_cols.saturating_mul(std::mem::size_of::<F256>());
+    debug_assert!(
+        chunk_count.saturating_mul(comb_bytes) <= FOLD_COMB_BUDGET_BYTES
+            || (chunk_count == 1 && comb_bytes > FOLD_COMB_BUDGET_BYTES),
+        "private C1 fold combs must obey the fixed scratch budget",
+    );
+    let groups_per_chunk = group_count.div_ceil(chunk_count);
+
+    (0..chunk_count)
+        .into_par_iter()
+        .map(|chunk| {
+            let first = chunk * groups_per_chunk;
+            let end = ((chunk + 1) * groups_per_chunk).min(group_count);
+            let mut comb = vec![F256::ZERO; n_cols];
+            fold_chunk(first..end, &mut comb);
+            comb
+        })
+        .reduce_with(|mut accumulator, partial| {
+            for (left, right) in accumulator.iter_mut().zip(partial) {
+                *left += right;
+            }
+            accumulator
+        })
+        .expect("non-empty compact group range has one C1 fold chunk")
 }
 
 impl LincheckCircuit for FieldCscCircuit {
@@ -5582,6 +5645,60 @@ impl<'a> FieldRowCircuit<'a> {
             b_0,
             const_pin,
         }
+    }
+
+    /// Fold both matrix sides into one C1 comb. The row weight is computed
+    /// once, multiplied by `alpha` once, then each F128 matrix coefficient is
+    /// applied with the two-product [`F256::scale_base`] path.
+    fn fold_alpha_batched_c1_with_row_weight<W>(&self, alpha: F256, row_weight: W) -> Vec<F256>
+    where
+        W: Fn(usize) -> F256 + Sync,
+    {
+        use rayon::prelude::*;
+
+        let n = self.a_0.num_cols;
+        debug_assert_eq!(self.a_0.num_rows, self.b_0.num_rows);
+        let row_count = self.a_0.num_rows;
+        let nnz = self.a_0.nnz() + self.b_0.nnz();
+        let threads = rayon::current_num_threads().max(1);
+
+        let fold_rows = |rows: std::ops::Range<usize>, comb: &mut [F256]| {
+            for row in rows {
+                let weight = row_weight(row);
+                let alpha_weight = alpha * weight;
+                for (column, coefficient) in self.a_0.row(row) {
+                    comb[column as usize] += alpha_weight.scale_base(coefficient);
+                }
+                for (column, coefficient) in self.b_0.row(row) {
+                    comb[column as usize] += weight.scale_base(coefficient);
+                }
+            }
+        };
+
+        if nnz < FIELD_FOLD_PAR_THRESHOLD || threads == 1 || row_count == 0 {
+            let mut comb = vec![F256::ZERO; n];
+            fold_rows(0..row_count, &mut comb);
+            return comb;
+        }
+
+        let chunk_count = compact_c1_fold_chunk_count_for_threads(n, row_count, threads).max(1);
+        let rows_per_chunk = row_count.div_ceil(chunk_count);
+        (0..chunk_count)
+            .into_par_iter()
+            .map(|chunk| {
+                let first = chunk * rows_per_chunk;
+                let end = ((chunk + 1) * rows_per_chunk).min(row_count);
+                let mut comb = vec![F256::ZERO; n];
+                fold_rows(first..end, &mut comb);
+                comb
+            })
+            .reduce_with(|mut accumulator, partial| {
+                for (left, right) in accumulator.iter_mut().zip(partial) {
+                    *left += right;
+                }
+                accumulator
+            })
+            .expect("non-empty row range has one C1 fold chunk")
     }
 }
 
@@ -5677,6 +5794,27 @@ impl LincheckCircuit for FieldRowCircuit<'_> {
         }
         comb
     }
+
+    fn fold_alpha_batched_c1(&self, alpha: F256, eq_inner: &[F256]) -> Vec<F256> {
+        assert_eq!(eq_inner.len(), self.a_0.num_cols);
+        self.fold_alpha_batched_c1_with_row_weight(alpha, |row| eq_inner[row])
+    }
+
+    fn fold_alpha_batched_quirky_c1(
+        &self,
+        alpha: F256,
+        z_skip: F256,
+        x_inner_rest: &[F256],
+        k_skip: usize,
+    ) -> Vec<F256> {
+        let skip_size = 1usize << k_skip;
+        let skip = crate::zerocheck::field_c1::lagrange_weights(k_skip, z_skip, 0);
+        let rest = crate::zerocheck::field_c1::build_eq_table(x_inner_rest);
+        assert_eq!(skip_size.saturating_mul(rest.len()), self.a_0.num_cols);
+        self.fold_alpha_batched_c1_with_row_weight(alpha, |row| {
+            skip[row & (skip_size - 1)] * rest[row >> k_skip]
+        })
+    }
 }
 
 impl LincheckCircuit for FieldR1cs {
@@ -5691,6 +5829,82 @@ impl LincheckCircuit for FieldR1cs {
     fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
         FieldRowCircuit::new(&self.a_0, &self.b_0, self.const_pin)
             .fold_alpha_batched(alpha, eq_inner)
+    }
+
+    fn fold_alpha_batched_c1(&self, alpha: F256, eq_inner: &[F256]) -> Vec<F256> {
+        FieldRowCircuit::new(&self.a_0, &self.b_0, self.const_pin)
+            .fold_alpha_batched_c1(alpha, eq_inner)
+    }
+
+    fn fold_alpha_batched_quirky_c1(
+        &self,
+        alpha: F256,
+        z_skip: F256,
+        x_inner_rest: &[F256],
+        k_skip: usize,
+    ) -> Vec<F256> {
+        FieldRowCircuit::new(&self.a_0, &self.b_0, self.const_pin).fold_alpha_batched_quirky_c1(
+            alpha,
+            z_skip,
+            x_inner_rest,
+            k_skip,
+        )
+    }
+}
+
+impl CompactFieldR1cs {
+    /// Fold an arbitrary C1 row-weight oracle over the authenticated compact
+    /// relation without materializing a width-k equality table. Each 2048-row
+    /// tile holds its weights and alpha-scaled weights once and scans A and B
+    /// into the same bounded private comb.
+    fn fold_alpha_batched_c1_with_row_weight<W>(&self, alpha: F256, row_weight: W) -> Vec<F256>
+    where
+        W: Fn(usize) -> F256 + Sync,
+    {
+        let n = self.k();
+        let a = &self.matrices[0];
+        let b = &self.matrices[1];
+        let bytes = self.backing.planar_hot_bytes();
+        debug_assert_eq!(a.total_groups, b.total_groups);
+        let group_count = a.retained_group_count().max(b.retained_group_count());
+
+        let fill_group_weights =
+            |group: usize,
+             weights: &mut [F256; ARTIFACT_GROUP_ROWS],
+             alpha_weights: &mut [F256; ARTIFACT_GROUP_ROWS]| {
+                let first_row = group * ARTIFACT_GROUP_ROWS;
+                let rows = n.saturating_sub(first_row).min(ARTIFACT_GROUP_ROWS);
+                for local_row in 0..rows {
+                    let weight = row_weight(first_row + local_row);
+                    weights[local_row] = weight;
+                    alpha_weights[local_row] = alpha * weight;
+                }
+                first_row
+            };
+
+        let fold_groups = |groups: std::ops::Range<usize>, comb: &mut [F256]| {
+            let mut weights = [F256::ZERO; ARTIFACT_GROUP_ROWS];
+            let mut alpha_weights = [F256::ZERO; ARTIFACT_GROUP_ROWS];
+            for group in groups {
+                let first_row = fill_group_weights(group, &mut weights, &mut alpha_weights);
+                let visited = a.for_each_group_entry(bytes, group, |row, column, coefficient| {
+                    comb[column as usize] += alpha_weights[row - first_row].scale_base(coefficient);
+                });
+                debug_assert!(visited);
+                let visited = b.for_each_group_entry(bytes, group, |row, column, coefficient| {
+                    comb[column as usize] += weights[row - first_row].scale_base(coefficient);
+                });
+                debug_assert!(visited);
+            }
+        };
+
+        let nnz = a.nnz + b.nnz;
+        if nnz < FIELD_FOLD_PAR_THRESHOLD || rayon::current_num_threads() == 1 {
+            let mut comb = vec![F256::ZERO; n];
+            fold_groups(0..group_count, &mut comb);
+            return comb;
+        }
+        parallel_compact_group_fold_c1(n, group_count, fold_groups)
     }
 }
 
@@ -5850,6 +6064,28 @@ impl LincheckCircuit for CompactFieldR1cs {
                 });
                 debug_assert!(visited);
             }
+        })
+    }
+
+    fn fold_alpha_batched_c1(&self, alpha: F256, eq_inner: &[F256]) -> Vec<F256> {
+        assert_eq!(eq_inner.len(), self.k());
+        self.fold_alpha_batched_c1_with_row_weight(alpha, |row| eq_inner[row])
+    }
+
+    fn fold_alpha_batched_quirky_c1(
+        &self,
+        alpha: F256,
+        z_skip: F256,
+        x_inner_rest: &[F256],
+        k_skip: usize,
+    ) -> Vec<F256> {
+        let n = self.k();
+        let skip_size = 1usize << k_skip;
+        let skip = crate::zerocheck::field_c1::lagrange_weights(k_skip, z_skip, 0);
+        let rest = crate::zerocheck::field_c1::build_eq_table(x_inner_rest);
+        assert_eq!(skip_size.saturating_mul(rest.len()), n);
+        self.fold_alpha_batched_c1_with_row_weight(alpha, |row| {
+            skip[row & (skip_size - 1)] * rest[row >> k_skip]
         })
     }
 }
@@ -6053,6 +6289,28 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+
+        fn f256(&mut self) -> F256 {
+            F256::new(self.f128(), self.f128())
+        }
+    }
+
+    /// Retains only the legacy F128 fold so the trait defaults provide an
+    /// independent four-pass oracle for optimized C1 implementations.
+    struct LegacyC1FoldOracle<'a, T: LincheckCircuit + ?Sized>(&'a T);
+
+    impl<T: LincheckCircuit + ?Sized> LincheckCircuit for LegacyC1FoldOracle<'_, T> {
+        fn n_cols(&self) -> usize {
+            self.0.n_cols()
+        }
+
+        fn fold_alpha_batched(&self, alpha: F128, eq_inner: &[F128]) -> Vec<F128> {
+            self.0.fold_alpha_batched(alpha, eq_inner)
+        }
+
+        fn const_pin_col(&self) -> Option<usize> {
+            self.0.const_pin_col()
         }
     }
 
@@ -6745,6 +7003,22 @@ mod tests {
         assert_eq!(
             compact_fold_chunk_count_for_threads(1usize << 24, 1usize << 13, 11),
             4,
+        );
+
+        // C1 combs carry two F128 coordinates. The same budget therefore
+        // permits half as many private accumulators at every large width and
+        // exactly two at the production B255 width.
+        assert_eq!(
+            compact_c1_fold_chunk_count_for_threads(1usize << 22, 1usize << 11, 11),
+            8,
+        );
+        assert_eq!(
+            compact_c1_fold_chunk_count_for_threads(1usize << 23, 1usize << 12, 11),
+            4,
+        );
+        assert_eq!(
+            compact_c1_fold_chunk_count_for_threads(1usize << 24, 1usize << 13, 11),
+            2,
         );
     }
 
@@ -7639,6 +7913,70 @@ mod tests {
 
         assert_eq!(serial, expected, "single-comb verifier fold drifted");
         assert_eq!(parallel, expected, "parallel row fold drifted");
+    }
+
+    #[test]
+    fn c1_single_scan_folds_match_four_pass_oracle_for_every_hot_layout() {
+        let (r1cs, _) = random_satisfiable(13, 12, 0xC1_51_6E5C);
+        let row = FieldRowCircuit::new(&r1cs.a_0, &r1cs.b_0, r1cs.const_pin);
+        let mut rng = Rng::new(0xC1_F01D_0A11);
+        let alpha = rng.f256();
+        let z_skip = rng.f256();
+        let inner_rest = (0..r1cs.k_log - r1cs.k_skip)
+            .map(|_| rng.f256())
+            .collect::<Vec<_>>();
+        let dense_point = (0..r1cs.k_log).map(|_| rng.f256()).collect::<Vec<_>>();
+        let dense_eq = crate::zerocheck::field_c1::build_eq_table(&dense_point);
+
+        let row_oracle = LegacyC1FoldOracle(&row);
+        let expected_quirky =
+            row_oracle.fold_alpha_batched_quirky_c1(alpha, z_skip, &inner_rest, r1cs.k_skip);
+        let expected_dense = row_oracle.fold_alpha_batched_c1(alpha, &dense_eq);
+
+        for threads in [1, 2] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .expect("C1 fold test pool");
+            let (quirky, dense) = pool.install(|| {
+                (
+                    row.fold_alpha_batched_quirky_c1(alpha, z_skip, &inner_rest, r1cs.k_skip),
+                    row.fold_alpha_batched_c1(alpha, &dense_eq),
+                )
+            });
+            assert_eq!(quirky, expected_quirky, "resident quirky C1 fold drifted");
+            assert_eq!(dense, expected_dense, "resident dense C1 fold drifted");
+        }
+
+        let shape = FieldShape::of(&r1cs);
+        let digest = r1cs.structural_statement_digest();
+        let mut bytes = Vec::new();
+        r1cs.write_artifact(&mut bytes).unwrap();
+        let compact =
+            CompactFieldR1cs::open(bytes.clone().into_boxed_slice(), shape, digest).unwrap();
+        let packed =
+            CompactFieldR1cs::open_packed(bytes.into_boxed_slice(), shape, digest).unwrap();
+        for (name, relation) in [("compact", &compact), ("packed", &packed)] {
+            for threads in [1, 2] {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .expect("compact C1 fold test pool");
+                let (quirky, dense) = pool.install(|| {
+                    (
+                        relation.fold_alpha_batched_quirky_c1(
+                            alpha,
+                            z_skip,
+                            &inner_rest,
+                            r1cs.k_skip,
+                        ),
+                        relation.fold_alpha_batched_c1(alpha, &dense_eq),
+                    )
+                });
+                assert_eq!(quirky, expected_quirky, "{name} quirky C1 fold drifted");
+                assert_eq!(dense, expected_dense, "{name} dense C1 fold drifted");
+            }
+        }
     }
 
     /// A proof produced against either circuit representation is byte-for-byte

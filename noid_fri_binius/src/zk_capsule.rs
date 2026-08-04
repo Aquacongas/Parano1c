@@ -106,9 +106,9 @@ pub struct ZkCapsuleGeometry {
     pub mid_uses_root_copy_tail: bool,
     pub wallet_b_slots_per_auth: usize,
 
-    pub source_transcript_delta_lanes: usize,
-    pub mid_transcript_delta_lanes: usize,
-    pub tail_transcript_delta_lanes: usize,
+    pub source_transcript_delta_lanes: isize,
+    pub mid_transcript_delta_lanes: isize,
+    pub tail_transcript_delta_lanes: isize,
 }
 
 /// Why a candidate parameter set does not describe this capsule construction.
@@ -164,14 +164,17 @@ impl ZkCapsuleGeometry {
             Some(2) => 2,
             _ => return Err(ZkCapsuleGeometryError::UnsupportedFundamentalHighVars),
         };
-        // Natural novel-basis order gives the selected rank certificate
-        // X_{2^state_vars+j} = W_state_vars * X_j. Keep exactly one complete
-        // state-sized block independently uniform so later Libra claims cannot
-        // condition away any of the rank coins.
-        if p.pcs_coin_len != p.state_len {
+        // The dedicated PCS-coin zone is one complete dyadic block at the end
+        // of the bank. Natural novel-basis order then gives
+        // X_{s+j} = W_log2(s) * X_j for s <= j < 2s, while the earlier state,
+        // Libra mask, and terminal pads can be conditioned independently.
+        if p.pcs_coin_len == 0 || !p.pcs_coin_len.is_power_of_two() {
             return Err(ZkCapsuleGeometryError::PcsCoinZoneMismatch);
         }
-        let pcs_coin_start = p.state_len;
+        let pcs_coin_start = match bank_len.checked_sub(p.pcs_coin_len) {
+            Some(value) if value == p.pcs_coin_len => value,
+            _ => return Err(ZkCapsuleGeometryError::PcsCoinZoneMismatch),
+        };
         // Every authorization relation is extended over the whole bank. A
         // selector restricts semantic support to the fundamental state slice,
         // while the two high variables randomize terminal evaluations. Using
@@ -187,19 +190,16 @@ impl ZkCapsuleGeometry {
             return Err(ZkCapsuleGeometryError::MaskZoneLengthMismatch);
         }
 
-        let mask_main_start = match pcs_coin_start.checked_add(p.pcs_coin_len) {
-            Some(value) => value,
-            None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
-        };
+        let mask_main_start = p.state_len;
         let occupied = match mask_main_start.checked_add(p.mask_main_len) {
             Some(value) => value,
             None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
         };
-        if occupied > bank_len {
+        if occupied > pcs_coin_start {
             return Err(ZkCapsuleGeometryError::ZonesExceedBank);
         }
         let trailing_padding_start = occupied;
-        let trailing_padding_len = bank_len - occupied;
+        let trailing_padding_len = pcs_coin_start - occupied;
         let total_fresh_padding_len = match p.pcs_coin_len.checked_add(trailing_padding_len) {
             Some(value) => value,
             None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
@@ -325,14 +325,14 @@ impl ZkCapsuleGeometry {
             return Err(ZkCapsuleGeometryError::InsufficientIndependentPcsCoins);
         }
 
-        if p.wallet_b_legs != 2
-            || p.wallet_b_stride < source_path_depth
-            || p.wallet_b_stride < mid_path_depth
-        {
+        if p.wallet_b_legs != 2 || p.wallet_b_stride < source_path_depth + mid_path_depth {
             return Err(ZkCapsuleGeometryError::WalletBShapeMismatch);
         }
-        let source_uses_root_copy_tail = p.wallet_b_stride > source_path_depth;
-        let mid_uses_root_copy_tail = p.wallet_b_stride > mid_path_depth;
+        // C1 packs the two path families densely inside one per-query tile.
+        // There is no family-local dyadic tail: both roots are exposed from
+        // their final feed-forward node expressions.
+        let source_uses_root_copy_tail = false;
+        let mid_uses_root_copy_tail = false;
         let wallet_a_symbols_per_query = match source_leaf_symbols.checked_add(mid_leaf_symbols) {
             Some(value) => value,
             None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
@@ -343,21 +343,11 @@ impl ZkCapsuleGeometry {
             None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
         };
 
-        let wallet_b_leg_slots = match p.query_count.checked_mul(p.wallet_b_legs) {
-            Some(value) => value,
-            None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
-        };
-        let wallet_b_slots_per_auth = match wallet_b_leg_slots.checked_mul(p.wallet_b_stride) {
+        let wallet_b_slots_per_auth = match p.query_count.checked_mul(p.wallet_b_stride) {
             Some(value) => value,
             None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
         };
 
-        if p.baseline_source_cap_depth > p.source_cap_depth
-            || p.baseline_mid_cap_depth > p.mid_cap_depth
-            || p.baseline_tail_len > tail_len
-        {
-            return Err(ZkCapsuleGeometryError::TranscriptBaselineExceedsSelected);
-        }
         let selected_source_cap_nodes = match pow2(p.source_cap_depth) {
             Some(value) => value,
             None => return Err(ZkCapsuleGeometryError::LogTooLarge),
@@ -374,19 +364,13 @@ impl ZkCapsuleGeometry {
             Some(value) => value,
             None => return Err(ZkCapsuleGeometryError::LogTooLarge),
         };
-        let source_cap_delta_nodes = selected_source_cap_nodes - baseline_source_cap_nodes;
-        let source_transcript_delta_lanes =
-            match source_cap_delta_nodes.checked_mul(p.digest_field_lanes) {
-                Some(value) => value,
-                None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
-            };
-        let mid_cap_delta_nodes = selected_mid_cap_nodes - baseline_mid_cap_nodes;
-        let mid_transcript_delta_lanes = match mid_cap_delta_nodes.checked_mul(p.digest_field_lanes)
-        {
-            Some(value) => value,
-            None => return Err(ZkCapsuleGeometryError::ArithmeticOverflow),
-        };
-        let tail_transcript_delta_lanes = tail_len - p.baseline_tail_len;
+        let source_transcript_delta_lanes = (selected_source_cap_nodes as isize
+            - baseline_source_cap_nodes as isize)
+            * p.digest_field_lanes as isize;
+        let mid_transcript_delta_lanes = (selected_mid_cap_nodes as isize
+            - baseline_mid_cap_nodes as isize)
+            * p.digest_field_lanes as isize;
+        let tail_transcript_delta_lanes = tail_len as isize - p.baseline_tail_len as isize;
 
         Ok(Self {
             bank_log: p.bank_log,
@@ -471,17 +455,17 @@ impl ZkCapsuleGeometry {
     }
 
     #[inline]
-    pub const fn source_transcript_delta_lanes(&self) -> usize {
+    pub const fn source_transcript_delta_lanes(&self) -> isize {
         self.source_transcript_delta_lanes
     }
 
     #[inline]
-    pub const fn mid_transcript_delta_lanes(&self) -> usize {
+    pub const fn mid_transcript_delta_lanes(&self) -> isize {
         self.mid_transcript_delta_lanes
     }
 
     #[inline]
-    pub const fn tail_transcript_delta_lanes(&self) -> usize {
+    pub const fn tail_transcript_delta_lanes(&self) -> isize {
         self.tail_transcript_delta_lanes
     }
 }
@@ -560,24 +544,24 @@ pub const ZK_AUTH_CAPSULE_PARAMETERS: ZkCapsuleParameters = ZkCapsuleParameters 
     bank_log: 11,
     companion_bank_log: 11,
     state_len: 512,
-    pcs_coin_len: 512,
+    pcs_coin_len: 1_024,
     mask_main_degree: 10,
-    mask_extra_dof: 64,
+    mask_extra_dof: 65,
     mask_main_len: 256,
     log_rate: 5,
     source_bank_symbols_per_leaf: 8,
     source_companion_symbols_per_leaf: 8,
     source_inner_gamma_folds: 1,
     source_standard_fold_log: 3,
-    source_cap_depth: 5,
-    mid_cap_depth: 1,
+    source_cap_depth: 3,
+    mid_cap_depth: 3,
     second_wide_fold_log: 4,
     tail_local_fold_log: 1,
-    query_count: 64,
+    query_count: 65,
     query_seed_bits: u128::BITS as usize,
-    query_bits_with_existing_carriers: 12,
+    query_bits_with_existing_carriers: 10,
     wallet_b_legs: 2,
-    wallet_b_stride: 8,
+    wallet_b_stride: 16,
     digest_field_lanes: 2,
     baseline_source_cap_depth: 5,
     baseline_mid_cap_depth: 0,
@@ -617,20 +601,19 @@ mod tests {
         assert_eq!(g.state_len, 512);
         assert_eq!(g.state_vars, 9);
         assert_eq!(g.fundamental_high_vars, 2);
-        assert_eq!(g.pcs_coin_start, g.state_len);
-        assert_eq!(g.pcs_coin_start, 512);
-        assert_eq!(g.pcs_coin_len, 512);
+        assert_eq!(g.pcs_coin_start, 1_024);
+        assert_eq!(g.pcs_coin_len, 1_024);
         assert_eq!(g.mask_sumcheck_vars, g.bank_log);
         assert_eq!(g.mask_sumcheck_vars, 11);
         assert_eq!(g.mask_main_degree, 10);
         assert_eq!(g.mask_extra_dof, g.query_count);
-        assert_eq!(g.mask_main_start, 1_024);
+        assert_eq!(g.mask_main_start, 512);
         assert_eq!(g.mask_main_len, 256);
-        assert_eq!(g.trailing_padding_start, 1_280);
-        assert_eq!(g.trailing_padding_len, 768);
+        assert_eq!(g.trailing_padding_start, 768);
+        assert_eq!(g.trailing_padding_len, 256);
         assert_eq!(g.total_fresh_padding_len, 1_280);
         assert_eq!(g.raw_source_observation_bound, 8 * g.query_count);
-        assert_eq!(g.raw_source_observation_bound, 512);
+        assert_eq!(g.raw_source_observation_bound, 520);
         assert!(g.pcs_coin_len >= g.raw_source_observation_bound);
 
         assert_eq!(g.log_rate, 5);
@@ -653,12 +636,12 @@ mod tests {
         );
         assert_eq!(g.source_tree_depth, g.source_leaf_count.ilog2() as usize);
         assert_eq!(g.source_tree_depth, 13);
-        assert_eq!(g.source_cap_depth, 5);
+        assert_eq!(g.source_cap_depth, 3);
         assert_eq!(
             g.source_path_depth,
             g.source_tree_depth - g.source_cap_depth
         );
-        assert_eq!(g.source_path_depth, 8);
+        assert_eq!(g.source_path_depth, 10);
 
         assert_eq!(g.mid_log, g.bank_log - g.source_standard_fold_log);
         assert_eq!(g.mid_log, 8);
@@ -668,9 +651,9 @@ mod tests {
         assert_eq!(g.mid_tree_depth, g.mid_domain_log - g.second_wide_fold_log);
         assert_eq!(g.mid_tree_depth, 9);
         assert_eq!(g.mid_leaf_count, 1 << g.mid_tree_depth);
-        assert_eq!(g.mid_cap_depth, 1);
+        assert_eq!(g.mid_cap_depth, 3);
         assert_eq!(g.mid_path_depth, g.mid_tree_depth - g.mid_cap_depth);
-        assert_eq!(g.mid_path_depth, 8);
+        assert_eq!(g.mid_path_depth, 6);
 
         assert_eq!(g.tail_log, g.mid_log - g.second_wide_fold_log);
         assert_eq!(g.tail_len, 1 << g.tail_log);
@@ -702,29 +685,29 @@ mod tests {
 
         assert_eq!(g.query_width_bits, g.source_tree_depth);
         assert_eq!(g.query_width_bits, 13);
-        assert_eq!(g.query_count(), 64);
+        assert_eq!(g.query_count(), 65);
         assert_eq!(
             g.query_seed_count(),
             (g.query_count * g.query_width_bits).div_ceil(g.query_seed_bits)
         );
         assert_eq!(g.query_seed_count(), 7);
-        assert_eq!(g.query_bits_with_existing_carriers, 12);
-        assert_eq!(g.query_bits_requiring_aux_carrier, 1);
-        assert_eq!(QUERY_BITS_REQUIRING_AUX_CARRIER, 1);
+        assert_eq!(g.query_bits_with_existing_carriers, 10);
+        assert_eq!(g.query_bits_requiring_aux_carrier, 3);
+        assert_eq!(QUERY_BITS_REQUIRING_AUX_CARRIER, 3);
         assert_eq!(
             g.wallet_a_symbols_per_auth(),
             g.query_count * (g.source_leaf_symbols + g.mid_leaf_symbols)
         );
-        assert_eq!(g.wallet_a_symbols_per_auth(), 2_048);
+        assert_eq!(g.wallet_a_symbols_per_auth(), 2_080);
         assert_eq!(g.wallet_b_legs, 2);
-        assert_eq!(g.wallet_b_stride, 8);
+        assert_eq!(g.wallet_b_stride, 16);
         assert!(!g.source_uses_root_copy_tail);
         assert!(!g.mid_uses_root_copy_tail);
         assert_eq!(
             g.wallet_b_slots_per_auth(),
-            g.query_count * g.wallet_b_legs * g.wallet_b_stride
+            g.query_count * g.wallet_b_stride
         );
-        assert_eq!(g.wallet_b_slots_per_auth(), 1_024);
+        assert_eq!(g.wallet_b_slots_per_auth(), 1_040);
     }
 
     #[test]
@@ -734,17 +717,19 @@ mod tests {
 
         assert_eq!(
             g.source_transcript_delta_lanes(),
-            ((1 << g.source_cap_depth) - (1 << p.baseline_source_cap_depth)) * p.digest_field_lanes
+            ((1 << g.source_cap_depth) as isize - (1 << p.baseline_source_cap_depth) as isize)
+                * p.digest_field_lanes as isize
         );
-        assert_eq!(g.source_transcript_delta_lanes(), 0);
+        assert_eq!(g.source_transcript_delta_lanes(), -48);
         assert_eq!(
             g.mid_transcript_delta_lanes(),
-            ((1 << g.mid_cap_depth) - (1 << p.baseline_mid_cap_depth)) * p.digest_field_lanes
+            ((1 << g.mid_cap_depth) as isize - (1 << p.baseline_mid_cap_depth) as isize)
+                * p.digest_field_lanes as isize
         );
-        assert_eq!(g.mid_transcript_delta_lanes(), 2);
+        assert_eq!(g.mid_transcript_delta_lanes(), 14);
         assert_eq!(
             g.tail_transcript_delta_lanes(),
-            g.tail_len - p.baseline_tail_len
+            g.tail_len as isize - p.baseline_tail_len as isize
         );
         assert_eq!(g.tail_transcript_delta_lanes(), 14);
     }

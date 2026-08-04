@@ -50,6 +50,8 @@ use crate::zerocheck::multilinear::lagrange_weights_naive;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use rayon::prelude::*;
 
+pub mod c1;
+
 const MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"NOID/IVC/MATRIX-CLAIM-REQUEST/V1";
 
 /// A plain accumulated claim `M̂~(point) = value` on the stacked matrix.

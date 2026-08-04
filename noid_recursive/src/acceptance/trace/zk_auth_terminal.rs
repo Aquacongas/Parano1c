@@ -34,7 +34,10 @@ use noid_poseidon2b::native::permutation::{
     F_ROUNDS, MDS_FULL, MDS_PARTIAL, P_ROUNDS, ROUND_CONSTANTS, STATE_SIZE,
 };
 
-use super::{eq_ind_partial_eval_trace, flat_of, mul, FieldR1csBuilder, LinExpr, F128};
+use super::{
+    eq_ind_partial_eval_ext_trace, flat_of, mul_ext, pow7_ext, ExtExpr, FieldR1csBuilder, F128,
+    F256,
+};
 
 const STATE_LANE_BITS: usize = 2;
 const STATE_ROUND_BITS: usize = 7;
@@ -45,17 +48,17 @@ const STORED_ROUNDS: usize = 1 << STATE_ROUND_BITS;
 
 /// The first round-equality split is linear because it multiplies by one;
 /// the remaining six splits allocate `2 + 4 + ... + 64` products.
-pub const ZK_AUTH_TERMINAL_ROUND_EQ_ROWS: usize = STORED_ROUNDS - 2;
-/// One shared `lane_bit_0 * lane_bit_1` product.
-pub const ZK_AUTH_TERMINAL_LANE_ROWS: usize = 1;
+pub const ZK_AUTH_TERMINAL_ROUND_EQ_ROWS: usize = 3 * (STORED_ROUNDS - 2);
+/// One shared extension-field `lane_bit_0 * lane_bit_1` product.
+pub const ZK_AUTH_TERMINAL_LANE_ROWS: usize = 3;
 /// `high = (1 + r_9)(1 + r_10)`.
-pub const ZK_AUTH_TERMINAL_HIGH_ROWS: usize = 1;
+pub const ZK_AUTH_TERMINAL_HIGH_ROWS: usize = 3;
 /// `high * active_round` and `high * partial_round`.
-pub const ZK_AUTH_TERMINAL_ROUND_SELECTOR_ROWS: usize = 2;
+pub const ZK_AUTH_TERMINAL_ROUND_SELECTOR_ROWS: usize = 6;
 /// Four independently valued public round-constant MLEs, each gated by high.
-pub const ZK_AUTH_TERMINAL_RC_ROWS: usize = STATE_SIZE;
+pub const ZK_AUTH_TERMINAL_RC_ROWS: usize = 3 * STATE_SIZE;
 /// Two dynamic products (full and partial) for each public MDS column.
-pub const ZK_AUTH_TERMINAL_MDS_ROWS: usize = 2 * STATE_SIZE;
+pub const ZK_AUTH_TERMINAL_MDS_ROWS: usize = 6 * STATE_SIZE;
 /// Exact public fixed-table evaluation cost, shared across all thirteen
 /// native tables (`active`, four MDS, four sigma, four RC).
 pub const ZK_AUTH_TERMINAL_FIXED_TABLE_ROWS: usize = ZK_AUTH_TERMINAL_ROUND_EQ_ROWS
@@ -65,10 +68,12 @@ pub const ZK_AUTH_TERMINAL_FIXED_TABLE_ROWS: usize = ZK_AUTH_TERMINAL_ROUND_EQ_R
     + ZK_AUTH_TERMINAL_RC_ROWS
     + ZK_AUTH_TERMINAL_MDS_ROWS;
 
-/// Four products for x^7, one sigma mix, and one MDS contribution per lane.
-pub const ZK_AUTH_TERMINAL_ROWS_PER_LANE: usize = 6;
+/// The extension x^7 chain costs ten rows because its two squarings use the
+/// quadratic-tower square gadget. One sigma mix and one MDS contribution add
+/// three rows each.
+pub const ZK_AUTH_TERMINAL_ROWS_PER_LANE: usize = 16;
 /// One final multiplication by the active selector.
-pub const ZK_AUTH_TERMINAL_FINAL_ROWS: usize = 1;
+pub const ZK_AUTH_TERMINAL_FINAL_ROWS: usize = 3;
 /// Exact incremental ledger after the sixteen caller-owned witness inputs
 /// have already been allocated.
 pub const ZK_AUTH_TERMINAL_TRACE_ROWS: usize = ZK_AUTH_TERMINAL_FIXED_TABLE_ROWS
@@ -82,9 +87,9 @@ const _: () =
     assert!(ZK_AUTH_CAPSULE_BANK_VARS == STATE_LANE_BITS + STATE_ROUND_BITS + STATE_HIGH_BITS);
 const _: () = assert!(ZK_AUTH_CAPSULE_ACTIVE_ROUNDS == F_ROUNDS + P_ROUNDS);
 const _: () = assert!(ZK_AUTH_CAPSULE_ACTIVE_ROUNDS == 66);
-const _: () = assert!(ZK_AUTH_TERMINAL_ROUND_EQ_ROWS == 126);
-const _: () = assert!(ZK_AUTH_TERMINAL_FIXED_TABLE_ROWS == 142);
-const _: () = assert!(ZK_AUTH_TERMINAL_TRACE_ROWS == 167);
+const _: () = assert!(ZK_AUTH_TERMINAL_ROUND_EQ_ROWS == 378);
+const _: () = assert!(ZK_AUTH_TERMINAL_FIXED_TABLE_ROWS == 426);
+const _: () = assert!(ZK_AUTH_TERMINAL_TRACE_ROWS == 493);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkAuthTerminalDynamicInput {
@@ -106,12 +111,12 @@ pub enum ZkAuthTerminalTraceError {
 /// Recursive form of the native five ZK-padded terminal operand claims.
 #[derive(Clone, Debug)]
 pub struct AuthCapsuleTerminalOperandClaimsTrace {
-    pub increment: LinExpr,
-    pub lane: [LinExpr; STATE_SIZE],
+    pub increment: ExtExpr,
+    pub lane: [ExtExpr; STATE_SIZE],
 }
 
 fn check_dynamic(
-    expression: &LinExpr,
+    expression: &ExtExpr,
     input: ZkAuthTerminalDynamicInput,
     index: usize,
 ) -> Result<(), ZkAuthTerminalTraceError> {
@@ -123,7 +128,7 @@ fn check_dynamic(
 }
 
 fn preflight_dynamic_inputs(
-    point: &[LinExpr; ZK_AUTH_CAPSULE_BANK_VARS],
+    point: &[ExtExpr; ZK_AUTH_CAPSULE_BANK_VARS],
     claims: &AuthCapsuleTerminalOperandClaimsTrace,
 ) -> Result<(), ZkAuthTerminalTraceError> {
     for (index, coordinate) in point.iter().enumerate() {
@@ -155,10 +160,10 @@ fn tower_constant(value: u128) -> F128 {
 fn fixed_lane_mle(
     table: &[[u128; STATE_SIZE]; STATE_SIZE],
     input_lane: usize,
-    lane_0: &LinExpr,
-    lane_1: &LinExpr,
-    lane_cross: &LinExpr,
-) -> LinExpr {
+    lane_0: &ExtExpr,
+    lane_1: &ExtExpr,
+    lane_cross: &ExtExpr,
+) -> ExtExpr {
     let c0 = tower_constant(table[0][input_lane]);
     let c1 = tower_constant(table[1][input_lane]);
     let c2 = tower_constant(table[2][input_lane]);
@@ -166,34 +171,34 @@ fn fixed_lane_mle(
 
     // Multilinear interpolation in little-endian Boolean-index order:
     // c0 + r0(c0+c1) + r1(c0+c2) + r0*r1(c0+c1+c2+c3).
-    LinExpr::constant(c0)
-        .add(&lane_0.scale(c0 + c1))
-        .add(&lane_1.scale(c0 + c2))
-        .add(&lane_cross.scale(c0 + c1 + c2 + c3))
+    ExtExpr::constant(F256::from_base(c0))
+        .add(&lane_0.scale_base(c0 + c1))
+        .add(&lane_1.scale_base(c0 + c2))
+        .add(&lane_cross.scale_base(c0 + c1 + c2 + c3))
 }
 
 struct FixedTerminalTablesTrace {
-    active: LinExpr,
-    mds: [LinExpr; STATE_SIZE],
-    sigma: [LinExpr; STATE_SIZE],
-    rc: [LinExpr; STATE_SIZE],
+    active: ExtExpr,
+    mds: [ExtExpr; STATE_SIZE],
+    sigma: [ExtExpr; STATE_SIZE],
+    rc: [ExtExpr; STATE_SIZE],
 }
 
 /// Factor and evaluate the native public tables at an arbitrary field point.
 fn evaluate_fixed_terminal_tables_trace(
     b: &mut FieldR1csBuilder,
-    point: &[LinExpr; ZK_AUTH_CAPSULE_BANK_VARS],
+    point: &[ExtExpr; ZK_AUTH_CAPSULE_BANK_VARS],
 ) -> FixedTerminalTablesTrace {
     let start = b.num_wires();
 
     let round_eq =
-        eq_ind_partial_eval_trace(b, &point[STATE_ROUND_POINT_OFFSET..STATE_HIGH_POINT_OFFSET]);
+        eq_ind_partial_eval_ext_trace(b, &point[STATE_ROUND_POINT_OFFSET..STATE_HIGH_POINT_OFFSET]);
     debug_assert_eq!(round_eq.len(), STORED_ROUNDS);
     debug_assert_eq!(b.num_wires() - start, ZK_AUTH_TERMINAL_ROUND_EQ_ROWS);
 
-    let mut active_round = LinExpr::zero();
-    let mut partial_round = LinExpr::zero();
-    let mut rc_round: [LinExpr; STATE_SIZE] = std::array::from_fn(|_| LinExpr::zero());
+    let mut active_round = ExtExpr::zero();
+    let mut partial_round = ExtExpr::zero();
+    let mut rc_round: [ExtExpr; STATE_SIZE] = std::array::from_fn(|_| ExtExpr::zero());
     for round in 0..ZK_AUTH_CAPSULE_ACTIVE_ROUNDS {
         active_round = active_round.add(&round_eq[round]);
         if is_partial_round(round) {
@@ -203,24 +208,25 @@ fn evaluate_fixed_terminal_tables_trace(
             if is_partial_round(round) && input_lane != 0 {
                 continue;
             }
-            rc_round[input_lane] = rc_round[input_lane]
-                .add(&round_eq[round].scale(tower_constant(ROUND_CONSTANTS[input_lane][round])));
+            rc_round[input_lane] = rc_round[input_lane].add(
+                &round_eq[round].scale_base(tower_constant(ROUND_CONSTANTS[input_lane][round])),
+            );
         }
     }
 
-    let lane_cross = mul(b, &point[0], &point[1]);
-    let high_zero = mul(
+    let lane_cross = mul_ext(b, &point[0], &point[1]);
+    let high_zero = mul_ext(
         b,
-        &point[STATE_HIGH_POINT_OFFSET].add_const(F128::ONE),
-        &point[STATE_HIGH_POINT_OFFSET + 1].add_const(F128::ONE),
+        &point[STATE_HIGH_POINT_OFFSET].add_const(F256::ONE),
+        &point[STATE_HIGH_POINT_OFFSET + 1].add_const(F256::ONE),
     );
-    let active = mul(b, &high_zero, &active_round);
-    let partial = mul(b, &high_zero, &partial_round);
+    let active = mul_ext(b, &high_zero, &active_round);
+    let partial = mul_ext(b, &high_zero, &partial_round);
     // The active rounds are the disjoint union of full and partial rounds;
     // subtraction is addition in characteristic two.
     let full = active.add(&partial);
 
-    let rc = std::array::from_fn(|input_lane| mul(b, &high_zero, &rc_round[input_lane]));
+    let rc = std::array::from_fn(|input_lane| mul_ext(b, &high_zero, &rc_round[input_lane]));
     let sigma = std::array::from_fn(|input_lane| {
         if input_lane == 0 {
             active.clone()
@@ -232,7 +238,7 @@ fn evaluate_fixed_terminal_tables_trace(
         let full_lane = fixed_lane_mle(&MDS_FULL, input_lane, &point[0], &point[1], &lane_cross);
         let partial_lane =
             fixed_lane_mle(&MDS_PARTIAL, input_lane, &point[0], &point[1], &lane_cross);
-        mul(b, &full, &full_lane).add(&mul(b, &partial, &partial_lane))
+        mul_ext(b, &full, &full_lane).add(&mul_ext(b, &partial, &partial_lane))
     });
 
     debug_assert_eq!(b.num_wires() - start, ZK_AUTH_TERMINAL_FIXED_TABLE_ROWS);
@@ -254,9 +260,9 @@ fn evaluate_fixed_terminal_tables_trace(
 /// appends exactly [`ZK_AUTH_TERMINAL_TRACE_ROWS`] rows.
 pub fn evaluate_auth_main_terminal_from_claims_trace(
     b: &mut FieldR1csBuilder,
-    point: &[LinExpr; ZK_AUTH_CAPSULE_BANK_VARS],
+    point: &[ExtExpr; ZK_AUTH_CAPSULE_BANK_VARS],
     claims: &AuthCapsuleTerminalOperandClaimsTrace,
-) -> Result<LinExpr, ZkAuthTerminalTraceError> {
+) -> Result<ExtExpr, ZkAuthTerminalTraceError> {
     preflight_dynamic_inputs(point, claims)?;
     let start = b.num_wires();
     let tables = evaluate_fixed_terminal_tables_trace(b, point);
@@ -265,14 +271,14 @@ pub fn evaluate_auth_main_terminal_from_claims_trace(
     for input_lane in 0..STATE_SIZE {
         let state = &claims.lane[input_lane];
         let with_rc = state.add(&tables.rc[input_lane]);
-        let seventh = b.pow7(&with_rc);
+        let seventh = pow7_ext(b, &with_rc);
 
         // Exact characteristic-two refactor of the native expression:
         // sigma*x^7 + (1+sigma)*state = state + sigma*(x^7+state).
-        let poseidon_pi = state.add(&mul(b, &tables.sigma[input_lane], &seventh.add(state)));
-        q = q.add(&mul(b, &tables.mds[input_lane], &poseidon_pi));
+        let poseidon_pi = state.add(&mul_ext(b, &tables.sigma[input_lane], &seventh.add(state)));
+        q = q.add(&mul_ext(b, &tables.mds[input_lane], &poseidon_pi));
     }
-    let result = mul(b, &tables.active, &q);
+    let result = mul_ext(b, &tables.active, &q);
 
     debug_assert_eq!(b.num_wires() - start, ZK_AUTH_TERMINAL_TRACE_ROWS);
     Ok(result)
@@ -281,8 +287,10 @@ pub fn evaluate_auth_main_terminal_from_claims_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::{alloc_block, pin_eq, test_support::assert_expr_is};
-    use noid_core::TowerField;
+    use crate::acceptance::trace::{
+        alloc_block256, const_block256, pin_eq_ext, test_support::assert_ext_expr_is,
+    };
+    use noid_core::{Block256, TowerField};
     use noid_gkr::layers::evaluate_permutation;
     use noid_gkr::zk_auth_capsule::{
         compute_terminal_operand_claims, evaluate_auth_main_terminal_from_claims, state_cell_index,
@@ -293,8 +301,8 @@ mod tests {
     use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 
     const DYNAMIC_INPUT_ROWS: usize =
-        ZK_AUTH_CAPSULE_BANK_VARS + ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS;
-    const EXPECTED_AND_PIN_ROWS: usize = 2;
+        2 * (ZK_AUTH_CAPSULE_BANK_VARS + ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS);
+    const EXPECTED_AND_PIN_ROWS: usize = 4;
     const COMPLETE_TEST_ROWS: usize =
         1 + DYNAMIC_INPUT_ROWS + ZK_AUTH_TERMINAL_TRACE_ROWS + EXPECTED_AND_PIN_ROWS;
 
@@ -307,37 +315,41 @@ mod tests {
         )
     }
 
-    fn point(domain: u128) -> [Block128; ZK_AUTH_CAPSULE_BANK_VARS] {
-        std::array::from_fn(|index| elem(index + 19, domain))
+    fn ext_elem(index: usize, domain: u128) -> Block256 {
+        Block256::new(elem(index, domain), elem(index + 89, domain ^ 0xC1_256))
     }
 
-    fn claims(domain: u128) -> AuthCapsuleTerminalOperandClaims {
+    fn point(domain: u128) -> [Block256; ZK_AUTH_CAPSULE_BANK_VARS] {
+        std::array::from_fn(|index| ext_elem(index + 19, domain))
+    }
+
+    fn claims(domain: u128) -> AuthCapsuleTerminalOperandClaims<Block256> {
         AuthCapsuleTerminalOperandClaims {
-            increment: elem(101, domain),
-            lane: std::array::from_fn(|lane| elem(131 + lane, domain)),
+            increment: ext_elem(101, domain),
+            lane: std::array::from_fn(|lane| ext_elem(131 + lane, domain)),
         }
     }
 
     fn alloc_case(
         b: &mut FieldR1csBuilder,
-        point: &[Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-        claims: AuthCapsuleTerminalOperandClaims,
+        point: &[Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+        claims: AuthCapsuleTerminalOperandClaims<Block256>,
     ) -> (
-        [LinExpr; ZK_AUTH_CAPSULE_BANK_VARS],
+        [ExtExpr; ZK_AUTH_CAPSULE_BANK_VARS],
         AuthCapsuleTerminalOperandClaimsTrace,
     ) {
         (
-            std::array::from_fn(|index| alloc_block(b, point[index])),
+            std::array::from_fn(|index| alloc_block256(b, point[index])),
             AuthCapsuleTerminalOperandClaimsTrace {
-                increment: alloc_block(b, claims.increment),
-                lane: std::array::from_fn(|lane| alloc_block(b, claims.lane[lane])),
+                increment: alloc_block256(b, claims.increment),
+                lane: std::array::from_fn(|lane| alloc_block256(b, claims.lane[lane])),
             },
         )
     }
 
     fn pinned_relation(
-        point: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-        claims: AuthCapsuleTerminalOperandClaims,
+        point: [Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+        claims: AuthCapsuleTerminalOperandClaims<Block256>,
     ) -> (FieldR1cs, Vec<F128>) {
         let expected = evaluate_auth_main_terminal_from_claims(&point, claims)
             .expect("native terminal evaluation");
@@ -347,10 +359,10 @@ mod tests {
         let result = evaluate_auth_main_terminal_from_claims_trace(&mut b, &point_w, &claims_w)
             .expect("dynamic trace inputs");
         assert_eq!(b.num_wires() - trace_start, ZK_AUTH_TERMINAL_TRACE_ROWS);
-        assert_expr_is(&b, &result, expected, "auth main terminal");
+        assert_ext_expr_is(&b, &result, expected, "auth main terminal");
 
-        let expected_w = alloc_block(&mut b, expected);
-        pin_eq(&mut b, &result, &expected_w);
+        let expected_w = alloc_block256(&mut b, expected);
+        pin_eq_ext(&mut b, &result, &expected_w);
         let (r1cs, witness) = b.build();
         assert_eq!(r1cs.useful_rows, COMPLETE_TEST_ROWS);
         assert!(r1cs.satisfies(&witness));
@@ -370,7 +382,7 @@ mod tests {
             let result =
                 evaluate_auth_main_terminal_from_claims_trace(&mut b, &point_w, &claims_w).unwrap();
             assert_eq!(b.num_wires() - start, ZK_AUTH_TERMINAL_TRACE_ROWS);
-            assert_expr_is(&b, &result, expected, "varied auth terminal");
+            assert_ext_expr_is(&b, &result, expected, "varied auth terminal");
             let (r1cs, witness) = b.build();
             assert!(r1cs.satisfies(&witness));
         }
@@ -397,7 +409,7 @@ mod tests {
         let (point_w, claims_w) = alloc_case(&mut b, &terminal, terminal_claims);
         let result =
             evaluate_auth_main_terminal_from_claims_trace(&mut b, &point_w, &claims_w).unwrap();
-        assert_expr_is(&b, &result, expected, "direct bank carrier terminal");
+        assert_ext_expr_is(&b, &result, expected, "direct bank carrier terminal");
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));
     }
@@ -433,15 +445,15 @@ mod tests {
 
         let mut b = FieldR1csBuilder::new();
         let (point_w, claims_w) = alloc_case(&mut b, &point, claims);
-        let point_wire = point_w[4].terms[0].0 as usize;
-        let high_wire = point_w[STATE_HIGH_POINT_OFFSET].terms[0].0 as usize;
-        let claim_wire = claims_w.lane[2].terms[0].0 as usize;
+        let point_wire = point_w[4].lo.terms[0].0 as usize;
+        let high_wire = point_w[STATE_HIGH_POINT_OFFSET].lo.terms[0].0 as usize;
+        let claim_wire = claims_w.lane[2].lo.terms[0].0 as usize;
         let product_wire = b.num_wires();
         let result =
             evaluate_auth_main_terminal_from_claims_trace(&mut b, &point_w, &claims_w).unwrap();
-        let expected_w = alloc_block(&mut b, expected);
-        let output_wire = expected_w.terms[0].0 as usize;
-        pin_eq(&mut b, &result, &expected_w);
+        let expected_w = alloc_block256(&mut b, expected);
+        let output_wire = expected_w.lo.terms[0].0 as usize;
+        pin_eq_ext(&mut b, &result, &expected_w);
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));
 
@@ -464,7 +476,7 @@ mod tests {
         let native_claims = claims(0xD1A1);
         let mut b = FieldR1csBuilder::new();
         let (mut point_w, claims_w) = alloc_case(&mut b, &native_point, native_claims);
-        point_w[7] = LinExpr::constant(flat_of(native_point[7]));
+        point_w[7] = const_block256(native_point[7]);
         let before = b.num_wires();
         assert_eq!(
             evaluate_auth_main_terminal_from_claims_trace(&mut b, &point_w, &claims_w),

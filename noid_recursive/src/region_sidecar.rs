@@ -52,6 +52,7 @@ use crate::acceptance::trace::region_source_binding::{
 mod block;
 pub use block::*;
 mod bounded_decode;
+mod c1_repeat;
 mod canonical_codec;
 pub use bounded_decode::*;
 mod link;
@@ -538,6 +539,18 @@ pub enum MerkleRegionFamily {
         n_paths: usize,
         iv: [F128; 2],
     },
+    /// Feed-forward paths whose active nodes occupy a fixed caller-selected
+    /// stride. This represents disjoint packed families such as the selected
+    /// authorization layout's `10 + 6` nodes inside each 16-slot query tile.
+    /// No root-copy padding slot is enabled; the final feed-forward root is
+    /// linked from the last active node by the caller's composite-root trace.
+    FeedForwardStrided {
+        offset: usize,
+        depth: usize,
+        n_paths: usize,
+        stride: usize,
+        iv: [F128; 2],
+    },
     TwoPermutation {
         offset: usize,
         depth: usize,
@@ -554,7 +567,7 @@ pub enum MerkleRegionFamily {
 impl MerkleRegionFamily {
     fn fixed_len(self) -> usize {
         match self {
-            Self::FeedForward { .. } => 6,
+            Self::FeedForward { .. } | Self::FeedForwardStrided { .. } => 6,
             Self::TwoPermutation { .. } => 9,
             Self::PairedUpdate { .. } => 12,
         }
@@ -562,7 +575,9 @@ impl MerkleRegionFamily {
 
     fn protocol(self, fixed_base: usize) -> MerkleProtocolFamily {
         match self {
-            Self::FeedForward { .. } => MerkleProtocolFamily::feed_forward(fixed_base),
+            Self::FeedForward { .. } | Self::FeedForwardStrided { .. } => {
+                MerkleProtocolFamily::feed_forward(fixed_base)
+            }
             Self::TwoPermutation { .. } => MerkleProtocolFamily::two_permutation(fixed_base),
             Self::PairedUpdate { .. } => MerkleProtocolFamily::paired_update(fixed_base),
         }
@@ -573,6 +588,7 @@ impl MerkleRegionFamily {
             Self::FeedForward { .. } => 0,
             Self::TwoPermutation { .. } => 1,
             Self::PairedUpdate { .. } => 2,
+            Self::FeedForwardStrided { .. } => 3,
         }
     }
 
@@ -586,6 +602,19 @@ impl MerkleRegionFamily {
             } => {
                 let stride = depth.checked_next_power_of_two()?;
                 Some((offset, n_paths.checked_mul(stride)?))
+            }
+            Self::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                ..
+            } => {
+                if depth == 0 || n_paths == 0 || stride < depth {
+                    return None;
+                }
+                let span = (n_paths - 1).checked_mul(stride)?.checked_add(depth)?;
+                Some((offset, span))
             }
             Self::TwoPermutation {
                 offset,
@@ -605,6 +634,35 @@ impl MerkleRegionFamily {
 
     fn canonical_fixed(self, block_log: usize) -> Option<Vec<FixedPattern>> {
         let (offset, active_slots) = self.geometry()?;
+        if let Self::FeedForwardStrided {
+            depth,
+            n_paths,
+            stride,
+            iv,
+            ..
+        } = self
+        {
+            let family = FfMerklePathFamily { depth, n_paths: 1 };
+            let block = 1usize.checked_shl(block_log as u32)?;
+            let mut fixed = ff_merkle_fixed_patterns(&family, iv)
+                .into_iter()
+                .map(|pattern| {
+                    let mut table = vec![F128::ZERO; block];
+                    for path in 0..n_paths {
+                        let start = offset + path * stride;
+                        table[start..start + depth].copy_from_slice(&pattern.table[..depth]);
+                    }
+                    FixedPattern::new(block_log, table)
+                })
+                .collect::<Vec<_>>();
+            let mut region = vec![F128::ZERO; block];
+            for path in 0..n_paths {
+                let start = offset + path * stride;
+                region[start..start + depth].fill(F128::ONE);
+            }
+            fixed.push(FixedPattern::new(block_log, region));
+            return Some(fixed);
+        }
         let mut fixed = match self {
             Self::FeedForward {
                 depth, n_paths, iv, ..
@@ -632,6 +690,7 @@ impl MerkleRegionFamily {
                 .into_iter()
                 .map(|pattern| common_period_pattern(&pattern.table, offset, n_updates, block_log))
                 .collect::<Vec<_>>(),
+            Self::FeedForwardStrided { .. } => unreachable!("handled above"),
         };
         fixed.push(common_period_ones(offset, active_slots, block_log));
         Some(fixed)
@@ -655,6 +714,21 @@ impl MerkleRegionFamily {
                 push_usize(bytes, offset);
                 push_usize(bytes, depth);
                 push_usize(bytes, n_paths);
+                for value in iv {
+                    push_f128(bytes, value);
+                }
+            }
+            Self::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                iv,
+            } => {
+                push_usize(bytes, offset);
+                push_usize(bytes, depth);
+                push_usize(bytes, n_paths);
+                push_usize(bytes, stride);
                 for value in iv {
                     push_f128(bytes, value);
                 }
@@ -901,8 +975,18 @@ impl MerkleRegionVerifierWalkContinuation<'_> {
             terminal,
             challenger,
         )
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-        resolve_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims)
+        .map_err(|error| {
+            if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+                eprintln!("[merkle-sidecar verify] deferred suffix: {error:?}");
+            }
+            RegionSidecarError::InvalidProof
+        })?;
+        resolve_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims).map_err(|error| {
+            if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+                eprintln!("[merkle-sidecar verify] terminal claims: {error:?}");
+            }
+            error
+        })
     }
 }
 
@@ -1090,7 +1174,12 @@ pub(crate) fn verify_merkle_region_walk_deferred_prefix<'a, Ch: Challenger>(
         proof.authority().as_ref(),
         challenger,
     )
-    .map_err(|_| RegionSidecarError::InvalidProof)?;
+    .map_err(|error| {
+        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+            eprintln!("[merkle-sidecar verify] deferred prefix: {error:?}");
+        }
+        RegionSidecarError::InvalidProof
+    })?;
     Ok(MerkleRegionVerifierWalkContinuation {
         vk,
         total_vars,
@@ -1121,7 +1210,12 @@ pub fn verify_merkle_region_sidecar<Ch: Challenger>(
         &proof.authority,
         challenger,
     )
-    .map_err(|_| RegionSidecarError::InvalidProof)?;
+    .map_err(|error| {
+        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+            eprintln!("[merkle-sidecar verify] complete proof: {error:?}");
+        }
+        RegionSidecarError::InvalidProof
+    })?;
     resolve_merkle_terminal_claims(vk, total_vars, terminal)
 }
 
@@ -1133,10 +1227,12 @@ fn validate_merkle_family_geometry(
         return Err(RegionSidecarError::BadVk);
     }
     let block = 1usize << block_log;
-    let mut ranges = Vec::with_capacity(families.len());
+    let mut ranges = Vec::new();
+    let mut previous_offset = None;
     for family in families {
         let nonempty = match family {
             MerkleRegionFamily::FeedForward { depth, n_paths, .. }
+            | MerkleRegionFamily::FeedForwardStrided { depth, n_paths, .. }
             | MerkleRegionFamily::TwoPermutation { depth, n_paths, .. } => {
                 *depth > 0 && *n_paths > 0
             }
@@ -1144,11 +1240,37 @@ fn validate_merkle_family_geometry(
         };
         let (offset, len) = family.geometry().ok_or(RegionSidecarError::BadVk)?;
         let end = offset.checked_add(len).ok_or(RegionSidecarError::BadVk)?;
-        if !nonempty || len == 0 || end > block {
+        if !nonempty
+            || len == 0
+            || end > block
+            || previous_offset.is_some_and(|previous| offset < previous)
+        {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-        ranges.push((offset, end));
+        previous_offset = Some(offset);
+        match *family {
+            MerkleRegionFamily::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                ..
+            } => {
+                for path in 0..n_paths {
+                    let start = offset
+                        .checked_add(path.checked_mul(stride).ok_or(RegionSidecarError::BadVk)?)
+                        .ok_or(RegionSidecarError::BadVk)?;
+                    let end = start.checked_add(depth).ok_or(RegionSidecarError::BadVk)?;
+                    if end > block {
+                        return Err(RegionSidecarError::UnsupportedVkShape);
+                    }
+                    ranges.push((start, end));
+                }
+            }
+            _ => ranges.push((offset, end)),
+        }
     }
+    ranges.sort_unstable();
     if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
@@ -1410,6 +1532,9 @@ mod tests {
         build_duplex_union, build_duplex_union_with_recordings, RecordingSpec,
     };
     use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
+    use noid_ivc_core::deep_chain::ff_merkle::{
+        build_ff_merkle_path_columns, FfMerklePathFamily, FfMerklePathWitness,
+    };
     use noid_ivc_core::deep_chain::relations::{
         prove_column_relation, verify_column_relation, RelationColumns,
     };
@@ -1875,6 +2000,309 @@ mod tests {
             block_log,
             families,
         )
+    }
+
+    #[test]
+    fn strided_feed_forward_ten_plus_six_matches_dense_wallet_layout_end_to_end() {
+        const W_LOG: usize = 5;
+        const BLOCK_LOG: usize = 5;
+        const N_PATHS: usize = 2;
+        const DESTINATION_STRIDE: usize = 16;
+        const SOURCE_DEPTH: usize = 10;
+        const MID_DEPTH: usize = 6;
+
+        let iv = [F128::new(0x1357, 0x2468), F128::new(0x3579, 0x468a)];
+        let paths = |depth: usize, salt: u64| {
+            (0..N_PATHS)
+                .map(|path| FfMerklePathWitness {
+                    entry: [
+                        F128::new(salt + path as u64 + 1, salt + 0x100 + path as u64),
+                        F128::new(salt + path as u64 + 3, salt + 0x200 + path as u64),
+                    ],
+                    siblings: (0..depth)
+                        .map(|level| {
+                            [
+                                F128::new(
+                                    salt + 0x300 + (path * depth + level) as u64,
+                                    salt + 0x400 + level as u64,
+                                ),
+                                F128::new(
+                                    salt + 0x500 + (path * depth + level) as u64,
+                                    salt + 0x600 + level as u64,
+                                ),
+                            ]
+                        })
+                        .collect(),
+                    directions: (0..depth)
+                        .map(|level| (path + level + salt as usize) & 1 == 1)
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_family = FfMerklePathFamily {
+            depth: SOURCE_DEPTH,
+            n_paths: N_PATHS,
+        };
+        let mid_family = FfMerklePathFamily {
+            depth: MID_DEPTH,
+            n_paths: N_PATHS,
+        };
+        let source =
+            build_ff_merkle_path_columns(&source_family, iv, &paths(SOURCE_DEPTH, 0x1000), W_LOG);
+        let mid = build_ff_merkle_path_columns(&mid_family, iv, &paths(MID_DEPTH, 0x2000), 4);
+
+        let column_len = 1usize << W_LOG;
+        let mut committed: [Vec<F128>; MERKLE_REGION_COMMITTED_COLUMNS] =
+            std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s_out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut place = |columns: &noid_ivc_core::deep_chain::ff_merkle::FfMerklePathColumns,
+                         depth: usize,
+                         source_stride: usize,
+                         destination_offset: usize| {
+            for path in 0..N_PATHS {
+                for level in 0..depth {
+                    let from = path * source_stride + level;
+                    let to = path * DESTINATION_STRIDE + destination_offset + level;
+                    for lane in 0..2 {
+                        committed[4 + lane][to] = columns.cr[lane][from];
+                        committed[6 + lane][to] = columns.sib[lane][from];
+                    }
+                    committed[8][to] = columns.d[from];
+                    for lane in 0..4 {
+                        committed[lane][to] = columns.c[lane][from];
+                        s0[lane][to] = columns.s0[lane][from];
+                        s_out[lane][to] = columns.s_out[lane][from];
+                    }
+                }
+            }
+        };
+        place(&source, SOURCE_DEPTH, source_family.stride(), 0);
+        place(&mid, MID_DEPTH, mid_family.stride(), SOURCE_DEPTH);
+
+        let mut z =
+            vec![F128::ZERO; (MERKLE_REGION_COMMITTED_COLUMNS * column_len).next_power_of_two()];
+        for (column, values) in committed.iter().enumerate() {
+            z[column * column_len..(column + 1) * column_len].copy_from_slice(values);
+        }
+        let slices = std::array::from_fn(|index| WitnessSlice {
+            log2_len: W_LOG,
+            index,
+        });
+        let purpose = [0xA6; 32];
+        let families = vec![
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: 0,
+                depth: SOURCE_DEPTH,
+                n_paths: N_PATHS,
+                stride: DESTINATION_STRIDE,
+                iv,
+            },
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: SOURCE_DEPTH,
+                depth: MID_DEPTH,
+                n_paths: N_PATHS,
+                stride: DESTINATION_STRIDE,
+                iv,
+            },
+        ];
+        let vk = MerkleRegionVk::new(purpose, W_LOG, slices, BLOCK_LOG, families).unwrap();
+        assert_eq!(vk.fixed().len(), 12);
+        for slot in 0..column_len {
+            let local = slot % DESTINATION_STRIDE;
+            assert_eq!(
+                vk.fixed()[5].table[slot],
+                if local < SOURCE_DEPTH {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            );
+            assert_eq!(
+                vk.fixed()[11].table[slot],
+                if local >= SOURCE_DEPTH {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            );
+        }
+
+        let plan = MerkleRegionProverPlan::new(&vk, &s0, &s_out).unwrap();
+        let mut prover = FsLaneChallenger::new(b"strided-wallet-b-10-plus-6-v1");
+        let (proof, claims) = plan.prove(&z, &mut prover).unwrap();
+        let prover_next = prover.sample_f128();
+        let mut verifier = FsLaneChallenger::new(b"strided-wallet-b-10-plus-6-v1");
+        let replay = verify_merkle_region_sidecar(
+            &vk,
+            z.len().trailing_zeros() as usize,
+            &proof,
+            &mut verifier,
+        )
+        .unwrap();
+        let claim_tuples = |claims: &[QuirkyDirectClaim]| {
+            claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.z_skip,
+                        claim.k_skip,
+                        claim.x_rest.clone(),
+                        claim.value,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claim_tuples(&claims), claim_tuples(&replay));
+        assert_eq!(prover_next, verifier.sample_f128());
+
+        let old_eight_plus_eight = MerkleRegionVk::new(
+            purpose,
+            W_LOG,
+            slices,
+            BLOCK_LOG,
+            vec![
+                MerkleRegionFamily::FeedForwardStrided {
+                    offset: 0,
+                    depth: 8,
+                    n_paths: N_PATHS,
+                    stride: DESTINATION_STRIDE,
+                    iv,
+                },
+                MerkleRegionFamily::FeedForwardStrided {
+                    offset: 8,
+                    depth: 8,
+                    n_paths: N_PATHS,
+                    stride: DESTINATION_STRIDE,
+                    iv,
+                },
+            ],
+        )
+        .unwrap();
+        let mut wrong_verifier = FsLaneChallenger::new(b"strided-wallet-b-10-plus-6-v1");
+        assert!(
+            verify_merkle_region_sidecar(
+                &old_eight_plus_eight,
+                z.len().trailing_zeros() as usize,
+                &proof,
+                &mut wrong_verifier,
+            )
+            .is_err(),
+            "the selected 10+6 authority replayed under the retired 8+8 key"
+        );
+    }
+
+    #[test]
+    fn family_major_feed_forward_paths_fill_the_dyadic_domain_end_to_end() {
+        const W_LOG: usize = 8;
+        const DEPTHS: [usize; 4] = [21, 17, 13, 9];
+        const PATH_COUNTS: [usize; 4] = [5, 5, 3, 3];
+
+        let iv = [F128::new(0x1357, 0x2468), F128::new(0x3579, 0x468a)];
+        let column_len = 1usize << W_LOG;
+        let mut committed: [Vec<F128>; MERKLE_REGION_COMMITTED_COLUMNS] =
+            std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s_out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut families = Vec::with_capacity(DEPTHS.len());
+        let mut offset = 0usize;
+
+        for (family_index, (depth, path_count)) in DEPTHS.into_iter().zip(PATH_COUNTS).enumerate() {
+            let source_family = FfMerklePathFamily {
+                depth,
+                n_paths: path_count,
+            };
+            let source_stride = source_family.stride();
+            let source_slots = (path_count * source_stride).next_power_of_two();
+            let witnesses = (0..path_count)
+                .map(|path| {
+                    let salt = ((family_index + 1) * 0x1000 + path * 0x100) as u64;
+                    FfMerklePathWitness {
+                        entry: [F128::new(salt + 1, salt + 2), F128::new(salt + 3, salt + 4)],
+                        siblings: (0..depth)
+                            .map(|level| {
+                                [
+                                    F128::new(salt + 0x10 + level as u64, salt + 0x20),
+                                    F128::new(salt + 0x30 + level as u64, salt + 0x40),
+                                ]
+                            })
+                            .collect(),
+                        directions: (0..depth)
+                            .map(|level| (path + level + family_index) & 1 == 1)
+                            .collect(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let source = build_ff_merkle_path_columns(
+                &source_family,
+                iv,
+                &witnesses,
+                source_slots.trailing_zeros() as usize,
+            );
+            for path in 0..path_count {
+                for level in 0..depth {
+                    let from = path * source_stride + level;
+                    let to = offset + path * depth + level;
+                    for lane in 0..2 {
+                        committed[4 + lane][to] = source.cr[lane][from];
+                        committed[6 + lane][to] = source.sib[lane][from];
+                    }
+                    committed[8][to] = source.d[from];
+                    for lane in 0..4 {
+                        committed[lane][to] = source.c[lane][from];
+                        s0[lane][to] = source.s0[lane][from];
+                        s_out[lane][to] = source.s_out[lane][from];
+                    }
+                }
+            }
+            families.push(MerkleRegionFamily::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths: path_count,
+                stride: depth,
+                iv,
+            });
+            offset += path_count * depth;
+        }
+        assert_eq!(offset, column_len, "families cover the dyadic domain");
+
+        let mut z =
+            vec![F128::ZERO; (MERKLE_REGION_COMMITTED_COLUMNS * column_len).next_power_of_two()];
+        for (column, values) in committed.iter().enumerate() {
+            z[column * column_len..(column + 1) * column_len].copy_from_slice(values);
+        }
+        let slices = std::array::from_fn(|index| WitnessSlice {
+            log2_len: W_LOG,
+            index,
+        });
+        let vk = MerkleRegionVk::new([0xA7; 32], W_LOG, slices, W_LOG, families).unwrap();
+        let plan = MerkleRegionProverPlan::new(&vk, &s0, &s_out).unwrap();
+        let mut prover = FsLaneChallenger::new(b"family-major-feed-forward-v1");
+        let (proof, claims) = plan.prove(&z, &mut prover).unwrap();
+        let prover_next = prover.sample_f128();
+        let mut verifier = FsLaneChallenger::new(b"family-major-feed-forward-v1");
+        let replay = verify_merkle_region_sidecar(
+            &vk,
+            z.len().trailing_zeros() as usize,
+            &proof,
+            &mut verifier,
+        )
+        .unwrap();
+        let claim_tuples = |claims: &[QuirkyDirectClaim]| {
+            claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.z_skip,
+                        claim.k_skip,
+                        claim.x_rest.clone(),
+                        claim.value,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claim_tuples(&claims), claim_tuples(&replay));
+        assert_eq!(prover_next, verifier.sample_f128());
     }
 
     pub(super) fn merkle_decode_fixture_with_purpose(

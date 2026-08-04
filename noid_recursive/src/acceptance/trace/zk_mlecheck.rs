@@ -17,18 +17,18 @@
 
 use noid_gkr::zk_mlecheck::{ZK_MLECHECK_N_VARS, ZK_MLECHECK_ROUND_PROOF_COEFFS};
 
-use super::{pin_eq, FieldR1csBuilder, LinExpr, F128};
+use super::{mul_ext, pin_eq_ext, ExtExpr, FieldR1csBuilder, F256};
 
 /// One product for `lambda * mask_mle_eval`.
-pub const ZK_MLECHECK_INIT_ROWS: usize = 1;
+pub const ZK_MLECHECK_INIT_ROWS: usize = 3;
 /// One endpoint-recovery product plus ten Horner products.
-pub const ZK_MLECHECK_ROWS_PER_ROUND: usize = 1 + ZK_MLECHECK_ROUND_PROOF_COEFFS;
+pub const ZK_MLECHECK_ROWS_PER_ROUND: usize = 3 * (1 + ZK_MLECHECK_ROUND_PROOF_COEFFS);
 /// Eleven fixed rounds of the degree-ten telescope.
 pub const ZK_MLECHECK_ROUND_ROWS: usize = ZK_MLECHECK_N_VARS * ZK_MLECHECK_ROWS_PER_ROUND;
 /// One product for `lambda * mask_final_eval`.
-pub const ZK_MLECHECK_UNBATCH_ROWS: usize = 1;
+pub const ZK_MLECHECK_UNBATCH_ROWS: usize = 3;
 /// One equality pin against the independently supplied main terminal value.
-pub const ZK_MLECHECK_FINAL_PIN_ROWS: usize = 1;
+pub const ZK_MLECHECK_FINAL_PIN_ROWS: usize = 2;
 /// Exact incremental verifier ledger, excluding caller-owned witness inputs.
 pub const ZK_MLECHECK_VERIFIER_ROWS: usize = ZK_MLECHECK_INIT_ROWS
     + ZK_MLECHECK_ROUND_ROWS
@@ -37,8 +37,8 @@ pub const ZK_MLECHECK_VERIFIER_ROWS: usize = ZK_MLECHECK_INIT_ROWS
 
 const _: () = assert!(ZK_MLECHECK_N_VARS == 11);
 const _: () = assert!(ZK_MLECHECK_ROUND_PROOF_COEFFS == 10);
-const _: () = assert!(ZK_MLECHECK_ROWS_PER_ROUND == 11);
-const _: () = assert!(ZK_MLECHECK_VERIFIER_ROWS == 124);
+const _: () = assert!(ZK_MLECHECK_ROWS_PER_ROUND == 33);
+const _: () = assert!(ZK_MLECHECK_VERIFIER_ROWS == 371);
 
 /// Dynamic field whose accidental constant embedding would change the frozen
 /// recursive matrix. Round-coefficient indices are flattened as
@@ -71,7 +71,7 @@ pub enum ZkMleCheckTraceError {
 #[derive(Clone, Debug)]
 pub struct ZkMleCheckRoundProofTrace {
     /// Witness expressions `[a_1, ..., a_10]`; `a_0` is reconstructed.
-    pub coeffs_without_constant: [LinExpr; ZK_MLECHECK_ROUND_PROOF_COEFFS],
+    pub coeffs_without_constant: [ExtExpr; ZK_MLECHECK_ROUND_PROOF_COEFFS],
 }
 
 /// Fixed-shape disconnected verifier inputs.
@@ -81,30 +81,30 @@ pub struct ZkMleCheckRoundProofTrace {
 /// use canonical low-to-high variable order.
 #[derive(Clone, Debug)]
 pub struct ZkMleCheckVerifierTraceInputs {
-    pub input_point: [LinExpr; ZK_MLECHECK_N_VARS],
-    pub main_claim: LinExpr,
-    pub mask_mle_eval: LinExpr,
-    pub lambda: LinExpr,
+    pub input_point: [ExtExpr; ZK_MLECHECK_N_VARS],
+    pub main_claim: ExtExpr,
+    pub mask_mle_eval: ExtExpr,
+    pub lambda: ExtExpr,
     pub rounds: [ZkMleCheckRoundProofTrace; ZK_MLECHECK_N_VARS],
-    pub challenges: [LinExpr; ZK_MLECHECK_N_VARS],
-    pub mask_final_eval: LinExpr,
+    pub challenges: [ExtExpr; ZK_MLECHECK_N_VARS],
+    pub mask_final_eval: ExtExpr,
     /// Must be computed and bound independently by the surrounding trace.
-    pub expected_main_final: LinExpr,
+    pub expected_main_final: ExtExpr,
 }
 
 /// Output aliases and derived expressions after the final equality pin.
 #[derive(Clone, Debug)]
 pub struct ZkMleCheckVerifierOutputTrace {
     /// Unbatched main-polynomial terminal evaluation.
-    pub main_eval: LinExpr,
+    pub main_eval: ExtExpr,
     /// Alias of the caller-supplied final mask evaluation.
-    pub mask_eval: LinExpr,
+    pub mask_eval: ExtExpr,
     /// Canonical low-to-high point, despite high-to-low round execution.
-    pub terminal_point: [LinExpr; ZK_MLECHECK_N_VARS],
+    pub terminal_point: [ExtExpr; ZK_MLECHECK_N_VARS],
 }
 
 fn check_dynamic(
-    expression: &LinExpr,
+    expression: &ExtExpr,
     input: ZkMleCheckTraceDynamicInput,
     index: usize,
 ) -> Result<(), ZkMleCheckTraceError> {
@@ -128,7 +128,7 @@ fn preflight_dynamic_inputs(
             variable,
         )?;
     }
-    if inputs.main_claim.is_const() && inputs.main_claim.constant != F128::ZERO {
+    if inputs.main_claim.is_const() && inputs.main_claim.constant_value() != Some(F256::ZERO) {
         return Err(ZkMleCheckTraceError::NonzeroConstantMainClaim);
     }
     check_dynamic(
@@ -168,26 +168,26 @@ fn preflight_dynamic_inputs(
 /// Production callers should use [`verify_zk_mlecheck_trace`], whose fixed
 /// arrays make an incomplete or oversized round sequence unrepresentable.
 struct ZkMleCheckVerifierStateTrace {
-    input_point: [LinExpr; ZK_MLECHECK_N_VARS],
-    lambda: LinExpr,
-    running_claim: LinExpr,
+    input_point: [ExtExpr; ZK_MLECHECK_N_VARS],
+    lambda: ExtExpr,
+    running_claim: ExtExpr,
     completed_rounds: usize,
-    terminal_point: [Option<LinExpr>; ZK_MLECHECK_N_VARS],
+    terminal_point: [Option<ExtExpr>; ZK_MLECHECK_N_VARS],
 }
 
 impl ZkMleCheckVerifierStateTrace {
     fn new(
         b: &mut FieldR1csBuilder,
-        input_point: &[LinExpr; ZK_MLECHECK_N_VARS],
-        main_claim: &LinExpr,
-        mask_mle_eval: &LinExpr,
-        lambda: &LinExpr,
+        input_point: &[ExtExpr; ZK_MLECHECK_N_VARS],
+        main_claim: &ExtExpr,
+        mask_mle_eval: &ExtExpr,
+        lambda: &ExtExpr,
     ) -> Self {
         // Use the raw builder product throughout this fixed ledger. Preflight
         // rejects direct constant substitution; raw products additionally
         // preserve the row if a protocol-fixed affine combination happens to
         // simplify syntactically.
-        let batched_mask = LinExpr::from_wire(b.mul(lambda, mask_mle_eval));
+        let batched_mask = mul_ext(b, lambda, mask_mle_eval);
         Self {
             input_point: input_point.clone(),
             lambda: lambda.clone(),
@@ -203,7 +203,7 @@ impl ZkMleCheckVerifierStateTrace {
         &mut self,
         b: &mut FieldR1csBuilder,
         round: &ZkMleCheckRoundProofTrace,
-        challenge: &LinExpr,
+        challenge: &ExtExpr,
     ) {
         assert!(
             self.completed_rounds < ZK_MLECHECK_N_VARS,
@@ -215,10 +215,10 @@ impl ZkMleCheckVerifierStateTrace {
         let nonconstant_sum = round
             .coeffs_without_constant
             .iter()
-            .fold(LinExpr::zero(), |sum, coeff| sum.add(coeff));
+            .fold(ExtExpr::zero(), |sum, coeff| sum.add(coeff));
         // Subtraction is addition in characteristic two. This is the one
         // endpoint-recovery product charged by each round.
-        let recovered_product = LinExpr::from_wire(b.mul(alpha, &nonconstant_sum));
+        let recovered_product = mul_ext(b, alpha, &nonconstant_sum);
         let a0 = self.running_claim.add(&recovered_product);
 
         // Exactly ten products for a degree-ten Horner evaluation. Start at
@@ -229,9 +229,9 @@ impl ZkMleCheckVerifierStateTrace {
             .iter()
             .rev()
         {
-            evaluation = LinExpr::from_wire(b.mul(&evaluation, challenge)).add(coeff);
+            evaluation = mul_ext(b, &evaluation, challenge).add(coeff);
         }
-        evaluation = LinExpr::from_wire(b.mul(&evaluation, challenge)).add(&a0);
+        evaluation = mul_ext(b, &evaluation, challenge).add(&a0);
 
         self.running_claim = evaluation;
         self.terminal_point[var_index] = Some(challenge.clone());
@@ -241,17 +241,17 @@ impl ZkMleCheckVerifierStateTrace {
     fn finish_checked(
         self,
         b: &mut FieldR1csBuilder,
-        mask_final_eval: &LinExpr,
-        expected_main_final: &LinExpr,
+        mask_final_eval: &ExtExpr,
+        expected_main_final: &ExtExpr,
     ) -> ZkMleCheckVerifierOutputTrace {
         assert_eq!(
             self.completed_rounds, ZK_MLECHECK_N_VARS,
             "ZK MLE-check rounds incomplete"
         );
 
-        let unbatched_mask = LinExpr::from_wire(b.mul(&self.lambda, mask_final_eval));
+        let unbatched_mask = mul_ext(b, &self.lambda, mask_final_eval);
         let main_eval = self.running_claim.add(&unbatched_mask);
-        pin_eq(b, &main_eval, expected_main_final);
+        pin_eq_ext(b, &main_eval, expected_main_final);
 
         ZkMleCheckVerifierOutputTrace {
             main_eval,
@@ -293,13 +293,13 @@ pub fn verify_zk_mlecheck_trace(
 
 #[cfg(test)]
 mod tests {
-    use noid_core::{Block128, TowerField};
+    use noid_core::{Block128, Block256, TowerField};
     use noid_gkr::zk_mlecheck::{
         combine_main_and_mask_round, ZkMleCheckMaskView, ZkMleCheckRoundProof,
         ZkMleCheckVerifierState, ZK_MLECHECK_MASK_LEN,
     };
 
-    use super::super::{alloc_block, test_support::assert_expr_is};
+    use super::super::{alloc_block256, const_block256, test_support::assert_ext_expr_is};
     use super::*;
 
     fn elem(index: usize, domain: u128) -> Block128 {
@@ -315,20 +315,24 @@ mod tests {
         std::array::from_fn(|index| elem(index, domain))
     }
 
-    fn point(domain: u128) -> [Block128; ZK_MLECHECK_N_VARS] {
-        std::array::from_fn(|index| elem(index + 31, domain))
+    fn ext_elem(index: usize, domain: u128) -> Block256 {
+        Block256::new(elem(index, domain), elem(index + 83, domain ^ 0xC1_256))
+    }
+
+    fn point(domain: u128) -> [Block256; ZK_MLECHECK_N_VARS] {
+        std::array::from_fn(|index| ext_elem(index + 31, domain))
     }
 
     #[derive(Clone)]
     struct NativeFixture {
-        input_point: [Block128; ZK_MLECHECK_N_VARS],
-        main_claim: Block128,
-        mask_claim: Block128,
-        lambda: Block128,
-        challenges: [Block128; ZK_MLECHECK_N_VARS],
-        proofs: [ZkMleCheckRoundProof; ZK_MLECHECK_N_VARS],
-        main_final: Block128,
-        mask_final: Block128,
+        input_point: [Block256; ZK_MLECHECK_N_VARS],
+        main_claim: Block256,
+        mask_claim: Block256,
+        lambda: Block256,
+        challenges: [Block256; ZK_MLECHECK_N_VARS],
+        proofs: [ZkMleCheckRoundProof<Block256>; ZK_MLECHECK_N_VARS],
+        main_final: Block256,
+        mask_final: Block256,
     }
 
     /// Same honest two-separable-polynomial construction as the native
@@ -340,12 +344,12 @@ mod tests {
         let main = ZkMleCheckMaskView::checked(&main_cells).unwrap();
         let mask = ZkMleCheckMaskView::checked(&mask_cells).unwrap();
         let input_point = point(0x1A907 ^ salt.rotate_left(31));
-        let lambda = elem(77, 0x1A4BDA ^ salt.rotate_left(43));
+        let lambda = ext_elem(77, 0x1A4BDA ^ salt.rotate_left(43));
         let challenges = point(0xC4A11 ^ salt.rotate_left(59));
         let main_claim = main.evaluate_mle(&input_point);
         let mask_claim = mask.evaluate_mle(&input_point);
 
-        let proofs: [ZkMleCheckRoundProof; ZK_MLECHECK_N_VARS] =
+        let proofs: [ZkMleCheckRoundProof<Block256>; ZK_MLECHECK_N_VARS] =
             std::array::from_fn(|round_index| {
                 let main_round = main
                     .round_coefficients(&input_point, &challenges[..round_index])
@@ -376,7 +380,9 @@ mod tests {
         }
     }
 
-    fn native_output(fixture: &NativeFixture) -> noid_gkr::zk_mlecheck::ZkMleCheckVerifierOutput {
+    fn native_output(
+        fixture: &NativeFixture,
+    ) -> noid_gkr::zk_mlecheck::ZkMleCheckVerifierOutput<Block256> {
         let mut state = ZkMleCheckVerifierState::new(
             fixture.input_point,
             fixture.main_claim,
@@ -395,21 +401,22 @@ mod tests {
         b: &mut FieldR1csBuilder,
         fixture: &NativeFixture,
     ) -> ZkMleCheckVerifierTraceInputs {
-        let input_point = std::array::from_fn(|index| alloc_block(b, fixture.input_point[index]));
-        let main_claim = alloc_block(b, fixture.main_claim);
-        let mask_mle_eval = alloc_block(b, fixture.mask_claim);
-        let lambda = alloc_block(b, fixture.lambda);
+        let input_point =
+            std::array::from_fn(|index| alloc_block256(b, fixture.input_point[index]));
+        let main_claim = alloc_block256(b, fixture.main_claim);
+        let mask_mle_eval = alloc_block256(b, fixture.mask_claim);
+        let lambda = alloc_block256(b, fixture.lambda);
         let rounds = std::array::from_fn(|round| ZkMleCheckRoundProofTrace {
             coeffs_without_constant: std::array::from_fn(|coefficient| {
-                alloc_block(
+                alloc_block256(
                     b,
                     fixture.proofs[round].coeffs_without_constant[coefficient],
                 )
             }),
         });
-        let challenges = std::array::from_fn(|round| alloc_block(b, fixture.challenges[round]));
-        let mask_final_eval = alloc_block(b, fixture.mask_final);
-        let expected_main_final = alloc_block(b, fixture.main_final);
+        let challenges = std::array::from_fn(|round| alloc_block256(b, fixture.challenges[round]));
+        let mask_final_eval = alloc_block256(b, fixture.mask_final);
+        let expected_main_final = alloc_block256(b, fixture.main_final);
 
         ZkMleCheckVerifierTraceInputs {
             input_point,
@@ -429,9 +436,9 @@ mod tests {
         noid_ivc_core::field_r1cs::FieldR1cs,
         Vec<noid_ivc_core::field::F128>,
         usize,
-        [Block128; ZK_MLECHECK_N_VARS],
-        Block128,
-        Block128,
+        [Block256; ZK_MLECHECK_N_VARS],
+        Block256,
+        Block256,
     ) {
         let mut b = FieldR1csBuilder::new();
         let inputs = alloc_inputs(&mut b, fixture);
@@ -439,10 +446,10 @@ mod tests {
         let output = verify_zk_mlecheck_trace(&mut b, &inputs).expect("dynamic trace inputs");
         let verifier_rows = b.num_wires() - before;
         let terminal_point = std::array::from_fn(|index| {
-            super::super::test_support::tower_value(&b, &output.terminal_point[index])
+            super::super::test_support::tower_value_ext(&b, &output.terminal_point[index])
         });
-        let main_eval = super::super::test_support::tower_value(&b, &output.main_eval);
-        let mask_eval = super::super::test_support::tower_value(&b, &output.mask_eval);
+        let main_eval = super::super::test_support::tower_value_ext(&b, &output.main_eval);
+        let mask_eval = super::super::test_support::tower_value_ext(&b, &output.mask_eval);
         let (r1cs, witness) = b.build();
         (
             r1cs,
@@ -464,10 +471,10 @@ mod tests {
         let before = b.num_wires();
         let output = verify_zk_mlecheck_trace(&mut b, &inputs).expect("dynamic trace inputs");
         assert_eq!(b.num_wires() - before, ZK_MLECHECK_VERIFIER_ROWS);
-        assert_expr_is(&b, &output.main_eval, native.main_eval, "main terminal");
-        assert_expr_is(&b, &output.mask_eval, native.mask_eval, "mask terminal");
+        assert_ext_expr_is(&b, &output.main_eval, native.main_eval, "main terminal");
+        assert_ext_expr_is(&b, &output.mask_eval, native.mask_eval, "mask terminal");
         for (index, coordinate) in output.terminal_point.iter().enumerate() {
-            assert_expr_is(
+            assert_ext_expr_is(
                 &b,
                 coordinate,
                 native.terminal_point[index],
@@ -493,27 +500,27 @@ mod tests {
         };
 
         let mut candidate = honest.clone();
-        candidate.proofs[4].coeffs_without_constant[7] += Block128::ONE;
+        candidate.proofs[4].coeffs_without_constant[7] += Block256::ONE;
         assert_rejected(candidate, "round coefficient tamper");
 
         let mut candidate = honest.clone();
-        candidate.challenges[3] += Block128::ONE;
+        candidate.challenges[3] += Block256::ONE;
         assert_rejected(candidate, "challenge tamper");
 
         let mut candidate = honest.clone();
-        candidate.mask_claim += Block128::ONE;
+        candidate.mask_claim += Block256::ONE;
         assert_rejected(candidate, "initial mask evaluation tamper");
 
         let mut candidate = honest.clone();
-        candidate.mask_final += Block128::ONE;
+        candidate.mask_final += Block256::ONE;
         assert_rejected(candidate, "final mask evaluation tamper");
 
         let mut candidate = honest.clone();
-        candidate.main_claim += Block128::ONE;
+        candidate.main_claim += Block256::ONE;
         assert_rejected(candidate, "initial main claim tamper");
 
         let mut candidate = honest;
-        candidate.main_final += Block128::ONE;
+        candidate.main_final += Block256::ONE;
         assert_rejected(candidate, "expected main terminal tamper");
     }
 
@@ -567,7 +574,7 @@ mod tests {
         let mut b = FieldR1csBuilder::new();
         let mut inputs = alloc_inputs(&mut b, &fixture);
 
-        inputs.challenges[3] = LinExpr::constant(super::super::flat_of(fixture.challenges[3]));
+        inputs.challenges[3] = const_block256(fixture.challenges[3]);
         let before = b.num_wires();
         assert_eq!(
             verify_zk_mlecheck_trace(&mut b, &inputs).unwrap_err(),
@@ -578,10 +585,9 @@ mod tests {
         );
         assert_eq!(b.num_wires(), before, "challenge preflight appended rows");
 
-        inputs.challenges[3] = alloc_block(&mut b, fixture.challenges[3]);
-        inputs.rounds[7].coeffs_without_constant[3] = LinExpr::constant(super::super::flat_of(
-            fixture.proofs[7].coeffs_without_constant[3],
-        ));
+        inputs.challenges[3] = alloc_block256(&mut b, fixture.challenges[3]);
+        inputs.rounds[7].coeffs_without_constant[3] =
+            const_block256(fixture.proofs[7].coeffs_without_constant[3]);
         let before = b.num_wires();
         assert_eq!(
             verify_zk_mlecheck_trace(&mut b, &inputs).unwrap_err(),
@@ -596,11 +602,11 @@ mod tests {
     #[test]
     fn main_claim_allows_only_dynamic_or_exact_zero_constant() {
         let fixture = honest_fixture(0xA071_C6A1);
-        assert_ne!(fixture.main_claim, Block128::ZERO);
+        assert_ne!(fixture.main_claim, Block256::ZERO);
         let mut b = FieldR1csBuilder::new();
         let mut inputs = alloc_inputs(&mut b, &fixture);
 
-        inputs.main_claim = LinExpr::constant(super::super::flat_of(fixture.main_claim));
+        inputs.main_claim = const_block256(fixture.main_claim);
         let before = b.num_wires();
         assert_eq!(
             verify_zk_mlecheck_trace(&mut b, &inputs).unwrap_err(),
@@ -608,7 +614,7 @@ mod tests {
         );
         assert_eq!(b.num_wires(), before, "main-claim preflight appended rows");
 
-        inputs.main_claim = LinExpr::zero();
+        inputs.main_claim = ExtExpr::zero();
         let before = b.num_wires();
         verify_zk_mlecheck_trace(&mut b, &inputs)
             .expect("protocol-owned zero main claim is an admitted class member");

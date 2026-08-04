@@ -38,7 +38,7 @@ use super::zk_post_claim_relation::{
     ZkPostClaimRelationTraceInput, ZkPostClaimRelationTraceOutput,
     ZK_POST_CLAIM_RELATION_TRACE_ROWS,
 };
-use super::{FieldR1csBuilder, LinExpr};
+use super::{ExtExpr, FieldR1csBuilder, LinExpr};
 
 /// Exact incremental ledger after all caller-owned dynamic inputs are
 /// allocated.  Alias-only component boundaries add no rows.
@@ -47,10 +47,10 @@ pub const ZK_AUTH_COMPOSITION_TRACE_ROWS: usize =
 
 const _: () = assert!(ZK_AUTH_CAPSULE_BANK_VARS == 11);
 const _: () = assert!(ZK_PHASE_A_ROUNDS == ZK_AUTH_CAPSULE_BANK_VARS);
-const _: () = assert!(ZK_OWNER_VERIFIER_TRACE_ROWS == 294);
-const _: () = assert!(ZK_POST_CLAIM_RELATION_TRACE_ROWS == 299);
-const _: () = assert!(ZK_PHASE_A_TRACE_ROWS == 31);
-const _: () = assert!(ZK_AUTH_COMPOSITION_TRACE_ROWS == 624);
+const _: () = assert!(ZK_OWNER_VERIFIER_TRACE_ROWS == 871);
+const _: () = assert!(ZK_POST_CLAIM_RELATION_TRACE_ROWS == 893);
+const _: () = assert!(ZK_PHASE_A_TRACE_ROWS == 88);
+const _: () = assert!(ZK_AUTH_COMPOSITION_TRACE_ROWS == 1_852);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkAuthCompositionTraceError {
@@ -85,28 +85,28 @@ impl From<ZkPhaseATraceError> for ZkAuthCompositionTraceError {
 #[derive(Clone, Debug)]
 pub struct ZkAuthCompositionTraceInput {
     /// AuthGKR input point in canonical LOW-to-HIGH order.
-    pub rho: [LinExpr; ZK_AUTH_CAPSULE_BANK_VARS],
-    pub mask_mle_at_input: LinExpr,
-    pub mask_final_at_terminal: LinExpr,
-    pub lambda: LinExpr,
+    pub rho: [ExtExpr; ZK_AUTH_CAPSULE_BANK_VARS],
+    pub mask_mle_at_input: ExtExpr,
+    pub mask_final_at_terminal: ExtExpr,
+    pub lambda: ExtExpr,
     /// Owner MLE-check rounds in transcript HIGH-to-LOW order.
     pub owner_rounds: [ZkMleCheckRoundProofTrace; ZK_AUTH_CAPSULE_BANK_VARS],
     /// Owner round challenges `[r_10, ..., r_0]`.
-    pub owner_challenges_high_to_low: [LinExpr; ZK_AUTH_CAPSULE_BANK_VARS],
+    pub owner_challenges_high_to_low: [ExtExpr; ZK_AUTH_CAPSULE_BANK_VARS],
     pub terminal_operands: AuthCapsuleTerminalOperandClaimsTrace,
     /// Public output-address lanes; the capacity-IV lanes are constants in
     /// the post-claim relation.
     pub expected_address: [LinExpr; 2],
     /// Post-claim RLC challenge, sampled after all eleven claims.
-    pub eta: LinExpr,
+    pub eta: ExtExpr,
     /// `sigma = <C,t>`, transcript-bound before `gamma` is sampled.
-    pub companion_claim: LinExpr,
-    pub gamma: LinExpr,
+    pub companion_claim: ExtExpr,
+    pub gamma: ExtExpr,
     /// Phase-A challenges `[s_10, ..., s_0]`.
-    pub phase_a_challenges_high_to_low: [LinExpr; ZK_PHASE_A_ROUNDS],
+    pub phase_a_challenges_high_to_low: [ExtExpr; ZK_PHASE_A_ROUNDS],
     pub phase_a_rounds: [ZkPhaseATraceRound; ZK_PHASE_A_ROUNDS],
     /// Phase-B-linked `O_gamma(s)` value `v`.
-    pub terminal_oracle_value: LinExpr,
+    pub terminal_oracle_value: ExtExpr,
 }
 
 /// Component outputs retained for the later transcript and Phase-B wrapper.
@@ -141,7 +141,7 @@ pub fn verify_zk_auth_composition_trace(
 
     // These are aliases of the exact Phase-A challenge expressions.  The
     // Phase-A verifier independently returns the same reversal below.
-    let phase_a_terminal_point: [LinExpr; ZK_PHASE_A_ROUNDS] =
+    let phase_a_terminal_point: [ExtExpr; ZK_PHASE_A_ROUNDS] =
         std::array::from_fn(|low_variable| {
             input.phase_a_challenges_high_to_low[ZK_PHASE_A_ROUNDS - 1 - low_variable].clone()
         });
@@ -201,7 +201,7 @@ pub fn verify_zk_auth_composition_trace(
 #[cfg(test)]
 mod tests {
     use noid_core::mle::evaluate::evaluate_slice;
-    use noid_core::{Block128, TowerField};
+    use noid_core::{Block128, Block256, TowerField};
     use noid_fri_binius::zk_phase_a::{
         prove_phase_a, verify_phase_a, ZkPhaseARoundProof, PHASE_A_ORACLE_LEN,
     };
@@ -216,22 +216,23 @@ mod tests {
     use noid_ivc_core::field_r1cs::FieldR1cs;
     use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 
-    use super::super::{alloc_block, flat_of, test_support::tower_value, F128};
+    use super::super::{alloc_block, alloc_block256, flat_of, test_support::tower_value_ext, F128};
     use super::*;
 
-    const DYNAMIC_INPUT_ROWS: usize = ZK_AUTH_CAPSULE_BANK_VARS
-        + 2
-        + 1
-        + ZK_AUTH_CAPSULE_BANK_VARS * 10
-        + ZK_AUTH_CAPSULE_BANK_VARS
-        + 5
-        + 2
-        + 1
-        + 1
-        + 1
-        + ZK_PHASE_A_ROUNDS
-        + ZK_PHASE_A_ROUNDS * 2
-        + 1;
+    const DYNAMIC_INPUT_ROWS: usize = 2
+        * (ZK_AUTH_CAPSULE_BANK_VARS
+            + 2
+            + 1
+            + ZK_AUTH_CAPSULE_BANK_VARS * 10
+            + ZK_AUTH_CAPSULE_BANK_VARS
+            + 5
+            + 1
+            + 1
+            + 1
+            + ZK_PHASE_A_ROUNDS
+            + ZK_PHASE_A_ROUNDS * 2
+            + 1)
+        + 2;
     const FIXTURE_USEFUL_ROWS: usize = 1 + DYNAMIC_INPUT_ROWS + ZK_AUTH_COMPOSITION_TRACE_ROWS;
 
     fn elem(index: usize, domain: u128, salt: u128) -> Block128 {
@@ -244,32 +245,39 @@ mod tests {
         )
     }
 
-    fn point(domain: u128, salt: u128) -> [Block128; ZK_AUTH_CAPSULE_BANK_VARS] {
-        std::array::from_fn(|index| elem(index + 29, domain, salt))
+    fn ext_elem(index: usize, domain: u128, salt: u128) -> Block256 {
+        Block256::new(
+            elem(index, domain, salt),
+            elem(index + 137, domain ^ 0xC1_256, salt.rotate_left(59)),
+        )
+    }
+
+    fn point(domain: u128, salt: u128) -> [Block256; ZK_AUTH_CAPSULE_BANK_VARS] {
+        std::array::from_fn(|index| ext_elem(index + 29, domain, salt))
     }
 
     #[derive(Clone)]
     struct NativeCase {
-        rho: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-        mask_mle_at_input: Block128,
-        mask_final_at_terminal: Block128,
-        lambda: Block128,
-        owner_rounds: [ZkMleCheckRoundProof; ZK_AUTH_CAPSULE_BANK_VARS],
-        owner_challenges: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-        terminal_operands: AuthCapsuleTerminalOperandClaims,
-        owner_terminal_point: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-        owner_main_final: Block128,
+        rho: [Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+        mask_mle_at_input: Block256,
+        mask_final_at_terminal: Block256,
+        lambda: Block256,
+        owner_rounds: [ZkMleCheckRoundProof<Block256>; ZK_AUTH_CAPSULE_BANK_VARS],
+        owner_challenges: [Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+        terminal_operands: AuthCapsuleTerminalOperandClaims<Block256>,
+        owner_terminal_point: [Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+        owner_main_final: Block256,
         expected_address: [Block128; 2],
-        eta: Block128,
-        bank_claim: Block128,
-        companion_claim: Block128,
-        gamma: Block128,
-        phase_a_challenges: [Block128; ZK_PHASE_A_ROUNDS],
-        phase_a_rounds: [ZkPhaseARoundProof; ZK_PHASE_A_ROUNDS],
-        phase_a_terminal_point: [Block128; ZK_PHASE_A_ROUNDS],
-        terminal_relation_value: Block128,
-        terminal_oracle_value: Block128,
-        initial_claim: Block128,
+        eta: Block256,
+        bank_claim: Block256,
+        companion_claim: Block256,
+        gamma: Block256,
+        phase_a_challenges: [Block256; ZK_PHASE_A_ROUNDS],
+        phase_a_rounds: [ZkPhaseARoundProof<Block256>; ZK_PHASE_A_ROUNDS],
+        phase_a_terminal_point: [Block256; ZK_PHASE_A_ROUNDS],
+        terminal_relation_value: Block256,
+        terminal_oracle_value: Block256,
+        initial_claim: Block256,
     }
 
     /// Build the actual Poseidon state bank, explicit AuthGKR carrier,
@@ -316,16 +324,16 @@ mod tests {
 
         let rho = point(0x1A90_7, salt ^ 0x50);
         let owner_challenges = point(0xC4A1_1, salt ^ 0x60);
-        let mut lambda = elem(71, 0x1A4B_DA, salt ^ 0x70);
-        if lambda == Block128::ZERO {
-            lambda = Block128::ONE;
+        let mut lambda = ext_elem(71, 0x1A4B_DA, salt ^ 0x70);
+        if lambda == Block256::ZERO {
+            lambda = Block256::ONE;
         }
         let carrier = build_explicit_mlecheck_carrier(bank_view, rho, lambda, owner_challenges)
             .expect("real explicit Owner carrier");
 
-        let mut eta = elem(73, 0xE7A0, salt ^ 0x80);
-        if eta == Block128::ZERO {
-            eta = Block128::ONE;
+        let mut eta = ext_elem(73, 0xE7A0, salt ^ 0x80);
+        if eta == Block256::ZERO {
+            eta = Block256::ONE;
         }
         let relation = build_post_claim_relation(
             &rho,
@@ -339,14 +347,20 @@ mod tests {
 
         // This companion uses a disjoint deterministic domain solely to make
         // the fixture reproducible.  It is not copied from or derived from B.
-        let companion: Vec<Block128> = (0..PHASE_A_ORACLE_LEN)
-            .map(|index| elem(index, 0xC09A_91, salt ^ 0x90))
+        let companion: Vec<Block256> = (0..PHASE_A_ORACLE_LEN)
+            .map(|index| ext_elem(index, 0xC09A_91, salt ^ 0x90))
             .collect();
-        assert_ne!(companion, bank, "fixture companion must be independent");
+        assert!(
+            companion
+                .iter()
+                .zip(&bank)
+                .any(|(&companion, &bank)| companion != Block256::from(bank)),
+            "fixture companion must be independent"
+        );
         let phase_a_challenges = point(0x5A11_CE, salt ^ 0xA0);
-        let mut gamma = elem(79, 0x6A77_A, salt ^ 0xB0);
-        if gamma == Block128::ZERO || gamma == Block128::ONE {
-            gamma += Block128::from(2u128);
+        let mut gamma = ext_elem(79, 0x6A77_A, salt ^ 0xB0);
+        if gamma == Block256::ZERO || gamma == Block256::ONE {
+            gamma += Block256::from(2u128);
         }
         let phase_a = prove_phase_a(
             &bank,
@@ -403,41 +417,41 @@ mod tests {
 
     fn alloc_input(b: &mut FieldR1csBuilder, native: &NativeCase) -> ZkAuthCompositionTraceInput {
         ZkAuthCompositionTraceInput {
-            rho: std::array::from_fn(|index| alloc_block(b, native.rho[index])),
-            mask_mle_at_input: alloc_block(b, native.mask_mle_at_input),
-            mask_final_at_terminal: alloc_block(b, native.mask_final_at_terminal),
-            lambda: alloc_block(b, native.lambda),
+            rho: std::array::from_fn(|index| alloc_block256(b, native.rho[index])),
+            mask_mle_at_input: alloc_block256(b, native.mask_mle_at_input),
+            mask_final_at_terminal: alloc_block256(b, native.mask_final_at_terminal),
+            lambda: alloc_block256(b, native.lambda),
             owner_rounds: std::array::from_fn(|round| ZkMleCheckRoundProofTrace {
                 coeffs_without_constant: std::array::from_fn(|coefficient| {
-                    alloc_block(
+                    alloc_block256(
                         b,
                         native.owner_rounds[round].coeffs_without_constant[coefficient],
                     )
                 }),
             }),
             owner_challenges_high_to_low: std::array::from_fn(|round| {
-                alloc_block(b, native.owner_challenges[round])
+                alloc_block256(b, native.owner_challenges[round])
             }),
             terminal_operands: AuthCapsuleTerminalOperandClaimsTrace {
-                increment: alloc_block(b, native.terminal_operands.increment),
+                increment: alloc_block256(b, native.terminal_operands.increment),
                 lane: std::array::from_fn(|lane| {
-                    alloc_block(b, native.terminal_operands.lane[lane])
+                    alloc_block256(b, native.terminal_operands.lane[lane])
                 }),
             },
             expected_address: std::array::from_fn(|lane| {
                 alloc_block(b, native.expected_address[lane])
             }),
-            eta: alloc_block(b, native.eta),
-            companion_claim: alloc_block(b, native.companion_claim),
-            gamma: alloc_block(b, native.gamma),
+            eta: alloc_block256(b, native.eta),
+            companion_claim: alloc_block256(b, native.companion_claim),
+            gamma: alloc_block256(b, native.gamma),
             phase_a_challenges_high_to_low: std::array::from_fn(|round| {
-                alloc_block(b, native.phase_a_challenges[round])
+                alloc_block256(b, native.phase_a_challenges[round])
             }),
             phase_a_rounds: std::array::from_fn(|round| ZkPhaseATraceRound {
-                at_one: alloc_block(b, native.phase_a_rounds[round].at_one),
-                at_infinity: alloc_block(b, native.phase_a_rounds[round].at_infinity),
+                at_one: alloc_block256(b, native.phase_a_rounds[round].at_one),
+                at_infinity: alloc_block256(b, native.phase_a_rounds[round].at_infinity),
             }),
-            terminal_oracle_value: alloc_block(b, native.terminal_oracle_value),
+            terminal_oracle_value: alloc_block256(b, native.terminal_oracle_value),
         }
     }
 
@@ -445,20 +459,22 @@ mod tests {
         r1cs: FieldR1cs,
         witness: Vec<F128>,
         trace_rows: usize,
-        owner_terminal_point: [Block128; ZK_AUTH_CAPSULE_BANK_VARS],
-        phase_a_terminal_point: [Block128; ZK_PHASE_A_ROUNDS],
-        owner_main_final: Block128,
-        bank_claim: Block128,
-        terminal_relation_value: Block128,
-        initial_claim: Block128,
+        owner_terminal_point: [Block256; ZK_AUTH_CAPSULE_BANK_VARS],
+        phase_a_terminal_point: [Block256; ZK_PHASE_A_ROUNDS],
+        owner_main_final: Block256,
+        bank_claim: Block256,
+        terminal_relation_value: Block256,
+        initial_claim: Block256,
         bank_internal_wire: usize,
         terminal_relation_internal_wire: usize,
     }
 
-    fn internal_wire(expression: &LinExpr, first_internal_wire: usize) -> usize {
+    fn internal_wire(expression: &ExtExpr, first_internal_wire: usize) -> usize {
         expression
+            .lo
             .terms
             .iter()
+            .chain(expression.hi.terms.iter())
             .map(|(wire, _)| *wire as usize)
             .filter(|wire| *wire >= first_internal_wire)
             .max()
@@ -474,13 +490,14 @@ mod tests {
         let trace_rows = b.num_wires() - first_internal_wire;
 
         let owner_terminal_point =
-            std::array::from_fn(|index| tower_value(&b, &output.owner.terminal_point[index]));
+            std::array::from_fn(|index| tower_value_ext(&b, &output.owner.terminal_point[index]));
         let phase_a_terminal_point =
-            std::array::from_fn(|index| tower_value(&b, &output.phase_a.terminal_point[index]));
-        let owner_main_final = tower_value(&b, &output.owner.main_eval);
-        let bank_claim = tower_value(&b, &output.post_claim.bank_claim);
-        let terminal_relation_value = tower_value(&b, &output.post_claim.terminal_relation_value);
-        let initial_claim = tower_value(&b, &output.phase_a.initial_claim);
+            std::array::from_fn(|index| tower_value_ext(&b, &output.phase_a.terminal_point[index]));
+        let owner_main_final = tower_value_ext(&b, &output.owner.main_eval);
+        let bank_claim = tower_value_ext(&b, &output.post_claim.bank_claim);
+        let terminal_relation_value =
+            tower_value_ext(&b, &output.post_claim.terminal_relation_value);
+        let initial_claim = tower_value_ext(&b, &output.phase_a.initial_claim);
         let bank_internal_wire = internal_wire(&output.post_claim.bank_claim, first_internal_wire);
         let terminal_relation_internal_wire = internal_wire(
             &output.post_claim.terminal_relation_value,
@@ -516,10 +533,10 @@ mod tests {
         let native = native_case(0xA11C_E001);
         let built = build_case(&native).expect("honest complete composition");
         assert!(built.r1cs.satisfies(&built.witness));
-        assert_eq!(ZK_OWNER_VERIFIER_TRACE_ROWS, 294);
-        assert_eq!(ZK_POST_CLAIM_RELATION_TRACE_ROWS, 299);
-        assert_eq!(ZK_PHASE_A_TRACE_ROWS, 31);
-        assert_eq!(ZK_AUTH_COMPOSITION_TRACE_ROWS, 624);
+        assert_eq!(ZK_OWNER_VERIFIER_TRACE_ROWS, 871);
+        assert_eq!(ZK_POST_CLAIM_RELATION_TRACE_ROWS, 893);
+        assert_eq!(ZK_PHASE_A_TRACE_ROWS, 88);
+        assert_eq!(ZK_AUTH_COMPOSITION_TRACE_ROWS, 1_852);
         assert_eq!(built.trace_rows, ZK_AUTH_COMPOSITION_TRACE_ROWS);
         assert_eq!(built.r1cs.useful_rows, FIXTURE_USEFUL_ROWS);
         assert_eq!(built.owner_terminal_point, native.owner_terminal_point);
@@ -538,15 +555,15 @@ mod tests {
         let honest = native_case(0xA11C_E002);
 
         let mut r = honest.clone();
-        r.owner_challenges[4] += Block128::ONE;
+        r.owner_challenges[4] += Block256::ONE;
         assert_rejected(&r, "Owner r");
 
         let mut state = honest.clone();
-        state.terminal_operands.lane[1] += Block128::ONE;
+        state.terminal_operands.lane[1] += Block256::ONE;
         assert_rejected(&state, "shared terminal state");
 
         let mut rho = honest.clone();
-        rho.rho[7] += Block128::ONE;
+        rho.rho[7] += Block256::ONE;
         assert_rejected(&rho, "shared rho");
 
         let mut order = honest;
@@ -570,11 +587,11 @@ mod tests {
         assert_rejected(&bank_and_t, "foreign bank/t(s) Phase-A splice");
 
         let mut sigma = honest.clone();
-        sigma.companion_claim += Block128::ONE;
+        sigma.companion_claim += Block256::ONE;
         assert_rejected(&sigma, "sigma");
 
         let mut v = honest.clone();
-        v.terminal_oracle_value += Block128::ONE;
+        v.terminal_oracle_value += Block256::ONE;
         assert_rejected(&v, "v");
 
         let mut address = honest.clone();
@@ -582,9 +599,9 @@ mod tests {
         assert_rejected(&address, "address");
 
         let mut eta = honest;
-        eta.eta += Block128::ONE;
-        if eta.eta == Block128::ZERO {
-            eta.eta += Block128::from(2u128);
+        eta.eta += Block256::ONE;
+        if eta.eta == Block256::ZERO {
+            eta.eta += Block256::from(2u128);
         }
         assert_rejected(&eta, "eta");
     }
@@ -594,16 +611,16 @@ mod tests {
         let honest = native_case(0xA11C_E004);
 
         let mut lambda = honest.clone();
-        lambda.lambda += Block128::ONE;
-        if lambda.lambda == Block128::ZERO {
-            lambda.lambda += Block128::from(2u128);
+        lambda.lambda += Block256::ONE;
+        if lambda.lambda == Block256::ZERO {
+            lambda.lambda += Block256::from(2u128);
         }
         assert_rejected(&lambda, "lambda");
 
         let mut gamma = honest.clone();
-        gamma.gamma += Block128::ONE;
-        if gamma.gamma == Block128::ZERO || gamma.gamma == Block128::ONE {
-            gamma.gamma += Block128::from(2u128);
+        gamma.gamma += Block256::ONE;
+        if gamma.gamma == Block256::ZERO || gamma.gamma == Block256::ONE {
+            gamma.gamma += Block256::from(2u128);
         }
         assert_rejected(&gamma, "gamma");
 
@@ -666,7 +683,7 @@ mod tests {
                 ZkPostClaimRelationTraceError::DynamicInputIsConstant { .. }
             ))
         ));
-        // Owner precedes the post-claim component, so its exact 294 rows are
+        // Owner precedes the post-claim component, so its exact rows are
         // present; the failing component itself remains atomic.
         assert_eq!(b.num_wires() - before, ZK_OWNER_VERIFIER_TRACE_ROWS);
     }

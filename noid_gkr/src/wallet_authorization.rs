@@ -632,7 +632,7 @@ mod tests {
     fn proof_and_body_tamper_reject() {
         let (mut body, _, mut bundle) = prove_standard_fixture();
 
-        bundle.proof.owner.mask_mu += Block128::ONE;
+        bundle.proof.owner.mask_mu += noid_core::Block256::ONE;
         assert!(matches!(
             verify_wallet_authorization(&body, &bundle),
             Err(VerifyAuthorizationError::AuthProof)

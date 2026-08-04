@@ -142,6 +142,9 @@ pub(super) enum SidecarProofShape {
     #[cfg(test)]
     Fixed(FixedProofShape),
     DeferredFixed(DeferredFixedProofShape),
+    /// Recording child: one fixed F128 selector followed by the ordinary
+    /// walk-deferred duplex authority.
+    RecordingDeferredFixed(DeferredFixedProofShape),
     DeferredMerkle(DeferredMerkleProofShape),
     MultiWalk(MultiWalkProofShape),
 }
@@ -734,6 +737,10 @@ fn scan_composite_proof(
             SidecarProofShape::DeferredFixed(shape) => {
                 scan_deferred_fixed_proof_body(&mut cursor, shape, observe)?
             }
+            SidecarProofShape::RecordingDeferredFixed(shape) => {
+                cursor.skip_f128s(1)?;
+                scan_deferred_fixed_proof_body(&mut cursor, shape, observe)?
+            }
             SidecarProofShape::DeferredMerkle(shape) => {
                 scan_deferred_merkle_proof_body(&mut cursor, shape, observe)?
             }
@@ -796,6 +803,9 @@ pub(super) fn sidecar_proof_encoded_len(
         #[cfg(test)]
         SidecarProofShape::Fixed(shape) => fixed_proof_encoded_len(shape),
         SidecarProofShape::DeferredFixed(shape) => deferred_fixed_proof_encoded_len(shape),
+        SidecarProofShape::RecordingDeferredFixed(shape) => {
+            checked_add(F128_BYTES, deferred_fixed_proof_encoded_len(shape)?)
+        }
         SidecarProofShape::DeferredMerkle(shape) => deferred_merkle_proof_encoded_len(shape),
         SidecarProofShape::MultiWalk(shape) => multi_walk_proof_encoded_len(shape),
     }

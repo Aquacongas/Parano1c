@@ -28,8 +28,8 @@ regenerates matrices.
 Options:
   --pack DIR       Canonical HistoryStep pack root (required).
   --output DIR     Fresh output directory. Defaults under target/release-builds/.
-  --skip-tests     Build and smoke-test only. Intended for the five release jobs;
-                   source validation must already have passed on main.
+  --skip-tests     Build and smoke-test only. Intended for secondary platform
+                   release jobs after the primary job passes source validation.
   -h, --help       Show this help.
 
 Environment:
@@ -226,18 +226,17 @@ release_authenticate_pack "$PACK_DIR" 0
 
 # shellcheck disable=SC2031 # The pack-tool helper uses an intentional subshell.
 export RUSTFLAGS="$RELEASE_RUSTFLAGS"
+export NOID_HISTORY_STEP_PACK_DIR="$PACK_DIR"
+export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
+export NOID_HISTORY_STEP_PACK_LEAF_DIGESTS="$RELEASE_LEAF_DIGESTS"
 
 CURRENT_STAGE='format check'
 printf '\n==> Checking formatting\n'
 cargo fmt --all -- --check
 
 CURRENT_STAGE='workspace check'
-printf '\n==> Checking the workspace for %s\n' "$HOST_TRIPLE"
-cargo check --locked --workspace --all-targets --target "$HOST_TRIPLE"
-
-export NOID_HISTORY_STEP_PACK_DIR="$PACK_DIR"
-export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
-export NOID_HISTORY_STEP_PACK_LEAF_DIGESTS="$RELEASE_LEAF_DIGESTS"
+printf '\n==> Checking the release workspace for %s\n' "$HOST_TRIPLE"
+cargo check --locked --release --workspace --all-targets --target "$HOST_TRIPLE"
 
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'
@@ -251,15 +250,8 @@ if [[ $SKIP_TESTS == 1 ]]; then
   printf '\n==> Skipping repeated release tests; source gates must already be green\n'
 else
   CURRENT_STAGE='release test suite'
-  printf '\n==> Running native release tests\n'
-  cargo test --locked --release --target "$HOST_TRIPLE" \
-    -p noid_block \
-    -p noid_chain \
-    -p noid_miner \
-    -p noid_p2p \
-    -p noid_recursive \
-    -p noid_rpc \
-    -p noid_node
+  printf '\n==> Running complete native workspace tests in release mode\n'
+  cargo test --locked --release --workspace --target "$HOST_TRIPLE"
 fi
 
 TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"

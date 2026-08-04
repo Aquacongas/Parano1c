@@ -16,9 +16,10 @@
 //! - [`FsChallenger`] — Fiat-Shamir transcript backed by the production
 //!   Poseidon2b sponge domain.
 
-use crate::field::F128;
+use crate::field::{F128, F256};
 use noid_poseidon2b::native::{
-    Poseidon2bSponge, TAG_FSCHALNG, TAG_LANECHAL, capacity_iv, poseidon2b_hash_byte_slices,
+    Poseidon2bSponge, TAG_FSCH256, TAG_FSCHALNG, TAG_LANE256, TAG_LANECHAL, capacity_iv,
+    poseidon2b_hash_byte_slices,
 };
 
 // `Send` supertrait: the verifier runs its PIOP/PCS replay inside a dedicated
@@ -43,6 +44,24 @@ pub trait Challenger: Send {
         }
     }
 
+    /// Absorb one C1 extension-field prover message.
+    ///
+    /// Production C1 challengers override this with an explicit wide op
+    /// frame. The coordinate-wise default keeps test and forwarding
+    /// challengers source-compatible, but it is not the canonical C1 wire
+    /// schedule.
+    fn observe_f256(&mut self, value: F256) {
+        self.observe_f128(value.lo);
+        self.observe_f128(value.hi);
+    }
+
+    /// Absorb a slice of C1 extension-field prover messages.
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        for value in values {
+            self.observe_f256(*value);
+        }
+    }
+
     /// Absorb arbitrary bytes (e.g. a Merkle root or a statement digest).
     fn observe_bytes(&mut self, _bytes: &[u8]) {
         // default no-op — RandomChallenger inherits this.
@@ -54,6 +73,20 @@ pub trait Challenger: Send {
     /// Produce `n` F128 challenges, in order.
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         (0..n).map(|_| self.sample_f128()).collect()
+    }
+
+    /// Produce one C1 extension-field algebraic challenge.
+    ///
+    /// The canonical C1 implementations override this so the pair is one
+    /// framed wide squeeze. The fallback is suitable for test challengers.
+    fn sample_f256(&mut self) -> F256 {
+        let lanes = self.sample_f128_vec(2);
+        F256::from_raw_challenge_lanes(lanes[0], lanes[1])
+    }
+
+    /// Produce `n` C1 extension-field algebraic challenges.
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        (0..n).map(|_| self.sample_f256()).collect()
     }
 
     /// Prover-side transcript grinding: snapshot the current transcript state,
@@ -151,6 +184,8 @@ const OP_BYTES: u8 = 0x05;
 
 const KIND_SCALAR: u8 = 0x01;
 const KIND_SLICE: u8 = 0x02;
+const KIND_WIDE_SCALAR: u8 = 0x03;
+const KIND_WIDE_SLICE: u8 = 0x04;
 
 /// Global Fiat-Shamir hash counters, enabled with `--features hash-count`.
 /// Tracks proof-core squeeze count and PoW hash checks; absorbed
@@ -183,6 +218,7 @@ pub struct FsChallenger {
     /// instrumentation (read only under that feature).
     #[allow(dead_code)]
     n_absorbed: u64,
+    c1: bool,
 }
 
 impl FsChallenger {
@@ -191,9 +227,20 @@ impl FsChallenger {
     /// absorbed so two domains where one is a prefix of the other cannot
     /// produce the same initial state.
     pub fn new(domain: &[u8]) -> Self {
+        Self::with_profile(domain, TAG_FSCHALNG, false)
+    }
+
+    /// C1 byte-oriented challenger with a domain-separated capacity IV and
+    /// canonical extension-field op framing.
+    pub fn new_c1(domain: &[u8]) -> Self {
+        Self::with_profile(domain, TAG_FSCH256, true)
+    }
+
+    fn with_profile(domain: &[u8], tag: noid_poseidon2b::native::DomainTag, c1: bool) -> Self {
         let mut c = Self {
-            sponge: Poseidon2bSponge::with_iv(capacity_iv(TAG_FSCHALNG)),
+            sponge: Poseidon2bSponge::with_iv(capacity_iv(tag)),
             n_absorbed: 0,
+            c1,
         };
         c.absorb(&[OP_DOMAIN]);
         c.absorb(&(domain.len() as u64).to_le_bytes());
@@ -212,6 +259,12 @@ impl FsChallenger {
     fn absorb_f128(&mut self, v: F128) {
         self.absorb(&v.lo.to_le_bytes());
         self.absorb(&v.hi.to_le_bytes());
+    }
+
+    #[inline]
+    fn absorb_f256(&mut self, value: F256) {
+        self.absorb_f128(value.lo);
+        self.absorb_f128(value.hi);
     }
 
     /// Squeeze `out.len()` pseudorandom bytes from a cloned Poseidon2b
@@ -260,6 +313,27 @@ impl Challenger for FsChallenger {
         }
     }
 
+    fn observe_f256(&mut self, value: F256) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChallenger::new_c1"
+        );
+        self.absorb(&[OP_OBSERVE, KIND_WIDE_SCALAR]);
+        self.absorb_f256(value);
+    }
+
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChallenger::new_c1"
+        );
+        self.absorb(&[OP_OBSERVE, KIND_WIDE_SLICE]);
+        self.absorb(&(values.len() as u64).to_le_bytes());
+        for value in values {
+            self.absorb_f256(*value);
+        }
+    }
+
     fn observe_bytes(&mut self, bytes: &[u8]) {
         self.absorb(&[OP_BYTES]);
         self.absorb(&(bytes.len() as u64).to_le_bytes());
@@ -291,6 +365,44 @@ impl Challenger for FsChallenger {
             .map(|c| F128 {
                 lo: u64::from_le_bytes(c[..8].try_into().unwrap()),
                 hi: u64::from_le_bytes(c[8..].try_into().unwrap()),
+            })
+            .collect()
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChallenger::new_c1"
+        );
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb(&[OP_SQUEEZE, KIND_WIDE_SCALAR]);
+        let mut bytes = [0u8; 32];
+        self.squeeze_into(&mut bytes);
+        self.absorb(&bytes);
+        let raw = F256::from_le_bytes(bytes);
+        F256::from_raw_challenge_lanes(raw.lo, raw.hi)
+    }
+
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChallenger::new_c1"
+        );
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb(&[OP_SQUEEZE, KIND_WIDE_SLICE]);
+        self.absorb(&(n as u64).to_le_bytes());
+        let mut bytes = vec![0u8; n * 32];
+        self.squeeze_into(&mut bytes);
+        self.absorb(&bytes);
+        bytes
+            .chunks_exact(32)
+            .map(|chunk| {
+                let mut encoded = [0u8; 32];
+                encoded.copy_from_slice(chunk);
+                let raw = F256::from_le_bytes(encoded);
+                F256::from_raw_challenge_lanes(raw.lo, raw.hi)
             })
             .collect()
     }
@@ -445,6 +557,8 @@ pub const FS_OP_BYTES: u8 = 0x05;
 pub const FS_OP_POW: u8 = 0x06;
 pub const FS_KIND_SCALAR: u8 = 0x01;
 pub const FS_KIND_SLICE: u8 = 0x02;
+pub const FS_KIND_WIDE_SCALAR: u8 = 0x03;
+pub const FS_KIND_WIDE_SLICE: u8 = 0x04;
 
 #[inline]
 fn f128_of_u128(v: u128) -> F128 {
@@ -498,6 +612,11 @@ pub fn fs_lane_iv_flat() -> [F128; 2] {
     capacity_iv_flat_lanes(TAG_LANECHAL)
 }
 
+/// Capacity IV of the C1 lane challenger in the flat basis.
+pub fn fs_c1_lane_iv_flat() -> [F128; 2] {
+    capacity_iv_flat_lanes(TAG_LANE256)
+}
+
 /// Capacity IV (`TAG_KSCHANNL`) lanes of the killshot channel
 /// (`Poseidon2bChannel`), in the flat basis — the seed of its in-trace
 /// replay ([`crate::field_circuit::RawChannelTrace`]).
@@ -522,6 +641,7 @@ pub struct FsLaneChallenger {
     buffered: Option<F128>,
     pending: Option<F128>,
     perms: usize,
+    c1: bool,
 }
 
 /// Run the production Poseidon2b permutation on a flat-basis state.
@@ -538,12 +658,23 @@ fn permute_flat(state: &mut [F128; 4]) {
 
 impl FsLaneChallenger {
     pub fn new(domain: &[u8]) -> Self {
-        let [iv0, iv1] = fs_lane_iv_flat();
+        Self::with_profile(domain, fs_lane_iv_flat(), false)
+    }
+
+    /// C1 lane challenger. Raw F128 operations remain available for query
+    /// indices and grinding; algebraic protocol moves use the explicit F256
+    /// methods on [`Challenger`].
+    pub fn new_c1(domain: &[u8]) -> Self {
+        Self::with_profile(domain, fs_c1_lane_iv_flat(), true)
+    }
+
+    fn with_profile(domain: &[u8], [iv0, iv1]: [F128; 2], c1: bool) -> Self {
         let mut c = Self {
             state: [F128::ZERO, F128::ZERO, iv0, iv1],
             buffered: None,
             pending: None,
             perms: 0,
+            c1,
         };
         c.absorb_lane(fs_op_lane(FS_OP_DOMAIN, 0, domain.len() as u64));
         for lane in fs_pack_bytes_lanes(domain) {
@@ -599,6 +730,40 @@ impl FsLaneChallenger {
         self.pending = Some(self.state[1]);
         self.permute();
         out
+    }
+
+    /// Canonical C1 scalar draw together with the two raw sponge lanes that
+    /// determine it. The raw lanes are exposed within this crate so the
+    /// recursive duplex recorder can bind the actual sponge outputs before
+    /// applying the trace-one map.
+    pub(crate) fn sample_f256_with_raw(&mut self) -> (F256, [F128; 2]) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsLaneChallenger::new_c1"
+        );
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb_lane(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SCALAR, 0));
+        let raw = [self.squeeze_lane(), self.squeeze_lane()];
+        (F256::from_raw_challenge_lanes(raw[0], raw[1]), raw)
+    }
+
+    /// Canonical C1 vector draw plus the raw sponge-lane pairs, with one
+    /// vector frame for the whole draw.
+    pub(crate) fn sample_f256_vec_with_raw(&mut self, n: usize) -> Vec<(F256, [F128; 2])> {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsLaneChallenger::new_c1"
+        );
+        #[cfg(feature = "hash-count")]
+        fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.absorb_lane(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SLICE, n as u64));
+        (0..n)
+            .map(|_| {
+                let raw = [self.squeeze_lane(), self.squeeze_lane()];
+                (F256::from_raw_challenge_lanes(raw[0], raw[1]), raw)
+            })
+            .collect()
     }
 
     /// PoW predicate under the GRIND-BY-SQUEEZE rule: absorb the
@@ -663,6 +828,32 @@ impl Challenger for FsLaneChallenger {
         }
     }
 
+    fn observe_f256(&mut self, value: F256) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsLaneChallenger::new_c1"
+        );
+        self.absorb_lane(fs_op_lane(FS_OP_OBSERVE, FS_KIND_WIDE_SCALAR, 0));
+        self.absorb_lane(value.lo);
+        self.absorb_lane(value.hi);
+    }
+
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsLaneChallenger::new_c1"
+        );
+        self.absorb_lane(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_WIDE_SLICE,
+            values.len() as u64,
+        ));
+        for value in values {
+            self.absorb_lane(value.lo);
+            self.absorb_lane(value.hi);
+        }
+    }
+
     fn observe_bytes(&mut self, bytes: &[u8]) {
         self.absorb_lane(fs_op_lane(FS_OP_BYTES, 0, bytes.len() as u64));
         for lane in fs_pack_bytes_lanes(bytes) {
@@ -682,6 +873,17 @@ impl Challenger for FsLaneChallenger {
         fs_count::SQUEEZES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.absorb_lane(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SLICE, n as u64));
         (0..n).map(|_| self.squeeze_lane()).collect()
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        self.sample_f256_with_raw().0
+    }
+
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        self.sample_f256_vec_with_raw(n)
+            .into_iter()
+            .map(|(challenge, _)| challenge)
+            .collect()
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -935,5 +1137,68 @@ mod tests {
         c1.observe_f128(F128::ONE);
         c2.observe_f128(F128::ONE);
         assert_ne!(c1.sample_f128(), c2.sample_f128());
+    }
+
+    #[test]
+    fn c1_byte_challenger_wide_roundtrip_and_subfield_exclusion() {
+        let message = F256::new(F128::new(1, 2), F128::new(3, 4));
+        let mut prover = FsChallenger::new_c1(b"history-c1");
+        let mut verifier = FsChallenger::new_c1(b"history-c1");
+        prover.observe_f256(message);
+        verifier.observe_f256(message);
+        for _ in 0..8 {
+            let p = prover.sample_f256();
+            let v = verifier.sample_f256();
+            assert_eq!(p, v);
+            assert!(!p.is_in_base_subfield());
+        }
+        assert_eq!(prover.sample_f128_vec(4), verifier.sample_f128_vec(4));
+    }
+
+    #[test]
+    fn c1_lane_challenger_wide_roundtrip_and_subfield_exclusion() {
+        let messages = [
+            F256::new(F128::new(5, 6), F128::new(7, 8)),
+            F256::new(F128::new(9, 10), F128::new(11, 12)),
+        ];
+        let mut prover = FsLaneChallenger::new_c1(b"history-c1");
+        let mut verifier = FsLaneChallenger::new_c1(b"history-c1");
+        prover.observe_f256_slice(&messages);
+        verifier.observe_f256_slice(&messages);
+        let p = prover.sample_f256_vec(9);
+        let v = verifier.sample_f256_vec(9);
+        assert_eq!(p, v);
+        assert!(p.iter().all(|challenge| !challenge.is_in_base_subfield()));
+        assert_eq!(prover.sample_f128_vec(23), verifier.sample_f128_vec(23));
+        assert_eq!(prover.perms(), verifier.perms());
+        assert_eq!(prover.post_state(), verifier.post_state());
+    }
+
+    #[test]
+    fn c1_wide_scalar_and_slice_frames_are_distinct() {
+        let value = F256::new(F128::new(13, 14), F128::new(15, 16));
+        let mut scalar = FsLaneChallenger::new_c1(b"history-c1");
+        let mut slice = FsLaneChallenger::new_c1(b"history-c1");
+        scalar.observe_f256(value);
+        slice.observe_f256_slice(&[value]);
+        assert_ne!(scalar.sample_f256(), slice.sample_f256());
+
+        let mut one = FsLaneChallenger::new_c1(b"history-c1");
+        let mut vector = FsLaneChallenger::new_c1(b"history-c1");
+        assert_ne!(one.sample_f256(), vector.sample_f256_vec(1)[0]);
+    }
+
+    #[test]
+    fn c1_capacity_domain_is_distinct_from_legacy_lane_channel() {
+        let mut legacy = FsLaneChallenger::new(b"same-inner-domain");
+        let mut c1 = FsLaneChallenger::new_c1(b"same-inner-domain");
+        assert_ne!(legacy.sample_f128(), c1.sample_f128());
+    }
+
+    #[test]
+    #[should_panic(expected = "requires FsLaneChallenger::new_c1")]
+    fn legacy_lane_channel_rejects_wide_operations() {
+        let mut legacy = FsLaneChallenger::new(b"legacy");
+        let _ = legacy.sample_f256();
     }
 }

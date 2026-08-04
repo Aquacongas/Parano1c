@@ -1,0 +1,1110 @@
+//! Extension-field matrix accumulator for the C1 History profile.
+//!
+//! Matrix coefficients remain in F128. Claims, sumcheck messages, transcript
+//! challenges, folded tables, and the outgoing accumulator live in F256.
+
+use super::{MatrixFoldError, MatrixFoldRows};
+use crate::challenger::Challenger;
+#[cfg(test)]
+use crate::field::F128;
+use crate::field::F256;
+use crate::field_r1cs::{
+    CompactFieldR1cs, FieldR1cs, FieldR1csArtifactError, FieldR1csArtifactMatrix,
+    parallel_compact_group_fold_c1,
+};
+use crate::proof::FieldShape;
+use crate::zerocheck::field_c1::{build_eq_table, lagrange_weights};
+use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
+use rayon::prelude::*;
+
+const C1_MATRIX_CLAIM_REQUEST_DOMAIN: &[u8] = b"NOID/IVC/MATRIX-CLAIM-REQUEST/C1/V1";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1MatrixAccClaim {
+    pub point: Vec<F256>,
+    pub value: F256,
+}
+
+impl C1MatrixAccClaim {
+    pub fn zero(k_log: usize) -> Self {
+        Self {
+            point: vec![F256::ZERO; 2 * k_log + 1],
+            value: F256::ZERO,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct C1FreshLincheckClaim {
+    pub alpha: F256,
+    pub z_skip: F256,
+    pub x_inner_rest: Vec<F256>,
+    pub r_inner_rest: Vec<F256>,
+    pub z_partial: Vec<F256>,
+    pub value: F256,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1MatrixFoldProof {
+    pub phase1_rounds: Vec<[F256; 2]>,
+    pub g_v: F256,
+    pub g_e: F256,
+    pub phase2_rounds: Vec<[F256; 2]>,
+    pub final_matrix_eval: F256,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedC1MatrixClaimEvaluations {
+    structural_digest: [u8; 32],
+    request_binding: [u8; 32],
+    fresh_value: Option<F256>,
+    accumulated_value: Option<F256>,
+}
+
+impl AuthenticatedC1MatrixClaimEvaluations {
+    pub const fn structural_digest(&self) -> [u8; 32] {
+        self.structural_digest
+    }
+
+    pub const fn fresh_value(&self) -> Option<F256> {
+        self.fresh_value
+    }
+
+    pub const fn accumulated_value(&self) -> Option<F256> {
+        self.accumulated_value
+    }
+
+    pub fn is_bound_to(
+        &self,
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+    ) -> bool {
+        self.request_binding == c1_matrix_claim_request_binding(fresh, accumulated)
+    }
+
+    fn new(
+        structural_digest: [u8; 32],
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+        fresh_value: Option<F256>,
+        accumulated_value: Option<F256>,
+    ) -> Self {
+        Self {
+            structural_digest,
+            request_binding: c1_matrix_claim_request_binding(fresh, accumulated),
+            fresh_value,
+            accumulated_value,
+        }
+    }
+}
+
+fn c1_matrix_claim_request_binding(
+    fresh: Option<&C1FreshLincheckClaim>,
+    accumulated: Option<&C1MatrixAccClaim>,
+) -> [u8; 32] {
+    fn push_field(bytes: &mut Vec<u8>, value: F256) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    fn push_fields(bytes: &mut Vec<u8>, values: &[F256]) {
+        bytes.extend_from_slice(&(values.len() as u64).to_le_bytes());
+        for &value in values {
+            push_field(bytes, value);
+        }
+    }
+
+    let mut bytes = Vec::new();
+    bytes.push(u8::from(fresh.is_some()));
+    if let Some(claim) = fresh {
+        push_field(&mut bytes, claim.alpha);
+        push_field(&mut bytes, claim.z_skip);
+        push_fields(&mut bytes, &claim.x_inner_rest);
+        push_fields(&mut bytes, &claim.r_inner_rest);
+        push_fields(&mut bytes, &claim.z_partial);
+        push_field(&mut bytes, claim.value);
+    }
+    bytes.push(u8::from(accumulated.is_some()));
+    if let Some(claim) = accumulated {
+        push_fields(&mut bytes, &claim.point);
+        push_field(&mut bytes, claim.value);
+    }
+    poseidon2b_hash_byte_slices(C1_MATRIX_CLAIM_REQUEST_DOMAIN, &[&bytes])
+}
+
+pub trait C1MatrixClaimEvaluator {
+    fn field_shape(&self) -> FieldShape;
+
+    fn evaluate_matrix_claims_c1(
+        &mut self,
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+    ) -> Result<AuthenticatedC1MatrixClaimEvaluations, FieldR1csArtifactError>;
+}
+
+fn validate_claim_shapes(
+    shape: FieldShape,
+    fresh: Option<&C1FreshLincheckClaim>,
+    accumulated: Option<&C1MatrixAccClaim>,
+) -> Result<(), FieldR1csArtifactError> {
+    if let Some(claim) = fresh {
+        let rest = shape.k_log - shape.k_skip;
+        if claim.x_inner_rest.len() != rest || claim.r_inner_rest.len() != rest {
+            return Err(FieldR1csArtifactError::MatrixClaimShape(
+                "C1 fresh inner-rest width",
+            ));
+        }
+        if claim.z_partial.len() != 1usize << shape.k_skip {
+            return Err(FieldR1csArtifactError::MatrixClaimShape(
+                "C1 fresh partial window",
+            ));
+        }
+    }
+    if accumulated.is_some_and(|claim| claim.point.len() != 2 * shape.k_log + 1) {
+        return Err(FieldR1csArtifactError::MatrixClaimShape(
+            "C1 accumulated point width",
+        ));
+    }
+    Ok(())
+}
+
+impl C1MatrixClaimEvaluator for FieldR1cs {
+    fn field_shape(&self) -> FieldShape {
+        FieldShape::of(self)
+    }
+
+    fn evaluate_matrix_claims_c1(
+        &mut self,
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+    ) -> Result<AuthenticatedC1MatrixClaimEvaluations, FieldR1csArtifactError> {
+        let shape = FieldShape::of(&*self);
+        validate_claim_shapes(shape, fresh, accumulated)?;
+        Ok(AuthenticatedC1MatrixClaimEvaluations::new(
+            self.structural_statement_digest(),
+            fresh,
+            accumulated,
+            fresh.map(|claim| fresh_claim_value_c1(self, claim)),
+            accumulated.map(|claim| stacked_matrix_mle_eval_c1(self, claim)),
+        ))
+    }
+}
+
+pub fn fresh_claim_value_c1(r1cs: &FieldR1cs, claim: &C1FreshLincheckClaim) -> F256 {
+    let low_count = 1usize << r1cs.k_skip;
+    let mask = low_count - 1;
+    let lambda = lagrange_weights(r1cs.k_skip, claim.z_skip, 0);
+    let row_rest = build_eq_table(&claim.x_inner_rest);
+    let column_rest = build_eq_table(&claim.r_inner_rest);
+    [(&r1cs.a_0, claim.alpha), (&r1cs.b_0, F256::ONE)]
+        .into_par_iter()
+        .map(|(matrix, stack_weight)| {
+            (0..matrix.num_rows)
+                .into_par_iter()
+                .map(|row| {
+                    let row_weight =
+                        lambda[row & mask] * row_rest[row >> r1cs.k_skip] * stack_weight;
+                    matrix
+                        .row(row)
+                        .fold(F256::ZERO, |sum, (column, coefficient)| {
+                            let column = column as usize;
+                            let column_weight =
+                                claim.z_partial[column & mask] * column_rest[column >> r1cs.k_skip];
+                            sum + (row_weight * column_weight).scale_base(coefficient)
+                        })
+                })
+                .reduce(|| F256::ZERO, |left, right| left + right)
+        })
+        .reduce(|| F256::ZERO, |left, right| left + right)
+}
+
+pub fn stacked_matrix_mle_eval_c1(r1cs: &FieldR1cs, claim: &C1MatrixAccClaim) -> F256 {
+    assert_eq!(claim.point.len(), 2 * r1cs.k_log + 1);
+    let (row_point, column_point) = claim.point.split_at(r1cs.k_log + 1);
+    let row_weights = build_eq_table(row_point);
+    let column_weights = build_eq_table(column_point);
+    let width = 1usize << r1cs.k_log;
+    [(&r1cs.a_0, 0usize), (&r1cs.b_0, width)]
+        .into_par_iter()
+        .map(|(matrix, offset)| {
+            (0..matrix.num_rows)
+                .into_par_iter()
+                .map(|row| {
+                    let row_weight = row_weights[offset + row];
+                    matrix
+                        .row(row)
+                        .fold(F256::ZERO, |sum, (column, coefficient)| {
+                            sum + (row_weight * column_weights[column as usize])
+                                .scale_base(coefficient)
+                        })
+                })
+                .reduce(|| F256::ZERO, |left, right| left + right)
+        })
+        .reduce(|| F256::ZERO, |left, right| left + right)
+}
+
+fn eq_points(left: &[F256], right: &[F256]) -> F256 {
+    assert_eq!(left.len(), right.len());
+    left.iter()
+        .zip(right)
+        .fold(F256::ONE, |product, (&left, &right)| {
+            product * (F256::ONE + left + right)
+        })
+}
+
+fn small_mle_eval(values: &[F256], point: &[F256]) -> F256 {
+    assert_eq!(values.len(), 1usize << point.len());
+    values
+        .iter()
+        .zip(build_eq_table(point))
+        .fold(F256::ZERO, |sum, (&value, weight)| sum + value * weight)
+}
+
+fn alpha_weight(alpha: F256, stack_point: F256) -> F256 {
+    alpha + stack_point * (alpha + F256::ONE)
+}
+
+fn u_weight_eval(fresh: &C1FreshLincheckClaim, k_skip: usize, rho: &[F256]) -> F256 {
+    let lambda = lagrange_weights(k_skip, fresh.z_skip, 0);
+    let low = small_mle_eval(&lambda, &rho[..k_skip]);
+    let rest = eq_points(&fresh.x_inner_rest, &rho[k_skip..rho.len() - 1]);
+    let stack = alpha_weight(fresh.alpha, rho[rho.len() - 1]);
+    low * rest * stack
+}
+
+fn v_weight_eval(fresh: &C1FreshLincheckClaim, k_skip: usize, sigma: &[F256]) -> F256 {
+    let partial = small_mle_eval(&fresh.z_partial, &sigma[..k_skip]);
+    let rest = eq_points(&fresh.r_inner_rest, &sigma[k_skip..]);
+    partial * rest
+}
+
+fn absorb_fold_header<Ch: Challenger>(
+    channel: &mut Ch,
+    fresh: &C1FreshLincheckClaim,
+    incoming: &C1MatrixAccClaim,
+    gate: F256,
+) {
+    channel.observe_label(b"history-matrix-claim-fold-c1");
+    channel.observe_f256(fresh.alpha);
+    channel.observe_f256(fresh.z_skip);
+    channel.observe_f256_slice(&fresh.x_inner_rest);
+    channel.observe_f256_slice(&fresh.r_inner_rest);
+    channel.observe_f256_slice(&fresh.z_partial);
+    channel.observe_f256(fresh.value);
+    channel.observe_f256_slice(&incoming.point);
+    channel.observe_f256(incoming.value);
+    channel.observe_f256(gate);
+}
+
+fn fold_table_pairs_reusing(
+    mut table: Vec<F256>,
+    mut spare: Vec<F256>,
+    challenge: F256,
+) -> (Vec<F256>, Vec<F256>) {
+    let half = table.len() / 2;
+    if half >= 1024 {
+        if spare.len() < half {
+            let folded = (0..half)
+                .into_par_iter()
+                .map(|index| {
+                    let low = table[2 * index];
+                    let high = table[2 * index + 1];
+                    low + challenge * (low + high)
+                })
+                .collect();
+            return (folded, table);
+        }
+        spare.truncate(half);
+        spare
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, output)| {
+                let low = table[2 * index];
+                let high = table[2 * index + 1];
+                *output = low + challenge * (low + high);
+            });
+        (spare, table)
+    } else {
+        for index in 0..half {
+            let low = table[2 * index];
+            let high = table[2 * index + 1];
+            table[index] = low + challenge * (low + high);
+        }
+        table.truncate(half);
+        (table, spare)
+    }
+}
+
+fn round_coefficients_two_products(
+    w1: &[F256],
+    g1: &[F256],
+    w2: &[F256],
+    g2: &[F256],
+) -> [F256; 2] {
+    let half = w1.len() / 2;
+    (0..half)
+        .into_par_iter()
+        .map(|index| {
+            let mut output = [F256::ZERO; 2];
+            for (weights, values) in [(w1, g1), (w2, g2)] {
+                let weight_low = weights[2 * index];
+                let weight_high = weights[2 * index + 1];
+                let value_low = values[2 * index];
+                let value_high = values[2 * index + 1];
+                output[0] += weight_low * value_low;
+                output[1] += (weight_low + weight_high) * (value_low + value_high);
+            }
+            output
+        })
+        .reduce(
+            || [F256::ZERO; 2],
+            |left, right| [left[0] + right[0], left[1] + right[1]],
+        )
+}
+
+fn round_coefficients_one_product(weights: &[F256], values: &[F256]) -> [F256; 2] {
+    let half = weights.len() / 2;
+    (0..half)
+        .into_par_iter()
+        .map(|index| {
+            let weight_low = weights[2 * index];
+            let weight_high = weights[2 * index + 1];
+            let value_low = values[2 * index];
+            let value_high = values[2 * index + 1];
+            [
+                weight_low * value_low,
+                (weight_low + weight_high) * (value_low + value_high),
+            ]
+        })
+        .reduce(
+            || [F256::ZERO; 2],
+            |left, right| [left[0] + right[0], left[1] + right[1]],
+        )
+}
+
+fn mix_and_round_coefficients_one_product(
+    weights: &mut [F256],
+    equality: &[F256],
+    values: &[F256],
+    scale: F256,
+) -> [F256; 2] {
+    weights
+        .par_chunks_exact_mut(2)
+        .zip(equality.par_chunks_exact(2))
+        .zip(values.par_chunks_exact(2))
+        .map(|((weights, equality), values)| {
+            let low = weights[0] + scale * equality[0];
+            let high = weights[1] + scale * equality[1];
+            weights[0] = low;
+            weights[1] = high;
+            [low * values[0], (low + high) * (values[0] + values[1])]
+        })
+        .reduce(
+            || [F256::ZERO; 2],
+            |left, right| [left[0] + right[0], left[1] + right[1]],
+        )
+}
+
+fn run_phase<Ch: Challenger>(
+    mut claim: F256,
+    mut w1: Vec<F256>,
+    mut g1: Vec<F256>,
+    mut w2: Vec<F256>,
+    mut g2: Vec<F256>,
+    channel: &mut Ch,
+) -> (Vec<[F256; 2]>, Vec<F256>, F256, [F256; 4]) {
+    let rounds_count = w1.len().trailing_zeros() as usize;
+    let mut rounds = Vec::with_capacity(rounds_count);
+    let mut point = Vec::with_capacity(rounds_count);
+    let mut spare = Vec::new();
+    for _ in 0..rounds_count {
+        let [constant, quadratic] = round_coefficients_two_products(&w1, &g1, &w2, &g2);
+        let linear = claim + quadratic;
+        let wire = [constant, quadratic];
+        channel.observe_f256_slice(&wire);
+        let challenge = channel.sample_f256();
+        claim = (quadratic * challenge + linear) * challenge + constant;
+        rounds.push(wire);
+        point.push(challenge);
+        (w1, spare) = fold_table_pairs_reusing(w1, spare, challenge);
+        (g1, spare) = fold_table_pairs_reusing(g1, spare, challenge);
+        (w2, spare) = fold_table_pairs_reusing(w2, spare, challenge);
+        (g2, spare) = fold_table_pairs_reusing(g2, spare, challenge);
+    }
+    (rounds, point, claim, [w1[0], g1[0], w2[0], g2[0]])
+}
+
+fn run_phase_one_product<Ch: Challenger>(
+    mut claim: F256,
+    mut weights: Vec<F256>,
+    mut values: Vec<F256>,
+    mut first_round: Option<[F256; 2]>,
+    channel: &mut Ch,
+) -> (Vec<[F256; 2]>, Vec<F256>, F256, [F256; 2]) {
+    let rounds_count = weights.len().trailing_zeros() as usize;
+    let mut rounds = Vec::with_capacity(rounds_count);
+    let mut point = Vec::with_capacity(rounds_count);
+    let mut spare = Vec::new();
+    for _ in 0..rounds_count {
+        let [constant, quadratic] = first_round
+            .take()
+            .unwrap_or_else(|| round_coefficients_one_product(&weights, &values));
+        let linear = claim + quadratic;
+        let wire = [constant, quadratic];
+        channel.observe_f256_slice(&wire);
+        let challenge = channel.sample_f256();
+        claim = (quadratic * challenge + linear) * challenge + constant;
+        rounds.push(wire);
+        point.push(challenge);
+        (weights, spare) = fold_table_pairs_reusing(weights, spare, challenge);
+        (values, spare) = fold_table_pairs_reusing(values, spare, challenge);
+    }
+    (rounds, point, claim, [weights[0], values[0]])
+}
+
+fn build_eq_table_scaled(point: &[F256], scale: F256) -> Vec<F256> {
+    if scale.is_zero() {
+        return vec![F256::ZERO; 1usize << point.len()];
+    }
+    let mut output = vec![scale];
+    for (round, &challenge) in point.iter().enumerate() {
+        let length = 1usize << round;
+        output.resize(2 * length, F256::ZERO);
+        for index in 0..length {
+            let value = output[index];
+            output[index + length] = value * challenge;
+            output[index] = value * (F256::ONE + challenge);
+        }
+    }
+    output
+}
+
+fn build_stacked_u_weights(
+    k_log: usize,
+    k_skip: usize,
+    alpha: F256,
+    lambda: &[F256],
+    rest: &[F256],
+) -> Vec<F256> {
+    let width = 1usize << k_log;
+    let low_count = 1usize << k_skip;
+    let mut output = vec![F256::ZERO; 2 * width];
+    let (a, b) = output.split_at_mut(width);
+    a.par_chunks_mut(low_count)
+        .zip(b.par_chunks_mut(low_count))
+        .zip(rest.par_iter())
+        .for_each(|((a, b), &rest_weight)| {
+            for ((a, b), &low_weight) in a.iter_mut().zip(b).zip(lambda) {
+                let base = low_weight * rest_weight;
+                *a = alpha * base;
+                *b = base;
+            }
+        });
+    output
+}
+
+struct FactoredEqTable {
+    low: Vec<F256>,
+    high: Vec<F256>,
+    low_mask: usize,
+    low_bits: usize,
+}
+
+impl FactoredEqTable {
+    fn new(point: &[F256]) -> Self {
+        let low_bits = point.len() / 2;
+        Self {
+            low: build_eq_table(&point[..low_bits]),
+            high: build_eq_table(&point[low_bits..]),
+            low_mask: (1usize << low_bits) - 1,
+            low_bits,
+        }
+    }
+
+    fn value(&self, index: usize) -> F256 {
+        self.low[index & self.low_mask] * self.high[index >> self.low_bits]
+    }
+}
+
+impl MatrixFoldRows<'_> {
+    fn fill_row_images_c1(
+        &self,
+        v_table: &[F256],
+        e_c: &[F256],
+        g_v: &mut [F256],
+        g_e: &mut [F256],
+    ) {
+        let width = 1usize << self.k_log();
+        match self {
+            Self::Resident(r1cs) => {
+                for (matrix, offset) in [(&r1cs.a_0, 0usize), (&r1cs.b_0, width)] {
+                    g_v[offset..offset + width]
+                        .par_iter_mut()
+                        .zip(g_e[offset..offset + width].par_iter_mut())
+                        .enumerate()
+                        .for_each(|(row, (g_v, g_e))| {
+                            if row >= matrix.num_rows {
+                                return;
+                            }
+                            for (column, coefficient) in matrix.row(row) {
+                                *g_v += v_table[column as usize].scale_base(coefficient);
+                                *g_e += e_c[column as usize].scale_base(coefficient);
+                            }
+                        });
+                }
+            }
+            Self::Compact(r1cs) => {
+                const GROUP_ROWS: usize = 2048;
+                for (side, offset) in [
+                    (FieldR1csArtifactMatrix::A, 0usize),
+                    (FieldR1csArtifactMatrix::B, width),
+                ] {
+                    g_v[offset..offset + width]
+                        .par_chunks_mut(GROUP_ROWS)
+                        .zip(g_e[offset..offset + width].par_chunks_mut(GROUP_ROWS))
+                        .enumerate()
+                        .for_each(|(group, (g_v_group, g_e_group))| {
+                            if group >= r1cs.matrix_group_count(side) {
+                                return;
+                            }
+                            let first_row = group * GROUP_ROWS;
+                            let visited = r1cs.for_each_matrix_group_entry(
+                                side,
+                                group,
+                                |row, column, coefficient| {
+                                    let local = row - first_row;
+                                    g_v_group[local] +=
+                                        v_table[column as usize].scale_base(coefficient);
+                                    g_e_group[local] +=
+                                        e_c[column as usize].scale_base(coefficient);
+                                },
+                            );
+                            assert!(visited);
+                        });
+                }
+            }
+        }
+    }
+
+    fn weighted_column_image_c1(&self, equality: &FactoredEqTable) -> Vec<F256> {
+        let width = 1usize << self.k_log();
+        match self {
+            Self::Resident(r1cs) => {
+                let parts = [(&r1cs.a_0, 0usize), (&r1cs.b_0, width)]
+                    .into_par_iter()
+                    .map(|(matrix, offset)| {
+                        let mut output = vec![F256::ZERO; width];
+                        for row in 0..matrix.num_rows {
+                            let weight = equality.value(offset + row);
+                            if weight.is_zero() {
+                                continue;
+                            }
+                            for (column, coefficient) in matrix.row(row) {
+                                output[column as usize] += weight.scale_base(coefficient);
+                            }
+                        }
+                        output
+                    })
+                    .collect::<Vec<_>>();
+                let mut parts = parts.into_iter();
+                let mut output = parts.next().expect("A matrix image");
+                for part in parts {
+                    output
+                        .par_iter_mut()
+                        .zip(part)
+                        .for_each(|(left, right)| *left += right);
+                }
+                output
+            }
+            Self::Compact(r1cs) => {
+                let group_count = r1cs
+                    .matrix_group_count(FieldR1csArtifactMatrix::A)
+                    .max(r1cs.matrix_group_count(FieldR1csArtifactMatrix::B));
+                parallel_compact_group_fold_c1(width, group_count, |groups, output| {
+                    for group in groups {
+                        for (side, offset) in [
+                            (FieldR1csArtifactMatrix::A, 0usize),
+                            (FieldR1csArtifactMatrix::B, width),
+                        ] {
+                            if group >= r1cs.matrix_group_count(side) {
+                                continue;
+                            }
+                            let mut cached_row = usize::MAX;
+                            let mut weight = F256::ZERO;
+                            let visited = r1cs.for_each_matrix_group_entry(
+                                side,
+                                group,
+                                |row, column, coefficient| {
+                                    if row != cached_row {
+                                        cached_row = row;
+                                        weight = equality.value(offset + row);
+                                    }
+                                    if !weight.is_zero() {
+                                        output[column as usize] += weight.scale_base(coefficient);
+                                    }
+                                },
+                            );
+                            assert!(visited);
+                        }
+                    }
+                })
+            }
+        }
+    }
+}
+
+fn prove_from_rows<Ch: Challenger>(
+    rows: MatrixFoldRows<'_>,
+    fresh: &C1FreshLincheckClaim,
+    incoming: &C1MatrixAccClaim,
+    gate: bool,
+    channel: &mut Ch,
+) -> (C1MatrixFoldProof, C1MatrixAccClaim) {
+    let k_log = rows.k_log();
+    let k_skip = rows.k_skip();
+    let width = 1usize << k_log;
+    assert_eq!(fresh.x_inner_rest.len(), k_log - k_skip);
+    assert_eq!(fresh.r_inner_rest.len(), k_log - k_skip);
+    assert_eq!(fresh.z_partial.len(), 1usize << k_skip);
+    assert_eq!(incoming.point.len(), 2 * k_log + 1);
+
+    let gate = if gate { F256::ONE } else { F256::ZERO };
+    absorb_fold_header(channel, fresh, incoming, gate);
+    let gamma = channel.sample_f256();
+    let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
+
+    let rest = build_eq_table(&fresh.r_inner_rest);
+    let low_count = 1usize << k_skip;
+    let mut v_table = vec![F256::ZERO; width];
+    v_table
+        .par_chunks_mut(low_count)
+        .zip(rest)
+        .for_each(|(chunk, rest_weight)| {
+            for (output, &partial) in chunk.iter_mut().zip(&fresh.z_partial) {
+                *output = partial * rest_weight;
+            }
+        });
+    let e_c = build_eq_table(incoming_column);
+
+    let mut g_v = vec![F256::ZERO; 2 * width];
+    let mut g_e = vec![F256::ZERO; 2 * width];
+    rows.fill_row_images_c1(&v_table, &e_c, &mut g_v, &mut g_e);
+
+    let lambda = lagrange_weights(k_skip, fresh.z_skip, 0);
+    let inner = build_eq_table(&fresh.x_inner_rest);
+    let w_u = build_stacked_u_weights(k_log, k_skip, fresh.alpha, &lambda, &inner);
+    let gamma_gate = gamma * gate;
+    let incoming_row_weights = build_eq_table_scaled(incoming_row, gamma_gate);
+    let phase1_target = fresh.value + gamma_gate * incoming.value;
+    let (phase1_rounds, rho, phase1_claim, phase1_finals) =
+        run_phase(phase1_target, w_u, g_v, incoming_row_weights, g_e, channel);
+    let g_v = phase1_finals[1];
+    let g_e = phase1_finals[3];
+    debug_assert_eq!(
+        phase1_finals[0] * g_v + phase1_finals[2] * g_e,
+        phase1_claim
+    );
+    channel.observe_f256(g_v);
+    channel.observe_f256(g_e);
+    let delta = channel.sample_f256();
+
+    let equality = FactoredEqTable::new(&rho);
+    let h = rows.weighted_column_image_c1(&equality);
+    let delta_gate = delta * gate;
+    let mut phase2_weights = v_table;
+    let first_round =
+        mix_and_round_coefficients_one_product(&mut phase2_weights, &e_c, &h, delta_gate);
+    let phase2_target = g_v + delta_gate * g_e;
+    let (phase2_rounds, sigma, phase2_claim, phase2_finals) =
+        run_phase_one_product(phase2_target, phase2_weights, h, Some(first_round), channel);
+    let final_matrix_eval = phase2_finals[1];
+    debug_assert_eq!(phase2_finals[0] * final_matrix_eval, phase2_claim);
+    channel.observe_f256(final_matrix_eval);
+
+    let mut point = rho;
+    point.extend(sigma);
+    (
+        C1MatrixFoldProof {
+            phase1_rounds,
+            g_v,
+            g_e,
+            phase2_rounds,
+            final_matrix_eval,
+        },
+        C1MatrixAccClaim {
+            point,
+            value: final_matrix_eval,
+        },
+    )
+}
+
+pub fn prove_matrix_claim_fold_c1<Ch: Challenger>(
+    r1cs: &FieldR1cs,
+    fresh: &C1FreshLincheckClaim,
+    incoming: &C1MatrixAccClaim,
+    gate: bool,
+    channel: &mut Ch,
+) -> (C1MatrixFoldProof, C1MatrixAccClaim) {
+    prove_from_rows(
+        MatrixFoldRows::Resident(r1cs),
+        fresh,
+        incoming,
+        gate,
+        channel,
+    )
+}
+
+pub fn prove_matrix_claim_fold_compact_c1<Ch: Challenger>(
+    r1cs: &CompactFieldR1cs,
+    fresh: &C1FreshLincheckClaim,
+    incoming: &C1MatrixAccClaim,
+    gate: bool,
+    channel: &mut Ch,
+) -> (C1MatrixFoldProof, C1MatrixAccClaim) {
+    prove_from_rows(
+        MatrixFoldRows::Compact(r1cs),
+        fresh,
+        incoming,
+        gate,
+        channel,
+    )
+}
+
+pub fn verify_matrix_claim_fold_c1<Ch: Challenger>(
+    k_log: usize,
+    k_skip: usize,
+    fresh: &C1FreshLincheckClaim,
+    incoming: &C1MatrixAccClaim,
+    gate: F256,
+    proof: &C1MatrixFoldProof,
+    channel: &mut Ch,
+) -> Result<C1MatrixAccClaim, MatrixFoldError> {
+    if fresh.x_inner_rest.len() != k_log - k_skip
+        || fresh.r_inner_rest.len() != k_log - k_skip
+        || fresh.z_partial.len() != 1usize << k_skip
+        || incoming.point.len() != 2 * k_log + 1
+        || proof.phase1_rounds.len() != k_log + 1
+        || proof.phase2_rounds.len() != k_log
+    {
+        return Err(MatrixFoldError::Shape);
+    }
+
+    absorb_fold_header(channel, fresh, incoming, gate);
+    let gamma = channel.sample_f256();
+    let gamma_gate = gamma * gate;
+    let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
+
+    let mut claim = fresh.value + gamma_gate * incoming.value;
+    let mut rho = Vec::with_capacity(k_log + 1);
+    for wire in &proof.phase1_rounds {
+        channel.observe_f256_slice(wire);
+        let linear = claim + wire[1];
+        let challenge = channel.sample_f256();
+        claim = (wire[1] * challenge + linear) * challenge + wire[0];
+        rho.push(challenge);
+    }
+    let fresh_weight = u_weight_eval(fresh, k_skip, &rho);
+    let incoming_weight = eq_points(incoming_row, &rho);
+    if fresh_weight * proof.g_v + gamma_gate * incoming_weight * proof.g_e != claim {
+        return Err(MatrixFoldError::FinalMismatch);
+    }
+    channel.observe_f256(proof.g_v);
+    channel.observe_f256(proof.g_e);
+    let delta = channel.sample_f256();
+    let delta_gate = delta * gate;
+
+    let mut claim = proof.g_v + delta_gate * proof.g_e;
+    let mut sigma = Vec::with_capacity(k_log);
+    for wire in &proof.phase2_rounds {
+        channel.observe_f256_slice(wire);
+        let linear = claim + wire[1];
+        let challenge = channel.sample_f256();
+        claim = (wire[1] * challenge + linear) * challenge + wire[0];
+        sigma.push(challenge);
+    }
+    let fresh_weight = v_weight_eval(fresh, k_skip, &sigma);
+    let incoming_weight = eq_points(incoming_column, &sigma);
+    if (fresh_weight + delta_gate * incoming_weight) * proof.final_matrix_eval != claim {
+        return Err(MatrixFoldError::FinalMismatch);
+    }
+    channel.observe_f256(proof.final_matrix_eval);
+
+    let mut point = rho;
+    point.extend(sigma);
+    Ok(C1MatrixAccClaim {
+        point,
+        value: proof.final_matrix_eval,
+    })
+}
+
+struct FactoredC1EqTable {
+    low: Vec<F256>,
+    high: Vec<F256>,
+    low_bits: usize,
+    low_mask: usize,
+}
+
+impl FactoredC1EqTable {
+    fn new(point: &[F256]) -> Self {
+        let low_bits = point.len() / 2;
+        Self {
+            low: build_eq_table(&point[..low_bits]),
+            high: build_eq_table(&point[low_bits..]),
+            low_bits,
+            low_mask: (1usize << low_bits) - 1,
+        }
+    }
+
+    #[inline(always)]
+    fn value(&self, index: usize) -> F256 {
+        self.low[index & self.low_mask] * self.high[index >> self.low_bits]
+    }
+}
+
+struct CompactC1FreshWeights<'a> {
+    claim: &'a C1FreshLincheckClaim,
+    mask: usize,
+    lambda: Vec<F256>,
+    row_rest: FactoredC1EqTable,
+    column_rest: FactoredC1EqTable,
+}
+
+impl<'a> CompactC1FreshWeights<'a> {
+    fn new(shape: FieldShape, claim: &'a C1FreshLincheckClaim) -> Self {
+        Self {
+            claim,
+            mask: (1usize << shape.k_skip) - 1,
+            lambda: lagrange_weights(shape.k_skip, claim.z_skip, 0),
+            row_rest: FactoredC1EqTable::new(&claim.x_inner_rest),
+            column_rest: FactoredC1EqTable::new(&claim.r_inner_rest),
+        }
+    }
+
+    fn row_weight(&self, row: usize, k_skip: usize) -> F256 {
+        self.lambda[row & self.mask] * self.row_rest.value(row >> k_skip)
+    }
+
+    fn column_weight(&self, column: usize, k_skip: usize) -> F256 {
+        self.claim.z_partial[column & self.mask] * self.column_rest.value(column >> k_skip)
+    }
+}
+
+struct CompactC1AccumulatedWeights {
+    stack: F256,
+    row: FactoredC1EqTable,
+    column: FactoredC1EqTable,
+}
+
+impl CompactC1AccumulatedWeights {
+    fn new(shape: FieldShape, claim: &C1MatrixAccClaim) -> Self {
+        let (row, column) = claim.point.split_at(shape.k_log + 1);
+        Self {
+            stack: row[shape.k_log],
+            row: FactoredC1EqTable::new(&row[..shape.k_log]),
+            column: FactoredC1EqTable::new(column),
+        }
+    }
+}
+
+fn compact_matrix_claim_values_c1(
+    r1cs: &CompactFieldR1cs,
+    fresh: Option<&C1FreshLincheckClaim>,
+    accumulated: Option<&C1MatrixAccClaim>,
+) -> (Option<F256>, Option<F256>) {
+    let shape = r1cs.shape();
+    let fresh_weights = fresh.map(|claim| CompactC1FreshWeights::new(shape, claim));
+    let accumulated_weights =
+        accumulated.map(|claim| CompactC1AccumulatedWeights::new(shape, claim));
+    if fresh_weights.is_none() && accumulated_weights.is_none() {
+        return (None, None);
+    }
+
+    let (fresh_total, accumulated_total) = [FieldR1csArtifactMatrix::A, FieldR1csArtifactMatrix::B]
+        .into_par_iter()
+        .map(|side| {
+            let (mut fresh_side, mut accumulated_side) = (0..r1cs.matrix_group_count(side))
+                .into_par_iter()
+                .map(|group| {
+                    let mut fresh_sum = F256::ZERO;
+                    let mut accumulated_sum = F256::ZERO;
+                    let mut cached_row = usize::MAX;
+                    let mut fresh_row = F256::ZERO;
+                    let mut accumulated_row = F256::ZERO;
+                    let visited = r1cs.for_each_matrix_group_entry(
+                        side,
+                        group,
+                        |row, column, coefficient| {
+                            if row != cached_row {
+                                cached_row = row;
+                                if let Some(weights) = &fresh_weights {
+                                    fresh_row = weights.row_weight(row, shape.k_skip);
+                                }
+                                if let Some(weights) = &accumulated_weights {
+                                    accumulated_row = weights.row.value(row);
+                                }
+                            }
+                            let column = column as usize;
+                            if let Some(weights) = &fresh_weights {
+                                fresh_sum += (fresh_row
+                                    * weights.column_weight(column, shape.k_skip))
+                                .scale_base(coefficient);
+                            }
+                            if let Some(weights) = &accumulated_weights {
+                                accumulated_sum += (accumulated_row * weights.column.value(column))
+                                    .scale_base(coefficient);
+                            }
+                        },
+                    );
+                    assert!(visited, "enumerated compact matrix group exists");
+                    (fresh_sum, accumulated_sum)
+                })
+                .reduce(
+                    || (F256::ZERO, F256::ZERO),
+                    |left, right| (left.0 + right.0, left.1 + right.1),
+                );
+            if let Some(weights) = &fresh_weights {
+                fresh_side *= match side {
+                    FieldR1csArtifactMatrix::A => weights.claim.alpha,
+                    FieldR1csArtifactMatrix::B => F256::ONE,
+                };
+            }
+            if let Some(weights) = &accumulated_weights {
+                accumulated_side *= match side {
+                    FieldR1csArtifactMatrix::A => F256::ONE + weights.stack,
+                    FieldR1csArtifactMatrix::B => weights.stack,
+                };
+            }
+            (fresh_side, accumulated_side)
+        })
+        .reduce(
+            || (F256::ZERO, F256::ZERO),
+            |left, right| (left.0 + right.0, left.1 + right.1),
+        );
+    (
+        fresh.map(|_| fresh_total),
+        accumulated.map(|_| accumulated_total),
+    )
+}
+
+impl CompactFieldR1cs {
+    pub fn evaluate_matrix_claims_c1_authenticated(
+        &self,
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+    ) -> Result<AuthenticatedC1MatrixClaimEvaluations, FieldR1csArtifactError> {
+        validate_claim_shapes(self.shape(), fresh, accumulated)?;
+        let (fresh_value, accumulated_value) =
+            compact_matrix_claim_values_c1(self, fresh, accumulated);
+        Ok(AuthenticatedC1MatrixClaimEvaluations::new(
+            self.statement_digest(),
+            fresh,
+            accumulated,
+            fresh_value,
+            accumulated_value,
+        ))
+    }
+}
+
+impl C1MatrixClaimEvaluator for CompactFieldR1cs {
+    fn field_shape(&self) -> FieldShape {
+        self.shape()
+    }
+
+    fn evaluate_matrix_claims_c1(
+        &mut self,
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+    ) -> Result<AuthenticatedC1MatrixClaimEvaluations, FieldR1csArtifactError> {
+        self.evaluate_matrix_claims_c1_authenticated(fresh, accumulated)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::challenger::FsLaneChallenger;
+    use crate::field_r1cs::synthetic_satisfiable;
+
+    fn value(seed: u64) -> F256 {
+        F256::new(
+            F128::new(seed, seed.rotate_left(7)),
+            F128::new(!seed, seed ^ 0xC1),
+        )
+    }
+
+    #[test]
+    fn c1_matrix_fold_roundtrip_and_tamper() {
+        let k_log = 8;
+        let (mut relation, _) = synthetic_satisfiable(k_log, k_log, 0xC1_ACC);
+        let mut fresh = C1FreshLincheckClaim {
+            alpha: value(1),
+            z_skip: value(2),
+            x_inner_rest: (0..k_log - relation.k_skip)
+                .map(|index| value(10 + index as u64))
+                .collect(),
+            r_inner_rest: (0..k_log - relation.k_skip)
+                .map(|index| value(20 + index as u64))
+                .collect(),
+            z_partial: (0..1usize << relation.k_skip)
+                .map(|index| value(100 + index as u64))
+                .collect(),
+            value: value(3),
+        };
+        fresh.value = fresh_claim_value_c1(&relation, &fresh);
+        let mut incoming = C1MatrixAccClaim {
+            point: (0..2 * k_log + 1)
+                .map(|index| value(200 + index as u64))
+                .collect(),
+            value: value(4),
+        };
+        incoming.value = stacked_matrix_mle_eval_c1(&relation, &incoming);
+
+        let shape = FieldShape::of(&relation);
+        let digest = relation.structural_statement_digest();
+        let mut artifact = Vec::new();
+        relation
+            .write_artifact(&mut artifact)
+            .expect("C1 fixture has a canonical artifact");
+        let compact = CompactFieldR1cs::open_packed(artifact.into_boxed_slice(), shape, digest)
+            .expect("C1 fixture authenticates as compact");
+        let expected = relation
+            .evaluate_matrix_claims_c1(Some(&fresh), Some(&incoming))
+            .expect("resident C1 claims evaluate");
+        let actual = compact
+            .evaluate_matrix_claims_c1_authenticated(Some(&fresh), Some(&incoming))
+            .expect("compact C1 claims evaluate");
+        assert_eq!(actual, expected);
+        assert!(actual.is_bound_to(Some(&fresh), Some(&incoming)));
+
+        let mut prover = FsLaneChallenger::new_c1(b"matrix-fold-c1-test");
+        let (proof, output) =
+            prove_matrix_claim_fold_c1(&relation, &fresh, &incoming, true, &mut prover);
+        let mut verifier = FsLaneChallenger::new_c1(b"matrix-fold-c1-test");
+        let verified = verify_matrix_claim_fold_c1(
+            k_log,
+            relation.k_skip,
+            &fresh,
+            &incoming,
+            F256::ONE,
+            &proof,
+            &mut verifier,
+        )
+        .expect("honest C1 matrix fold");
+        assert_eq!(verified, output);
+        assert_eq!(prover.sample_f256(), verifier.sample_f256());
+
+        let mut tampered = proof;
+        tampered.phase1_rounds[0][0] += F256::ONE;
+        let mut verifier = FsLaneChallenger::new_c1(b"matrix-fold-c1-test");
+        assert!(
+            verify_matrix_claim_fold_c1(
+                k_log,
+                relation.k_skip,
+                &fresh,
+                &incoming,
+                F256::ONE,
+                &tampered,
+                &mut verifier,
+            )
+            .is_err()
+        );
+    }
+}

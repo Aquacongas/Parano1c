@@ -138,7 +138,7 @@ impl<'a> CanonicalProofReader<'a> {
         Ok(value)
     }
 
-    fn f128(&mut self) -> Result<F128, RegionSidecarError> {
+    pub(crate) fn f128(&mut self) -> Result<F128, RegionSidecarError> {
         let end = add(self.position, F128_BYTES)?;
         let bytes = self.bytes.get(self.position..end).ok_or_else(invalid)?;
         self.position = end;
@@ -149,7 +149,7 @@ impl<'a> CanonicalProofReader<'a> {
     }
 }
 
-fn put_f128(out: &mut Vec<u8>, value: F128) {
+pub(crate) fn put_f128(out: &mut Vec<u8>, value: F128) {
     out.extend_from_slice(&value.lo.to_le_bytes());
     out.extend_from_slice(&value.hi.to_le_bytes());
 }

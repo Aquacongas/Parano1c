@@ -136,11 +136,13 @@ pub(super) fn verify_walk_a_union_walk_suffix_trace<C: FsChannelOps>(
     let substitution_terms = union_trace_terms(
         &mds_weights,
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     );
     let substitution_ref_terms = union_ref_terms(
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     );
@@ -458,6 +460,7 @@ fn preflight_walk_a_deferred_authority(
     let selection_values = claimed_refs(&carry_selection_terms(&protocol.meta_c, F128::ONE)).len();
     let substitution_refs = claimed_refs(&union_ref_terms(
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     ));

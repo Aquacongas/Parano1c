@@ -12,6 +12,9 @@
 //! cost of `66 × max(w_log)` aggregate rounds.  Terminal PCS claims are
 //! verifier output and therefore never appear in the serialized proof.
 
+use noid_fri_binius::zk_capsule_pcs::{
+    ZK_CAPSULE_PCS_MID_PATH_DEPTH, ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+};
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
 use noid_ivc_core::deep_chain::capsule_leaf::raw_flat_lane;
 use noid_ivc_core::deep_chain::schedule::{
@@ -22,7 +25,7 @@ use noid_ivc_core::deep_chain::{
     prove_ragged_multi_deep_chain_walk, verify_ragged_multi_deep_chain_walk,
     MultiDeepChainWalkProof,
 };
-use noid_ivc_core::field::F128;
+use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_circuit::{
     FsChannelOps, FsChannelUnionRecorder, LayoutRecordedChannel, LayoutRecordingChallenger,
     RecordedChannel,
@@ -32,7 +35,7 @@ use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
 use noid_ivc_prover::field_prover::FieldPostCommitProverContext;
 use noid_poseidon2b::native::domain::{
-    capacity_iv, capacity_iv_flat, TAG_CAPSNODE, TAG_EXSTNOD, TAG_KSCHANNL,
+    capacity_iv, capacity_iv_flat, TAG_CAPSNODE, TAG_EXSTNOD, TAG_KSCH256,
 };
 use noid_poseidon2b::native::permutation::N_ROUNDS;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
@@ -56,6 +59,7 @@ use super::bounded_decode::{
     duplex_shape_for_vk, merkle_shape_for_vk, multi_walk_proof_shape, preflight_composite_proof,
     record_serde_attempt, SidecarProofShape,
 };
+use super::c1_repeat::{WideResponseLowChallenger, SIDECAR_C1_REPETITIONS};
 use super::walk_a::walk_a_bounded_shape;
 use super::{
     preflight_duplex_region_walk_deferred_trace, preflight_merkle_region_walk_deferred_trace,
@@ -68,7 +72,7 @@ use super::{
     WalkARegionWalkDeferredProof,
 };
 
-pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 5;
+pub const BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION: u8 = 6;
 
 /// Compact retained portion of a selected Block sidecar VK.
 ///
@@ -111,6 +115,7 @@ pub(crate) struct SelectedZkBlockGeometry {
     pub paired_bases: [usize; 2],
     pub tx_root_base: usize,
     pub tx_root_paths_per_block: usize,
+    pub wallet_overflow_bases: [usize; 2],
 }
 
 pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
@@ -126,14 +131,15 @@ pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZk
             exact_state_region_log: 12,
             spine_cap_log: 1,
             meta_a_w_log: 14,
-            meta_b_w_log: 16,
-            meta_b_block_log: 10,
+            meta_b_w_log: 17,
+            meta_b_block_log: 11,
             touched_capacity: 641,
             segment_capacity: 256,
             paired_caps_per_block: [11, 4],
             paired_bases: [0, 704],
             tx_root_base: 960,
             tx_root_paths_per_block: 4,
+            wallet_overflow_bases: [1_024, 1_034],
         },
         255 => SelectedZkBlockGeometry {
             tier: 255,
@@ -154,6 +160,7 @@ pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZk
             paired_bases: [0, 384],
             tx_root_base: 448,
             tx_root_paths_per_block: 1,
+            wallet_overflow_bases: [464, 474],
         },
         _ => return None,
     };
@@ -177,21 +184,24 @@ const SELECTED_ZK_AUTH_OWNER_W_LOG: usize = 15;
 #[cfg(test)]
 const SELECTED_ZK_AUTH_WALLET_A_W_LOG: usize = 19;
 
-const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V5";
+const BLOCK_REGION_SELECTED_ZK_VK_DIGEST_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-VK/V6";
 const BLOCK_SELECTED_ZK_POST_COMMIT_CLASS_DIGEST_DOMAIN: &[u8] =
-    b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V5";
-const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-zk-auth-v5";
+    b"NOID/REGION-SIDECAR/BLOCK-ZK-AUTH-POST-COMMIT-CLASS/V6";
+const BLOCK_REGION_SELECTED_ZK_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-block-zk-auth-v6";
 
 /// Outer-channel label preceding the child-transcript seed draw.
-pub(crate) const BLOCK_SIDECAR_RECORDED_LABEL: &[u8] = b"history-block-sidecar-recorded-v1";
+pub(crate) const BLOCK_SIDECAR_RECORDED_LABEL: &[u8] = b"history-block-sidecar-recorded-v2";
 /// Fresh Fiat-Shamir domain of the block-sidecar CHILD transcript.  The
 /// child chain starts from this domain, absorbs one outer-sampled seed (so
 /// its challenges are causally post-commit), replays the complete V5 block
 /// sidecar verification, and squeezes a two-lane terminal digest that the
 /// outer channel re-absorbs before its first zerocheck challenge.
-pub(crate) const BLOCK_SIDECAR_CHILD_DOMAIN: &[u8] = b"history-block-sidecar-child-v1";
-/// Terminal child-state binding lanes re-absorbed by the outer channel.
-pub(crate) const BLOCK_SIDECAR_CHILD_TAIL_LANES: usize = 2;
+pub(crate) const BLOCK_SIDECAR_CHILD_DOMAIN: &[u8] = b"history-block-sidecar-child-c1-v2";
+const BLOCK_SIDECAR_C1_REPETITION_LABEL: &[u8] = b"history-block-sidecar-c1-repeat-v1";
+const BLOCK_SIDECAR_C1_REPETITION_LABELS: [&[u8]; SIDECAR_C1_REPETITIONS] = [
+    b"history-block-sidecar-c1-repeat-0",
+    b"history-block-sidecar-c1-repeat-1",
+];
 
 /// Canonical verification key for all six production block-region verticals.
 ///
@@ -241,16 +251,18 @@ impl BlockRegionSidecarVk {
             slices.wallet_b,
             10,
             vec![
-                super::MerkleRegionFamily::FeedForward {
+                super::MerkleRegionFamily::FeedForwardStrided {
                     offset: 0,
-                    depth: 8,
+                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
                     n_paths: 64,
+                    stride: 16,
                     iv: capsule_iv,
                 },
-                super::MerkleRegionFamily::FeedForward {
-                    offset: 512,
-                    depth: 8,
+                super::MerkleRegionFamily::FeedForwardStrided {
+                    offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
                     n_paths: 64,
+                    stride: 16,
                     iv: capsule_iv,
                 },
             ],
@@ -278,12 +290,26 @@ impl BlockRegionSidecarVk {
                     n_paths: geometry.tx_root_paths_per_block,
                     iv: compress_iv_flat(),
                 },
+                super::MerkleRegionFamily::FeedForwardStrided {
+                    offset: geometry.wallet_overflow_bases[0],
+                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv: capsule_iv,
+                },
+                super::MerkleRegionFamily::FeedForwardStrided {
+                    offset: geometry.wallet_overflow_bases[1],
+                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv: capsule_iv,
+                },
             ],
         )?;
         let schedules = ZkAuthCapsuleDuplexSchedules::selected();
-        let [iv_hi, iv_lo] = capacity_iv(TAG_KSCHANNL);
+        let [iv_hi, iv_lo] = capacity_iv(TAG_KSCH256);
         let iv = [flat_of_tower_u128(iv_hi.0), flat_of_tower_u128(iv_lo.0)];
-        let owner_layout = schedules.owner_layout();
+        let owner_layout = schedules.owner_sidecar_layout();
         let owner_c = DuplexRegionVk::new(
             selected_zk_auth_owner_sidecar_purpose(),
             geometry.owner_w_log,
@@ -292,7 +318,7 @@ impl BlockRegionSidecarVk {
             duplex_family_refs(0, 0),
             &owner_layout,
         )?;
-        let main_layout = schedules.main_layout();
+        let main_layout = schedules.main_sidecar_layout();
         let main_c = DuplexRegionVk::new(
             selected_zk_auth_main_sidecar_purpose(),
             geometry.main_w_log,
@@ -444,16 +470,18 @@ impl BlockRegionSidecarVk {
 
         let capsule_iv = capacity_iv_flat(TAG_CAPSNODE).map(raw_flat_lane);
         let expected_wallet_b = [
-            MerkleRegionFamily::FeedForward {
+            MerkleRegionFamily::FeedForwardStrided {
                 offset: 0,
-                depth: 8,
+                depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
                 n_paths: 64,
+                stride: 16,
                 iv: capsule_iv,
             },
-            MerkleRegionFamily::FeedForward {
-                offset: 512,
-                depth: 8,
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
                 n_paths: 64,
+                stride: 16,
                 iv: capsule_iv,
             },
         ];
@@ -479,6 +507,20 @@ impl BlockRegionSidecarVk {
                 n_paths: geometry.tx_root_paths_per_block,
                 iv: compress_iv_flat(),
             },
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: geometry.wallet_overflow_bases[0],
+                depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                n_paths: 1,
+                stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                iv: capsule_iv,
+            },
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: geometry.wallet_overflow_bases[1],
+                depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                n_paths: 1,
+                stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                iv: capsule_iv,
+            },
         ];
         if self.meta_b.families() != expected_meta_b {
             return Err(RegionSidecarError::UnsupportedVkShape);
@@ -487,13 +529,13 @@ impl BlockRegionSidecarVk {
         let schedules = ZkAuthCapsuleDuplexSchedules::selected();
         if !selected_duplex_vk_matches(
             self.owner_c(),
-            &schedules.owner_layout(),
+            &schedules.owner_sidecar_layout(),
             selected_zk_auth_owner_sidecar_purpose(),
             geometry.owner_w_log,
             ZK_AUTH_OWNER_TILE_LOG,
         ) || !selected_duplex_vk_matches(
             self.main_c(),
-            &schedules.main_layout(),
+            &schedules.main_sidecar_layout(),
             selected_zk_auth_main_sidecar_purpose(),
             geometry.main_w_log,
             ZK_AUTH_MAIN_TILE_LOG,
@@ -574,7 +616,7 @@ fn selected_duplex_vk_matches(
     w_log: usize,
     tile_log: usize,
 ) -> bool {
-    let [iv_hi, iv_lo] = capacity_iv(TAG_KSCHANNL);
+    let [iv_hi, iv_lo] = capacity_iv(TAG_KSCH256);
     let iv = [flat_of_tower_u128(iv_hi.0), flat_of_tower_u128(iv_lo.0)];
     vk.purpose() == &purpose
         && vk.w_log() == w_log
@@ -857,11 +899,12 @@ impl<'a> BlockRegionProverPlan<'a> {
         Ok(Self { vk, input })
     }
 
-    fn prove<Ch: Challenger>(
+    fn prove_repetition<Ch: Challenger>(
         &self,
         z: &[F128],
         challenger: &mut Ch,
-    ) -> Result<(BlockRegionSidecarProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
+    ) -> Result<(BlockRegionSidecarRepetitionProof, Vec<QuirkyDirectClaim>), RegionSidecarError>
+    {
         // Env-gated stage timing, mirroring NOIDH_FIELD_PROVE_TIMING.
         let timing = std::env::var_os("NOIDH_SIDECAR_TIMING").is_some();
         let mut t = std::time::Instant::now();
@@ -968,8 +1011,7 @@ impl<'a> BlockRegionProverPlan<'a> {
         lap("six-child finish", &mut t);
 
         Ok((
-            BlockRegionSidecarProof {
-                version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+            BlockRegionSidecarRepetitionProof {
                 wallet_a,
                 meta_a,
                 wallet_b,
@@ -987,30 +1029,76 @@ impl<'a> BlockRegionProverPlan<'a> {
     /// method also deposits every derived claim into its private sink before
     /// returning the sidecar proof.
     ///
-    /// The complete sidecar transcript rides a CHILD Fiat-Shamir chain: the
-    /// outer channel seeds it (one post-commit sample) and re-absorbs its
-    /// two-lane terminal digest, so the outer zerocheck challenges still
-    /// cover every sidecar message while a recursive replay may discharge
-    /// the child chain through a committed recording region instead of
-    /// inline sponge permutations.
+    /// The complete sidecar transcript rides a C1 CHILD Fiat-Shamir chain.
+    /// The outer channel seeds it with one wide post-commit sample and
+    /// re-absorbs one wide terminal digest. Two complete, domain-separated
+    /// repetitions consume independent C1-wide responses projected to their
+    /// uniform low base-field coordinate.
     pub fn prove_post_commit<Ch: Challenger>(
         &self,
         context: &mut FieldPostCommitProverContext<'_, Ch>,
     ) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
         let witness = context.witness();
         context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
-        let seed = context.sample_f128();
-        let mut child = FsLaneChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN);
-        child.observe_f128(seed);
-        let (proof, claims) = self.prove(witness, &mut child)?;
-        let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
-        context.observe_f128_slice(&tail);
-        context.append_claims(claims);
-        Ok(proof)
+        let seed = context.sample_f256();
+        let mut child = FsLaneChallenger::new_c1(BLOCK_SIDECAR_CHILD_DOMAIN);
+        child.observe_f256(seed);
+        child.observe_label(BLOCK_SIDECAR_C1_REPETITION_LABEL);
+        let mut repetitions = Vec::with_capacity(SIDECAR_C1_REPETITIONS);
+        for (repetition_index, label) in BLOCK_SIDECAR_C1_REPETITION_LABELS.into_iter().enumerate()
+        {
+            child.observe_label(label);
+            let diagnostic_child = std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG")
+                .is_some()
+                .then(|| child.clone());
+            let (proof, claims) = {
+                let mut channel = WideResponseLowChallenger::new(&mut child);
+                self.prove_repetition(witness, &mut channel)?
+            };
+            if let Some(mut diagnostic_child) = diagnostic_child {
+                let diagnostic = {
+                    let mut channel = WideResponseLowChallenger::new(&mut diagnostic_child);
+                    verify_block_region_sidecar_repetition(
+                        self.vk,
+                        context.total_vars(),
+                        &proof,
+                        &mut channel,
+                    )
+                };
+                eprintln!(
+                    "[block-sidecar prove] immediate repetition {repetition_index}: {:?}",
+                    diagnostic.as_ref().map(Vec::len)
+                );
+            }
+            context.append_claims(claims);
+            repetitions.push(proof);
+        }
+        let tail = child.sample_f256();
+        context.observe_f256(tail);
+        Ok(BlockRegionSidecarProof {
+            version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+            repetitions: repetitions
+                .try_into()
+                .expect("fixed C1 block-sidecar repetition count"),
+        })
     }
 }
 
-/// The fixed-shape selected-ZK V5 block sidecar envelope.
+/// One algebraic repetition of the six-child block authority. It is private
+/// so no caller can present a single base-field transcript as a production
+/// sidecar proof.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BlockRegionSidecarRepetitionProof {
+    wallet_a: WalkARegionWalkDeferredProof,
+    meta_a: WalkARegionWalkDeferredProof,
+    wallet_b: MerkleRegionWalkDeferredProof,
+    meta_b: MerkleRegionWalkDeferredProof,
+    owner_c: DuplexRegionWalkDeferredProof,
+    main_c: DuplexRegionWalkDeferredProof,
+    walk: MultiDeepChainWalkProof,
+}
+
+/// The fixed-shape selected-ZK V6 block sidecar envelope.
 ///
 /// All six children carry independent prefix/suffix authority with their
 /// walk deliberately absent; ONE mandatory six-instance ragged multi-walk
@@ -1019,13 +1107,7 @@ impl<'a> BlockRegionProverPlan<'a> {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BlockRegionSidecarProof {
     version: u8,
-    wallet_a: WalkARegionWalkDeferredProof,
-    meta_a: WalkARegionWalkDeferredProof,
-    wallet_b: MerkleRegionWalkDeferredProof,
-    meta_b: MerkleRegionWalkDeferredProof,
-    owner_c: DuplexRegionWalkDeferredProof,
-    main_c: DuplexRegionWalkDeferredProof,
-    walk: MultiDeepChainWalkProof,
+    repetitions: [BlockRegionSidecarRepetitionProof; SIDECAR_C1_REPETITIONS],
 }
 
 impl BlockRegionSidecarProof {
@@ -1052,43 +1134,45 @@ pub(crate) fn encode_block_region_sidecar_canonical(
     }
     let mut out = Vec::with_capacity(expected);
     out.push(proof.version);
-    canonical::encode_walk_a_deferred(
-        &mut out,
-        proof.wallet_a.version(),
-        proof.wallet_a.authority(),
-        &wallet_a_shape,
-    )?;
-    canonical::encode_walk_a_deferred(
-        &mut out,
-        proof.meta_a.version(),
-        proof.meta_a.authority(),
-        &meta_a_shape,
-    )?;
-    canonical::encode_merkle_deferred(
-        &mut out,
-        proof.wallet_b.version(),
-        proof.wallet_b.authority(),
-        &wallet_b_shape,
-    )?;
-    canonical::encode_merkle_deferred(
-        &mut out,
-        proof.meta_b.version(),
-        proof.meta_b.authority(),
-        &meta_b_shape,
-    )?;
-    canonical::encode_duplex_deferred(
-        &mut out,
-        proof.owner_c.version(),
-        proof.owner_c.authority(),
-        &owner_c_shape,
-    )?;
-    canonical::encode_duplex_deferred(
-        &mut out,
-        proof.main_c.version(),
-        proof.main_c.authority(),
-        &main_c_shape,
-    )?;
-    canonical::encode_multi_walk(&mut out, &proof.walk, &walk_shape)?;
+    for repetition in &proof.repetitions {
+        canonical::encode_walk_a_deferred(
+            &mut out,
+            repetition.wallet_a.version(),
+            repetition.wallet_a.authority(),
+            &wallet_a_shape,
+        )?;
+        canonical::encode_walk_a_deferred(
+            &mut out,
+            repetition.meta_a.version(),
+            repetition.meta_a.authority(),
+            &meta_a_shape,
+        )?;
+        canonical::encode_merkle_deferred(
+            &mut out,
+            repetition.wallet_b.version(),
+            repetition.wallet_b.authority(),
+            &wallet_b_shape,
+        )?;
+        canonical::encode_merkle_deferred(
+            &mut out,
+            repetition.meta_b.version(),
+            repetition.meta_b.authority(),
+            &meta_b_shape,
+        )?;
+        canonical::encode_duplex_deferred(
+            &mut out,
+            repetition.owner_c.version(),
+            repetition.owner_c.authority(),
+            &owner_c_shape,
+        )?;
+        canonical::encode_duplex_deferred(
+            &mut out,
+            repetition.main_c.version(),
+            repetition.main_c.authority(),
+            &main_c_shape,
+        )?;
+        canonical::encode_multi_walk(&mut out, &repetition.walk, &walk_shape)?;
+    }
     if out.len() != expected {
         return Err(RegionSidecarError::InvalidProof);
     }
@@ -1112,41 +1196,49 @@ pub(crate) fn decode_block_region_sidecar_canonical(
     if reader.u8()? != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
-    let wallet_a = WalkARegionWalkDeferredProof::new(canonical::decode_walk_a_deferred(
-        &mut reader,
-        &wallet_a_shape,
-    )?);
-    let meta_a = WalkARegionWalkDeferredProof::new(canonical::decode_walk_a_deferred(
-        &mut reader,
-        &meta_a_shape,
-    )?);
-    let wallet_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
-        &mut reader,
-        &wallet_b_shape,
-    )?);
-    let meta_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
-        &mut reader,
-        &meta_b_shape,
-    )?);
-    let owner_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
-        &mut reader,
-        &owner_c_shape,
-    )?);
-    let main_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
-        &mut reader,
-        &main_c_shape,
-    )?);
-    let walk = canonical::decode_multi_walk(&mut reader, &walk_shape)?;
+    let mut repetitions = Vec::with_capacity(SIDECAR_C1_REPETITIONS);
+    for _ in 0..SIDECAR_C1_REPETITIONS {
+        let wallet_a = WalkARegionWalkDeferredProof::new(canonical::decode_walk_a_deferred(
+            &mut reader,
+            &wallet_a_shape,
+        )?);
+        let meta_a = WalkARegionWalkDeferredProof::new(canonical::decode_walk_a_deferred(
+            &mut reader,
+            &meta_a_shape,
+        )?);
+        let wallet_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
+            &mut reader,
+            &wallet_b_shape,
+        )?);
+        let meta_b = MerkleRegionWalkDeferredProof::new(canonical::decode_merkle_deferred(
+            &mut reader,
+            &meta_b_shape,
+        )?);
+        let owner_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+            &mut reader,
+            &owner_c_shape,
+        )?);
+        let main_c = DuplexRegionWalkDeferredProof::new(canonical::decode_duplex_deferred(
+            &mut reader,
+            &main_c_shape,
+        )?);
+        let walk = canonical::decode_multi_walk(&mut reader, &walk_shape)?;
+        repetitions.push(BlockRegionSidecarRepetitionProof {
+            wallet_a,
+            meta_a,
+            wallet_b,
+            meta_b,
+            owner_c,
+            main_c,
+            walk,
+        });
+    }
     reader.finish()?;
     Ok(BlockRegionSidecarProof {
         version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
-        wallet_a,
-        meta_a,
-        wallet_b,
-        meta_b,
-        owner_c,
-        main_c,
-        walk,
+        repetitions: repetitions
+            .try_into()
+            .expect("fixed C1 block-sidecar repetition count"),
     })
 }
 
@@ -1161,7 +1253,7 @@ pub(crate) fn canonical_block_region_sidecar_len(
     else {
         return Err(RegionSidecarError::UnsupportedVkShape);
     };
-    [
+    let repetition_len = [
         canonical::deferred_fixed_len(&wallet_a_shape)?,
         canonical::deferred_fixed_len(&meta_a_shape)?,
         canonical::deferred_merkle_len(&wallet_b_shape)?,
@@ -1171,21 +1263,32 @@ pub(crate) fn canonical_block_region_sidecar_len(
         canonical::multi_walk_len(&walk_shape)?,
     ]
     .into_iter()
-    .try_fold(1usize, |sum, len| {
+    .try_fold(0usize, |sum, len| {
         sum.checked_add(len).ok_or(RegionSidecarError::InvalidProof)
-    })
+    })?;
+    repetition_len
+        .checked_mul(SIDECAR_C1_REPETITIONS)
+        .and_then(|len| len.checked_add(1))
+        .ok_or(RegionSidecarError::InvalidProof)
 }
 
-/// Decode the mandatory V5 block envelope only after every deferred child
-/// and the shared six-instance multi-walk have passed one allocation-free
-/// class-aware scan.
+/// Decode the mandatory V6 block envelope only after both repetitions of
+/// every deferred child and shared six-instance multi-walk have passed one
+/// allocation-free class-aware scan.
 pub fn decode_block_region_sidecar_bounded(
     vk: &BlockRegionSidecarVk,
     total_vars: usize,
     bytes: &[u8],
 ) -> Result<BlockRegionSidecarProof, RegionSidecarError> {
     let shapes = block_bounded_shapes(vk, total_vars)?;
-    preflight_composite_proof(bytes, BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION, &shapes)?;
+    let repeated_shapes = (0..SIDECAR_C1_REPETITIONS)
+        .flat_map(|_| shapes.iter().cloned())
+        .collect::<Vec<_>>();
+    preflight_composite_proof(
+        bytes,
+        BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+        &repeated_shapes,
+    )?;
     record_serde_attempt();
     let proof: BlockRegionSidecarProof =
         bincode::deserialize(bytes).map_err(|_| RegionSidecarError::InvalidProof)?;
@@ -1226,56 +1329,84 @@ fn block_bounded_shapes(
 
 /// Replay the canonical phased block authority and derive the complete outer PCS
 /// claim list. No claim descriptor is accepted from the prover.
-fn verify_block_region_sidecar<Ch: Challenger>(
+fn verify_block_region_sidecar_repetition<Ch: Challenger>(
     vk: &BlockRegionSidecarVk,
     total_vars: usize,
-    proof: &BlockRegionSidecarProof,
+    proof: &BlockRegionSidecarRepetitionProof,
     challenger: &mut Ch,
 ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-    vk.validate_selected_zk_roles()?;
-    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
+    macro_rules! verify_stage {
+        ($label:literal, $expression:expr) => {
+            match $expression {
+                Ok(value) => value,
+                Err(error) => {
+                    if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+                        eprintln!("[block-sidecar verify] {}: {error:?}", $label);
+                    }
+                    return Err(error);
+                }
+            }
+        };
     }
 
+    vk.validate_selected_zk_roles()?;
     bind_block_vk(challenger, vk);
     let mut claims = Vec::new();
 
-    let wallet_a_prefix = verify_walk_a_region_walk_deferred_prefix(
-        vk.wallet_a(),
-        total_vars,
-        &proof.wallet_a,
-        challenger,
-    )?;
-    let meta_a_prefix = verify_walk_a_region_walk_deferred_prefix(
-        vk.meta_a(),
-        total_vars,
-        &proof.meta_a,
-        challenger,
-    )?;
-    let wallet_b_prefix = verify_merkle_region_walk_deferred_prefix(
-        vk.wallet_b(),
-        total_vars,
-        &proof.wallet_b,
-        challenger,
-    )?;
-    let meta_b_prefix = verify_merkle_region_walk_deferred_prefix(
-        vk.meta_b(),
-        total_vars,
-        &proof.meta_b,
-        challenger,
-    )?;
-    let owner_c_prefix = verify_duplex_region_walk_deferred_prefix(
-        vk.owner_c(),
-        total_vars,
-        &proof.owner_c,
-        challenger,
-    )?;
-    let main_c_prefix = verify_duplex_region_walk_deferred_prefix(
-        vk.main_c(),
-        total_vars,
-        &proof.main_c,
-        challenger,
-    )?;
+    let wallet_a_prefix = verify_stage!(
+        "wallet-A prefix",
+        verify_walk_a_region_walk_deferred_prefix(
+            vk.wallet_a(),
+            total_vars,
+            &proof.wallet_a,
+            challenger,
+        )
+    );
+    let meta_a_prefix = verify_stage!(
+        "meta-A prefix",
+        verify_walk_a_region_walk_deferred_prefix(
+            vk.meta_a(),
+            total_vars,
+            &proof.meta_a,
+            challenger,
+        )
+    );
+    let wallet_b_prefix = verify_stage!(
+        "wallet-B prefix",
+        verify_merkle_region_walk_deferred_prefix(
+            vk.wallet_b(),
+            total_vars,
+            &proof.wallet_b,
+            challenger,
+        )
+    );
+    let meta_b_prefix = verify_stage!(
+        "meta-B prefix",
+        verify_merkle_region_walk_deferred_prefix(
+            vk.meta_b(),
+            total_vars,
+            &proof.meta_b,
+            challenger,
+        )
+    );
+    let owner_c_prefix = verify_stage!(
+        "owner-C prefix",
+        verify_duplex_region_walk_deferred_prefix(
+            vk.owner_c(),
+            total_vars,
+            &proof.owner_c,
+            challenger,
+        )
+    );
+    let main_c_prefix = verify_stage!(
+        "main-C prefix",
+        verify_duplex_region_walk_deferred_prefix(
+            vk.main_c(),
+            total_vars,
+            &proof.main_c,
+            challenger,
+        )
+    );
     let groups = vec![
         vec![wallet_a_prefix.group().clone()],
         vec![meta_a_prefix.group().clone()],
@@ -1291,32 +1422,52 @@ fn verify_block_region_sidecar<Ch: Challenger>(
         meta_b_terminal,
         owner_c_terminal,
         main_c_terminal,
-    ]: [_; 6] = verify_ragged_multi_deep_chain_walk(
-        &block_walk_w_logs(vk),
-        &groups,
-        &proof.walk,
-        challenger,
+    ]: [_; 6] = verify_stage!(
+        "six-child multi-walk",
+        verify_ragged_multi_deep_chain_walk(
+            &block_walk_w_logs(vk),
+            &groups,
+            &proof.walk,
+            challenger,
+        )
+        .map_err(|_| RegionSidecarError::InvalidProof)
     )
-    .map_err(|_| RegionSidecarError::InvalidProof)?
     .try_into()
     .expect("verified six-child terminal count");
-    claims.extend(wallet_a_prefix.finish(&wallet_a_terminal, challenger)?);
-    claims.extend(meta_a_prefix.finish(&meta_a_terminal, challenger)?);
-    claims.extend(wallet_b_prefix.finish(&wallet_b_terminal, challenger)?);
-    claims.extend(meta_b_prefix.finish(&meta_b_terminal, challenger)?);
-    claims.extend(owner_c_prefix.finish(&owner_c_terminal, challenger)?);
-    claims.extend(main_c_prefix.finish(&main_c_terminal, challenger)?);
+    claims.extend(verify_stage!(
+        "wallet-A finish",
+        wallet_a_prefix.finish(&wallet_a_terminal, challenger)
+    ));
+    claims.extend(verify_stage!(
+        "meta-A finish",
+        meta_a_prefix.finish(&meta_a_terminal, challenger)
+    ));
+    claims.extend(verify_stage!(
+        "wallet-B finish",
+        wallet_b_prefix.finish(&wallet_b_terminal, challenger)
+    ));
+    claims.extend(verify_stage!(
+        "meta-B finish",
+        meta_b_prefix.finish(&meta_b_terminal, challenger)
+    ));
+    claims.extend(verify_stage!(
+        "owner-C finish",
+        owner_c_prefix.finish(&owner_c_terminal, challenger)
+    ));
+    claims.extend(verify_stage!(
+        "main-C finish",
+        main_c_prefix.finish(&main_c_terminal, challenger)
+    ));
     Ok(claims)
 }
 
-/// Captured native child transcript: the outer-sampled seed plus the child
-/// chain's terminal binding lanes.  Recursive trace assembly consumes the
-/// seed to reproduce the exact child recording before any trace channel
+/// Captured native C1 child transcript. Recursive trace assembly consumes the
+/// wide seed to reproduce the exact child recording before any trace channel
 /// exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockSidecarChildTranscript {
-    pub seed: F128,
-    pub tail: [F128; BLOCK_SIDECAR_CHILD_TAIL_LANES],
+    pub seed: F256,
+    pub tail: F256,
 }
 
 /// Sound production verifier entry point.  Claims reconstructed from the six
@@ -1344,20 +1495,47 @@ pub fn verify_block_region_sidecar_post_commit_captured<Ch: Challenger>(
     proof: &BlockRegionSidecarProof,
     context: &mut FieldPostCommitVerifierContext<'_, Ch>,
 ) -> Result<BlockSidecarChildTranscript, RegionSidecarError> {
+    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
     context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
-    let seed = context.sample_f128();
-    let mut child = FsLaneChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN);
-    child.observe_f128(seed);
-    let claims = verify_block_region_sidecar(vk, context.total_vars(), proof, &mut child)?;
-    let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
-    context.observe_f128_slice(&tail);
-    context.append_claims(claims);
-    Ok(BlockSidecarChildTranscript {
-        seed,
-        tail: tail
-            .try_into()
-            .expect("child transcript terminal lane count"),
-    })
+    let seed = context.sample_f256();
+    let mut child = FsLaneChallenger::new_c1(BLOCK_SIDECAR_CHILD_DOMAIN);
+    child.observe_f256(seed);
+    child.observe_label(BLOCK_SIDECAR_C1_REPETITION_LABEL);
+    for (repetition_index, (label, repetition)) in BLOCK_SIDECAR_C1_REPETITION_LABELS
+        .into_iter()
+        .zip(&proof.repetitions)
+        .enumerate()
+    {
+        child.observe_label(label);
+        let claims = {
+            let mut channel = WideResponseLowChallenger::new(&mut child);
+            match verify_block_region_sidecar_repetition(
+                vk,
+                context.total_vars(),
+                repetition,
+                &mut channel,
+            ) {
+                Ok(claims) => claims,
+                Err(error) => {
+                    if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+                        eprintln!(
+                            "[block-sidecar verify] repetition {repetition_index}: {error:?}"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+            eprintln!("[block-sidecar verify] repetition {repetition_index}: ok");
+        }
+        context.append_claims(claims);
+    }
+    let tail = child.sample_f256();
+    context.observe_f256(tail);
+    Ok(BlockSidecarChildTranscript { seed, tail })
 }
 
 /// Native verifier that additionally records the exact child transcript in
@@ -1368,32 +1546,59 @@ pub(crate) fn verify_block_region_sidecar_post_commit_layout_captured<Ch: Challe
     context: &mut FieldPostCommitVerifierContext<'_, Ch>,
     layout: noid_ivc_core::deep_chain::schedule::DuplexLayout,
 ) -> Result<(BlockSidecarChildTranscript, LayoutRecordedChannel), RegionSidecarError> {
+    if proof.version != BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
     context.observe_label(BLOCK_SIDECAR_RECORDED_LABEL);
-    let seed = context.sample_f128();
-    let mut child = LayoutRecordingChallenger::new(BLOCK_SIDECAR_CHILD_DOMAIN, layout);
-    child.observe_f128(seed);
-    let claims = verify_block_region_sidecar(vk, context.total_vars(), proof, &mut child)?;
-    let tail = child.sample_f128_vec(BLOCK_SIDECAR_CHILD_TAIL_LANES);
-    let recording = child
-        .finish()
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-    context.observe_f128_slice(&tail);
-    context.append_claims(claims);
-    Ok((
-        BlockSidecarChildTranscript {
-            seed,
-            tail: tail
-                .try_into()
-                .expect("child transcript terminal lane count"),
-        },
-        recording,
-    ))
+    let seed = context.sample_f256();
+    let mut child = LayoutRecordingChallenger::new_c1(BLOCK_SIDECAR_CHILD_DOMAIN, layout);
+    child.observe_f256(seed);
+    child.observe_label(BLOCK_SIDECAR_C1_REPETITION_LABEL);
+    for (repetition_index, (label, repetition)) in BLOCK_SIDECAR_C1_REPETITION_LABELS
+        .into_iter()
+        .zip(&proof.repetitions)
+        .enumerate()
+    {
+        child.observe_label(label);
+        let claims = {
+            let mut channel = WideResponseLowChallenger::new(&mut child);
+            match verify_block_region_sidecar_repetition(
+                vk,
+                context.total_vars(),
+                repetition,
+                &mut channel,
+            ) {
+                Ok(claims) => claims,
+                Err(error) => {
+                    if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+                        eprintln!(
+                            "[block-sidecar verify] recorded repetition {repetition_index}: \
+                             {error:?}"
+                        );
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+            eprintln!("[block-sidecar verify] recorded repetition {repetition_index}: ok");
+        }
+        context.append_claims(claims);
+    }
+    let tail = child.sample_f256();
+    let recording = child.finish().map_err(|_| {
+        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+            eprintln!("[block-sidecar verify] recorded layout finish: InvalidProof");
+        }
+        RegionSidecarError::InvalidProof
+    })?;
+    context.observe_f256(tail);
+    Ok((BlockSidecarChildTranscript { seed, tail }, recording))
 }
 
-/// Recursive trace verifier for the fixed V5 block authority. Every deferred
-/// child and the shared six-instance multi-walk is shape-preflighted before
-/// the first proof witness allocation. Prefixes and suffixes remain
-/// role-local; only the ragged-domain deep walk is random-linearly batched.
+/// Recursive trace verifier for the fixed V6 block authority. Both complete
+/// repetitions are shape-preflighted before the first proof witness
+/// allocation.
 pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     context: &mut FieldPostCommitTraceContext<'_, C>,
@@ -1406,13 +1611,45 @@ pub fn verify_block_region_sidecar_trace_post_commit<C: FsChannelOps>(
     }
     let total_vars = context.total_vars();
     let w_logs = block_walk_w_logs(vk);
-    preflight_walk_a_region_walk_deferred_trace(vk.wallet_a(), total_vars, &proof.wallet_a)?;
-    preflight_walk_a_region_walk_deferred_trace(vk.meta_a(), total_vars, &proof.meta_a)?;
-    preflight_merkle_region_walk_deferred_trace(vk.wallet_b(), total_vars, &proof.wallet_b)?;
-    preflight_merkle_region_walk_deferred_trace(vk.meta_b(), total_vars, &proof.meta_b)?;
-    preflight_duplex_region_walk_deferred_trace(vk.owner_c(), total_vars, &proof.owner_c)?;
-    preflight_duplex_region_walk_deferred_trace(vk.main_c(), total_vars, &proof.main_c)?;
-    preflight_multi_walk(&proof.walk, max_w_log(&w_logs), w_logs.len())?;
+    for repetition in &proof.repetitions {
+        preflight_walk_a_region_walk_deferred_trace(
+            vk.wallet_a(),
+            total_vars,
+            &repetition.wallet_a,
+        )?;
+        preflight_walk_a_region_walk_deferred_trace(vk.meta_a(), total_vars, &repetition.meta_a)?;
+        preflight_merkle_region_walk_deferred_trace(
+            vk.wallet_b(),
+            total_vars,
+            &repetition.wallet_b,
+        )?;
+        preflight_merkle_region_walk_deferred_trace(vk.meta_b(), total_vars, &repetition.meta_b)?;
+        preflight_duplex_region_walk_deferred_trace(vk.owner_c(), total_vars, &repetition.owner_c)?;
+        preflight_duplex_region_walk_deferred_trace(vk.main_c(), total_vars, &repetition.main_c)?;
+        preflight_multi_walk(&repetition.walk, max_w_log(&w_logs), w_logs.len())?;
+    }
+
+    context.observe_label(b, BLOCK_SIDECAR_C1_REPETITION_LABEL);
+    for (label, repetition) in BLOCK_SIDECAR_C1_REPETITION_LABELS
+        .into_iter()
+        .zip(&proof.repetitions)
+    {
+        context.observe_label(b, label);
+        context.set_wide_response_low(true);
+        let result = verify_block_region_sidecar_repetition_trace(b, context, vk, repetition);
+        context.set_wide_response_low(false);
+        result?;
+    }
+    Ok(())
+}
+
+fn verify_block_region_sidecar_repetition_trace<C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    context: &mut FieldPostCommitTraceContext<'_, C>,
+    vk: &BlockRegionSidecarVk,
+    proof: &BlockRegionSidecarRepetitionProof,
+) -> Result<(), RegionSidecarError> {
+    let w_logs = block_walk_w_logs(vk);
 
     context.observe_label(b, vk.transcript_label());
     crate::acceptance::trace::self_verify::observe_pinned_digest(
@@ -1492,14 +1729,14 @@ pub(crate) fn verify_block_region_sidecar_recorded_trace_post_commit<C: FsChanne
     proof: &BlockRegionSidecarProof,
 ) -> Result<RecordedChannel, RegionSidecarError> {
     context.observe_label(b, BLOCK_SIDECAR_RECORDED_LABEL);
-    let seed = context.sample_f128(b);
-    let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
-    recorder.observe_f128(b, &seed);
+    let seed = context.sample_f256(b);
+    let mut recorder = FsChannelUnionRecorder::new_c1(BLOCK_SIDECAR_CHILD_DOMAIN);
+    recorder.observe_f256(b, &seed);
     let mut child = context.child(&mut recorder);
     verify_block_region_sidecar_trace_post_commit(b, &mut child, vk, proof)?;
     context.adopt_child_claims(child);
-    let tail = recorder.sample_f128_vec(b, BLOCK_SIDECAR_CHILD_TAIL_LANES);
-    context.observe_f128_slice(b, &tail);
+    let tail = recorder.sample_f256(b);
+    context.observe_f256(b, &tail);
     Ok(recorder.finish())
 }
 
@@ -1512,12 +1749,15 @@ pub(crate) fn scratch_record_block_sidecar_child(
     vk: &BlockRegionSidecarVk,
     proof: &BlockRegionSidecarProof,
     total_vars: usize,
-    seed: F128,
+    seed: F256,
 ) -> Result<RecordedChannel, RegionSidecarError> {
     let mut scratch = FieldR1csBuilder::new();
-    let mut recorder = FsChannelUnionRecorder::new(BLOCK_SIDECAR_CHILD_DOMAIN);
-    let seed_wire = crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(seed));
-    recorder.observe_f128(&mut scratch, &seed_wire);
+    let mut recorder = FsChannelUnionRecorder::new_c1(BLOCK_SIDECAR_CHILD_DOMAIN);
+    let seed_wire = crate::acceptance::trace::ExtExpr {
+        lo: crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(seed.lo)),
+        hi: crate::acceptance::trace::LinExpr::from_wire(scratch.alloc_f128(seed.hi)),
+    };
+    recorder.observe_f256(&mut scratch, &seed_wire);
     let root: crate::acceptance::trace::self_verify::FlatDigestExpr = [
         crate::acceptance::trace::LinExpr::zero(),
         crate::acceptance::trace::LinExpr::zero(),
@@ -1525,7 +1765,7 @@ pub(crate) fn scratch_record_block_sidecar_child(
     let mut context = FieldPostCommitTraceContext::detached(&root, total_vars, &mut recorder);
     verify_block_region_sidecar_trace_post_commit(&mut scratch, &mut context, vk, proof)?;
     drop(context);
-    let _tail = recorder.sample_f128_vec(&mut scratch, BLOCK_SIDECAR_CHILD_TAIL_LANES);
+    let _tail = recorder.sample_f256(&mut scratch);
     Ok(recorder.finish())
 }
 
@@ -1540,7 +1780,7 @@ pub(crate) fn derive_block_sidecar_recording_layout(
     total_vars: usize,
 ) -> Result<noid_ivc_core::deep_chain::schedule::DuplexLayout, RegionSidecarError> {
     let proof = shape_only_block_region_sidecar_proof(vk, total_vars)?;
-    let recording = scratch_record_block_sidecar_child(vk, &proof, total_vars, F128::ZERO)?;
+    let recording = scratch_record_block_sidecar_child(vk, &proof, total_vars, F256::ZERO)?;
     Ok(noid_ivc_core::deep_chain::schedule::compile_duplex(
         &recording.ops,
     ))
@@ -1626,8 +1866,7 @@ pub(crate) fn shape_only_block_region_sidecar_proof(
             shifts: shifts(shape.shifts, shape.w_log),
         })
     };
-    Ok(BlockRegionSidecarProof {
-        version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+    let repetition = BlockRegionSidecarRepetitionProof {
         wallet_a,
         meta_a,
         wallet_b: merkle_child(&wallet_b_shape),
@@ -1645,6 +1884,10 @@ pub(crate) fn shape_only_block_region_sidecar_proof(
                 })
                 .collect(),
         },
+    };
+    Ok(BlockRegionSidecarProof {
+        version: BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+        repetitions: [repetition.clone(), repetition],
     })
 }
 
@@ -1696,6 +1939,7 @@ fn push_u64(bytes: &mut Vec<u8>, value: usize) {
 mod tests {
     use noid_ivc_core::public_io::WitnessSlice;
 
+    use super::super::bounded_decode;
     use super::*;
 
     fn aligned_slices<const N: usize>(cursor: &mut usize, w_log: usize) -> [WitnessSlice; N] {
@@ -1716,7 +1960,7 @@ mod tests {
         tile_log: usize,
         slices: [WitnessSlice; 6],
     ) -> DuplexRegionVk {
-        let [iv_hi, iv_lo] = capacity_iv(TAG_KSCHANNL);
+        let [iv_hi, iv_lo] = capacity_iv(TAG_KSCH256);
         let iv = [flat_of_tower_u128(iv_hi.0), flat_of_tower_u128(iv_lo.0)];
         DuplexRegionVk::new(
             purpose,
@@ -1754,16 +1998,18 @@ mod tests {
             aligned_slices(&mut cursor, geometry.wallet_b_w_log),
             10,
             vec![
-                super::super::MerkleRegionFamily::FeedForward {
+                super::super::MerkleRegionFamily::FeedForwardStrided {
                     offset: 0,
-                    depth: 8,
+                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
                     n_paths: 64,
+                    stride: 16,
                     iv: capsule_iv,
                 },
-                super::super::MerkleRegionFamily::FeedForward {
-                    offset: 512,
-                    depth: 8,
+                super::super::MerkleRegionFamily::FeedForwardStrided {
+                    offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
                     n_paths: 64,
+                    stride: 16,
                     iv: capsule_iv,
                 },
             ],
@@ -1792,20 +2038,34 @@ mod tests {
                     n_paths: geometry.tx_root_paths_per_block,
                     iv: compress_iv_flat(),
                 },
+                super::super::MerkleRegionFamily::FeedForwardStrided {
+                    offset: geometry.wallet_overflow_bases[0],
+                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv: capsule_iv,
+                },
+                super::super::MerkleRegionFamily::FeedForwardStrided {
+                    offset: geometry.wallet_overflow_bases[1],
+                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv: capsule_iv,
+                },
             ],
         )
         .unwrap();
         let schedules = ZkAuthCapsuleDuplexSchedules::selected();
         let owner_c = selected_duplex_vk(
             selected_zk_auth_owner_sidecar_purpose(),
-            &schedules.owner_layout(),
+            &schedules.owner_sidecar_layout(),
             geometry.owner_w_log,
             ZK_AUTH_OWNER_TILE_LOG,
             aligned_slices(&mut cursor, geometry.owner_w_log),
         );
         let main_c = selected_duplex_vk(
             selected_zk_auth_main_sidecar_purpose(),
-            &schedules.main_layout(),
+            &schedules.main_sidecar_layout(),
             geometry.main_w_log,
             ZK_AUTH_MAIN_TILE_LOG,
             aligned_slices(&mut cursor, geometry.main_w_log),
@@ -1820,6 +2080,225 @@ mod tests {
 
     fn selected_b255_vk_fixture() -> BlockRegionSidecarVk {
         selected_vk_fixture(255)
+    }
+
+    #[test]
+    fn selected_block_sidecar_trace_row_ledger() {
+        use noid_ivc_core::field_circuit::{FsChannelTrace, FsChannelUnionRecorder};
+
+        for (tier, total_vars) in [(64usize, 23usize), (255, 24)] {
+            let vk = selected_vk_fixture(tier);
+            let proof = shape_only_block_region_sidecar_proof(&vk, total_vars).unwrap();
+            let mut builder = FieldR1csBuilder::new_witness_only();
+            let root = [
+                crate::acceptance::trace::LinExpr::zero(),
+                crate::acceptance::trace::LinExpr::zero(),
+            ];
+            let mut channel =
+                FsChannelTrace::new_c1(&mut builder, b"selected-block-sidecar-row-ledger-c1");
+            let mut context =
+                FieldPostCommitTraceContext::detached(&root, total_vars, &mut channel);
+            let start = builder.num_wires();
+            verify_block_region_sidecar_trace_post_commit(&mut builder, &mut context, &vk, &proof)
+                .unwrap();
+            eprintln!(
+                "[sidecar-row-ledger] block B{tier}: {} wires",
+                builder.num_wires() - start
+            );
+
+            let mut builder = FieldR1csBuilder::new_witness_only();
+            let root = [
+                crate::acceptance::trace::LinExpr::zero(),
+                crate::acceptance::trace::LinExpr::zero(),
+            ];
+            let mut channel =
+                FsChannelUnionRecorder::new_c1(b"selected-block-sidecar-recorded-row-ledger-c1");
+            let mut context =
+                FieldPostCommitTraceContext::detached(&root, total_vars, &mut channel);
+            let start = builder.num_wires();
+            let recording = verify_block_region_sidecar_recorded_trace_post_commit(
+                &mut builder,
+                &mut context,
+                &vk,
+                &proof,
+            )
+            .unwrap();
+            eprintln!(
+                "[sidecar-row-ledger] block-recorded B{tier}: {} wires, {} child ops, {} outer ops",
+                builder.num_wires() - start,
+                recording.ops.len(),
+                channel.finish().ops.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn selected_v6_codecs_bind_both_repetitions() {
+        let total_vars = 23;
+        let vk = selected_vk_fixture(64);
+        let proof = shape_only_block_region_sidecar_proof(&vk, total_vars).unwrap();
+
+        let canonical = encode_block_region_sidecar_canonical(&vk, total_vars, &proof).unwrap();
+        assert_eq!(
+            canonical.len(),
+            canonical_block_region_sidecar_len(&vk, total_vars).unwrap()
+        );
+        assert_eq!(
+            decode_block_region_sidecar_canonical(&vk, total_vars, &canonical).unwrap(),
+            proof
+        );
+
+        let encoded = bincode::serialize(&proof).unwrap();
+        assert_eq!(
+            decode_block_region_sidecar_bounded(&vk, total_vars, &encoded).unwrap(),
+            proof
+        );
+        let shapes = block_bounded_shapes(&vk, total_vars).unwrap();
+        let repeated_shapes = (0..SIDECAR_C1_REPETITIONS)
+            .flat_map(|_| shapes.iter().cloned())
+            .collect::<Vec<_>>();
+        let offsets = bounded_decode::composite_layout_offsets(
+            &encoded,
+            BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION,
+            &repeated_shapes,
+        )
+        .unwrap();
+        let versions = offsets
+            .iter()
+            .filter_map(|(field, offset)| {
+                (*field == bounded_decode::LayoutField::Version).then_some(*offset)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            versions.len(),
+            1 + 6 * SIDECAR_C1_REPETITIONS,
+            "envelope plus six child versions per repetition"
+        );
+        for offset in &versions[1..] {
+            let mut forged = encoded.clone();
+            forged[*offset] ^= 1;
+            assert_eq!(
+                decode_block_region_sidecar_bounded(&vk, total_vars, &forged).unwrap_err(),
+                RegionSidecarError::UnsupportedVersion
+            );
+        }
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert_eq!(
+            decode_block_region_sidecar_bounded(&vk, total_vars, &trailing).unwrap_err(),
+            RegionSidecarError::InvalidProof
+        );
+        let mut wrong_version = encoded;
+        wrong_version[0] = BLOCK_REGION_SELECTED_ZK_SIDECAR_VERSION.wrapping_add(1);
+        assert_eq!(
+            decode_block_region_sidecar_bounded(&vk, total_vars, &wrong_version).unwrap_err(),
+            RegionSidecarError::UnsupportedVersion
+        );
+    }
+
+    #[test]
+    fn selected_history_recording_geometry_row_ledger() {
+        use noid_ivc_core::field_circuit::FsChannelUnionRecorder;
+
+        let parts = crate::acceptance::history_step::derive_history_step_runtime_parts([
+            selected_vk_fixture(64),
+            selected_vk_fixture(255),
+        ])
+        .unwrap();
+        eprintln!(
+            "[history-recording-ledger] link columns: leaf=2^{} path=2^{} recording=2^{}",
+            parts.parent_recursion_vk().leaf_a().w_log(),
+            parts.parent_recursion_vk().path_b().w_log(),
+            parts.parent_recursion_vk().rec_c().w_log(),
+        );
+        let mut padded_total = 0usize;
+        for (slot, transcript) in parts.parent_transcripts().iter().enumerate() {
+            for (role, layout) in [
+                ("child", transcript.child()),
+                ("r-prev", transcript.r_prev()),
+            ] {
+                let padded = layout.slots.len().next_power_of_two();
+                padded_total += padded;
+                eprintln!(
+                    "[history-recording-ledger] slot {slot} {role}: {} slots, {} data, {} challenges -> {}",
+                    layout.slots.len(),
+                    layout.n_data,
+                    layout.challenges.len(),
+                    padded,
+                );
+            }
+        }
+        let binding_cells = |layout: &noid_ivc_core::deep_chain::schedule::DuplexLayout| {
+            let mut cells = std::collections::BTreeSet::new();
+            for &(slot, lane) in &layout.challenges {
+                assert!(cells.insert((2 + lane, slot)));
+            }
+            for (slot, lane) in
+                crate::acceptance::trace::region_source_binding::duplex_data_positions(layout)
+            {
+                assert!(cells.insert((lane, slot)));
+            }
+            cells
+        };
+        let transcripts = parts.parent_transcripts();
+        let layouts = [
+            ("c0", transcripts[0].child()),
+            ("r0", transcripts[0].r_prev()),
+            ("c1", transcripts[1].child()),
+            ("r1", transcripts[1].r_prev()),
+        ];
+        let cells = layouts
+            .iter()
+            .map(|(_, layout)| binding_cells(layout))
+            .collect::<Vec<_>>();
+        for left in 0..2 {
+            for right in 2..4 {
+                eprintln!(
+                    "[history-recording-ledger] overlap {}:{} = {}",
+                    layouts[left].0,
+                    layouts[right].0,
+                    cells[left].intersection(&cells[right]).count(),
+                );
+            }
+        }
+        eprintln!(
+            "[history-recording-ledger] packed: {} -> {}",
+            padded_total,
+            padded_total.next_power_of_two(),
+        );
+        for total_vars in [23usize, 24] {
+            let proof = crate::region_sidecar::shape_only_link_region_sidecar_proof(
+                parts.parent_recursion_vk(),
+                total_vars,
+            )
+            .unwrap();
+            let mut builder = FieldR1csBuilder::new_witness_only();
+            let root = [
+                crate::acceptance::trace::LinExpr::zero(),
+                crate::acceptance::trace::LinExpr::zero(),
+            ];
+            let mut channel =
+                FsChannelUnionRecorder::new_c1(b"production-link-sidecar-row-ledger-c1");
+            let mut context =
+                FieldPostCommitTraceContext::detached(&root, total_vars, &mut channel);
+            let start = builder.num_wires();
+            crate::region_sidecar::verify_link_region_sidecar_trace_post_commit(
+                &mut builder,
+                &mut context,
+                parts.parent_recursion_vk(),
+                &proof,
+            )
+            .unwrap();
+            let recording = channel.finish();
+            eprintln!(
+                "[history-recording-ledger] production link m{total_vars}: {} wires, {} ops, {} data, {} challenges",
+                builder.num_wires() - start,
+                recording.ops.len(),
+                recording.data_wires.len(),
+                recording.challenge_wires.len(),
+            );
+        }
     }
 
     #[test]
@@ -1954,7 +2433,7 @@ mod tests {
         );
 
         let mut wrong_domain = exact.clone();
-        let owner_layout = ZkAuthCapsuleDuplexSchedules::selected().owner_layout();
+        let owner_layout = ZkAuthCapsuleDuplexSchedules::selected().owner_sidecar_layout();
         let [iv_hi, iv_lo] = capacity_iv(noid_poseidon2b::native::domain::TAG_FRICHANL);
         wrong_domain.owner_c.fixed = duplex_fixed_patterns(
             &owner_layout,
@@ -1983,7 +2462,7 @@ mod tests {
         );
 
         let mut overlap = exact.clone();
-        let owner_layout = ZkAuthCapsuleDuplexSchedules::selected().owner_layout();
+        let owner_layout = ZkAuthCapsuleDuplexSchedules::selected().owner_sidecar_layout();
         overlap.owner_c = selected_duplex_vk(
             selected_zk_auth_owner_sidecar_purpose(),
             &owner_layout,

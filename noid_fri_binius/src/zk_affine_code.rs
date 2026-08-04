@@ -29,26 +29,29 @@ pub const AFFINE_SELECTED_RS_LAYER_COUNT: usize = 8;
 pub const AFFINE_FUNDAMENTAL_LOG: usize = 9;
 pub const AFFINE_FUNDAMENTAL_LEN: usize = 1 << AFFINE_FUNDAMENTAL_LOG;
 pub const AFFINE_STATE_LEN: usize = 512;
-pub const AFFINE_PCS_COINS_START: usize = AFFINE_STATE_LEN;
-pub const AFFINE_PCS_COINS_LEN: usize = 512;
-pub const AFFINE_LIBRA_MASK_START: usize = AFFINE_PCS_COINS_START + AFFINE_PCS_COINS_LEN;
+pub const AFFINE_LIBRA_MASK_START: usize = AFFINE_STATE_LEN;
 pub const AFFINE_LIBRA_MASK_LEN: usize = 256;
 pub const AFFINE_FRESH_PADDING_START: usize = AFFINE_LIBRA_MASK_START + AFFINE_LIBRA_MASK_LEN;
-pub const AFFINE_FRESH_PADDING_LEN: usize = AFFINE_CODE_MESSAGE_LEN - AFFINE_FRESH_PADDING_START;
+pub const AFFINE_PCS_COINS_LEN: usize = 1 << 10;
+pub const AFFINE_PCS_COINS_START: usize = AFFINE_CODE_MESSAGE_LEN - AFFINE_PCS_COINS_LEN;
+pub const AFFINE_FRESH_PADDING_LEN: usize = AFFINE_PCS_COINS_START - AFFINE_FRESH_PADDING_START;
 pub const AFFINE_RANK_RANDOM_BLOCK_START: usize = AFFINE_PCS_COINS_START;
-pub const AFFINE_RANK_RANDOM_BLOCK_LEN: usize = 1 << 9;
+pub const AFFINE_RANK_RANDOM_BLOCK_LEN: usize = AFFINE_PCS_COINS_LEN;
 pub const AFFINE_RANK_MAX_QUERIES: usize = AFFINE_RANK_RANDOM_BLOCK_LEN;
+pub const AFFINE_RANK_FACTOR_LEVEL: usize =
+    AFFINE_RANK_RANDOM_BLOCK_START.trailing_zeros() as usize;
 
 const _: () = assert!(AFFINE_CODE_LOG_LEN == 16);
 const _: () = assert!(AFFINE_CODE_MESSAGE_LEN == 2_048);
 const _: () = assert!(AFFINE_CODE_LEN == 65_536);
 const _: () = assert!(AFFINE_SELECTED_RS_LAYER_COUNT == 8);
 const _: () = assert!(AFFINE_SELECTED_RS_LAYER_COUNT <= AFFINE_CODE_MESSAGE_LOG + 1);
-const _: () = assert!(AFFINE_PCS_COINS_START == 512);
-const _: () = assert!(AFFINE_PCS_COINS_LEN == 512);
-const _: () = assert!(AFFINE_LIBRA_MASK_START == 1_024);
-const _: () = assert!(AFFINE_FRESH_PADDING_START == 1_280);
-const _: () = assert!(AFFINE_FRESH_PADDING_LEN == 768);
+const _: () = assert!(AFFINE_LIBRA_MASK_START == 512);
+const _: () = assert!(AFFINE_FRESH_PADDING_START == 768);
+const _: () = assert!(AFFINE_FRESH_PADDING_LEN == 256);
+const _: () = assert!(AFFINE_PCS_COINS_START == 1_024);
+const _: () = assert!(AFFINE_PCS_COINS_LEN == 1_024);
+const _: () = assert!(AFFINE_RANK_FACTOR_LEVEL == 10);
 const _: () = assert!(
     AFFINE_RANK_RANDOM_BLOCK_START + AFFINE_RANK_RANDOM_BLOCK_LEN <= AFFINE_CODE_MESSAGE_LEN
 );
@@ -165,11 +168,11 @@ pub struct AffineSelectedRsManifest {
 
 /// Structural row-rank certificate for opened affine positions.
 ///
-/// The certificate assumes logical novel coefficients `512..1024` are
+/// The certificate assumes logical novel coefficients `1024..2048` are
 /// independently uniform and are not later conditioned by another claim.
-/// Since `X_{512+j} = W_9 * X_j`, `W_9` is nonzero on the affine domain,
-/// and `{X_j}_{j<512}` spans all degree-`<512` polynomials, observations at
-/// `q <= 512` distinct points have row rank exactly `q`.
+/// Since `X_{1024+j} = W_10 * X_j`, `W_10` is nonzero on the affine domain,
+/// and `{X_j}_{j<1024}` spans all degree-`<1024` polynomials, observations at
+/// `q <= 1024` distinct points have row rank exactly `q`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AffineHighPaddingRankCertificate {
     pub distinct_query_count: usize,
@@ -412,7 +415,7 @@ impl ZkAffineLchCode {
     }
 
     /// Certify the observation rank contributed by the dedicated independent
-    /// random coefficient block `512..1024` after deduplicating query
+    /// random coefficient block `1024..2048` after deduplicating query
     /// positions. Randomness/conditioning is a caller-side precondition; this
     /// helper certifies only the affine-domain algebra.
     pub fn certify_high_padding_rank(
@@ -433,10 +436,13 @@ impl ZkAffineLchCode {
             });
         }
 
-        // X_{512+j} = W_9 * X_j. beta is outside V_16, hence outside
-        // V_9, so W_9 never vanishes on beta + V_16.
+        // X_{1024+j} = W_10 * X_j. beta is outside V_16, hence outside
+        // V_10, so W_10 never vanishes on beta + V_16.
+        let factor_level = AFFINE_RANK_FACTOR_LEVEL;
         for position in distinct.iter().copied() {
-            if self.normalized_subspace_eval_flat(9, self.domain_point_flat(position)) == 0 {
+            if self.normalized_subspace_eval_flat(factor_level, self.domain_point_flat(position))
+                == 0
+            {
                 return Err(ZkAffineCodeError::RankFactorVanished);
             }
         }
@@ -446,7 +452,7 @@ impl ZkAffineLchCode {
             certified_rank: distinct.len(),
             independent_coeff_start: AFFINE_RANK_RANDOM_BLOCK_START,
             independent_coeff_len: AFFINE_RANK_RANDOM_BLOCK_LEN,
-            nonzero_factor_level: 9,
+            nonzero_factor_level: factor_level,
         })
     }
 
@@ -491,6 +497,35 @@ impl ZkAffineLchCode {
         }
         self.forward_flat(&mut data, code_log);
         Ok(data.into_iter().map(from_flat).collect())
+    }
+
+    /// Encode extension-field coefficients with the same frozen affine LCH
+    /// butterfly schedule. Twiddles remain in the embedded GF(2^128)
+    /// subfield; only the message and all derived symbols live in `F`.
+    pub fn encode_extension_after_low_folds<F>(
+        &self,
+        message: &[F],
+        folds_done: usize,
+    ) -> Result<Vec<F>, ZkAffineCodeError>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if folds_done > AFFINE_CODE_MESSAGE_LOG {
+            return Err(ZkAffineCodeError::FoldCountOutOfRange);
+        }
+        let message_log = AFFINE_CODE_MESSAGE_LOG - folds_done;
+        let expected_message_len = 1usize << message_log;
+        if message.len() != expected_message_len {
+            return Err(ZkAffineCodeError::MessageLength {
+                expected: expected_message_len,
+                actual: message.len(),
+            });
+        }
+        let code_log = AFFINE_CODE_LOG_LEN - folds_done;
+        let mut data = vec![F::ZERO; 1usize << code_log];
+        data[..message.len()].copy_from_slice(message);
+        self.forward_extension(&mut data, code_log);
+        Ok(data)
     }
 
     /// Exact inverse of one forward butterfly.
@@ -601,6 +636,32 @@ impl ZkAffineLchCode {
         Ok(u + challenge * (u + v))
     }
 
+    /// Extension-field form of [`Self::fold_pair`]. The inverse-butterfly
+    /// twiddle is embedded from the base field before the wide fold.
+    pub fn fold_pair_extension<F>(
+        &self,
+        folds_done: usize,
+        pair_index: usize,
+        left: F,
+        right: F,
+        challenge: F,
+    ) -> Result<F, ZkAffineCodeError>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if folds_done >= AFFINE_CODE_LOG_LEN {
+            return Err(ZkAffineCodeError::FoldCountOutOfRange);
+        }
+        let layer = AFFINE_CODE_LOG_LEN - folds_done - 1;
+        if pair_index >= 1usize << layer {
+            return Err(ZkAffineCodeError::BlockOutOfRange);
+        }
+        let twiddle = F::from(self.twiddle(layer, pair_index)?);
+        let v = right + left;
+        let u = left + v * twiddle;
+        Ok(u + challenge * (u + v))
+    }
+
     pub fn fold_codeword_once(
         &self,
         codeword: &[Block128],
@@ -622,6 +683,35 @@ impl ZkAffineLchCode {
             .enumerate()
             .map(|(pair_index, pair)| {
                 self.fold_pair(folds_done, pair_index, pair[0], pair[1], challenge)
+            })
+            .collect()
+    }
+
+    /// Extension-field form of [`Self::fold_codeword_once`].
+    pub fn fold_codeword_once_extension<F>(
+        &self,
+        codeword: &[F],
+        folds_done: usize,
+        challenge: F,
+    ) -> Result<Vec<F>, ZkAffineCodeError>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if folds_done >= AFFINE_CODE_LOG_LEN {
+            return Err(ZkAffineCodeError::FoldCountOutOfRange);
+        }
+        let expected = 1usize << (AFFINE_CODE_LOG_LEN - folds_done);
+        if codeword.len() != expected {
+            return Err(ZkAffineCodeError::CodewordLength {
+                expected,
+                actual: codeword.len(),
+            });
+        }
+        codeword
+            .chunks_exact(2)
+            .enumerate()
+            .map(|(pair_index, pair)| {
+                self.fold_pair_extension(folds_done, pair_index, pair[0], pair[1], challenge)
             })
             .collect()
     }
@@ -667,6 +757,183 @@ impl ZkAffineLchCode {
             current = next;
         }
         Ok(current[0])
+    }
+
+    /// Extension-field form of [`Self::fold_contiguous_coset`].
+    pub fn fold_contiguous_coset_extension<F>(
+        &self,
+        coset: &[F],
+        folds_done: usize,
+        coset_index: usize,
+        challenges: &[F],
+    ) -> Result<F, ZkAffineCodeError>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if folds_done + challenges.len() > AFFINE_CODE_LOG_LEN {
+            return Err(ZkAffineCodeError::FoldCountOutOfRange);
+        }
+        let expected_coset_len = 1usize << challenges.len();
+        if coset.len() != expected_coset_len {
+            return Err(ZkAffineCodeError::CosetLength {
+                expected: expected_coset_len,
+                actual: coset.len(),
+            });
+        }
+        let current_code_len = 1usize << (AFFINE_CODE_LOG_LEN - folds_done);
+        if coset_index >= current_code_len / expected_coset_len {
+            return Err(ZkAffineCodeError::CosetIndexOutOfRange);
+        }
+
+        let mut current = coset.to_vec();
+        for (inner_fold, &challenge) in challenges.iter().enumerate() {
+            let next_len = current.len() / 2;
+            let mut next = Vec::with_capacity(next_len);
+            for pair in 0..next_len {
+                let global_pair_index = coset_index * next_len + pair;
+                next.push(self.fold_pair_extension(
+                    folds_done + inner_fold,
+                    global_pair_index,
+                    current[2 * pair],
+                    current[2 * pair + 1],
+                    challenge,
+                )?);
+            }
+            current = next;
+        }
+        Ok(current[0])
+    }
+
+    /// Convert one opened affine-code coset to its local fold-normal table.
+    ///
+    /// Entry `i` of the returned table is the result of applying the exact
+    /// inverse LCH butterflies with every local fold challenge fixed to the
+    /// bits of `i` (lowest challenge in the least-significant bit).  Hence a
+    /// plain multilinear evaluation of the returned table at arbitrary
+    /// challenges is exactly [`Self::fold_contiguous_coset_extension`] on the
+    /// original coset.  The transform is invertible and never mixes distinct
+    /// committed leaves.
+    pub fn fold_normalize_coset<F>(
+        &self,
+        coset: &[F],
+        folds_done: usize,
+        coset_index: usize,
+    ) -> Result<Vec<F>, ZkAffineCodeError>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if coset.is_empty() || !coset.len().is_power_of_two() {
+            return Err(ZkAffineCodeError::CosetLength {
+                expected: coset.len().max(1).next_power_of_two(),
+                actual: coset.len(),
+            });
+        }
+        let local_folds = coset.len().trailing_zeros() as usize;
+        if folds_done + local_folds > AFFINE_CODE_LOG_LEN {
+            return Err(ZkAffineCodeError::FoldCountOutOfRange);
+        }
+        let current_code_len = 1usize << (AFFINE_CODE_LOG_LEN - folds_done);
+        if coset_index >= current_code_len / coset.len() {
+            return Err(ZkAffineCodeError::CosetIndexOutOfRange);
+        }
+
+        // After round r, the low r+1 table bits are the Boolean values of
+        // challenges 0..=r.  Coefficients for those bits remain adjacent,
+        // while the next inverse butterfly joins neighboring coefficient
+        // blocks of size 2^r.
+        let mut table = coset.to_vec();
+        for inner_fold in 0..local_folds {
+            let coefficient_count = 1usize << inner_fold;
+            let next_len = coset.len() >> (inner_fold + 1);
+            let layer = AFFINE_CODE_LOG_LEN - folds_done - inner_fold - 1;
+            for pair in 0..next_len {
+                let global_pair_index = coset_index * next_len + pair;
+                let twiddle = F::from(self.twiddle(layer, global_pair_index)?);
+                let base = 2 * pair * coefficient_count;
+                for coefficient in 0..coefficient_count {
+                    let left_index = base + coefficient;
+                    let right_index = left_index + coefficient_count;
+                    let left = table[left_index];
+                    let right = table[right_index];
+                    let v = right + left;
+                    let u = left + v * twiddle;
+                    table[left_index] = u;
+                    table[right_index] = v;
+                }
+            }
+        }
+        Ok(table)
+    }
+
+    /// Restore the raw coset from [`Self::fold_normalize_coset`].
+    pub fn fold_denormalize_coset<F>(
+        &self,
+        table: &[F],
+        folds_done: usize,
+        coset_index: usize,
+    ) -> Result<Vec<F>, ZkAffineCodeError>
+    where
+        F: TowerField + From<Block128>,
+    {
+        if table.is_empty() || !table.len().is_power_of_two() {
+            return Err(ZkAffineCodeError::CosetLength {
+                expected: table.len().max(1).next_power_of_two(),
+                actual: table.len(),
+            });
+        }
+        let local_folds = table.len().trailing_zeros() as usize;
+        if folds_done + local_folds > AFFINE_CODE_LOG_LEN {
+            return Err(ZkAffineCodeError::FoldCountOutOfRange);
+        }
+        let current_code_len = 1usize << (AFFINE_CODE_LOG_LEN - folds_done);
+        if coset_index >= current_code_len / table.len() {
+            return Err(ZkAffineCodeError::CosetIndexOutOfRange);
+        }
+
+        let mut coset = table.to_vec();
+        for inner_fold in (0..local_folds).rev() {
+            let coefficient_count = 1usize << inner_fold;
+            let next_len = table.len() >> (inner_fold + 1);
+            let layer = AFFINE_CODE_LOG_LEN - folds_done - inner_fold - 1;
+            for pair in 0..next_len {
+                let global_pair_index = coset_index * next_len + pair;
+                let twiddle = F::from(self.twiddle(layer, global_pair_index)?);
+                let base = 2 * pair * coefficient_count;
+                for coefficient in 0..coefficient_count {
+                    let left_index = base + coefficient;
+                    let right_index = left_index + coefficient_count;
+                    let u = coset[left_index];
+                    let v = coset[right_index];
+                    let left = u + v * twiddle;
+                    coset[left_index] = left;
+                    coset[right_index] = v + left;
+                }
+            }
+        }
+        Ok(coset)
+    }
+
+    fn forward_extension<F>(&self, data: &mut [F], code_log: usize)
+    where
+        F: TowerField + From<Block128>,
+    {
+        debug_assert_eq!(data.len(), 1usize << code_log);
+        for layer in 0..code_log {
+            let block_size = 1usize << (code_log - layer);
+            let half = block_size / 2;
+            for block in 0..1usize << layer {
+                let twiddle = F::from(from_flat(self.twiddles_flat[layer][block]));
+                let start = block * block_size;
+                for offset in 0..half {
+                    let left = start + offset;
+                    let right = left + half;
+                    let v = data[right];
+                    let new_u = data[left] + v * twiddle;
+                    data[left] = new_u;
+                    data[right] = v + new_u;
+                }
+            }
+        }
     }
 
     fn forward_flat(&self, data: &mut [u128], code_log: usize) {
@@ -758,7 +1025,9 @@ fn binary_span_contains(basis: &[u128], value: u128) -> bool {
 mod tests {
     use std::collections::HashSet;
 
+    use noid_core::mle::evaluate::evaluate_slice;
     use noid_core::mle::fold::fold_variable_inplace;
+    use noid_core::Block256;
 
     use super::*;
 
@@ -782,6 +1051,48 @@ mod tests {
             fold_variable_inplace(&mut message, challenge, 0);
         }
         message
+    }
+
+    #[test]
+    fn fold_normal_cosets_are_invertible_and_match_wide_affine_folds() {
+        let code = ZkAffineLchCode::selected().unwrap();
+        for (case, folds_done, local_folds, coset_index) in [
+            (0usize, 0usize, 3usize, 0usize),
+            (1, 0, 3, (1usize << 13) - 1),
+            (2, 3, 4, 0),
+            (3, 3, 4, (1usize << 9) - 1),
+        ] {
+            let raw = (0..1usize << local_folds)
+                .map(|index| {
+                    Block256::new(
+                        elem(case * 100 + index + 1, 0xF01D_0001),
+                        elem(case * 100 + index + 41, 0xF01D_0002),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let challenges = (0..local_folds)
+                .map(|index| {
+                    Block256::new(
+                        elem(case * 100 + index + 81, 0xF01D_0003),
+                        elem(case * 100 + index + 121, 0xF01D_0004),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            let normalized = code
+                .fold_normalize_coset(&raw, folds_done, coset_index)
+                .unwrap();
+            let restored = code
+                .fold_denormalize_coset(&normalized, folds_done, coset_index)
+                .unwrap();
+            assert_eq!(restored, raw, "fold-normal inverse, case {case}");
+
+            let expected = code
+                .fold_contiguous_coset_extension(&raw, folds_done, coset_index, &challenges)
+                .unwrap();
+            let actual = evaluate_slice(&normalized, &challenges);
+            assert_eq!(actual, expected, "fold-normal evaluation, case {case}");
+        }
     }
 
     fn direct_novel_eval(
@@ -978,30 +1289,30 @@ mod tests {
     }
 
     #[test]
-    fn independent_high_padding_block_certifies_rank_512() {
+    fn independent_pcs_coin_block_certifies_rank_1024() {
         let code = ZkAffineLchCode::selected().unwrap();
-        assert_eq!(AFFINE_PCS_COINS_START, 512);
-        assert_eq!(AFFINE_PCS_COINS_LEN, 512);
-        assert_eq!(AFFINE_LIBRA_MASK_START, 1_024);
+        assert_eq!(AFFINE_LIBRA_MASK_START, 512);
         assert_eq!(AFFINE_LIBRA_MASK_LEN, 256);
-        assert_eq!(AFFINE_FRESH_PADDING_START, 1_280);
-        assert_eq!(AFFINE_FRESH_PADDING_LEN, 768);
-        assert_eq!(AFFINE_RANK_RANDOM_BLOCK_START, 512);
-        assert_eq!(AFFINE_RANK_RANDOM_BLOCK_LEN, 512);
+        assert_eq!(AFFINE_FRESH_PADDING_START, 768);
+        assert_eq!(AFFINE_FRESH_PADDING_LEN, 256);
+        assert_eq!(AFFINE_PCS_COINS_START, 1_024);
+        assert_eq!(AFFINE_PCS_COINS_LEN, 1_024);
+        assert_eq!(AFFINE_RANK_RANDOM_BLOCK_START, 1_024);
+        assert_eq!(AFFINE_RANK_RANDOM_BLOCK_LEN, 1_024);
 
-        // The unit coefficient X_512 is exactly the nonvanishing W_9
-        // factor shared by the certified 512-coefficient random block.
+        // The unit coefficient X_1024 is exactly the nonvanishing W_10
+        // factor shared by the certified 1024-coefficient random block.
         let mut unit = vec![Block128::ZERO; AFFINE_CODE_MESSAGE_LEN];
         unit[AFFINE_RANK_RANDOM_BLOCK_START] = Block128::ONE;
         let encoded_unit = code.encode(&unit).unwrap();
         for position in 0..AFFINE_CODE_LEN {
             let point = code.domain_point_flat(position);
-            let factor = code.normalized_subspace_eval_flat(9, point);
-            assert_ne!(factor, 0, "W_9 vanished at domain position {position}");
+            let factor = code.normalized_subspace_eval_flat(10, point);
+            assert_ne!(factor, 0, "W_10 vanished at domain position {position}");
             assert_eq!(to_flat(encoded_unit[position]), factor);
         }
 
-        // X_{512+j} = W_9 * X_j pins the structural Vandermonde
+        // X_{1024+j} = W_10 * X_j pins the structural Vandermonde
         // factorization independently of the encoder implementation.
         for position in [0, 1, 255, 4_097, AFFINE_CODE_LEN - 1] {
             let point = code.domain_point_flat(position);
@@ -1019,18 +1330,18 @@ mod tests {
             .collect();
         queries.extend_from_slice(&queries[..16].to_vec());
         let certificate = code.certify_high_padding_rank(&queries).unwrap();
-        assert_eq!(certificate.distinct_query_count, 512);
-        assert_eq!(certificate.certified_rank, 512);
-        assert_eq!(certificate.independent_coeff_start, 512);
-        assert_eq!(certificate.independent_coeff_len, 512);
-        assert_eq!(certificate.nonzero_factor_level, 9);
+        assert_eq!(certificate.distinct_query_count, 1_024);
+        assert_eq!(certificate.certified_rank, 1_024);
+        assert_eq!(certificate.independent_coeff_start, 1_024);
+        assert_eq!(certificate.independent_coeff_len, 1_024);
+        assert_eq!(certificate.nonzero_factor_level, 10);
 
         let too_many: Vec<usize> = (0..=AFFINE_RANK_MAX_QUERIES).collect();
         assert_eq!(
             code.certify_high_padding_rank(&too_many),
             Err(ZkAffineCodeError::TooManyDistinctQueries {
-                max: 512,
-                actual: 513,
+                max: 1_024,
+                actual: 1_025,
             })
         );
     }
@@ -1078,12 +1389,7 @@ mod tests {
             for domain_index in sampled {
                 assert_eq!(
                     encoded[domain_index],
-                    direct_projected_novel_eval(
-                        &code,
-                        &layer_message,
-                        folds_done,
-                        domain_index,
-                    ),
+                    direct_projected_novel_eval(&code, &layer_message, folds_done, domain_index,),
                     "direct projected evaluation drift at layer {folds_done}, coordinate {domain_index}"
                 );
             }

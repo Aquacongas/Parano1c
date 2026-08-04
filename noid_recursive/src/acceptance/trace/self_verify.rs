@@ -34,7 +34,8 @@ use noid_ivc_core::zerocheck::{self, K_SKIP};
 use noid_poseidon2b::native::{capacity_iv_flat, DomainTag};
 
 use super::{
-    evaluate_slice_trace, mul, pin_eq, poseidon2b_permute, FieldR1csBuilder, LinExpr, F128,
+    eq_ind_partial_eval_ext_trace, evaluate_slice_trace, mul, mul_ext, pin_eq, pin_eq_ext,
+    poseidon2b_permute, ExtExpr, FieldR1csBuilder, LinExpr, F128, F256,
 };
 
 /// A 32-byte digest as two little-endian **flat** u128 lanes (see module
@@ -309,6 +310,38 @@ pub fn bind_statement_field_parts_trace(
     observe_flat_digest(b, ch, root);
 }
 
+pub fn bind_statement_field_parts_c1_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    statement_digest: &FlatDigestExpr,
+    pcs_params: &PcsParams,
+    root: &FlatDigestExpr,
+) {
+    ch.observe_label(b, b"history-field-r1cs-c1");
+    observe_flat_digest(b, ch, statement_digest);
+    ch.observe_bytes_const(
+        b,
+        &noid_ivc_core::proof::pcs_params_statement_bytes(pcs_params),
+    );
+    observe_flat_digest(b, ch, root);
+}
+
+pub fn bind_statement_field_c1_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    r1cs: &FieldR1cs,
+    pcs_params: &PcsParams,
+    root: &FlatDigestExpr,
+) {
+    ch.observe_label(b, b"history-field-r1cs-c1");
+    ch.observe_bytes_const(b, &r1cs.statement_digest());
+    ch.observe_bytes_const(
+        b,
+        &noid_ivc_core::proof::pcs_params_statement_bytes(pcs_params),
+    );
+    observe_flat_digest(b, ch, root);
+}
+
 // ---------------------------------------------------------------------------
 // Lagrange interpolation over φ_8 node windows
 // ---------------------------------------------------------------------------
@@ -415,6 +448,94 @@ fn inverse_trace(b: &mut FieldR1csBuilder, x: &LinExpr) -> LinExpr {
     let prod = mul(b, x, &inv);
     pin_eq(b, &prod, &LinExpr::constant(F128::ONE));
     inv
+}
+
+fn alloc_f256(b: &mut FieldR1csBuilder, value: F256) -> ExtExpr {
+    ExtExpr::new(
+        LinExpr::from_wire(b.alloc_f128(value.lo)),
+        LinExpr::from_wire(b.alloc_f128(value.hi)),
+    )
+}
+
+fn inverse_ext_trace(b: &mut FieldR1csBuilder, value: &ExtExpr) -> ExtExpr {
+    let inverse = alloc_f256(b, value.eval(b.values()).inv());
+    let product = mul_ext(b, value, &inverse);
+    pin_eq_ext(b, &product, &ExtExpr::one());
+    inverse
+}
+
+pub(super) fn lagrange_weights_window_ext_trace(
+    b: &mut FieldR1csBuilder,
+    z: &ExtExpr,
+    node_start: usize,
+    node_count: usize,
+    keep_from: usize,
+) -> Vec<ExtExpr> {
+    assert!(node_start + node_count <= PHI_8_TABLE.len());
+    assert!(keep_from < node_count);
+    let nodes = &PHI_8_TABLE[node_start..node_start + node_count];
+    let factors = nodes
+        .iter()
+        .map(|&node| z.add_const(F256::from_base(node)))
+        .collect::<Vec<_>>();
+
+    let mut prefix = vec![ExtExpr::one()];
+    for factor in &factors[..node_count - 1] {
+        let previous = prefix.last().expect("nonempty prefix").clone();
+        prefix.push(mul_ext(b, &previous, factor));
+    }
+    let mut suffix = vec![ExtExpr::one(); node_count + 1];
+    for index in (0..node_count).rev() {
+        if index + 1 > keep_from {
+            suffix[index] = mul_ext(b, &suffix[index + 1].clone(), &factors[index]);
+        }
+    }
+
+    (keep_from..node_count)
+        .map(|index| {
+            let numerator = mul_ext(b, &prefix[index], &suffix[index + 1]);
+            let mut denominator = F128::ONE;
+            for (other, &node) in nodes.iter().enumerate() {
+                if other != index {
+                    denominator *= nodes[index] + node;
+                }
+            }
+            numerator.scale_base(denominator.inv())
+        })
+        .collect()
+}
+
+fn dot_ext_trace(b: &mut FieldR1csBuilder, left: &[ExtExpr], right: &[ExtExpr]) -> ExtExpr {
+    assert_eq!(left.len(), right.len());
+    left.iter()
+        .zip(right)
+        .fold(ExtExpr::zero(), |sum, (left, right)| {
+            sum.add(&mul_ext(b, left, right))
+        })
+}
+
+fn interpolate_lambda_ext_trace(
+    b: &mut FieldR1csBuilder,
+    values: &[ExtExpr],
+    k_skip: usize,
+    z: &ExtExpr,
+) -> ExtExpr {
+    let count = 1usize << k_skip;
+    assert_eq!(values.len(), count);
+    let weights = lagrange_weights_window_ext_trace(b, z, count, count, 0);
+    dot_ext_trace(b, &weights, values)
+}
+
+fn interpolate_combined_ext_trace(
+    b: &mut FieldR1csBuilder,
+    values: &[ExtExpr],
+    k_skip: usize,
+    z: &ExtExpr,
+) -> ExtExpr {
+    let count = 1usize << k_skip;
+    assert_eq!(values.len(), count);
+    let weights = lagrange_weights_window_ext_trace(b, z, 0, 2 * count, count);
+    dot_ext_trace(b, &weights, values)
 }
 
 // ---------------------------------------------------------------------------
@@ -562,6 +683,117 @@ pub fn zerocheck_field_verify_trace(
     }
 }
 
+pub struct C1ZerocheckProofTrace {
+    pub round1_ab: Vec<ExtExpr>,
+    pub round1_c: Vec<ExtExpr>,
+    pub multilinear_rounds: Vec<(ExtExpr, ExtExpr)>,
+    pub final_a_eval: ExtExpr,
+    pub final_b_eval: ExtExpr,
+    pub final_c_eval: ExtExpr,
+}
+
+impl C1ZerocheckProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &zerocheck::field_c1::C1ZerocheckProof,
+        m: usize,
+    ) -> Self {
+        let count = 1usize << K_SKIP;
+        assert!(m >= K_SKIP + 1);
+        assert_eq!(native.round1_ab.len(), count);
+        assert_eq!(native.round1_c.len(), count);
+        assert_eq!(native.multilinear_rounds.len(), m - K_SKIP);
+        Self {
+            round1_ab: native
+                .round1_ab
+                .iter()
+                .map(|&value| alloc_f256(b, value))
+                .collect(),
+            round1_c: native
+                .round1_c
+                .iter()
+                .map(|&value| alloc_f256(b, value))
+                .collect(),
+            multilinear_rounds: native
+                .multilinear_rounds
+                .iter()
+                .map(|&(one, infinity)| (alloc_f256(b, one), alloc_f256(b, infinity)))
+                .collect(),
+            final_a_eval: alloc_f256(b, native.final_a_eval),
+            final_b_eval: alloc_f256(b, native.final_b_eval),
+            final_c_eval: alloc_f256(b, native.final_c_eval),
+        }
+    }
+}
+
+pub struct C1ZerocheckClaimTrace {
+    pub z: ExtExpr,
+    pub mlv_challenges: Vec<ExtExpr>,
+    pub r_rest: Vec<ExtExpr>,
+    pub a_eval: ExtExpr,
+    pub b_eval: ExtExpr,
+    pub c_eval: ExtExpr,
+}
+
+pub fn zerocheck_field_verify_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    log_n: usize,
+    proof: &C1ZerocheckProofTrace,
+) -> C1ZerocheckClaimTrace {
+    let multilinear_rounds = log_n - K_SKIP;
+    channel.observe_label(b, b"history-field-zerocheck-c1");
+    let r_rest = channel.sample_f256_vec(b, multilinear_rounds);
+    channel.observe_f256_slice(b, &proof.round1_ab);
+    channel.observe_f256_slice(b, &proof.round1_c);
+    let z = channel.sample_f256(b);
+
+    let computed_c = interpolate_lambda_ext_trace(b, &proof.round1_c, K_SKIP, &z);
+    pin_eq_ext(b, &computed_c, &proof.final_c_eval);
+    let combined = proof
+        .round1_ab
+        .iter()
+        .zip(&proof.round1_c)
+        .map(|(ab, c)| ab.add(c))
+        .collect::<Vec<_>>();
+    let mut running = interpolate_combined_ext_trace(b, &combined, K_SKIP, &z).add(&computed_c);
+
+    let mut challenges = Vec::with_capacity(multilinear_rounds);
+    for (round, (message_one, message_infinity)) in proof.multilinear_rounds.iter().enumerate() {
+        let eq_challenge = &r_rest[round];
+        let one_plus_eq = eq_challenge.add_const(F256::ONE);
+        let inverse = inverse_ext_trace(b, &one_plus_eq);
+        let eq_times_one = mul_ext(b, eq_challenge, message_one);
+        let value_zero = mul_ext(b, &running.add(&eq_times_one), &inverse);
+
+        channel.observe_f256(b, message_one);
+        channel.observe_f256(b, message_infinity);
+        let challenge = channel.sample_f256(b);
+        challenges.push(challenge.clone());
+
+        let one_plus_challenge = challenge.add_const(F256::ONE);
+        let term_zero = mul_ext(b, &value_zero, &one_plus_challenge);
+        let term_one = mul_ext(b, message_one, &challenge);
+        let term_infinity = mul_ext(b, message_infinity, &challenge);
+        let term_infinity = mul_ext(b, &term_infinity, &one_plus_challenge);
+        running = term_zero.add(&term_one).add(&term_infinity);
+    }
+
+    let expected = mul_ext(b, &proof.final_a_eval, &proof.final_b_eval);
+    pin_eq_ext(b, &running, &expected);
+    channel.observe_f256(b, &proof.final_a_eval);
+    channel.observe_f256(b, &proof.final_b_eval);
+
+    C1ZerocheckClaimTrace {
+        z,
+        mlv_challenges: challenges,
+        r_rest,
+        a_eval: proof.final_a_eval.clone(),
+        b_eval: proof.final_b_eval.clone(),
+        c_eval: proof.final_c_eval.clone(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Lincheck verify replay
 // ---------------------------------------------------------------------------
@@ -617,6 +849,51 @@ pub struct LincheckClaimTrace {
     pub r_inner_skip: LinExpr,
     pub r_inner_rest: Vec<LinExpr>,
     pub w: LinExpr,
+}
+
+pub struct C1QuirkyPointTrace {
+    pub z_skip: ExtExpr,
+    pub x_inner_rest: Vec<ExtExpr>,
+    pub x_outer: Vec<ExtExpr>,
+}
+
+pub struct C1LincheckProofTrace {
+    pub rounds: Vec<(ExtExpr, ExtExpr)>,
+    pub z_partial: Vec<ExtExpr>,
+}
+
+impl C1LincheckProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::lincheck::c1::C1LincheckProof,
+        k_log: usize,
+        k_skip: usize,
+    ) -> Self {
+        assert_eq!(native.rounds.len(), k_log - k_skip, "rounds off shape");
+        assert_eq!(
+            native.z_partial.len(),
+            1usize << k_skip,
+            "z_partial off shape"
+        );
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|&(one, infinity)| (alloc_f256(b, one), alloc_f256(b, infinity)))
+                .collect(),
+            z_partial: native
+                .z_partial
+                .iter()
+                .map(|&value| alloc_f256(b, value))
+                .collect(),
+        }
+    }
+}
+
+pub struct C1LincheckClaimTrace {
+    pub r_inner_skip: ExtExpr,
+    pub r_inner_rest: Vec<ExtExpr>,
+    pub w: ExtExpr,
 }
 
 /// The final lincheck consistency sum `Σ_s comb_partial[s] · z_partial[s]`
@@ -740,6 +1017,92 @@ fn lincheck_final_sum_trace(
     f
 }
 
+fn lincheck_final_sum_c1_trace(
+    b: &mut FieldR1csBuilder,
+    r1cs: &FieldR1cs,
+    alpha: &ExtExpr,
+    beta: Option<&ExtExpr>,
+    lambda: &[ExtExpr],
+    e_rest: &[ExtExpr],
+    q_rest: &[ExtExpr],
+    z_partial: &[ExtExpr],
+) -> ExtExpr {
+    use std::collections::BTreeMap;
+
+    let count = 1usize << r1cs.k_skip;
+    assert_eq!(lambda.len(), count);
+    assert_eq!(z_partial.len(), count);
+    assert_eq!(e_rest.len(), 1usize << (r1cs.k_log - r1cs.k_skip));
+    assert_eq!(q_rest.len(), e_rest.len());
+
+    type Block = Vec<(usize, usize, F128)>;
+    let mut blocks_a: BTreeMap<(usize, usize), Block> = BTreeMap::new();
+    let mut blocks_b: BTreeMap<(usize, usize), Block> = BTreeMap::new();
+    let k_skip = r1cs.k_skip;
+    let mask = count - 1;
+    for (matrix, blocks) in [(&r1cs.a_0, &mut blocks_a), (&r1cs.b_0, &mut blocks_b)] {
+        for row in 0..matrix.num_rows {
+            for (column, coefficient) in matrix.row(row) {
+                let column = column as usize;
+                blocks
+                    .entry((row >> k_skip, column >> k_skip))
+                    .or_default()
+                    .push((row & mask, column & mask, coefficient));
+            }
+        }
+    }
+
+    let mut partial_products: BTreeMap<(usize, usize), ExtExpr> = BTreeMap::new();
+    for block in blocks_a.values().chain(blocks_b.values()) {
+        for &(row, column, _) in block {
+            partial_products
+                .entry((row, column))
+                .or_insert_with(ExtExpr::zero);
+        }
+    }
+    let keys = partial_products.keys().copied().collect::<Vec<_>>();
+    for (row, column) in keys {
+        partial_products.insert((row, column), mul_ext(b, &lambda[row], &z_partial[column]));
+    }
+
+    let mut all_blocks = blocks_a
+        .keys()
+        .chain(blocks_b.keys())
+        .copied()
+        .collect::<Vec<_>>();
+    all_blocks.sort_unstable();
+    all_blocks.dedup();
+    let mut pair_products = BTreeMap::new();
+    for &(row_block, column_block) in &all_blocks {
+        pair_products.insert(
+            (row_block, column_block),
+            mul_ext(b, &e_rest[row_block], &q_rest[column_block]),
+        );
+    }
+
+    let block_sum =
+        |blocks: &BTreeMap<(usize, usize), Block>, b: &mut FieldR1csBuilder| -> ExtExpr {
+            blocks.iter().fold(ExtExpr::zero(), |sum, (key, entries)| {
+                let inner =
+                    entries
+                        .iter()
+                        .fold(ExtExpr::zero(), |inner, &(row, column, coefficient)| {
+                            inner.add(&partial_products[&(row, column)].scale_base(coefficient))
+                        });
+                sum.add(&mul_ext(b, &pair_products[key], &inner))
+            })
+        };
+    let sum_a = block_sum(&blocks_a, b);
+    let sum_b = block_sum(&blocks_b, b);
+    let mut result = mul_ext(b, alpha, &sum_a).add(&sum_b);
+
+    if let (Some(beta), Some(column)) = (beta, r1cs.const_pin) {
+        let pin = mul_ext(b, &z_partial[column & mask], &q_rest[column >> k_skip]);
+        result = result.add(&mul_ext(b, beta, &pin));
+    }
+    result
+}
+
 /// Trace twin of `lincheck::verify` for a **protocol-constant** FieldR1cs
 /// instance (its CSC circuit is `r1cs.csc_lincheck_circuit()` — coefficient
 /// semantics enter through the constant matrices). Native shape errors are
@@ -837,6 +1200,169 @@ pub fn lincheck_verify_trace(
         r_inner_rest,
         w,
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lincheck_verify_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    r1cs: &FieldR1cs,
+    m: usize,
+    point: &C1QuirkyPointTrace,
+    a_value: &ExtExpr,
+    b_value: &ExtExpr,
+    proof: &C1LincheckProofTrace,
+) -> C1LincheckClaimTrace {
+    let k_log = r1cs.k_log;
+    let k_skip = r1cs.k_skip;
+    let count = 1usize << k_skip;
+    let inner_rest_len = k_log - k_skip;
+    assert!(k_skip <= k_log, "k_skip exceeds k_log");
+    assert_eq!(point.x_inner_rest.len(), inner_rest_len);
+    assert_eq!(point.x_outer.len(), m - k_log);
+    assert_eq!(proof.rounds.len(), inner_rest_len);
+    assert_eq!(proof.z_partial.len(), count);
+
+    channel.observe_label(b, b"history-lincheck-c1");
+    let alpha = channel.sample_f256(b);
+    let lambda = lagrange_weights_window_ext_trace(b, &point.z_skip, 0, count, 0);
+    let e_rest = eq_ind_partial_eval_ext_trace(b, &point.x_inner_rest);
+
+    let mut running = mul_ext(b, &alpha, a_value).add(b_value);
+    let beta = if r1cs.const_pin.is_some() {
+        let beta = channel.sample_f256(b);
+        running = running.add(&beta);
+        Some(beta)
+    } else {
+        None
+    };
+
+    let mut sampled = Vec::with_capacity(inner_rest_len);
+    for (at_one, at_infinity) in &proof.rounds {
+        channel.observe_f256(b, at_one);
+        channel.observe_f256(b, at_infinity);
+        let challenge = channel.sample_f256(b);
+        let at_zero = running.add(at_one);
+        let linear = at_zero.add(at_one).add(at_infinity);
+        let challenge_square = mul_ext(b, &challenge, &challenge);
+        running = mul_ext(b, at_infinity, &challenge_square)
+            .add(&mul_ext(b, &linear, &challenge))
+            .add(&at_zero);
+        sampled.push(challenge);
+    }
+
+    channel.observe_f256_slice(b, &proof.z_partial);
+    let r_inner_rest = sampled.iter().rev().cloned().collect::<Vec<_>>();
+    let q_rest = eq_ind_partial_eval_ext_trace(b, &r_inner_rest);
+    let final_sum = lincheck_final_sum_c1_trace(
+        b,
+        r1cs,
+        &alpha,
+        beta.as_ref(),
+        &lambda,
+        &e_rest,
+        &q_rest,
+        &proof.z_partial,
+    );
+    pin_eq_ext(b, &running, &final_sum);
+
+    let r_inner_skip = channel.sample_f256(b);
+    let output_weights = lagrange_weights_window_ext_trace(b, &r_inner_skip, 0, count, 0);
+    let w = dot_ext_trace(b, &output_weights, &proof.z_partial);
+
+    C1LincheckClaimTrace {
+        r_inner_skip,
+        r_inner_rest,
+        w,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lincheck_verify_c1_trace_deferred(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    k_log: usize,
+    k_skip: usize,
+    const_pin: Option<usize>,
+    m: usize,
+    point: &C1QuirkyPointTrace,
+    a_value: &ExtExpr,
+    b_value: &ExtExpr,
+    proof: &C1LincheckProofTrace,
+) -> (
+    C1LincheckClaimTrace,
+    super::matrix_fold::C1FreshLincheckClaimTrace,
+) {
+    let count = 1usize << k_skip;
+    let inner_rest_len = k_log - k_skip;
+    assert!(k_skip <= k_log);
+    assert_eq!(point.x_inner_rest.len(), inner_rest_len);
+    assert_eq!(point.x_outer.len(), m - k_log);
+    assert_eq!(proof.rounds.len(), inner_rest_len);
+    assert_eq!(proof.z_partial.len(), count);
+
+    channel.observe_label(b, b"history-lincheck-c1");
+    let alpha = channel.sample_f256(b);
+    let mut running = mul_ext(b, &alpha, a_value).add(b_value);
+    let beta = if const_pin.is_some() {
+        let beta = channel.sample_f256(b);
+        running = running.add(&beta);
+        Some(beta)
+    } else {
+        None
+    };
+
+    let mut sampled = Vec::with_capacity(inner_rest_len);
+    for (at_one, at_infinity) in &proof.rounds {
+        channel.observe_f256(b, at_one);
+        channel.observe_f256(b, at_infinity);
+        let challenge = channel.sample_f256(b);
+        let at_zero = running.add(at_one);
+        let linear = at_zero.add(at_one).add(at_infinity);
+        let square = mul_ext(b, &challenge, &challenge);
+        running = mul_ext(b, at_infinity, &square)
+            .add(&mul_ext(b, &linear, &challenge))
+            .add(&at_zero);
+        sampled.push(challenge);
+    }
+    channel.observe_f256_slice(b, &proof.z_partial);
+    let r_inner_rest = sampled.iter().rev().cloned().collect::<Vec<_>>();
+
+    let mut fresh_value = running.clone();
+    if let (Some(beta), Some(column)) = (beta, const_pin) {
+        let mask = count - 1;
+        let mut pin_weight = ExtExpr::one();
+        for (index, challenge) in r_inner_rest.iter().enumerate() {
+            let factor = if (column >> k_skip >> index) & 1 == 1 {
+                challenge.clone()
+            } else {
+                challenge.add_const(F256::ONE)
+            };
+            pin_weight = mul_ext(b, &pin_weight, &factor);
+        }
+        let term = mul_ext(b, &beta, &proof.z_partial[column & mask]);
+        fresh_value = fresh_value.add(&mul_ext(b, &term, &pin_weight));
+    }
+    let fresh = super::matrix_fold::C1FreshLincheckClaimTrace {
+        alpha,
+        z_skip: point.z_skip.clone(),
+        x_inner_rest: point.x_inner_rest.clone(),
+        r_inner_rest: r_inner_rest.clone(),
+        z_partial: proof.z_partial.clone(),
+        value: fresh_value,
+    };
+
+    let r_inner_skip = channel.sample_f256(b);
+    let weights = lagrange_weights_window_ext_trace(b, &r_inner_skip, 0, count, 0);
+    let w = dot_ext_trace(b, &weights, &proof.z_partial);
+    (
+        C1LincheckClaimTrace {
+            r_inner_skip,
+            r_inner_rest,
+            w,
+        },
+        fresh,
+    )
 }
 
 /// Twin of `lincheck::verify_deferred` — the matrix-free lincheck replay
@@ -1148,6 +1674,206 @@ impl BaseFoldProofTrace {
     }
 }
 
+pub struct C1QueryOpeningTrace {
+    pub position: usize,
+    pub initial_leaf: Vec<LinExpr>,
+    pub initial_path: Vec<FlatDigestExpr>,
+    pub post_row_batch_leaf: Vec<ExtExpr>,
+    pub post_row_batch_path: Vec<FlatDigestExpr>,
+    pub epoch_leaves: Vec<Vec<ExtExpr>>,
+    pub epoch_paths: Vec<Vec<FlatDigestExpr>>,
+}
+
+pub struct C1BaseFoldProofTrace {
+    pub round_messages: Vec<(ExtExpr, ExtExpr)>,
+    pub post_row_batch_commit: FlatDigestExpr,
+    pub round_commitments: Vec<FlatDigestExpr>,
+    pub final_a: ExtExpr,
+    pub final_b: ExtExpr,
+    pub final_codeword: Vec<ExtExpr>,
+    pub plaintext_tail: Vec<ExtExpr>,
+    pub pow_nonce: LinExpr,
+    pub queries: Vec<C1QueryOpeningTrace>,
+}
+
+impl C1BaseFoldProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &pcs::C1BaseFoldProof,
+        params: &PcsParams,
+    ) -> Self {
+        Self::alloc_mode(b, native, params, true)
+    }
+
+    pub fn alloc_mode(
+        b: &mut FieldR1csBuilder,
+        native: &pcs::C1BaseFoldProof,
+        params: &PcsParams,
+        alloc_paths: bool,
+    ) -> Self {
+        let log_msg_len = params.m - LOG_PACKING;
+        let log_batch_size = params.log_batch_size;
+        assert!(log_batch_size <= log_msg_len, "invalid proof shape");
+        let log_dim = log_msg_len - log_batch_size;
+        let k_code = log_dim + params.log_inv_rate;
+        let num_ntts = 1usize << log_batch_size;
+        let arities = compute_fri_arities(log_dim);
+        let (num_fri_commits, tail_layout) = pcs::fri_commit_layout(k_code, &arities);
+        let first_arity = arities.first().copied().unwrap_or(0);
+
+        assert_eq!(native.round_messages.len(), log_msg_len, "rounds off shape");
+        assert_eq!(
+            native.plaintext_tail.len(),
+            tail_layout.map_or(0, |(len, _)| len),
+            "plaintext tail off shape"
+        );
+        assert_eq!(
+            native.round_commitments.len(),
+            num_fri_commits,
+            "round commitments off shape"
+        );
+        assert_eq!(
+            native.queries.len(),
+            default_fri_queries(params.log_dim(), params.log_inv_rate),
+            "query count off shape"
+        );
+        assert_eq!(
+            native.final_codeword.len(),
+            1usize << params.log_inv_rate,
+            "final codeword off shape"
+        );
+
+        let alloc_base_vec = |b: &mut FieldR1csBuilder, values: &[F128]| {
+            values
+                .iter()
+                .map(|&value| LinExpr::from_wire(b.alloc_f128(value)))
+                .collect::<Vec<_>>()
+        };
+        let alloc_ext_vec = |b: &mut FieldR1csBuilder, values: &[F256]| {
+            values
+                .iter()
+                .map(|&value| alloc_f256(b, value))
+                .collect::<Vec<_>>()
+        };
+        let alloc_digests = |b: &mut FieldR1csBuilder, digests: &[Hash]| {
+            digests
+                .iter()
+                .map(|digest| alloc_flat_digest(b, digest))
+                .collect::<Vec<_>>()
+        };
+
+        let round_messages = native
+            .round_messages
+            .iter()
+            .map(|message| (alloc_f256(b, message.u_0), alloc_f256(b, message.u_2)))
+            .collect();
+        let post_row_batch_commit = alloc_flat_digest(b, &native.post_row_batch_commit.root);
+        let round_commitments = native
+            .round_commitments
+            .iter()
+            .map(|commitment| alloc_flat_digest(b, &commitment.root))
+            .collect();
+        let final_a = alloc_f256(b, native.final_a);
+        let final_b = alloc_f256(b, native.final_b);
+        let final_codeword = alloc_ext_vec(b, &native.final_codeword);
+        let plaintext_tail = alloc_ext_vec(b, &native.plaintext_tail);
+        let pow_nonce = LinExpr::from_wire(b.alloc_f128(f128_from_u128(native.pow_nonce as u128)));
+
+        let queries = native
+            .queries
+            .iter()
+            .map(|query| {
+                assert!(
+                    query.position < (1usize << k_code),
+                    "query position off shape"
+                );
+                assert_eq!(query.initial_leaf.len(), num_ntts, "initial leaf off shape");
+                assert_eq!(query.initial_path.len(), k_code, "initial path off shape");
+                if arities.is_empty() {
+                    assert!(
+                        query.post_row_batch_leaf.is_empty(),
+                        "post-rb leaf off shape"
+                    );
+                    assert!(
+                        query.post_row_batch_path.is_empty(),
+                        "post-rb path off shape"
+                    );
+                } else {
+                    assert_eq!(
+                        query.post_row_batch_leaf.len(),
+                        1usize << first_arity,
+                        "post-rb leaf off shape"
+                    );
+                    assert_eq!(
+                        query.post_row_batch_path.len(),
+                        k_code - first_arity,
+                        "post-rb path off shape"
+                    );
+                }
+                assert_eq!(query.epoch_leaves.len(), num_fri_commits);
+                assert_eq!(query.epoch_paths.len(), num_fri_commits);
+                let mut cumulative = first_arity;
+                for (index, (leaf, path)) in query
+                    .epoch_leaves
+                    .iter()
+                    .zip(&query.epoch_paths)
+                    .enumerate()
+                {
+                    let arity = arities[index + 1];
+                    assert_eq!(leaf.len(), 1usize << arity, "epoch leaf off shape");
+                    assert_eq!(
+                        path.len(),
+                        k_code - cumulative - arity,
+                        "epoch path off shape"
+                    );
+                    cumulative += arity;
+                }
+                C1QueryOpeningTrace {
+                    position: query.position,
+                    initial_leaf: alloc_base_vec(b, &query.initial_leaf),
+                    initial_path: if alloc_paths {
+                        alloc_digests(b, &query.initial_path)
+                    } else {
+                        Vec::new()
+                    },
+                    post_row_batch_leaf: alloc_ext_vec(b, &query.post_row_batch_leaf),
+                    post_row_batch_path: if alloc_paths {
+                        alloc_digests(b, &query.post_row_batch_path)
+                    } else {
+                        Vec::new()
+                    },
+                    epoch_leaves: query
+                        .epoch_leaves
+                        .iter()
+                        .map(|leaf| alloc_ext_vec(b, leaf))
+                        .collect(),
+                    epoch_paths: if alloc_paths {
+                        query
+                            .epoch_paths
+                            .iter()
+                            .map(|path| alloc_digests(b, path))
+                            .collect()
+                    } else {
+                        query.epoch_paths.iter().map(|_| Vec::new()).collect()
+                    },
+                }
+            })
+            .collect();
+
+        Self {
+            round_messages,
+            post_row_batch_commit,
+            round_commitments,
+            final_a,
+            final_b,
+            final_codeword,
+            plaintext_tail,
+            pow_nonce,
+            queries,
+        }
+    }
+}
+
 /// Bind the query positions carried by ONE squeezed lane: the native rule
 /// (`pcs::sample_query_positions`) reads `floor(128 / k_code)` positions as
 /// consecutive `k_code`-bit windows of the lane's FLAT bit pattern, low
@@ -1297,6 +2023,130 @@ fn fri_fold_coset_bits_trace(
         buf = next;
     }
     buf.pop().unwrap()
+}
+
+fn flatten_ext_lanes(values: &[ExtExpr]) -> Vec<LinExpr> {
+    let mut lanes = Vec::with_capacity(2 * values.len());
+    for value in values {
+        lanes.push(value.lo.clone());
+        lanes.push(value.hi.clone());
+    }
+    lanes
+}
+
+fn mul_ext_maybe_base(b: &mut FieldR1csBuilder, left: &ExtExpr, right: &ExtExpr) -> ExtExpr {
+    if right.hi.is_const() && right.hi.constant == F128::ZERO {
+        return super::mul_ext_base(b, left, &right.lo);
+    }
+    if left.hi.is_const() && left.hi.constant == F128::ZERO {
+        return super::mul_ext_base(b, right, &left.lo);
+    }
+    mul_ext(b, left, right)
+}
+
+fn row_batch_fold_one_c1_trace(
+    b: &mut FieldR1csBuilder,
+    lanes: &[LinExpr],
+    challenges: &[ExtExpr],
+) -> ExtExpr {
+    assert_eq!(lanes.len(), 1usize << challenges.len());
+    let mut buffer = lanes
+        .iter()
+        .cloned()
+        .map(ExtExpr::from_base)
+        .collect::<Vec<_>>();
+    for challenge in challenges {
+        let half = buffer.len() / 2;
+        let mut next = Vec::with_capacity(half);
+        for index in 0..half {
+            let low = &buffer[2 * index];
+            let high = &buffer[2 * index + 1];
+            let delta = low.add(high);
+            next.push(low.add(&mul_ext_maybe_base(b, challenge, &delta)));
+        }
+        buffer = next;
+    }
+    buffer.pop().expect("nonempty row batch")
+}
+
+fn evaluate_slice_ext_at_base_trace(
+    b: &mut FieldR1csBuilder,
+    table: &[ExtExpr],
+    point: &[LinExpr],
+) -> ExtExpr {
+    assert_eq!(table.len(), 1usize << point.len());
+    let mut scratch = table.to_vec();
+    for challenge in point.iter().rev() {
+        let half = scratch.len() / 2;
+        for index in 0..half {
+            let delta = scratch[index].add(&scratch[index + half]);
+            scratch[index] = scratch[index].add(&super::mul_ext_base(b, &delta, challenge));
+        }
+        scratch.truncate(half);
+    }
+    scratch.pop().expect("nonempty extension table")
+}
+
+fn fri_fold_coset_c1_trace(
+    b: &mut FieldR1csBuilder,
+    coset: &[ExtExpr],
+    challenges: &[ExtExpr],
+    ntt: &AdditiveNttF128,
+    input_layer: usize,
+    coset_index: usize,
+) -> ExtExpr {
+    assert_eq!(coset.len(), 1usize << challenges.len());
+    let mut buffer = coset.to_vec();
+    for (round, challenge) in challenges.iter().enumerate() {
+        let post_fold_layer = input_layer - round - 1;
+        let next_len = buffer.len() / 2;
+        let mut next = Vec::with_capacity(next_len);
+        for index in 0..next_len {
+            let low = &buffer[2 * index];
+            let high = &buffer[2 * index + 1];
+            let position = coset_index * next_len + index;
+            let twiddle = ntt.twiddle(post_fold_layer, position);
+            let v = high.add(low);
+            let u = low.add(&v.scale_base(twiddle));
+            next.push(u.add(&mul_ext(b, challenge, &u.add(&v))));
+        }
+        buffer = next;
+    }
+    buffer.pop().expect("nonempty C1 FRI coset")
+}
+
+fn fri_fold_coset_bits_c1_trace(
+    b: &mut FieldR1csBuilder,
+    coset: &[ExtExpr],
+    challenges: &[ExtExpr],
+    ntt: &AdditiveNttF128,
+    input_layer: usize,
+    coset_index_bits: &[LinExpr],
+) -> ExtExpr {
+    assert_eq!(coset.len(), 1usize << challenges.len());
+    let mut buffer = coset.to_vec();
+    for (round, challenge) in challenges.iter().enumerate() {
+        let post_fold_layer = input_layer - round - 1;
+        let next_len = buffer.len() / 2;
+        let log_next_len = next_len.trailing_zeros() as usize;
+        let bit_coefficients = (0..coset_index_bits.len())
+            .map(|index| ntt.twiddle(post_fold_layer, 1usize << (log_next_len + index)))
+            .collect::<Vec<_>>();
+        let mut next = Vec::with_capacity(next_len);
+        for index in 0..next_len {
+            let low = &buffer[2 * index];
+            let high = &buffer[2 * index + 1];
+            let mut twiddle = LinExpr::constant(ntt.twiddle(post_fold_layer, index));
+            for (bit, &coefficient) in coset_index_bits.iter().zip(&bit_coefficients) {
+                twiddle = twiddle.add(&bit.scale(coefficient));
+            }
+            let v = high.add(low);
+            let u = low.add(&super::mul_ext_base(b, &v, &twiddle));
+            next.push(u.add(&mul_ext(b, challenge, &u.add(&v))));
+        }
+        buffer = next;
+    }
+    buffer.pop().expect("nonempty C1 FRI coset")
 }
 
 /// Trace twin of `merkle::verify_merkle_proof`: fold the leaf hash up its
@@ -1650,6 +2500,239 @@ pub fn basefold_verify_trace(
     (challenges, bit_ranges)
 }
 
+pub fn basefold_verify_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    target: &ExtExpr,
+    proof: &C1BaseFoldProofTrace,
+    initial_codeword_root: &FlatDigestExpr,
+    params: &PcsParams,
+    mut region: Option<&mut PcsWalkObligations>,
+) -> (Vec<ExtExpr>, Vec<std::ops::Range<usize>>) {
+    let log_msg_len = params.m - LOG_PACKING;
+    let log_batch_size = params.log_batch_size;
+    let log_inv_rate = params.log_inv_rate;
+    let log_dim = log_msg_len - log_batch_size;
+    let k_code = log_dim + log_inv_rate;
+    let arities = compute_fri_arities(log_dim);
+    let (num_fri_commits, tail_layout) = pcs::fri_commit_layout(k_code, &arities);
+    let first_arity = arities.first().copied().unwrap_or(0);
+    let ntt = AdditiveNttF128::standard(k_code);
+
+    channel.observe_label(b, b"history-basefold-c1");
+    let mut ledger = b.num_wires();
+
+    if log_batch_size == 0 && !arities.is_empty() {
+        channel.observe_f128(b, &proof.post_row_batch_commit[0]);
+        channel.observe_f128(b, &proof.post_row_batch_commit[1]);
+    }
+
+    let mut running = target.clone();
+    let mut challenges = Vec::with_capacity(log_msg_len);
+    let mut current_epoch = 0usize;
+    let mut rounds_in_epoch = 0usize;
+    for round in 0..log_msg_len {
+        let (u_0, u_2) = &proof.round_messages[round];
+        channel.observe_f256(b, u_0);
+        channel.observe_f256(b, u_2);
+        let challenge = channel.sample_f256(b);
+
+        let u_1 = running.add(u_2);
+        let challenge_square = mul_ext(b, &challenge, &challenge);
+        running = u_0
+            .add(&mul_ext(b, &challenge, &u_1))
+            .add(&mul_ext(b, &challenge_square, u_2));
+        challenges.push(challenge);
+
+        if round + 1 == log_batch_size && !arities.is_empty() {
+            channel.observe_f128(b, &proof.post_row_batch_commit[0]);
+            channel.observe_f128(b, &proof.post_row_batch_commit[1]);
+        }
+        if round >= log_batch_size {
+            rounds_in_epoch += 1;
+            if rounds_in_epoch == arities[current_epoch] {
+                let boundary = current_epoch + 1;
+                if boundary <= num_fri_commits {
+                    channel.observe_f128(b, &proof.round_commitments[current_epoch][0]);
+                    channel.observe_f128(b, &proof.round_commitments[current_epoch][1]);
+                } else if tail_layout.is_some() && boundary == num_fri_commits + 1 {
+                    channel.observe_f256_slice(b, &proof.plaintext_tail);
+                }
+                rounds_in_epoch = 0;
+                current_epoch += 1;
+            }
+        }
+    }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs-c1: sumcheck rounds");
+
+    let final_product = mul_ext(b, &proof.final_a, &proof.final_b);
+    pin_eq_ext(b, &final_product, &running);
+    let constant = &proof.final_codeword[0];
+    for value in proof.final_codeword.iter().skip(1) {
+        pin_eq_ext(b, value, constant);
+    }
+    pin_eq_ext(b, constant, &proof.final_a);
+
+    channel.verify_pow(b, &proof.pow_nonce, pcs::QUERY_GRIND_BITS);
+    let query_count = proof.queries.len();
+    let per_lane = 128 / k_code;
+    let lanes = channel.sample_f128_vec(b, query_count.div_ceil(per_lane));
+    let mut query_bits = Vec::with_capacity(query_count);
+    let mut bit_ranges = Vec::with_capacity(lanes.len());
+    for lane in &lanes {
+        let used = per_lane.min(query_count - query_bits.len());
+        let (bound, range) = bind_query_positions_lane_trace(b, lane, k_code, used);
+        bit_ranges.push(range);
+        query_bits.extend(bound.into_iter().map(|(_, bits)| bits));
+    }
+    assert_eq!(query_bits.len(), query_count, "query positions off shape");
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs-c1: grind + query sample");
+
+    for (query, bits) in proof.queries.iter().zip(&query_bits) {
+        if let Some(obligations) = region.as_deref_mut() {
+            assert!(
+                query.initial_path.is_empty(),
+                "region mode expects path-free alloc"
+            );
+            obligations.push(&query.initial_leaf, bits, initial_codeword_root);
+        } else {
+            let leaf_hash = merkle_hash_leaf_lanes_trace(b, &query.initial_leaf);
+            verify_merkle_path_trace(
+                b,
+                initial_codeword_root,
+                &leaf_hash,
+                bits,
+                &query.initial_path,
+            );
+        }
+
+        let post_row_batch_value =
+            row_batch_fold_one_c1_trace(b, &query.initial_leaf, &challenges[..log_batch_size]);
+        let fri_challenge_start = log_batch_size;
+        let mut cumulative_arity = first_arity;
+        let mut expected = if arities.is_empty() {
+            post_row_batch_value
+        } else {
+            let post_leaf_lanes = flatten_ext_lanes(&query.post_row_batch_leaf);
+            if let Some(obligations) = region.as_deref_mut() {
+                assert!(
+                    query.post_row_batch_path.is_empty(),
+                    "region mode expects path-free alloc"
+                );
+                obligations.push(
+                    &post_leaf_lanes,
+                    &bits[first_arity..],
+                    &proof.post_row_batch_commit,
+                );
+            } else {
+                let leaf_hash = merkle_hash_leaf_lanes_trace(b, &post_leaf_lanes);
+                verify_merkle_path_trace(
+                    b,
+                    &proof.post_row_batch_commit,
+                    &leaf_hash,
+                    &bits[first_arity..],
+                    &query.post_row_batch_path,
+                );
+            }
+
+            let at_offset = evaluate_slice_ext_at_base_trace(
+                b,
+                &query.post_row_batch_leaf,
+                &bits[..first_arity],
+            );
+            pin_eq_ext(b, &at_offset, &post_row_batch_value);
+            fri_fold_coset_bits_c1_trace(
+                b,
+                &query.post_row_batch_leaf,
+                &challenges[fri_challenge_start..fri_challenge_start + first_arity],
+                &ntt,
+                k_code,
+                &bits[first_arity..],
+            )
+        };
+
+        for epoch in 0..num_fri_commits {
+            let leaf = &query.epoch_leaves[epoch];
+            let next_arity = arities[epoch + 1];
+            let leaf_lanes = flatten_ext_lanes(leaf);
+            if let Some(obligations) = region.as_deref_mut() {
+                assert!(
+                    query.epoch_paths[epoch].is_empty(),
+                    "region mode expects path-free alloc"
+                );
+                obligations.push(
+                    &leaf_lanes,
+                    &bits[cumulative_arity + next_arity..],
+                    &proof.round_commitments[epoch],
+                );
+            } else {
+                let leaf_hash = merkle_hash_leaf_lanes_trace(b, &leaf_lanes);
+                verify_merkle_path_trace(
+                    b,
+                    &proof.round_commitments[epoch],
+                    &leaf_hash,
+                    &bits[cumulative_arity + next_arity..],
+                    &query.epoch_paths[epoch],
+                );
+            }
+
+            let at_offset = evaluate_slice_ext_at_base_trace(
+                b,
+                leaf,
+                &bits[cumulative_arity..cumulative_arity + next_arity],
+            );
+            pin_eq_ext(b, &at_offset, &expected);
+            let input_layer = k_code - cumulative_arity;
+            expected = fri_fold_coset_bits_c1_trace(
+                b,
+                leaf,
+                &challenges[fri_challenge_start + cumulative_arity
+                    ..fri_challenge_start + cumulative_arity + next_arity],
+                &ntt,
+                input_layer,
+                &bits[cumulative_arity + next_arity..],
+            );
+            cumulative_arity += next_arity;
+        }
+
+        if let Some((_, tail_cumulative_arity)) = tail_layout {
+            assert_eq!(cumulative_arity, tail_cumulative_arity);
+            let at_tail = evaluate_slice_ext_at_base_trace(
+                b,
+                &proof.plaintext_tail,
+                &bits[cumulative_arity..],
+            );
+            pin_eq_ext(b, &at_tail, &expected);
+        } else {
+            pin_eq_ext(b, &proof.final_codeword[0], &expected);
+        }
+    }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs-c1: per-query folds+paths");
+
+    if let Some((tail_len, tail_cumulative_arity)) = tail_layout {
+        let remaining = log_dim - tail_cumulative_arity;
+        let coset_len = 1usize << remaining;
+        assert_eq!(tail_len >> remaining, 1usize << log_inv_rate);
+        let remaining_challenges =
+            &challenges[log_batch_size + tail_cumulative_arity..log_batch_size + log_dim];
+        let input_layer = k_code - tail_cumulative_arity;
+        for final_index in 0..tail_len >> remaining {
+            let folded = fri_fold_coset_c1_trace(
+                b,
+                &proof.plaintext_tail[final_index * coset_len..(final_index + 1) * coset_len],
+                remaining_challenges,
+                &ntt,
+                input_layer,
+                final_index,
+            );
+            pin_eq_ext(b, &folded, &proof.final_codeword[final_index]);
+        }
+    }
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-pcs-c1: plaintext tail");
+
+    (challenges, bit_ranges)
+}
+
 // ---------------------------------------------------------------------------
 // Quirky-direct batched opening verify replay
 // ---------------------------------------------------------------------------
@@ -1664,6 +2747,14 @@ pub struct QuirkyDirectClaimTrace {
     pub value: LinExpr,
 }
 
+#[derive(Clone)]
+pub struct C1QuirkyDirectClaimTrace {
+    pub z_skip: ExtExpr,
+    pub k_skip: usize,
+    pub x_rest: Vec<ExtExpr>,
+    pub value: ExtExpr,
+}
+
 /// Opaque recursive-trace capability for a causally post-commit auxiliary
 /// verifier. It delegates the exact enclosing FS channel and owns the claim
 /// sink appended to that proof's shared PCS replay.
@@ -1672,6 +2763,7 @@ pub struct FieldPostCommitTraceContext<'a, C> {
     total_vars: usize,
     channel: &'a mut C,
     claims: Vec<QuirkyDirectClaimTrace>,
+    wide_response_low: bool,
 }
 
 impl<'a, C> FieldPostCommitTraceContext<'a, C> {
@@ -1681,6 +2773,7 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
             total_vars,
             channel,
             claims: Vec::new(),
+            wide_response_low: false,
         }
     }
 
@@ -1706,6 +2799,14 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
 
     pub fn claim_count(&self) -> usize {
         self.claims.len()
+    }
+
+    /// Switch scalar algebra to the uniform low coordinate of canonically
+    /// framed C1 responses.  Sidecar repetition scopes this around one whole
+    /// base-field transcript and restores the ordinary profile before
+    /// returning to the enclosing Field verifier.
+    pub(crate) fn set_wide_response_low(&mut self, enabled: bool) {
+        self.wide_response_low = enabled;
     }
 
     /// Open a CHILD post-commit context over a different channel (the
@@ -1754,12 +2855,40 @@ impl<C: FsChannelOps> FsChannelOps for FieldPostCommitTraceContext<'_, C> {
         self.channel.observe_f128_slice(b, values);
     }
 
+    fn observe_f256(&mut self, b: &mut FieldR1csBuilder, value: &ExtExpr) {
+        self.channel.observe_f256(b, value);
+    }
+
+    fn observe_f256_slice(&mut self, b: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        self.channel.observe_f256_slice(b, values);
+    }
+
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
-        self.channel.sample_f128(b)
+        if self.wide_response_low {
+            self.channel.sample_f256(b).lo
+        } else {
+            self.channel.sample_f128(b)
+        }
     }
 
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
-        self.channel.sample_f128_vec(b, n)
+        if self.wide_response_low {
+            self.channel
+                .sample_f256_vec(b, n)
+                .into_iter()
+                .map(|challenge| challenge.lo)
+                .collect()
+        } else {
+            self.channel.sample_f128_vec(b, n)
+        }
+    }
+
+    fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
+        self.channel.sample_f256(b)
+    }
+
+    fn sample_f256_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        self.channel.sample_f256_vec(b, n)
     }
 
     fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
@@ -1858,6 +2987,92 @@ pub fn verify_opening_batch_quirky_direct_trace_region(
     query_bit_ranges
 }
 
+pub fn verify_opening_batch_quirky_direct_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    commitment_root: &FlatDigestExpr,
+    claims: &[C1QuirkyDirectClaimTrace],
+    proof: &C1BaseFoldProofTrace,
+    params: &PcsParams,
+) -> Vec<std::ops::Range<usize>> {
+    verify_opening_batch_quirky_direct_c1_trace_region(
+        b,
+        channel,
+        commitment_root,
+        claims,
+        proof,
+        params,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_opening_batch_quirky_direct_c1_trace_region(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    commitment_root: &FlatDigestExpr,
+    claims: &[C1QuirkyDirectClaimTrace],
+    proof: &C1BaseFoldProofTrace,
+    params: &PcsParams,
+    region: Option<&mut PcsWalkObligations>,
+) -> Vec<std::ops::Range<usize>> {
+    assert!(!claims.is_empty(), "need at least one claim");
+    let log_length = params.m - LOG_PACKING;
+    for claim in claims {
+        assert_eq!(claim.x_rest.len() + claim.k_skip, log_length);
+    }
+
+    channel.observe_label(b, b"history-pcs-open-field-c1");
+    for claim in claims {
+        channel.observe_label(b, b"history-pcs-quirky-direct-c1");
+        channel.observe_f256(b, &claim.z_skip);
+        channel.observe_f256(
+            b,
+            &ExtExpr::constant(F256::from_base(F128::new(claim.k_skip as u64, 0))),
+        );
+        let flattened = flatten_ext_lanes(&claim.x_rest);
+        let pinned = pin_transcript_constant_coordinates(b, &flattened);
+        let transcript_rest = pinned
+            .chunks_exact(2)
+            .map(|coordinates| ExtExpr::new(coordinates[0].clone(), coordinates[1].clone()))
+            .collect::<Vec<_>>();
+        channel.observe_f256_slice(b, &transcript_rest);
+        channel.observe_f256(b, &claim.value);
+    }
+    let gammas = (0..claims.len())
+        .map(|_| channel.sample_f256(b))
+        .collect::<Vec<_>>();
+    let target = claims
+        .iter()
+        .zip(&gammas)
+        .fold(ExtExpr::zero(), |sum, (claim, gamma)| {
+            sum.add(&mul_ext(b, gamma, &claim.value))
+        });
+
+    let (challenges, query_bit_ranges) =
+        basefold_verify_c1_trace(b, channel, &target, proof, commitment_root, params, region);
+    assert_eq!(challenges.len(), log_length);
+
+    let mut expected_final_b = ExtExpr::zero();
+    for (claim, gamma) in claims.iter().zip(&gammas) {
+        let count = 1usize << claim.k_skip;
+        let weights = lagrange_weights_window_ext_trace(b, &claim.z_skip, 0, count, 0);
+        let eq_skip = eq_ind_partial_eval_ext_trace(b, &challenges[..claim.k_skip]);
+        let skip_factor = dot_ext_trace(b, &weights, &eq_skip);
+        let eq_rest = claim
+            .x_rest
+            .iter()
+            .zip(&challenges[claim.k_skip..])
+            .fold(ExtExpr::one(), |product, (left, right)| {
+                mul_ext(b, &product, &left.add(right).add_const(F256::ONE))
+            });
+        let term = mul_ext(b, gamma, &skip_factor);
+        expected_final_b = expected_final_b.add(&mul_ext(b, &term, &eq_rest));
+    }
+    pin_eq_ext(b, &expected_final_b, &proof.final_b);
+    query_bit_ranges
+}
+
 // ---------------------------------------------------------------------------
 // Top-level FieldR1cs verifier replay ([R])
 // ---------------------------------------------------------------------------
@@ -1874,6 +3089,18 @@ pub struct ZClaimTrace {
 pub struct R1csClaimTrace {
     pub ab: ZClaimTrace,
     pub c: ZClaimTrace,
+}
+
+pub struct C1ZClaimTrace {
+    pub z_skip: ExtExpr,
+    pub x_inner_rest: Vec<ExtExpr>,
+    pub x_outer: Vec<ExtExpr>,
+    pub value: ExtExpr,
+}
+
+pub struct C1R1csClaimTrace {
+    pub ab: C1ZClaimTrace,
+    pub c: C1ZClaimTrace,
 }
 
 /// Witness allocation of a full `proof::FieldR1csProof`.
@@ -1923,6 +3150,64 @@ impl FieldR1csProofTrace {
             zerocheck: ZerocheckProofTrace::alloc(b, &native.zerocheck, shape.m),
             lincheck: LincheckProofTrace::alloc(b, &native.lincheck, shape.k_log, shape.k_skip),
             pcs_open: BaseFoldProofTrace::alloc_mode(b, &native.pcs_open, pcs_params, alloc_paths),
+        }
+    }
+}
+
+pub struct C1FieldR1csProofTrace {
+    pub zerocheck: C1ZerocheckProofTrace,
+    pub lincheck: C1LincheckProofTrace,
+    pub pcs_open: C1BaseFoldProofTrace,
+}
+
+impl C1FieldR1csProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::proof::C1FieldR1csProof,
+        r1cs: &FieldR1cs,
+        pcs_params: &PcsParams,
+    ) -> Self {
+        Self::alloc_shape_mode(
+            b,
+            native,
+            &noid_ivc_core::proof::FieldShape::of(r1cs),
+            pcs_params,
+            true,
+        )
+    }
+
+    pub fn alloc_mode(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::proof::C1FieldR1csProof,
+        r1cs: &FieldR1cs,
+        pcs_params: &PcsParams,
+        alloc_paths: bool,
+    ) -> Self {
+        Self::alloc_shape_mode(
+            b,
+            native,
+            &noid_ivc_core::proof::FieldShape::of(r1cs),
+            pcs_params,
+            alloc_paths,
+        )
+    }
+
+    pub fn alloc_shape_mode(
+        b: &mut FieldR1csBuilder,
+        native: &noid_ivc_core::proof::C1FieldR1csProof,
+        shape: &noid_ivc_core::proof::FieldShape,
+        pcs_params: &PcsParams,
+        alloc_paths: bool,
+    ) -> Self {
+        Self {
+            zerocheck: C1ZerocheckProofTrace::alloc(b, &native.zerocheck, shape.m),
+            lincheck: C1LincheckProofTrace::alloc(b, &native.lincheck, shape.k_log, shape.k_skip),
+            pcs_open: C1BaseFoldProofTrace::alloc_mode(
+                b,
+                &native.pcs_open,
+                pcs_params,
+                alloc_paths,
+            ),
         }
     }
 }
@@ -1981,6 +3266,360 @@ pub fn bind_public_io_trace(
         });
     }
     claims
+}
+
+/// Extension-field public-IO binding used by the C1 History profile. The IO
+/// cells remain base-field witness expressions, while the sampled binding
+/// point and all PCS claim coordinates are wide.
+pub fn bind_public_io_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    total_vars: usize,
+) -> Vec<C1QuirkyDirectClaimTrace> {
+    spec.validate(total_vars);
+    assert_eq!(io.len(), spec.io_len, "envelope length must match the spec");
+
+    channel.observe_label(b, b"history-public-io-c1");
+    let spec_lanes = spec
+        .transcript_lanes()
+        .into_iter()
+        .map(LinExpr::constant)
+        .collect::<Vec<_>>();
+    channel.observe_f128_slice(b, &spec_lanes);
+    channel.observe_f128_slice(b, io);
+    let y = channel.sample_f256_vec(b, spec.io_slice.log2_len);
+
+    let eq = eq_ind_partial_eval_ext_trace(b, &y);
+    let io_ext = io
+        .iter()
+        .cloned()
+        .map(ExtExpr::from_base)
+        .collect::<Vec<_>>();
+    let io_value = dot_ext_trace(b, &eq[..io.len()], &io_ext);
+    let prefix = |slice: &noid_ivc_core::public_io::WitnessSlice| {
+        slice
+            .prefix_coords(total_vars)
+            .into_iter()
+            .map(|value| ExtExpr::constant(F256::from_base(value)))
+            .collect::<Vec<_>>()
+    };
+    let mut x_rest = y;
+    x_rest.extend(prefix(&spec.io_slice));
+    let mut claims = vec![C1QuirkyDirectClaimTrace {
+        z_skip: ExtExpr::zero(),
+        k_skip: 0,
+        x_rest,
+        value: io_value,
+    }];
+
+    for claim in &spec.claims {
+        let mut x_rest = io[claim.point.clone()]
+            .iter()
+            .cloned()
+            .map(ExtExpr::from_base)
+            .collect::<Vec<_>>();
+        x_rest.extend(prefix(&claim.slice));
+        claims.push(C1QuirkyDirectClaimTrace {
+            z_skip: ExtExpr::zero(),
+            k_skip: 0,
+            x_rest,
+            value: ExtExpr::from_base(io[claim.value].clone()),
+        });
+    }
+    claims
+}
+
+pub fn verify_field_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    r1cs: &FieldR1cs,
+    pcs_params: &PcsParams,
+    commitment_root: &FlatDigestExpr,
+    proof: &C1FieldR1csProofTrace,
+) -> C1R1csClaimTrace {
+    verify_field_c1_trace_region(b, channel, r1cs, pcs_params, commitment_root, proof, None)
+}
+
+pub fn verify_field_c1_trace_region(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    r1cs: &FieldR1cs,
+    pcs_params: &PcsParams,
+    commitment_root: &FlatDigestExpr,
+    proof: &C1FieldR1csProofTrace,
+    region: Option<&mut PcsWalkObligations>,
+) -> C1R1csClaimTrace {
+    assert_eq!(pcs_params.m, r1cs.m + LOG_PACKING);
+    assert!(pcs_params.log_batch_size + LOG_PACKING <= pcs_params.m);
+
+    let mut ledger = b.num_wires();
+    bind_statement_field_c1_trace(b, channel, r1cs, pcs_params, commitment_root);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: statement bind");
+
+    let zerocheck_claim = zerocheck_field_verify_c1_trace(b, channel, r1cs.m, &proof.zerocheck);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: zerocheck");
+
+    let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+    let lincheck_point = C1QuirkyPointTrace {
+        z_skip: zerocheck_claim.z.clone(),
+        x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let lincheck_claim = lincheck_verify_c1_trace(
+        b,
+        channel,
+        r1cs,
+        r1cs.m,
+        &lincheck_point,
+        &zerocheck_claim.a_eval,
+        &zerocheck_claim.b_eval,
+        &proof.lincheck,
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: lincheck");
+
+    let ab = C1ZClaimTrace {
+        z_skip: lincheck_claim.r_inner_skip,
+        x_inner_rest: lincheck_claim.r_inner_rest,
+        x_outer: lincheck_point.x_outer,
+        value: lincheck_claim.w,
+    };
+    let c = C1ZClaimTrace {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.r_rest[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.r_rest[inner_rest_len..].to_vec(),
+        value: zerocheck_claim.c_eval,
+    };
+    let claim_rest = |claim: &C1ZClaimTrace| {
+        let mut rest = claim.x_inner_rest.clone();
+        rest.extend_from_slice(&claim.x_outer);
+        rest
+    };
+    let claims = [
+        C1QuirkyDirectClaimTrace {
+            z_skip: ab.z_skip.clone(),
+            k_skip: r1cs.k_skip,
+            x_rest: claim_rest(&ab),
+            value: ab.value.clone(),
+        },
+        C1QuirkyDirectClaimTrace {
+            z_skip: c.z_skip.clone(),
+            k_skip: r1cs.k_skip,
+            x_rest: claim_rest(&c),
+            value: c.value.clone(),
+        },
+    ];
+    verify_opening_batch_quirky_direct_c1_trace_region(
+        b,
+        channel,
+        commitment_root,
+        &claims,
+        &proof.pcs_open,
+        pcs_params,
+        region,
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: PCS opening batch");
+
+    C1R1csClaimTrace { ab, c }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_c1_trace_deferred_region(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &C1FieldR1csProofTrace,
+    region: Option<&mut PcsWalkObligations>,
+) -> (
+    C1R1csClaimTrace,
+    super::matrix_fold::C1FreshLincheckClaimTrace,
+) {
+    assert_eq!(pcs_params.m, shape.m + LOG_PACKING);
+    bind_statement_field_parts_c1_trace(b, channel, statement_digest, pcs_params, commitment_root);
+    let zerocheck_claim = zerocheck_field_verify_c1_trace(b, channel, shape.m, &proof.zerocheck);
+    let inner_rest_len = shape.k_log - shape.k_skip;
+    let lincheck_point = C1QuirkyPointTrace {
+        z_skip: zerocheck_claim.z.clone(),
+        x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let (lincheck_claim, fresh) = lincheck_verify_c1_trace_deferred(
+        b,
+        channel,
+        shape.k_log,
+        shape.k_skip,
+        shape.const_pin,
+        shape.m,
+        &lincheck_point,
+        &zerocheck_claim.a_eval,
+        &zerocheck_claim.b_eval,
+        &proof.lincheck,
+    );
+
+    let ab = C1ZClaimTrace {
+        z_skip: lincheck_claim.r_inner_skip,
+        x_inner_rest: lincheck_claim.r_inner_rest,
+        x_outer: lincheck_point.x_outer,
+        value: lincheck_claim.w,
+    };
+    let c = C1ZClaimTrace {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.r_rest[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.r_rest[inner_rest_len..].to_vec(),
+        value: zerocheck_claim.c_eval,
+    };
+    let claim_rest = |claim: &C1ZClaimTrace| {
+        let mut rest = claim.x_inner_rest.clone();
+        rest.extend_from_slice(&claim.x_outer);
+        rest
+    };
+    let claims = [
+        C1QuirkyDirectClaimTrace {
+            z_skip: ab.z_skip.clone(),
+            k_skip: shape.k_skip,
+            x_rest: claim_rest(&ab),
+            value: ab.value.clone(),
+        },
+        C1QuirkyDirectClaimTrace {
+            z_skip: c.z_skip.clone(),
+            k_skip: shape.k_skip,
+            x_rest: claim_rest(&c),
+            value: c.value.clone(),
+        },
+    ];
+    verify_opening_batch_quirky_direct_c1_trace_region(
+        b,
+        channel,
+        commitment_root,
+        &claims,
+        &proof.pcs_open,
+        pcs_params,
+        region,
+    );
+    (C1R1csClaimTrace { ab, c }, fresh)
+}
+
+/// Production C1 deferred replay with public IO and the existing typed
+/// post-commit sidecar context. Sidecar terminal claims are base-field
+/// expressions and are embedded into the wide PCS batch after replay.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_field_c1_trace_deferred_region_with_post_commit_context_expr<C, PostCommit>(
+    b: &mut FieldR1csBuilder,
+    channel: &mut C,
+    shape: &noid_ivc_core::proof::FieldShape,
+    pcs_params: &PcsParams,
+    statement_digest: &FlatDigestExpr,
+    commitment_root: &FlatDigestExpr,
+    proof: &C1FieldR1csProofTrace,
+    spec: &noid_ivc_core::public_io::PublicIoSpec,
+    io: &[LinExpr],
+    post_commit_class_digest: &FlatDigestExpr,
+    region: Option<&mut PcsWalkObligations>,
+    post_commit: PostCommit,
+) -> (
+    C1R1csClaimTrace,
+    super::matrix_fold::C1FreshLincheckClaimTrace,
+)
+where
+    C: FsChannelOps,
+    PostCommit: FnOnce(&mut FieldR1csBuilder, &mut FieldPostCommitTraceContext<'_, C>),
+{
+    assert_eq!(pcs_params.m, shape.m + LOG_PACKING);
+    assert!(pcs_params.log_batch_size + LOG_PACKING <= pcs_params.m);
+
+    let mut ledger = b.num_wires();
+    bind_statement_field_parts_c1_trace(b, channel, statement_digest, pcs_params, commitment_root);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: statement bind");
+    let io_claims = bind_public_io_c1_trace(b, channel, spec, io, shape.m);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: public-IO bind");
+    channel.observe_label(b, POST_COMMIT_CLASS_BINDING_LABEL);
+    observe_flat_digest(b, channel, post_commit_class_digest);
+    let auxiliary_claims = {
+        let mut context = FieldPostCommitTraceContext::new(commitment_root, shape.m, channel);
+        post_commit(b, &mut context);
+        context.finish()
+    };
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: post-commit auxiliary");
+
+    let zerocheck_claim = zerocheck_field_verify_c1_trace(b, channel, shape.m, &proof.zerocheck);
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: zerocheck");
+    let inner_rest_len = shape.k_log - shape.k_skip;
+    let lincheck_point = C1QuirkyPointTrace {
+        z_skip: zerocheck_claim.z.clone(),
+        x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let (lincheck_claim, fresh) = lincheck_verify_c1_trace_deferred(
+        b,
+        channel,
+        shape.k_log,
+        shape.k_skip,
+        shape.const_pin,
+        shape.m,
+        &lincheck_point,
+        &zerocheck_claim.a_eval,
+        &zerocheck_claim.b_eval,
+        &proof.lincheck,
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: lincheck");
+
+    let ab = C1ZClaimTrace {
+        z_skip: lincheck_claim.r_inner_skip,
+        x_inner_rest: lincheck_claim.r_inner_rest,
+        x_outer: lincheck_point.x_outer,
+        value: lincheck_claim.w,
+    };
+    let c = C1ZClaimTrace {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.r_rest[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.r_rest[inner_rest_len..].to_vec(),
+        value: zerocheck_claim.c_eval,
+    };
+    let claim_rest = |claim: &C1ZClaimTrace| {
+        let mut rest = claim.x_inner_rest.clone();
+        rest.extend_from_slice(&claim.x_outer);
+        rest
+    };
+    let mut claims = vec![
+        C1QuirkyDirectClaimTrace {
+            z_skip: ab.z_skip.clone(),
+            k_skip: shape.k_skip,
+            x_rest: claim_rest(&ab),
+            value: ab.value.clone(),
+        },
+        C1QuirkyDirectClaimTrace {
+            z_skip: c.z_skip.clone(),
+            k_skip: shape.k_skip,
+            x_rest: claim_rest(&c),
+            value: c.value.clone(),
+        },
+    ];
+    claims.extend(io_claims);
+    claims.extend(
+        auxiliary_claims
+            .into_iter()
+            .map(|claim| C1QuirkyDirectClaimTrace {
+                z_skip: ExtExpr::from_base(claim.z_skip),
+                k_skip: claim.k_skip,
+                x_rest: claim.x_rest.into_iter().map(ExtExpr::from_base).collect(),
+                value: ExtExpr::from_base(claim.value),
+            }),
+    );
+    verify_opening_batch_quirky_direct_c1_trace_region(
+        b,
+        channel,
+        commitment_root,
+        &claims,
+        &proof.pcs_open,
+        pcs_params,
+        region,
+    );
+    crate::acceptance::row_ledger_mark(b, &mut ledger, "R-c1: PCS opening batch");
+    (C1R1csClaimTrace { ab, c }, fresh)
 }
 
 /// Trace twin of `verifier::verify_field` — the [R] slot body. The verified
@@ -2397,56 +4036,60 @@ fn canonical_zero_merkle_path(lanes: usize, depth: usize) -> (Vec<Hash>, Hash) {
     (path, carried)
 }
 
-/// Zero-valued `FieldR1csProof` and its exact commitment root for recording
-/// layout derivation. It cannot verify algebraically, but every Merkle path is
-/// an honest path in the uniform zero-leaf tree. This matters even under the
-/// disabled base arm: the post-commit region columns still enforce their
-/// native hash relation and may never be populated with fake zero roots.
-/// Query positions start at zero; the layout driver patches them between its
-/// two passes. Uniform-tree siblings make the authenticated root independent
-/// of those positions.
-pub(crate) fn shape_only_field_r1cs_proof(
+fn canonical_zero_c1_merkle_path(elements: usize, depth: usize) -> (Vec<Hash>, Hash) {
+    let leaf = merkle::hash_leaf(&vec![0u8; elements * 32]);
+    let mut carried = leaf;
+    let mut path = Vec::with_capacity(depth);
+    for _ in 0..depth {
+        path.push(carried);
+        carried = merkle::hash_pair(&carried, &carried);
+    }
+    (path, carried)
+}
+
+/// C1 shape-only proof used solely to derive the fixed recursive transcript
+/// geometry. Its T1 commitment remains F128; every post-fold leaf and
+/// algebraic proof field uses the canonical F256 encoding.
+pub(crate) fn shape_only_field_r1cs_proof_c1(
     shape: &noid_ivc_core::proof::FieldShape,
     pcs_params: &PcsParams,
-) -> (noid_ivc_core::proof::FieldR1csProof, Hash) {
+) -> (noid_ivc_core::proof::C1FieldR1csProof, Hash) {
     let log_msg_len = pcs_params.m - LOG_PACKING;
     let log_batch_size = pcs_params.log_batch_size;
     let log_dim = log_msg_len - log_batch_size;
     let k_code = log_dim + pcs_params.log_inv_rate;
     let arities = compute_fri_arities(log_dim);
     let (num_fri_commits, tail_layout) = pcs::fri_commit_layout(k_code, &arities);
-    let arity_0 = arities.first().copied().unwrap_or(0);
+    let first_arity = arities.first().copied().unwrap_or(0);
     let n_queries = default_fri_queries(pcs_params.log_dim(), pcs_params.log_inv_rate);
 
-    // The proof carries full-length zero Merkle paths: the path-free trace
-    // allocation still shape-checks the native path lengths (it only skips
-    // allocating wires for them).
-    let mut cum = arity_0;
-    let epoch_shapes: Vec<(usize, usize)> = (0..num_fri_commits)
-        .map(|i| {
-            let shape = (1usize << arities[i + 1], k_code - cum - arities[i + 1]);
-            cum += arities[i + 1];
+    let mut cumulative = first_arity;
+    let epoch_shapes = (0..num_fri_commits)
+        .map(|index| {
+            let arity = arities[index + 1];
+            let shape = (1usize << arity, k_code - cumulative - arity);
+            cumulative += arity;
             shape
         })
-        .collect();
+        .collect::<Vec<_>>();
     let (initial_path, initial_root) = canonical_zero_merkle_path(1usize << log_batch_size, k_code);
     let (post_row_batch_path, post_row_batch_root) = if arities.is_empty() {
         (Vec::new(), [0u8; 32])
     } else {
-        canonical_zero_merkle_path(1usize << arity_0, k_code - arity_0)
+        canonical_zero_c1_merkle_path(1usize << first_arity, k_code - first_arity)
     };
     let epoch_paths_and_roots = epoch_shapes
         .iter()
-        .map(|&(lanes, depth)| canonical_zero_merkle_path(lanes, depth))
+        .map(|&(elements, depth)| canonical_zero_c1_merkle_path(elements, depth))
         .collect::<Vec<_>>();
-    let query = pcs::basefold::QueryOpening {
+    let query = pcs::C1QueryOpening {
         position: 0,
         initial_leaf: vec![F128::ZERO; 1usize << log_batch_size],
         initial_path,
         post_row_batch_leaf: if arities.is_empty() {
             Vec::new()
         } else {
-            vec![F128::ZERO; 1usize << arity_0]
+            vec![F256::ZERO; 1usize << first_arity]
         },
         post_row_batch_path: if arities.is_empty() {
             Vec::new()
@@ -2455,31 +4098,31 @@ pub(crate) fn shape_only_field_r1cs_proof(
         },
         epoch_leaves: epoch_shapes
             .iter()
-            .map(|&(lanes, _)| vec![F128::ZERO; lanes])
+            .map(|&(elements, _)| vec![F256::ZERO; elements])
             .collect(),
         epoch_paths: epoch_paths_and_roots
             .iter()
             .map(|(path, _)| path.clone())
             .collect(),
     };
-    let proof = noid_ivc_core::proof::FieldR1csProof {
-        zerocheck: zerocheck::ZerocheckProof {
-            round1_ab: vec![F128::ZERO; 1usize << K_SKIP],
-            round1_c: vec![F128::ZERO; 1usize << K_SKIP],
-            multilinear_rounds: vec![(F128::ZERO, F128::ZERO); shape.m - K_SKIP],
-            final_a_eval: F128::ZERO,
-            final_b_eval: F128::ZERO,
-            final_c_eval: F128::ZERO,
+    let proof = noid_ivc_core::proof::C1FieldR1csProof {
+        zerocheck: zerocheck::field_c1::C1ZerocheckProof {
+            round1_ab: vec![F256::ZERO; 1usize << K_SKIP],
+            round1_c: vec![F256::ZERO; 1usize << K_SKIP],
+            multilinear_rounds: vec![(F256::ZERO, F256::ZERO); shape.m - K_SKIP],
+            final_a_eval: F256::ZERO,
+            final_b_eval: F256::ZERO,
+            final_c_eval: F256::ZERO,
         },
-        lincheck: noid_ivc_core::lincheck::LincheckProof {
-            rounds: vec![(F128::ZERO, F128::ZERO); shape.k_log - shape.k_skip],
-            z_partial: vec![F128::ZERO; 1usize << shape.k_skip],
+        lincheck: noid_ivc_core::lincheck::c1::C1LincheckProof {
+            rounds: vec![(F256::ZERO, F256::ZERO); shape.k_log - shape.k_skip],
+            z_partial: vec![F256::ZERO; 1usize << shape.k_skip],
         },
-        pcs_open: pcs::BaseFoldProof {
+        pcs_open: pcs::C1BaseFoldProof {
             round_messages: vec![
-                pcs::basefold::RoundMessage {
-                    u_0: F128::ZERO,
-                    u_2: F128::ZERO,
+                pcs::basefold::C1RoundMessage {
+                    u_0: F256::ZERO,
+                    u_2: F256::ZERO,
                 };
                 log_msg_len
             ],
@@ -2490,13 +4133,11 @@ pub(crate) fn shape_only_field_r1cs_proof(
                 .iter()
                 .map(|(_, root)| pcs::RoundCommitment { root: *root })
                 .collect(),
-            final_a: F128::ZERO,
-            final_b: F128::ZERO,
-            final_codeword: vec![F128::ZERO; 1usize << pcs_params.log_inv_rate],
-            plaintext_tail: match tail_layout {
-                Some((tail_len, _)) => vec![F128::ZERO; tail_len],
-                None => Vec::new(),
-            },
+            final_a: F256::ZERO,
+            final_b: F256::ZERO,
+            final_codeword: vec![F256::ZERO; 1usize << pcs_params.log_inv_rate],
+            plaintext_tail: tail_layout
+                .map_or_else(Vec::new, |(length, _)| vec![F256::ZERO; length]),
             pow_nonce: 0,
             queries: vec![query; n_queries],
         },
@@ -2504,13 +4145,8 @@ pub(crate) fn shape_only_field_r1cs_proof(
     (proof, initial_root)
 }
 
-/// Install the positions derived by the recursive transcript into the
-/// redundant native query metadata consumed later by walk-column assembly.
-/// The final `div_ceil(n_queries, 128/k_code)` squeezed challenges are the
-/// query-position lanes because the PCS opening is the replay's last channel
-/// consumer.
-pub(crate) fn patch_shape_only_query_positions(
-    proof: &mut noid_ivc_core::proof::FieldR1csProof,
+pub(crate) fn patch_shape_only_query_positions_c1(
+    proof: &mut noid_ivc_core::proof::C1FieldR1csProof,
     pcs_params: &PcsParams,
     query_lane_values: &[F128],
 ) {
@@ -2519,11 +4155,7 @@ pub(crate) fn patch_shape_only_query_positions(
     let k_code = log_dim + pcs_params.log_inv_rate;
     let per_lane = 128 / k_code;
     let n_queries = proof.pcs_open.queries.len();
-    assert_eq!(
-        query_lane_values.len(),
-        n_queries.div_ceil(per_lane),
-        "query-lane harvest count"
-    );
+    assert_eq!(query_lane_values.len(), n_queries.div_ceil(per_lane));
     let mask = (1u128 << k_code) - 1;
     let mut query = 0usize;
     for lane in query_lane_values {
@@ -2533,7 +4165,6 @@ pub(crate) fn patch_shape_only_query_positions(
             query += 1;
         }
     }
-    assert_eq!(query, n_queries, "query position patch count");
 }
 
 // ---------------------------------------------------------------------------
@@ -2554,6 +4185,10 @@ mod tests {
             .collect()
     }
 
+    fn wide_lanes_bytes(lanes: &[F256]) -> Vec<u8> {
+        lanes.iter().flat_map(|lane| lane.to_le_bytes()).collect()
+    }
+
     #[test]
     fn shape_only_envelope_uses_honest_uniform_merkle_trees() {
         use crate::acceptance::history_step_bank::{
@@ -2565,7 +4200,7 @@ mod tests {
             let class = CanonicalHistoryStepClassId::new(slot).unwrap();
             let params = canonical_history_step_pcs_params(class);
             let shape = canonical_history_step_shape(class);
-            let (mut proof, commitment_root) = shape_only_field_r1cs_proof(&shape, &params);
+            let (mut proof, commitment_root) = shape_only_field_r1cs_proof_c1(&shape, &params);
             let log_dim = params.log_dim();
             let k_code = log_dim + params.log_inv_rate;
             let arities = compute_fri_arities(log_dim);
@@ -2581,7 +4216,7 @@ mod tests {
                 position,
                 &query.initial_path,
             ));
-            let post_leaf = merkle::hash_leaf(&lanes_bytes(&query.post_row_batch_leaf));
+            let post_leaf = merkle::hash_leaf(&wide_lanes_bytes(&query.post_row_batch_leaf));
             assert!(merkle::verify_merkle_proof(
                 &proof.pcs_open.post_row_batch_commit.root,
                 &post_leaf,
@@ -2596,7 +4231,7 @@ mod tests {
                 .enumerate()
             {
                 consumed += arities[index + 1];
-                let leaf_hash = merkle::hash_leaf(&lanes_bytes(leaf));
+                let leaf_hash = merkle::hash_leaf(&wide_lanes_bytes(leaf));
                 assert!(merkle::verify_merkle_proof(
                     &proof.pcs_open.round_commitments[index].root,
                     &leaf_hash,
@@ -2604,6 +4239,66 @@ mod tests {
                     path,
                 ));
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic row ledger for the canonical C1 verifier shapes"]
+    fn canonical_c1_verifier_row_ledger_diagnostic() {
+        use crate::acceptance::history_step_bank::{
+            canonical_history_step_pcs_params, canonical_history_step_shape,
+            history_step_bank_io_spec, CanonicalHistoryStepClassId, HISTORY_STEP_TIER_SLOT_COUNT,
+        };
+
+        for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
+            let class = CanonicalHistoryStepClassId::new(slot).unwrap();
+            let params = canonical_history_step_pcs_params(class);
+            let shape = canonical_history_step_shape(class);
+            let (proof, commitment_root) = shape_only_field_r1cs_proof_c1(&shape, &params);
+            let spec = history_step_bank_io_spec();
+
+            let mut builder = FieldR1csBuilder::new();
+            let mut channel = FsChannelTrace::new_c1(
+                &mut builder,
+                b"canonical-c1-verifier-row-ledger-diagnostic",
+            );
+            let statement_digest = alloc_flat_digest(&mut builder, &[0u8; 32]);
+            let commitment_root = alloc_flat_digest(&mut builder, &commitment_root);
+            let post_commit_digest = alloc_flat_digest(&mut builder, &[0u8; 32]);
+            let io = (0..spec.io_len)
+                .map(|_| LinExpr::from_wire(builder.alloc_f128(F128::ZERO)))
+                .collect::<Vec<_>>();
+            let proof_trace = C1FieldR1csProofTrace::alloc_shape_mode(
+                &mut builder,
+                &proof,
+                &shape,
+                &params,
+                false,
+            );
+            let verifier_start = builder.num_wires();
+            let mut obligations = PcsWalkObligations::default();
+            let _ = verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+                &mut builder,
+                &mut channel,
+                &shape,
+                &params,
+                &statement_digest,
+                &commitment_root,
+                &proof_trace,
+                &spec,
+                &io,
+                &post_commit_digest,
+                Some(&mut obligations),
+                |_builder, _context| {},
+            );
+            eprintln!(
+                "[canonical-c1-verifier] B{} allocation={} verifier={} total={} obligations={}",
+                class.current_tier(),
+                verifier_start,
+                builder.num_wires() - verifier_start,
+                builder.num_wires(),
+                obligations.leaves.len(),
+            );
         }
     }
     use noid_ivc_core::field_circuit::FsChannelTrace;
@@ -2622,6 +4317,10 @@ mod tests {
         }
         fn next_f128(&mut self) -> F128 {
             f128_from_u128(self.next_u128())
+        }
+
+        fn next_f256(&mut self) -> F256 {
+            F256::new(self.next_f128(), self.next_f128())
         }
     }
 
@@ -2829,6 +4528,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn c1_zerocheck_replay_lockstep_matches_native() {
+        for &(m, seed) in &[(7usize, 0xC101u128), (8, 0xC102), (10, 0xC103)] {
+            let mut rng = Rng(seed);
+            let length = 1usize << m;
+            let a = (0..length).map(|_| rng.next_f128()).collect::<Vec<_>>();
+            let bb = (0..length).map(|_| rng.next_f128()).collect::<Vec<_>>();
+            let c = a
+                .iter()
+                .zip(&bb)
+                .map(|(&left, &right)| left * right)
+                .collect::<Vec<_>>();
+            let mut prover = FsLaneChallenger::new_c1(b"self-verify-zc-c1-test");
+            let (proof, _) = zerocheck::field_c1::prove(&a, &bb, &c, m, &mut prover);
+            let mut native = FsLaneChallenger::new_c1(b"self-verify-zc-c1-test");
+            let native_claim = zerocheck::field_c1::verify(m, &proof, &mut native)
+                .expect("native C1 zerocheck accepts");
+
+            let mut builder = FieldR1csBuilder::new();
+            let mut trace = FsChannelTrace::new_c1(&mut builder, b"self-verify-zc-c1-test");
+            let proof_trace = C1ZerocheckProofTrace::alloc(&mut builder, &proof, m);
+            let claim = zerocheck_field_verify_c1_trace(&mut builder, &mut trace, m, &proof_trace);
+
+            assert_eq!(claim.z.eval(builder.values()), native_claim.z);
+            assert_eq!(
+                claim
+                    .mlv_challenges
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>(),
+                native_claim.mlv_challenges,
+            );
+            assert_eq!(
+                claim
+                    .r_rest
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>(),
+                native_claim.r_rest,
+            );
+            assert_eq!(claim.a_eval.eval(builder.values()), native_claim.a_eval);
+            assert_eq!(claim.b_eval.eval(builder.values()), native_claim.b_eval);
+            assert_eq!(claim.c_eval.eval(builder.values()), native_claim.c_eval);
+            let native_next = native.sample_f256();
+            let trace_next = trace.sample_f256(&mut builder);
+            assert_eq!(trace_next.eval(builder.values()), native_next);
+
+            let (relation, witness) = builder.build();
+            assert!(relation.satisfies(&witness), "C1 zerocheck trace m={m}");
+        }
+    }
+
     /// Mutating any zerocheck proof field makes the trace unsatisfiable —
     /// the replay-completeness mirror of the native `mutations_rejected`.
     #[test]
@@ -2900,6 +4651,43 @@ mod tests {
             &mut ch,
         );
         (r1cs, zc_proof, lc_proof)
+    }
+
+    fn c1_lincheck_fixture(
+        m: usize,
+        k_log: usize,
+        seed: u64,
+    ) -> (
+        FieldR1cs,
+        zerocheck::field_c1::C1ZerocheckProof,
+        noid_ivc_core::lincheck::c1::C1LincheckProof,
+    ) {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_core::lincheck::c1::{self, C1QuirkyPoint};
+
+        let (r1cs, witness) = synthetic_satisfiable(m, k_log, seed);
+        let a = r1cs.apply_a(&witness);
+        let bb = r1cs.apply_b(&witness);
+        let mut channel = FsLaneChallenger::new_c1(b"self-verify-lc-c1-test");
+        let (zerocheck_proof, zerocheck_claim) =
+            zerocheck::field_c1::prove(&a, &bb, &witness, m, &mut channel);
+        let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+        let point = C1QuirkyPoint {
+            z_skip: zerocheck_claim.z,
+            x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+            x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+        };
+        let (lincheck_proof, _) = c1::prove_field(
+            &witness,
+            m,
+            r1cs.k_log,
+            r1cs.k_skip,
+            r1cs.useful_rows,
+            r1cs.csc_lincheck_circuit(),
+            &point,
+            &mut channel,
+        );
+        (r1cs, zerocheck_proof, lincheck_proof)
     }
 
     /// THE lincheck lockstep gate: replay zerocheck + lincheck in-trace
@@ -2978,6 +4766,83 @@ mod tests {
 
             let (out_r1cs, out_z) = b.build();
             assert!(out_r1cs.satisfies(&out_z), "m={m} k_log={k_log}");
+        }
+    }
+
+    #[test]
+    fn c1_lincheck_replay_lockstep_matches_native() {
+        use noid_ivc_core::lincheck::c1::{self, C1QuirkyPoint};
+
+        for &(m, k_log, seed) in &[(10usize, 8usize, 0xC107u64), (9, 9, 0xC108)] {
+            let (r1cs, zerocheck_proof, lincheck_proof) = c1_lincheck_fixture(m, k_log, seed);
+
+            let mut native = FsLaneChallenger::new_c1(b"self-verify-lc-c1-test");
+            let zerocheck_claim = zerocheck::field_c1::verify(m, &zerocheck_proof, &mut native)
+                .expect("native C1 zerocheck accepts");
+            let inner_rest_len = r1cs.k_log - r1cs.k_skip;
+            let point = C1QuirkyPoint {
+                z_skip: zerocheck_claim.z,
+                x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+                x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+            };
+            let native_claim = c1::verify(
+                m,
+                r1cs.k_log,
+                r1cs.k_skip,
+                r1cs.csc_lincheck_circuit(),
+                &point,
+                zerocheck_claim.a_eval,
+                zerocheck_claim.b_eval,
+                &lincheck_proof,
+                &mut native,
+            )
+            .expect("native C1 lincheck accepts");
+
+            let mut builder = FieldR1csBuilder::new();
+            let mut trace = FsChannelTrace::new_c1(&mut builder, b"self-verify-lc-c1-test");
+            let zerocheck_trace = C1ZerocheckProofTrace::alloc(&mut builder, &zerocheck_proof, m);
+            let zerocheck_claim_trace =
+                zerocheck_field_verify_c1_trace(&mut builder, &mut trace, m, &zerocheck_trace);
+            let point_trace = C1QuirkyPointTrace {
+                z_skip: zerocheck_claim_trace.z.clone(),
+                x_inner_rest: zerocheck_claim_trace.mlv_challenges[..inner_rest_len].to_vec(),
+                x_outer: zerocheck_claim_trace.mlv_challenges[inner_rest_len..].to_vec(),
+            };
+            let lincheck_trace =
+                C1LincheckProofTrace::alloc(&mut builder, &lincheck_proof, r1cs.k_log, r1cs.k_skip);
+            let claim = lincheck_verify_c1_trace(
+                &mut builder,
+                &mut trace,
+                &r1cs,
+                m,
+                &point_trace,
+                &zerocheck_claim_trace.a_eval,
+                &zerocheck_claim_trace.b_eval,
+                &lincheck_trace,
+            );
+
+            assert_eq!(
+                claim.r_inner_skip.eval(builder.values()),
+                native_claim.r_inner_skip,
+            );
+            assert_eq!(
+                claim
+                    .r_inner_rest
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>(),
+                native_claim.r_inner_rest,
+            );
+            assert_eq!(claim.w.eval(builder.values()), native_claim.w);
+            let native_next = native.sample_f256();
+            let trace_next = trace.sample_f256(&mut builder);
+            assert_eq!(trace_next.eval(builder.values()), native_next);
+
+            let (relation, witness) = builder.build();
+            assert!(
+                relation.satisfies(&witness),
+                "C1 lincheck trace m={m} k_log={k_log}"
+            );
         }
     }
 
@@ -3083,6 +4948,93 @@ mod tests {
         (params, commitment, claims, proof)
     }
 
+    fn c1_pcs_fixture(
+        log_length: usize,
+        log_batch_size: usize,
+        log_inv_rate: usize,
+        k_skip: usize,
+        seed: u128,
+    ) -> (
+        PcsParams,
+        pcs::Commitment,
+        Vec<pcs::C1QuirkyDirectClaim>,
+        pcs::C1BaseFoldProof,
+    ) {
+        let params = PcsParams {
+            m: log_length + LOG_PACKING,
+            log_inv_rate,
+            log_batch_size,
+            profile: Default::default(),
+        };
+        let mut rng = Rng(seed);
+        let witness = (0..1usize << log_length)
+            .map(|_| rng.next_f128())
+            .collect::<Vec<_>>();
+        let (commitment, prover_data) = pcs::commit(&witness, &params);
+
+        let quirky_evaluation = |z_skip: F256, x_rest: &[F256]| {
+            let count = 1usize << k_skip;
+            let weights = (0..count)
+                .map(|index| {
+                    let node = PHI_8_TABLE[index];
+                    let mut numerator = F256::ONE;
+                    let mut denominator = F128::ONE;
+                    for (other, &other_node) in PHI_8_TABLE[..count].iter().enumerate() {
+                        if other == index {
+                            continue;
+                        }
+                        numerator *= z_skip + F256::from_base(other_node);
+                        denominator *= node + other_node;
+                    }
+                    numerator.scale_base(denominator.inv())
+                })
+                .collect::<Vec<_>>();
+            witness
+                .iter()
+                .enumerate()
+                .fold(F256::ZERO, |sum, (index, &value)| {
+                    let rest_index = index >> k_skip;
+                    let rest_weight =
+                        x_rest
+                            .iter()
+                            .enumerate()
+                            .fold(F256::ONE, |product, (bit, &coordinate)| {
+                                let factor = if (rest_index >> bit) & 1 == 1 {
+                                    coordinate
+                                } else {
+                                    F256::ONE + coordinate
+                                };
+                                product * factor
+                            });
+                    sum + (weights[index & (count - 1)] * rest_weight).scale_base(value)
+                })
+        };
+        let claims = (0..2)
+            .map(|_| {
+                let z_skip = rng.next_f256();
+                let x_rest = (0..log_length - k_skip)
+                    .map(|_| rng.next_f256())
+                    .collect::<Vec<_>>();
+                let value = quirky_evaluation(z_skip, &x_rest);
+                pcs::C1QuirkyDirectClaim {
+                    z_skip,
+                    k_skip,
+                    x_rest,
+                    value,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut channel = FsLaneChallenger::new_c1(b"self-verify-pcs-c1-test");
+        let proof = pcs::open_batch_quirky_direct_c1(
+            &witness,
+            &prover_data,
+            &commitment,
+            &claims,
+            &mut channel,
+        );
+        (params, commitment, claims, proof)
+    }
+
     /// Build the trace replay of a quirky-direct opening; returns the built
     /// instance/witness plus the proof-wire range for the mutation gate.
     fn build_pcs_trace(
@@ -3157,6 +5109,64 @@ mod tests {
         }
     }
 
+    #[test]
+    fn c1_pcs_replay_lockstep_matches_native() {
+        let (params, commitment, claims, proof) = c1_pcs_fixture(8, 2, 2, 4, 0xC1C5);
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new_c1(&mut builder, b"self-verify-pcs-c1-test");
+        let root = alloc_flat_digest(&mut builder, &commitment.root);
+        let claim_traces = claims
+            .iter()
+            .map(|claim| C1QuirkyDirectClaimTrace {
+                z_skip: alloc_f256(&mut builder, claim.z_skip),
+                k_skip: claim.k_skip,
+                x_rest: claim
+                    .x_rest
+                    .iter()
+                    .map(|&value| alloc_f256(&mut builder, value))
+                    .collect(),
+                value: alloc_f256(&mut builder, claim.value),
+            })
+            .collect::<Vec<_>>();
+        let proof_trace = C1BaseFoldProofTrace::alloc_mode(&mut builder, &proof, &params, false);
+        let mut obligations = PcsWalkObligations::default();
+        let bit_ranges = verify_opening_batch_quirky_direct_c1_trace_region(
+            &mut builder,
+            &mut trace,
+            &root,
+            &claim_traces,
+            &proof_trace,
+            &params,
+            Some(&mut obligations),
+        );
+        assert_eq!(
+            bit_ranges.len(),
+            proof.queries.len().div_ceil(128 / params.k_code())
+        );
+        assert_eq!(obligations.leaves.len(), obligations.paths.len());
+        assert!(!obligations.leaves.is_empty());
+
+        let references = claims
+            .iter()
+            .map(|claim| pcs::C1QuirkyDirectClaimRef {
+                z_skip: claim.z_skip,
+                k_skip: claim.k_skip,
+                x_rest: &claim.x_rest,
+                value: claim.value,
+            })
+            .collect::<Vec<_>>();
+        let mut native = FsLaneChallenger::new_c1(b"self-verify-pcs-c1-test");
+        pcs::verify_opening_batch_quirky_direct_c1(&commitment, &references, &proof, &mut native)
+            .expect("native C1 PCS accepts");
+        let native_next = native.sample_f256();
+        let trace_next = trace.sample_f256(&mut builder);
+        assert_eq!(trace_next.eval(builder.values()), native_next);
+
+        let (relation, witness) = builder.build();
+        assert!(relation.satisfies(&witness));
+    }
+
     /// THE PCS mutation gate: flipping ANY wire of the allocated proof data
     /// (commitment root, claim points/values, every BaseFold proof field,
     /// every multi-proof sibling) leaves the trace unsatisfiable.
@@ -3202,6 +5212,32 @@ mod tests {
         };
         let mut ch = FsLaneChallenger::new(b"self-verify-field-test");
         let (proof, commitment, claim) = prove_field(&r1cs, &z, &params, &mut ch);
+        (r1cs, params, commitment, proof, claim)
+    }
+
+    fn c1_field_proof_fixture(
+        m: usize,
+        log_inv_rate: usize,
+        seed: u64,
+    ) -> (
+        FieldR1cs,
+        PcsParams,
+        pcs::Commitment,
+        noid_ivc_core::proof::C1FieldR1csProof,
+        noid_ivc_core::proof::C1R1csClaim,
+    ) {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_prover::field_prover::prove_field_c1;
+
+        let (r1cs, witness) = synthetic_satisfiable(m, m, seed);
+        let params = PcsParams {
+            m: m + LOG_PACKING,
+            log_inv_rate,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut channel = FsLaneChallenger::new_c1(b"self-verify-field-c1-test");
+        let (proof, commitment, claim) = prove_field_c1(&r1cs, &witness, &params, &mut channel);
         (r1cs, params, commitment, proof, claim)
     }
 
@@ -3279,6 +5315,305 @@ mod tests {
             r1cs.m, params.log_inv_rate, rows
         );
         assert!(out_r1cs.satisfies(&out_z), "honest [R] trace unsatisfiable");
+    }
+
+    #[test]
+    fn verify_field_c1_replay_lockstep_e2e() {
+        let (r1cs, params, commitment, proof, native_claim) = c1_field_proof_fixture(8, 2, 0xC1F1);
+        let mut builder = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new_c1(&mut builder, b"self-verify-field-c1-test");
+        let root = alloc_flat_digest(&mut builder, &commitment.root);
+        let proof_trace =
+            C1FieldR1csProofTrace::alloc_mode(&mut builder, &proof, &r1cs, &params, false);
+        let mut obligations = PcsWalkObligations::default();
+        let claim = verify_field_c1_trace_region(
+            &mut builder,
+            &mut trace,
+            &r1cs,
+            &params,
+            &root,
+            &proof_trace,
+            Some(&mut obligations),
+        );
+
+        let evaluate_point = |claim: &C1ZClaimTrace, builder: &FieldR1csBuilder| {
+            (
+                claim.z_skip.eval(builder.values()),
+                claim
+                    .x_inner_rest
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>(),
+                claim
+                    .x_outer
+                    .iter()
+                    .map(|value| value.eval(builder.values()))
+                    .collect::<Vec<_>>(),
+                claim.value.eval(builder.values()),
+            )
+        };
+        assert_eq!(
+            evaluate_point(&claim.ab, &builder),
+            (
+                native_claim.ab.point.z_skip,
+                native_claim.ab.point.x_inner_rest,
+                native_claim.ab.point.x_outer,
+                native_claim.ab.value,
+            )
+        );
+        assert_eq!(
+            evaluate_point(&claim.c, &builder),
+            (
+                native_claim.c.point.z_skip,
+                native_claim.c.point.x_inner_rest,
+                native_claim.c.point.x_outer,
+                native_claim.c.value,
+            )
+        );
+        assert_eq!(obligations.leaves.len(), obligations.paths.len());
+        assert!(!obligations.leaves.is_empty());
+
+        let mut native = FsLaneChallenger::new_c1(b"self-verify-field-c1-test");
+        noid_ivc_core::verifier::verify_field_c1(&r1cs, &commitment, &proof, &mut native)
+            .expect("native C1 field verifier accepts");
+        let native_next = native.sample_f256();
+        let trace_next = trace.sample_f256(&mut builder);
+        assert_eq!(trace_next.eval(builder.values()), native_next);
+
+        let (relation, witness) = builder.build();
+        assert!(relation.satisfies(&witness));
+    }
+
+    #[test]
+    fn verify_field_c1_deferred_capture_lockstep_e2e() {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_prover::field_prover::prove_field_c1_capturing_fresh;
+
+        let (r1cs, witness) = synthetic_satisfiable(8, 8, 0xC1DEF);
+        let params = PcsParams {
+            m: r1cs.m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let mut prover = FsLaneChallenger::new_c1(b"self-verify-field-c1-deferred");
+        let (proof, commitment, _, capture) =
+            prove_field_c1_capturing_fresh(&r1cs, &witness, &params, &mut prover);
+        let native_fresh = capture.into_fresh_claim();
+        let shape = noid_ivc_core::proof::FieldShape::of(&r1cs);
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new_c1(&mut builder, b"self-verify-field-c1-deferred");
+        let statement_digest = alloc_flat_digest(&mut builder, &r1cs.statement_digest());
+        let root = alloc_flat_digest(&mut builder, &commitment.root);
+        let proof_trace =
+            C1FieldR1csProofTrace::alloc_shape_mode(&mut builder, &proof, &shape, &params, false);
+        let mut obligations = PcsWalkObligations::default();
+        let (_, fresh) = verify_field_c1_trace_deferred_region(
+            &mut builder,
+            &mut trace,
+            &shape,
+            &params,
+            &statement_digest,
+            &root,
+            &proof_trace,
+            Some(&mut obligations),
+        );
+        assert_eq!(fresh.alpha.eval(builder.values()), native_fresh.alpha);
+        assert_eq!(fresh.z_skip.eval(builder.values()), native_fresh.z_skip);
+        assert_eq!(
+            fresh
+                .x_inner_rest
+                .iter()
+                .map(|value| value.eval(builder.values()))
+                .collect::<Vec<_>>(),
+            native_fresh.x_inner_rest,
+        );
+        assert_eq!(
+            fresh
+                .r_inner_rest
+                .iter()
+                .map(|value| value.eval(builder.values()))
+                .collect::<Vec<_>>(),
+            native_fresh.r_inner_rest,
+        );
+        assert_eq!(
+            fresh
+                .z_partial
+                .iter()
+                .map(|value| value.eval(builder.values()))
+                .collect::<Vec<_>>(),
+            native_fresh.z_partial,
+        );
+        assert_eq!(fresh.value.eval(builder.values()), native_fresh.value);
+        let prover_next = prover.sample_f256();
+        let trace_next = trace.sample_f256(&mut builder);
+        assert_eq!(trace_next.eval(builder.values()), prover_next);
+        assert!(!obligations.leaves.is_empty());
+
+        let (relation, trace_witness) = builder.build();
+        assert!(relation.satisfies(&trace_witness));
+    }
+
+    #[test]
+    fn verify_field_c1_production_envelope_lockstep_e2e() {
+        use noid_ivc_core::field_r1cs::synthetic_satisfiable;
+        use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
+        use noid_ivc_core::verifier::VerifyError;
+        use noid_ivc_prover::field_prover::prove_field_c1_with_public_io_and_post_commit_context;
+
+        #[derive(Clone)]
+        struct Aux {
+            point: Vec<F128>,
+            value: F128,
+        }
+
+        let (r1cs, witness) = synthetic_satisfiable(8, 8, 0xC1E10);
+        let params = PcsParams {
+            m: r1cs.m + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let spec = PublicIoSpec {
+            io_slice: WitnessSlice {
+                log2_len: 2,
+                index: 1,
+            },
+            io_len: 4,
+            claims: Vec::new(),
+        };
+        let io = witness[spec.io_slice.start()..spec.io_slice.start() + spec.io_len].to_vec();
+        let class_digest = [0xC1; 32];
+        let domain = b"self-verify-field-c1-production-envelope";
+        let mut prover = FsLaneChallenger::new_c1(domain);
+        let (proof, auxiliary, commitment, _) =
+            prove_field_c1_with_public_io_and_post_commit_context(
+                &r1cs,
+                &witness,
+                &params,
+                &spec,
+                &io,
+                &class_digest,
+                &mut prover,
+                |context| {
+                    context.observe_label(b"self-verify-field-c1-production-aux");
+                    let point = context.sample_f128_vec(r1cs.m);
+                    let value = context
+                        .witness()
+                        .iter()
+                        .zip(noid_ivc_core::lincheck::build_eq_table(&point))
+                        .fold(F128::ZERO, |sum, (&lane, weight)| sum + lane * weight);
+                    context.observe_f128(value);
+                    context.append_claim(pcs::QuirkyDirectClaim {
+                        z_skip: F128::ZERO,
+                        k_skip: 0,
+                        x_rest: point.clone(),
+                        value,
+                    });
+                    Aux { point, value }
+                },
+            );
+        let shape = noid_ivc_core::proof::FieldShape::of(&r1cs);
+        let mut native = FsLaneChallenger::new_c1(domain);
+        let (_, native_fresh) =
+            noid_ivc_core::verifier::verify_field_c1_deferred_matrix_with_post_commit_context(
+                &shape,
+                &r1cs.structural_statement_digest(),
+                &commitment,
+                &proof,
+                &spec,
+                &io,
+                &class_digest,
+                &auxiliary,
+                &mut native,
+                |auxiliary, context| {
+                    context.observe_label(b"self-verify-field-c1-production-aux");
+                    if context.sample_f128_vec(r1cs.m) != auxiliary.point {
+                        return Err(VerifyError::Auxiliary);
+                    }
+                    context.observe_f128(auxiliary.value);
+                    context.append_claim(pcs::QuirkyDirectClaim {
+                        z_skip: F128::ZERO,
+                        k_skip: 0,
+                        x_rest: auxiliary.point.clone(),
+                        value: auxiliary.value,
+                    });
+                    Ok(())
+                },
+            )
+            .expect("native production C1 envelope accepts");
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new_c1(&mut builder, domain);
+        let statement_digest = alloc_flat_digest(&mut builder, &r1cs.structural_statement_digest());
+        let root = alloc_flat_digest(&mut builder, &commitment.root);
+        let io_trace = io
+            .iter()
+            .copied()
+            .map(|value| LinExpr::from_wire(builder.alloc_f128(value)))
+            .collect::<Vec<_>>();
+        let proof_trace =
+            C1FieldR1csProofTrace::alloc_shape_mode(&mut builder, &proof, &shape, &params, false);
+        let class_digest_trace = const_flat_digest(&class_digest);
+        let auxiliary_start = builder.num_wires();
+        let auxiliary_point_trace = auxiliary
+            .point
+            .iter()
+            .copied()
+            .map(|value| LinExpr::from_wire(builder.alloc_f128(value)))
+            .collect::<Vec<_>>();
+        let auxiliary_value_trace = LinExpr::from_wire(builder.alloc_f128(auxiliary.value));
+        let auxiliary_end = builder.num_wires();
+        let mut obligations = PcsWalkObligations::default();
+        let (_, trace_fresh) = verify_field_c1_trace_deferred_region_with_post_commit_context_expr(
+            &mut builder,
+            &mut trace,
+            &shape,
+            &params,
+            &statement_digest,
+            &root,
+            &proof_trace,
+            &spec,
+            &io_trace,
+            &class_digest_trace,
+            Some(&mut obligations),
+            |builder, context| {
+                context.observe_label(builder, b"self-verify-field-c1-production-aux");
+                let expected = context.sample_f128_vec(builder, r1cs.m);
+                for (actual, expected) in auxiliary_point_trace.iter().zip(&expected) {
+                    pin_eq(builder, actual, expected);
+                }
+                context.observe_f128(builder, &auxiliary_value_trace);
+                context.append_claim(QuirkyDirectClaimTrace {
+                    z_skip: LinExpr::zero(),
+                    k_skip: 0,
+                    x_rest: auxiliary_point_trace.clone(),
+                    value: auxiliary_value_trace.clone(),
+                });
+            },
+        );
+        assert_eq!(trace_fresh.alpha.eval(builder.values()), native_fresh.alpha);
+        assert_eq!(
+            trace_fresh.z_skip.eval(builder.values()),
+            native_fresh.z_skip
+        );
+        assert_eq!(trace_fresh.value.eval(builder.values()), native_fresh.value);
+        assert_eq!(
+            native.sample_f256(),
+            trace.sample_f256(&mut builder).eval(builder.values())
+        );
+        assert_eq!(obligations.leaves.len(), obligations.paths.len());
+        assert!(!obligations.leaves.is_empty());
+        let (relation, recursive_witness) = builder.build();
+        assert!(relation.satisfies(&recursive_witness));
+        let survivors = relation
+            .flip_battery(&recursive_witness)
+            .survivors(auxiliary_start..auxiliary_end);
+        assert!(
+            survivors.is_empty(),
+            "C1 auxiliary promotion mutation survivors: {survivors:?}"
+        );
     }
 
     /// THE [R] auto-mutator gate: flipping ANY allocated proof wire —

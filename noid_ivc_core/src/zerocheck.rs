@@ -21,6 +21,7 @@ use crate::ntt::{AdditiveNttGf8, InvNttTableByteSingleGf8};
 use serde::{Deserialize, Serialize};
 
 pub mod field;
+pub mod field_c1;
 pub mod multilinear;
 pub mod univariate_skip;
 pub mod univariate_skip_deg4;

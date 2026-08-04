@@ -31,12 +31,12 @@ use noid_fri_binius::zk_capsule_algebra::{
     SOURCE_STANDARD_FOLDS,
 };
 
-use super::{flat_of, mul, FieldR1csBuilder, LinExpr};
+use super::{flat_of, mul_ext, mul_ext_base, ExtExpr, FieldR1csBuilder, LinExpr};
 
 const MID_LEAF_QUERY_BIT_OFFSET: usize = MID_STANDARD_FOLDS;
 
 const _: () = assert!(JOINT_SOURCE_BANK_SYMBOLS == 8);
-const _: () = assert!(JOINT_SOURCE_LEAF_SYMBOLS == 16);
+const _: () = assert!(JOINT_SOURCE_LEAF_SYMBOLS == 24);
 const _: () = assert!(SOURCE_STANDARD_FOLDS == 3);
 const _: () = assert!(MID_STANDARD_FOLDS == 4);
 const _: () = assert!(SOURCE_QUERY_BITS == 13);
@@ -87,10 +87,10 @@ fn affine_lch_fold_pair_from_bits_trace(
     static_pair_index: usize,
     dynamic_bit_shift: usize,
     dynamic_pair_bits_lsb: &[LinExpr],
-    left: &LinExpr,
-    right: &LinExpr,
-    challenge: &LinExpr,
-) -> Result<LinExpr, ZkAffineCodeError> {
+    left: &ExtExpr,
+    right: &ExtExpr,
+    challenge: &ExtExpr,
+) -> Result<ExtExpr, ZkAffineCodeError> {
     if folds_done >= AFFINE_CODE_LOG_LEN {
         return Err(ZkAffineCodeError::FoldCountOutOfRange);
     }
@@ -107,9 +107,9 @@ fn affine_lch_fold_pair_from_bits_trace(
     // linear for a fixed index; with a transcript-witness index its product
     // with v is the first required multiplication row.
     let v = right.add(left);
-    let u = left.add(&mul(b, &v, &twiddle));
+    let u = left.add(&mul_ext_base(b, &v, &twiddle));
     let u_plus_v = u.add(&v);
-    Ok(u.add(&mul(b, challenge, &u_plus_v)))
+    Ok(u.add(&mul_ext(b, challenge, &u_plus_v)))
 }
 
 /// Fold one complete contiguous coset whose coset index is supplied entirely
@@ -121,11 +121,11 @@ fn affine_lch_fold_pair_from_bits_trace(
 fn affine_lch_fold_contiguous_coset_from_bits_trace(
     b: &mut FieldR1csBuilder,
     code: &ZkAffineLchCode,
-    symbols: &[LinExpr],
+    symbols: &[ExtExpr],
     folds_done: usize,
     coset_index_bits_lsb: &[LinExpr],
-    challenges: &[LinExpr],
-) -> Result<LinExpr, ZkAffineCodeError> {
+    challenges: &[ExtExpr],
+) -> Result<ExtExpr, ZkAffineCodeError> {
     let Some(total_folds) = folds_done.checked_add(challenges.len()) else {
         return Err(ZkAffineCodeError::FoldCountOutOfRange);
     };
@@ -175,12 +175,15 @@ fn affine_lch_fold_contiguous_coset_from_bits_trace(
 pub fn joint_source_line_fold_trace(
     b: &mut FieldR1csBuilder,
     joint_leaf: &[LinExpr; JOINT_SOURCE_LEAF_SYMBOLS],
-    gamma: &LinExpr,
-) -> [LinExpr; JOINT_SOURCE_BANK_SYMBOLS] {
-    std::array::from_fn(|pair| {
-        let bank = &joint_leaf[2 * pair];
-        let companion = &joint_leaf[2 * pair + 1];
-        bank.add(&mul(b, gamma, &bank.add(companion)))
+    gamma: &ExtExpr,
+) -> [ExtExpr; JOINT_SOURCE_BANK_SYMBOLS] {
+    std::array::from_fn(|symbol| {
+        let bank = ExtExpr::from_base(joint_leaf[3 * symbol].clone());
+        let companion = ExtExpr::new(
+            joint_leaf[3 * symbol + 1].clone(),
+            joint_leaf[3 * symbol + 2].clone(),
+        );
+        bank.add(&mul_ext(b, gamma, &bank.add(&companion)))
     })
 }
 
@@ -195,10 +198,10 @@ pub fn joint_source_line_fold_trace(
 pub fn source_standard_fold3_trace(
     b: &mut FieldR1csBuilder,
     code: &ZkAffineLchCode,
-    symbols: &[LinExpr; JOINT_SOURCE_BANK_SYMBOLS],
+    symbols: &[ExtExpr; JOINT_SOURCE_BANK_SYMBOLS],
     source_query_bits: &[LinExpr; SOURCE_QUERY_BITS],
-    challenges: &[LinExpr; SOURCE_STANDARD_FOLDS],
-) -> Result<LinExpr, ZkAffineCodeError> {
+    challenges: &[ExtExpr; SOURCE_STANDARD_FOLDS],
+) -> Result<ExtExpr, ZkAffineCodeError> {
     affine_lch_fold_contiguous_coset_from_bits_trace(
         b,
         code,
@@ -216,12 +219,103 @@ pub fn fold_joint_source_leaf_trace(
     b: &mut FieldR1csBuilder,
     code: &ZkAffineLchCode,
     joint_leaf: &[LinExpr; JOINT_SOURCE_LEAF_SYMBOLS],
-    gamma: &LinExpr,
+    gamma: &ExtExpr,
     source_query_bits: &[LinExpr; SOURCE_QUERY_BITS],
-    challenges: &[LinExpr; SOURCE_STANDARD_FOLDS],
-) -> Result<LinExpr, ZkAffineCodeError> {
+    challenges: &[ExtExpr; SOURCE_STANDARD_FOLDS],
+) -> Result<ExtExpr, ZkAffineCodeError> {
     let masked = joint_source_line_fold_trace(b, joint_leaf, gamma);
     source_standard_fold3_trace(b, code, &masked, source_query_bits, challenges)
+}
+
+/// Plain multilinear fold of a committed fold-normal table.  The local LCH
+/// inverse butterflies are already part of the committed leaf, so only the
+/// actual extension-field challenges allocate rows here.
+fn fold_normal_table_trace(
+    b: &mut FieldR1csBuilder,
+    symbols: &[ExtExpr],
+    challenges: &[ExtExpr],
+) -> ExtExpr {
+    assert_eq!(symbols.len(), 1usize << challenges.len());
+    let mut current = symbols.to_vec();
+    for challenge in challenges {
+        current = current
+            .chunks_exact(2)
+            .map(|pair| pair[0].add(&mul_ext(b, challenge, &pair[0].add(&pair[1]))))
+            .collect();
+    }
+    debug_assert_eq!(current.len(), 1);
+    current.pop().expect("fold-normal table leaves one value")
+}
+
+/// Apply the wide masking line and three ordinary MLE folds to a C1 source
+/// leaf.  This costs `8 * 3 + 7 * 3 = 45` base-field rows.
+pub fn fold_normal_joint_source_leaf_trace(
+    b: &mut FieldR1csBuilder,
+    joint_leaf: &[LinExpr; JOINT_SOURCE_LEAF_SYMBOLS],
+    gamma: &ExtExpr,
+    challenges: &[ExtExpr; SOURCE_STANDARD_FOLDS],
+) -> ExtExpr {
+    let masked = joint_source_line_fold_trace(b, joint_leaf, gamma);
+    fold_normal_table_trace(b, &masked, challenges)
+}
+
+/// Four ordinary MLE folds of a C1 fold-normal mid leaf.  Fifteen
+/// extension-field products cost exactly 45 base-field rows.
+pub fn fold_normal_mid_leaf_trace(
+    b: &mut FieldR1csBuilder,
+    symbols: &[ExtExpr; 1 << MID_STANDARD_FOLDS],
+    challenges: &[ExtExpr; MID_STANDARD_FOLDS],
+) -> ExtExpr {
+    fold_normal_table_trace(b, symbols, challenges)
+}
+
+/// Select one raw mid-codeword member directly from its committed
+/// fold-normal table.
+///
+/// Reversing normalization one dimension at a time and immediately choosing
+/// the requested branch fuses the inverse transform with the 16-way mux.  At
+/// reverse dimension `r`, the selected branch is
+/// `u + (twiddle + q_r) * v`.  The twiddle's pair index consists of the
+/// already selected higher member bits followed by the nine mid-leaf bits.
+/// This uses one wide-by-base product for each of the 15 internal nodes, or
+/// exactly 30 base-field rows, instead of materializing a raw leaf and then
+/// selecting it.
+pub fn select_fold_normal_mid_raw_member_trace(
+    b: &mut FieldR1csBuilder,
+    code: &ZkAffineLchCode,
+    symbols: &[ExtExpr; 1 << MID_STANDARD_FOLDS],
+    source_query_bits: &[LinExpr; SOURCE_QUERY_BITS],
+) -> Result<ExtExpr, ZkAffineCodeError> {
+    let member_bits = &source_query_bits[..MID_STANDARD_FOLDS];
+    let mid_leaf_bits = &source_query_bits[MID_LEAF_QUERY_BIT_OFFSET..];
+    let mut current = symbols.to_vec();
+
+    for reverse_round in (0..MID_STANDARD_FOLDS).rev() {
+        let half = 1usize << reverse_round;
+        debug_assert_eq!(current.len(), 2 * half);
+        let mut pair_bits =
+            Vec::with_capacity(MID_STANDARD_FOLDS - reverse_round - 1 + mid_leaf_bits.len());
+        pair_bits.extend_from_slice(&member_bits[reverse_round + 1..]);
+        pair_bits.extend_from_slice(mid_leaf_bits);
+        let layer = AFFINE_CODE_LOG_LEN - SOURCE_STANDARD_FOLDS - reverse_round - 1;
+        debug_assert_eq!(pair_bits.len(), layer);
+        let twiddle = affine_twiddle_from_pair_bits(code, layer, 0, 0, &pair_bits)?;
+        let branch_scalar = twiddle.add(&member_bits[reverse_round]);
+        current = (0..half)
+            .map(|coefficient| {
+                current[coefficient].add(&mul_ext_base(
+                    b,
+                    &current[half + coefficient],
+                    &branch_scalar,
+                ))
+            })
+            .collect();
+    }
+
+    debug_assert_eq!(current.len(), 1);
+    Ok(current
+        .pop()
+        .expect("selected inverse network leaves one member"))
 }
 
 /// Four selected affine-LCH folds over one contiguous 16-symbol mid coset.
@@ -236,10 +330,10 @@ pub fn fold_joint_source_leaf_trace(
 pub fn mid_standard_fold4_trace(
     b: &mut FieldR1csBuilder,
     code: &ZkAffineLchCode,
-    symbols: &[LinExpr; 1 << MID_STANDARD_FOLDS],
+    symbols: &[ExtExpr; 1 << MID_STANDARD_FOLDS],
     source_query_bits: &[LinExpr; SOURCE_QUERY_BITS],
-    challenges: &[LinExpr; MID_STANDARD_FOLDS],
-) -> Result<LinExpr, ZkAffineCodeError> {
+    challenges: &[ExtExpr; MID_STANDARD_FOLDS],
+) -> Result<ExtExpr, ZkAffineCodeError> {
     affine_lch_fold_contiguous_coset_from_bits_trace(
         b,
         code,
@@ -252,9 +346,11 @@ pub fn mid_standard_fold4_trace(
 
 #[cfg(test)]
 mod tests {
-    use super::super::{alloc_block, alloc_blocks, pin_eq, F128};
+    use super::super::{
+        alloc_block256, alloc_blocks, alloc_blocks256, flat_of_ext, pin_eq_ext, F128,
+    };
     use super::*;
-    use noid_core::Block128;
+    use noid_core::{Block128, Block256};
     use noid_fri_binius::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
     use noid_fri_binius::zk_capsule_algebra::{fold_joint_source_leaf, mid_standard_fold4};
 
@@ -276,6 +372,19 @@ mod tests {
             .unwrap_or_else(|_| unreachable!("array length is statically N"))
     }
 
+    fn ext_elem(index: usize, domain: u128) -> Block256 {
+        Block256::new(elem(index, domain), elem(index + 101, domain ^ 0xC1_256))
+    }
+
+    fn ext_expr_array<const N: usize>(
+        b: &mut FieldR1csBuilder,
+        values: &[Block256; N],
+    ) -> [ExtExpr; N] {
+        alloc_blocks256(b, values)
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("array length is statically N"))
+    }
+
     fn alloc_source_query_bits(
         b: &mut FieldR1csBuilder,
         source_leaf_index: usize,
@@ -287,13 +396,13 @@ mod tests {
     }
 
     #[test]
-    fn source_joint_fold_is_native_exact_class_fixed_and_twenty_two_rows() {
+    fn source_joint_fold_is_native_exact_class_fixed_and_fifty_nine_rows() {
         let code = ZkAffineLchCode::selected().unwrap();
         let joint_leaf: [Block128; JOINT_SOURCE_LEAF_SYMBOLS] =
             std::array::from_fn(|i| elem(i, 0x51_0A_7CE));
-        let gamma = elem(31, 0x6A_6D_6D_61);
-        let challenges: [Block128; SOURCE_STANDARD_FOLDS] =
-            std::array::from_fn(|i| elem(40 + i, 0x50_48_41_53_45_42));
+        let gamma = ext_elem(31, 0x6A_6D_6D_61);
+        let challenges: [Block256; SOURCE_STANDARD_FOLDS] =
+            std::array::from_fn(|i| ext_elem(40 + i, 0x50_48_41_53_45_42));
         let query_indices = [0x12A5usize, 0x0A5Ausize];
         let mut digests = Vec::new();
 
@@ -304,11 +413,11 @@ mod tests {
 
             let mut b = FieldR1csBuilder::new();
             let joint_e = expr_array(&mut b, &joint_leaf);
-            let gamma_e = alloc_block(&mut b, gamma);
+            let gamma_e = alloc_block256(&mut b, gamma);
             let query_bits = alloc_source_query_bits(&mut b, source_leaf_index);
             let query_bit_zero_wire = query_bits[0].terms[0].0 as usize;
-            let challenge_e = expr_array(&mut b, &challenges);
-            let expected_e = alloc_block(&mut b, expected);
+            let challenge_e = ext_expr_array(&mut b, &challenges);
+            let expected_e = alloc_block256(&mut b, expected);
             let helper_start = b.num_wires();
             let got = fold_joint_source_leaf_trace(
                 &mut b,
@@ -321,18 +430,18 @@ mod tests {
             .unwrap();
             assert_eq!(
                 b.num_wires() - helper_start,
-                22,
-                "eight gamma products plus fourteen dynamic-index affine-fold products"
+                59,
+                "eight wide gamma products plus seven wide affine-fold nodes"
             );
-            assert_eq!(got.eval(b.values()), flat_of(expected), "native parity");
-            pin_eq(&mut b, &got, &expected_e);
+            assert_eq!(got.eval(b.values()), flat_of_ext(expected), "native parity");
+            pin_eq_ext(&mut b, &got, &expected_e);
 
             let (r1cs, witness) = b.build();
             assert!(r1cs.satisfies(&witness), "honest source fold trace");
 
             if case == 0 {
                 let mut tampered_product = witness.clone();
-                tampered_product[helper_start + 8] += F128::ONE;
+                tampered_product[helper_start + 24] += F128::ONE;
                 assert!(
                     !r1cs.satisfies(&tampered_product),
                     "tampered dynamic-twiddle product survived"
@@ -355,12 +464,12 @@ mod tests {
     }
 
     #[test]
-    fn mid_fold_is_native_exact_class_fixed_and_thirty_rows() {
+    fn mid_fold_is_native_exact_class_fixed_and_seventy_five_rows() {
         let code = ZkAffineLchCode::selected().unwrap();
-        let symbols: [Block128; 1 << MID_STANDARD_FOLDS] =
-            std::array::from_fn(|i| elem(80 + i, 0x4D_49_44));
-        let challenges: [Block128; MID_STANDARD_FOLDS] =
-            std::array::from_fn(|i| elem(120 + i, 0x46_4F_4C_44));
+        let symbols: [Block256; 1 << MID_STANDARD_FOLDS] =
+            std::array::from_fn(|i| ext_elem(80 + i, 0x4D_49_44));
+        let challenges: [Block256; MID_STANDARD_FOLDS] =
+            std::array::from_fn(|i| ext_elem(120 + i, 0x46_4F_4C_44));
         let source_query_indices = [0x12A5usize, 0x0A5Ausize];
         let mut digests = Vec::new();
 
@@ -370,28 +479,28 @@ mod tests {
                 mid_standard_fold4(&code, &symbols, mid_leaf_index, &challenges).unwrap();
 
             let mut b = FieldR1csBuilder::new();
-            let symbol_e = expr_array(&mut b, &symbols);
+            let symbol_e = ext_expr_array(&mut b, &symbols);
             let query_bits = alloc_source_query_bits(&mut b, source_leaf_index);
             let query_bit_four_wire = query_bits[MID_LEAF_QUERY_BIT_OFFSET].terms[0].0 as usize;
-            let challenge_e = expr_array(&mut b, &challenges);
-            let expected_e = alloc_block(&mut b, expected);
+            let challenge_e = ext_expr_array(&mut b, &challenges);
+            let expected_e = alloc_block256(&mut b, expected);
             let helper_start = b.num_wires();
             let got = mid_standard_fold4_trace(&mut b, &code, &symbol_e, &query_bits, &challenge_e)
                 .unwrap();
             assert_eq!(
                 b.num_wires() - helper_start,
-                30,
-                "four dynamic-index affine layers must cost 2 * (8 + 4 + 2 + 1)"
+                75,
+                "four wide dynamic-index affine layers must cost 5 * (8 + 4 + 2 + 1)"
             );
-            assert_eq!(got.eval(b.values()), flat_of(expected), "native parity");
-            pin_eq(&mut b, &got, &expected_e);
+            assert_eq!(got.eval(b.values()), flat_of_ext(expected), "native parity");
+            pin_eq_ext(&mut b, &got, &expected_e);
 
             let (r1cs, witness) = b.build();
             assert!(r1cs.satisfies(&witness), "honest mid fold trace");
 
             if case == 0 {
                 let mut tampered_product = witness.clone();
-                tampered_product[helper_start + 29] += F128::ONE;
+                tampered_product[helper_start + 74] += F128::ONE;
                 assert!(
                     !r1cs.satisfies(&tampered_product),
                     "tampered terminal affine-fold product survived"

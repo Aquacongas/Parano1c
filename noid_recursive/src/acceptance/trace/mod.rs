@@ -77,11 +77,11 @@ pub mod zk_split_bridge;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use noid_core::Block128;
+use noid_core::{Block128, Block256};
 
-pub use noid_ivc_core::field::F128;
+pub use noid_ivc_core::field::{F128, F256};
 pub use noid_ivc_core::field_circuit::{
-    flat_const, poseidon2b_permute, FieldR1csBuilder, LinExpr, RawChannelTrace, Wire,
+    flat_const, poseidon2b_permute, ExtExpr, FieldR1csBuilder, LinExpr, RawChannelTrace, Wire,
 };
 
 /// φ-map a tower value into the circuit (flat) basis.
@@ -99,6 +99,32 @@ pub fn alloc_block(b: &mut FieldR1csBuilder, v: Block128) -> LinExpr {
 /// Allocate a witness wire per element.
 pub fn alloc_blocks(b: &mut FieldR1csBuilder, vs: &[Block128]) -> Vec<LinExpr> {
     vs.iter().map(|&v| alloc_block(b, v)).collect()
+}
+
+#[inline]
+pub fn flat_of_ext(v: Block256) -> F256 {
+    F256::from_tower(v)
+}
+
+#[inline]
+pub fn alloc_block256(b: &mut FieldR1csBuilder, v: Block256) -> ExtExpr {
+    let value = flat_of_ext(v);
+    ExtExpr::new(
+        LinExpr::from_wire(b.alloc_f128(value.lo)),
+        LinExpr::from_wire(b.alloc_f128(value.hi)),
+    )
+}
+
+pub fn alloc_blocks256(b: &mut FieldR1csBuilder, values: &[Block256]) -> Vec<ExtExpr> {
+    values
+        .iter()
+        .map(|&value| alloc_block256(b, value))
+        .collect()
+}
+
+#[inline]
+pub fn const_block256(v: Block256) -> ExtExpr {
+    ExtExpr::constant(flat_of_ext(v))
 }
 
 /// Constant (public, build-time) tower value as an expression.
@@ -158,6 +184,33 @@ pub fn pin_eq(b: &mut FieldR1csBuilder, lhs: &LinExpr, rhs: &LinExpr) {
     pin_zero(b, &lhs.add(rhs));
 }
 
+#[inline]
+pub fn pin_zero_ext(b: &mut FieldR1csBuilder, expr: &ExtExpr) {
+    pin_zero(b, &expr.lo);
+    pin_zero(b, &expr.hi);
+}
+
+#[inline]
+pub fn pin_eq_ext(b: &mut FieldR1csBuilder, lhs: &ExtExpr, rhs: &ExtExpr) {
+    pin_zero_ext(b, &lhs.add(rhs));
+}
+
+/// Allocate a GF(2^256) inverse witness and constrain `value * inverse = 1`.
+///
+/// The extension element occupies two base-field wires, its Karatsuba
+/// product occupies three, and the two coordinate pins occupy two more.
+/// Callers must reject zero before invoking this helper.
+#[inline]
+pub fn constrain_nonzero_ext(b: &mut FieldR1csBuilder, value: &ExtExpr) {
+    let inverse_value = value.eval(b.values()).inv();
+    let inverse = ExtExpr::new(
+        LinExpr::from_wire(b.alloc_f128(inverse_value.lo)),
+        LinExpr::from_wire(b.alloc_f128(inverse_value.hi)),
+    );
+    let product = mul_ext(b, value, &inverse);
+    pin_eq_ext(b, &product, &ExtExpr::one());
+}
+
 /// One multiplication, returned as an expression. Constant operands fold:
 /// multiplying by a build-time constant is F128-linear (`scale`), and two
 /// constants multiply at build time — zero constraint rows either way, with
@@ -172,6 +225,77 @@ pub fn mul(b: &mut FieldR1csBuilder, x: &LinExpr, y: &LinExpr) -> LinExpr {
         return y.scale(x.constant);
     }
     LinExpr::from_wire(b.mul(x, y))
+}
+
+#[inline]
+pub fn mul_ext(b: &mut FieldR1csBuilder, x: &ExtExpr, y: &ExtExpr) -> ExtExpr {
+    if let Some(value) = y.constant_value() {
+        return x.scale_ext(value);
+    }
+    if let Some(value) = x.constant_value() {
+        return y.scale_ext(value);
+    }
+    if y.hi.is_const() && y.hi.constant == F128::ZERO {
+        return mul_ext_base(b, x, &y.lo);
+    }
+    if x.hi.is_const() && x.hi.constant == F128::ZERO {
+        return mul_ext_base(b, y, &x.lo);
+    }
+    if x == y {
+        return b.square_f256(x);
+    }
+    b.mul_f256(x, y)
+}
+
+#[inline]
+pub fn mul_ext_base(b: &mut FieldR1csBuilder, value: &ExtExpr, scalar: &LinExpr) -> ExtExpr {
+    if scalar.is_const() {
+        return value.scale_base(scalar.constant);
+    }
+    ExtExpr::new(mul(b, &value.lo, scalar), mul(b, &value.hi, scalar))
+}
+
+/// Four-multiplication addition-chain for `x^7` over GF(2^256).
+#[inline]
+pub fn pow7_ext(b: &mut FieldR1csBuilder, value: &ExtExpr) -> ExtExpr {
+    let square = mul_ext(b, value, value);
+    let cube = mul_ext(b, &square, value);
+    let sixth = mul_ext(b, &cube, &cube);
+    mul_ext(b, &sixth, value)
+}
+
+/// Extension-field equality tensor in little-endian Boolean-index order.
+/// Every split after the first materializes two GF(2^256) products; the
+/// first split is linear because the initial tensor entry is one.
+pub fn eq_ind_partial_eval_ext_trace(b: &mut FieldR1csBuilder, point: &[ExtExpr]) -> Vec<ExtExpr> {
+    let mut result = vec![ExtExpr::one()];
+    for r_i in point {
+        let len = result.len();
+        for j in 0..len {
+            let prod = mul_ext(b, &result[j], r_i);
+            result[j] = result[j].add(&prod);
+            result.push(prod);
+        }
+    }
+    result
+}
+
+pub fn evaluate_slice_ext_trace(
+    b: &mut FieldR1csBuilder,
+    table: &[ExtExpr],
+    point: &[ExtExpr],
+) -> ExtExpr {
+    assert_eq!(table.len(), 1usize << point.len());
+    let mut scratch = table.to_vec();
+    for challenge in point.iter().rev() {
+        let half = scratch.len() / 2;
+        for index in 0..half {
+            let delta = scratch[index].add(&scratch[index + half]);
+            scratch[index] = scratch[index].add(&mul_ext(b, challenge, &delta));
+        }
+        scratch.truncate(half);
+    }
+    scratch.pop().expect("nonempty extension MLE table")
 }
 
 /// Trace twin of `noid_core::mle::eq::eq_ind` for two expression points:
@@ -430,6 +554,16 @@ pub(crate) mod test_support {
 
     pub fn assert_expr_is(b: &FieldR1csBuilder, e: &LinExpr, native: Block128, what: &str) {
         assert_eq!(tower_value(b, e), native, "{what} diverged from native");
+    }
+
+    /// Evaluate a symbolic C1 challenge-field expression and map both
+    /// coordinates back to the native tower basis.
+    pub fn tower_value_ext(b: &FieldR1csBuilder, e: &ExtExpr) -> Block256 {
+        e.eval(b.values()).to_tower()
+    }
+
+    pub fn assert_ext_expr_is(b: &FieldR1csBuilder, e: &ExtExpr, native: Block256, what: &str) {
+        assert_eq!(tower_value_ext(b, e), native, "{what} diverged from native");
     }
 }
 

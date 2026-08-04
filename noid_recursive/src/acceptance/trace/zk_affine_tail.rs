@@ -18,16 +18,16 @@ use std::sync::OnceLock;
 use noid_core::{Block128, TowerField};
 use noid_fri_binius::zk_affine_code::ZkAffineLchCode;
 
-use super::{const_block, flat_of, mul, FieldR1csBuilder, LinExpr};
+use super::{const_block, flat_of, mul_ext_base, ExtExpr, FieldR1csBuilder, LinExpr};
 
 pub const ZK_AFFINE_TAIL_FOLDS_DONE: usize = 7;
 pub const ZK_AFFINE_TAIL_LOG: usize = 4;
 pub const ZK_AFFINE_TAIL_LEN: usize = 1 << ZK_AFFINE_TAIL_LOG;
 pub const ZK_AFFINE_TAIL_QUERY_BITS: usize = 9;
 pub const ZK_AFFINE_TAIL_CODE_LEN: usize = 1 << ZK_AFFINE_TAIL_QUERY_BITS;
-pub const ZK_AFFINE_TAIL_SELECTOR_ROWS: usize = ZK_AFFINE_TAIL_LEN - 1;
+pub const ZK_AFFINE_TAIL_SELECTOR_ROWS: usize = 2 * (ZK_AFFINE_TAIL_LEN - 1);
 
-const _: () = assert!(ZK_AFFINE_TAIL_SELECTOR_ROWS == 15);
+const _: () = assert!(ZK_AFFINE_TAIL_SELECTOR_ROWS == 30);
 const _: () = assert!(
     ZK_AFFINE_TAIL_CODE_LEN
         == 1 << (noid_fri_binius::zk_affine_code::AFFINE_CODE_LOG_LEN - ZK_AFFINE_TAIL_FOLDS_DONE)
@@ -67,9 +67,9 @@ fn selected_tail_coordinates() -> &'static AffineTailCoordinates {
 /// would both waste rows and obscure the exact 15-row selector contract.
 pub fn select_affine_tail16_trace(
     b: &mut FieldR1csBuilder,
-    tail: &[LinExpr; ZK_AFFINE_TAIL_LEN],
+    tail: &[ExtExpr; ZK_AFFINE_TAIL_LEN],
     query_bits: &[LinExpr; ZK_AFFINE_TAIL_QUERY_BITS],
-) -> LinExpr {
+) -> ExtExpr {
     let coordinates = selected_tail_coordinates();
     let coordinate_exprs: [LinExpr; ZK_AFFINE_TAIL_LOG] = std::array::from_fn(|coordinate| {
         let mut value = const_block(coordinates.bases[coordinate]);
@@ -83,7 +83,7 @@ pub fn select_affine_tail16_trace(
     for coordinate in &coordinate_exprs {
         coefficients = coefficients
             .chunks_exact(2)
-            .map(|pair| pair[0].add(&mul(b, coordinate, &pair[1])))
+            .map(|pair| pair[0].add(&mul_ext_base(b, &pair[1], coordinate)))
             .collect();
     }
     debug_assert_eq!(coefficients.len(), 1);
@@ -93,13 +93,22 @@ pub fn select_affine_tail16_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::{alloc_block, pin_eq, F128};
+    use crate::acceptance::trace::{
+        alloc_block, alloc_block256, flat_of_ext, pin_eq_ext, F128, F256,
+    };
+    use noid_core::Block256;
 
-    fn tail(seed: u128) -> [Block128; ZK_AFFINE_TAIL_LEN] {
+    fn tail(seed: u128) -> [Block256; ZK_AFFINE_TAIL_LEN] {
         std::array::from_fn(|index| {
-            Block128::from(
-                seed.rotate_left((index * 7 % 127) as u32)
-                    ^ (index as u128 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            Block256::new(
+                Block128::from(
+                    seed.rotate_left((index * 7 % 127) as u32)
+                        ^ (index as u128 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                ),
+                Block128::from(
+                    seed.rotate_right((index * 11 % 127) as u32)
+                        ^ (index as u128 + 5).wrapping_mul(0xD1B5_4A32_D192_ED03),
+                ),
             )
         })
     }
@@ -148,15 +157,15 @@ mod tests {
     }
 
     #[test]
-    fn affine_tail_trace_matches_all_512_positions_at_exactly_15_rows_each() {
+    fn affine_tail_trace_matches_all_512_positions_at_exactly_30_rows_each() {
         let native_tail = tail(0xA771_1E5E);
         let codeword = ZkAffineLchCode::selected()
             .expect("selected affine code")
-            .encode_after_low_folds(&native_tail, ZK_AFFINE_TAIL_FOLDS_DONE)
+            .encode_extension_after_low_folds(&native_tail, ZK_AFFINE_TAIL_FOLDS_DONE)
             .expect("tail encode");
         let mut b = FieldR1csBuilder::new();
-        let tail_w: [LinExpr; ZK_AFFINE_TAIL_LEN] =
-            std::array::from_fn(|index| alloc_block(&mut b, native_tail[index]));
+        let tail_w: [ExtExpr; ZK_AFFINE_TAIL_LEN] =
+            std::array::from_fn(|index| alloc_block256(&mut b, native_tail[index]));
 
         for query in 0..ZK_AFFINE_TAIL_CODE_LEN {
             let bits = query_bits(&mut b, query);
@@ -167,18 +176,18 @@ mod tests {
                 ZK_AFFINE_TAIL_SELECTOR_ROWS,
                 "query {query} row count"
             );
-            assert_eq!(selected.eval(b.values()), flat_of(codeword[query]));
+            assert_eq!(selected.eval(b.values()), flat_of_ext(codeword[query]));
         }
 
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));
     }
 
-    fn relation(seed: u128, query: usize) -> ([u8; 32], usize, F128) {
+    fn relation(seed: u128, query: usize) -> ([u8; 32], usize, F256) {
         let native_tail = tail(seed);
         let mut b = FieldR1csBuilder::new();
-        let tail_w: [LinExpr; ZK_AFFINE_TAIL_LEN] =
-            std::array::from_fn(|index| alloc_block(&mut b, native_tail[index]));
+        let tail_w: [ExtExpr; ZK_AFFINE_TAIL_LEN] =
+            std::array::from_fn(|index| alloc_block256(&mut b, native_tail[index]));
         let bits = query_bits(&mut b, query);
         let before = b.num_wires();
         let selected = select_affine_tail16_trace(&mut b, &tail_w, &bits);
@@ -210,19 +219,19 @@ mod tests {
         let query = 0x16busize;
         let expected = ZkAffineLchCode::selected()
             .expect("selected affine code")
-            .encode_after_low_folds(&native_tail, ZK_AFFINE_TAIL_FOLDS_DONE)
+            .encode_extension_after_low_folds(&native_tail, ZK_AFFINE_TAIL_FOLDS_DONE)
             .expect("tail encode")[query];
 
         let mut b = FieldR1csBuilder::new();
-        let tail_w: [LinExpr; ZK_AFFINE_TAIL_LEN] =
-            std::array::from_fn(|index| alloc_block(&mut b, native_tail[index]));
+        let tail_w: [ExtExpr; ZK_AFFINE_TAIL_LEN] =
+            std::array::from_fn(|index| alloc_block256(&mut b, native_tail[index]));
         let bits = query_bits(&mut b, query);
         let helper_start = b.num_wires();
         let selected = select_affine_tail16_trace(&mut b, &tail_w, &bits);
         assert_eq!(b.num_wires() - helper_start, ZK_AFFINE_TAIL_SELECTOR_ROWS);
-        let expected_w = alloc_block(&mut b, expected);
-        let expected_wire = expected_w.terms[0].0 as usize;
-        pin_eq(&mut b, &selected, &expected_w);
+        let expected_w = alloc_block256(&mut b, expected);
+        let expected_wire = expected_w.lo.terms[0].0 as usize;
+        pin_eq_ext(&mut b, &selected, &expected_w);
 
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));

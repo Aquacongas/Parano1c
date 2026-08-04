@@ -15,7 +15,7 @@
 //!    the state to Phase B;
 //! 4. after `beta[0..3]`, commit the mid cap before `beta[3..7]`;
 //! 5. after `beta[3..7]`, reveal `tail[16]` before `beta[7]` and queries;
-//! 6. only then open the fixed 64 transcript-derived 13-bit queries.
+//! 6. only then open the fixed 65 transcript-derived 13-bit queries.
 //!
 //! There is deliberately no transcript in this file and no reuse of the
 //! active capsule's rejected all-beta-before-mid ordering.  The caller owns
@@ -24,19 +24,19 @@
 //! draws the bank's PCS coins, Libra mask, remaining padding, and the complete
 //! companion internally from a caller-supplied cryptographic RNG.
 //!
-//! Source leaves are adjacent joint cells
-//! `[B0,C0,...,B7,C7]` over 8192 leaves with a 32-hash cap.  Three
+//! Source leaves are fixed-shape fold-normal joint cells over 8192 leaves
+//! with an eight-hash cap.  Three
 //! LOW-to-HIGH affine folds land in one of the 16 cells of the corresponding
-//! 512-leaf mid tree, whose cap has two hashes.  Four more folds land in the
+//! 512-leaf mid tree, whose cap also has eight hashes.  Four more folds land in the
 //! locally re-encoded `Code(tail16)`.
 
 use noid_core::hardware::{flat_to_tower_u128, tower_to_flat_u128};
-use noid_core::{Block128, TowerField};
+use noid_core::{Block128, Block256, TowerField};
 use rand_core::{CryptoRng, RngCore};
 use rayon::prelude::*;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::capsule::{capsule_leaf_hash, CapsuleNodeHasher};
+use crate::capsule::{capsule_leaf_hash_mixed, capsule_leaf_hash_wide, CapsuleNodeHasher};
 use crate::interleaved_commit::{
     build_source_batched_merkle_proof_to_cap, verify_source_batched_merkle_proof_to_cap,
     CommitmentHashBackend, MerkleCap, SourceBatchedMerkleProof, SourceHash, SourceHashMerkleTree,
@@ -48,21 +48,22 @@ use crate::zk_affine_code::{
 };
 use crate::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
 use crate::zk_capsule_algebra::{
-    build_joint_source_leaf, build_mid_leaf, certify_source_query_hiding_rank,
-    contract_high3_for_each_low8, evaluate_upper_at_low8, fold_joint_source_leaf,
-    map_source_query_leaf, mid_standard_fold4, ZkCapsuleAlgebraError, JOINT_SOURCE_LEAF_SYMBOLS,
-    MID_STANDARD_FOLDS, PHASE_B_HIGH_VARS, PHASE_B_LOW_VARS, SOURCE_QUERY_BITS,
-    SOURCE_STANDARD_FOLDS, TAIL_SYMBOLS, UPPER_SYMBOLS,
+    build_fold_normal_joint_source_leaf, build_fold_normal_mid_leaf,
+    certify_source_query_hiding_rank, contract_high3_for_each_low8, evaluate_upper_at_low8,
+    fold_normal_joint_source_leaf, fold_normal_mid_leaf, fold_normal_mid_raw_member,
+    map_source_query_leaf, ZkCapsuleAlgebraError, JOINT_SOURCE_LEAF_SYMBOLS, MID_STANDARD_FOLDS,
+    PHASE_B_HIGH_VARS, PHASE_B_LOW_VARS, SOURCE_QUERY_BITS, SOURCE_STANDARD_FOLDS, TAIL_SYMBOLS,
+    UPPER_SYMBOLS,
 };
 use crate::zk_phase_a::{
     phase_a_relation_claims, phase_a_virtual_oracle, prove_phase_a_adaptive, ZkPhaseAError,
     ZkPhaseAProverOutput, ZkPhaseARoundProof, PHASE_A_VARS,
 };
 
-pub const ZK_CAPSULE_PCS_QUERY_COUNT: usize = 64;
+pub const ZK_CAPSULE_PCS_QUERY_COUNT: usize = 65;
 pub const ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT: usize = 8_192;
 pub const ZK_CAPSULE_PCS_SOURCE_TREE_DEPTH: usize = 13;
-pub const ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH: usize = 5;
+pub const ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH: usize = 3;
 pub const ZK_CAPSULE_PCS_SOURCE_CAP_HASHES: usize = 1 << ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH;
 pub const ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH: usize =
     ZK_CAPSULE_PCS_SOURCE_TREE_DEPTH - ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH;
@@ -72,7 +73,7 @@ pub const ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG: usize = AFFINE_CODE_MESSAGE_LOG +
 pub const ZK_CAPSULE_PCS_MID_CODE_LEN: usize = 8_192;
 pub const ZK_CAPSULE_PCS_MID_LEAF_COUNT: usize = 512;
 pub const ZK_CAPSULE_PCS_MID_TREE_DEPTH: usize = 9;
-pub const ZK_CAPSULE_PCS_MID_CAP_DEPTH: usize = 1;
+pub const ZK_CAPSULE_PCS_MID_CAP_DEPTH: usize = 3;
 pub const ZK_CAPSULE_PCS_MID_CAP_HASHES: usize = 1 << ZK_CAPSULE_PCS_MID_CAP_DEPTH;
 pub const ZK_CAPSULE_PCS_MID_PATH_DEPTH: usize =
     ZK_CAPSULE_PCS_MID_TREE_DEPTH - ZK_CAPSULE_PCS_MID_CAP_DEPTH;
@@ -82,14 +83,18 @@ pub const ZK_CAPSULE_PCS_SOURCE_SYMBOLS: usize =
     ZK_CAPSULE_PCS_QUERY_COUNT * JOINT_SOURCE_LEAF_SYMBOLS;
 pub const ZK_CAPSULE_PCS_MID_SYMBOLS: usize =
     ZK_CAPSULE_PCS_QUERY_COUNT * (1 << MID_STANDARD_FOLDS);
-pub const ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS: usize = 448;
-pub const ZK_CAPSULE_PCS_WORST_MID_SIBLINGS: usize = 192;
-pub const ZK_CAPSULE_PCS_WORST_OPENING_BYTES: usize =
-    (ZK_CAPSULE_PCS_SOURCE_SYMBOLS + ZK_CAPSULE_PCS_MID_SYMBOLS) * 16
-        + (ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS + ZK_CAPSULE_PCS_WORST_MID_SIBLINGS) * 32;
+/// Exact maxima for a canonical batched proof of 65 leaves in the eight
+/// capped source subtrees and their induced mid leaves.  The source maximum
+/// is `453`; the mid maximum is `193`.  The test below certifies both maxima
+/// by dynamic programming and exhibits one query set attaining them together.
+pub const ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS: usize = 453;
+pub const ZK_CAPSULE_PCS_WORST_MID_SIBLINGS: usize = 193;
+pub const ZK_CAPSULE_PCS_WORST_OPENING_BYTES: usize = ZK_CAPSULE_PCS_SOURCE_SYMBOLS * 16
+    + ZK_CAPSULE_PCS_MID_SYMBOLS * 32
+    + (ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS + ZK_CAPSULE_PCS_WORST_MID_SIBLINGS) * 32;
 pub const ZK_CAPSULE_PCS_SOURCE_COMMITMENT_BYTES: usize = ZK_CAPSULE_PCS_SOURCE_CAP_HASHES * 32;
 pub const ZK_CAPSULE_PCS_MID_COMMITMENT_BYTES: usize = ZK_CAPSULE_PCS_MID_CAP_HASHES * 32;
-pub const ZK_CAPSULE_PCS_TAIL_BYTES: usize = TAIL_SYMBOLS * 16;
+pub const ZK_CAPSULE_PCS_TAIL_BYTES: usize = TAIL_SYMBOLS * 32;
 pub const ZK_CAPSULE_PCS_WORST_TOTAL_BYTES: usize = ZK_CAPSULE_PCS_SOURCE_COMMITMENT_BYTES
     + ZK_CAPSULE_PCS_MID_COMMITMENT_BYTES
     + ZK_CAPSULE_PCS_TAIL_BYTES
@@ -107,8 +112,8 @@ const _: () = assert!(
         == AFFINE_CODE_LOG_RATE + ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG - 4
 );
 const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT == 1 << ZK_CAPSULE_PCS_SOURCE_TREE_DEPTH);
-const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH == 8);
-const _: () = assert!(ZK_CAPSULE_PCS_MID_PATH_DEPTH == 8);
+const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH == 10);
+const _: () = assert!(ZK_CAPSULE_PCS_MID_PATH_DEPTH == 6);
 const _: () = assert!(ZK_CAPSULE_PCS_MID_CODE_LEN == AFFINE_CODE_LEN >> SOURCE_STANDARD_FOLDS);
 const _: () = assert!(
     ZK_CAPSULE_PCS_MID_LEAF_COUNT * (1 << MID_STANDARD_FOLDS) == ZK_CAPSULE_PCS_MID_CODE_LEN
@@ -120,8 +125,8 @@ const _: () = assert!(
 const _: () = assert!(ZK_CAPSULE_PCS_QUERY_COUNT == ZK_AUTH_CAPSULE_GEOMETRY.query_count);
 const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH == ZK_AUTH_CAPSULE_GEOMETRY.source_cap_depth);
 const _: () = assert!(ZK_CAPSULE_PCS_MID_CAP_DEPTH == ZK_AUTH_CAPSULE_GEOMETRY.mid_cap_depth);
-const _: () = assert!(ZK_CAPSULE_PCS_WORST_OPENING_BYTES == 53_248);
-const _: () = assert!(ZK_CAPSULE_PCS_WORST_TOTAL_BYTES == 54_592);
+const _: () = assert!(ZK_CAPSULE_PCS_WORST_OPENING_BYTES == 78_912);
+const _: () = assert!(ZK_CAPSULE_PCS_WORST_TOTAL_BYTES == 79_936);
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZkCapsulePcsSourceCommitment {
@@ -133,9 +138,11 @@ impl ZkCapsulePcsSourceCommitment {
         self.cap.hashes.len() * 32
     }
 
-    /// Flatten the 32 flat-basis hashes into the 64 tower-basis transcript
+    /// Flatten the eight flat-basis hashes into 16 tower-basis transcript
     /// lanes absorbed by Owner, hash-major and low-half first.
-    pub fn transcript_lanes(&self) -> Result<[Block128; 64], ZkCapsulePcsError> {
+    pub fn transcript_lanes(
+        &self,
+    ) -> Result<[Block128; 2 * ZK_CAPSULE_PCS_SOURCE_CAP_HASHES], ZkCapsulePcsError> {
         if self.cap.hashes.len() != ZK_CAPSULE_PCS_SOURCE_CAP_HASHES {
             return Err(ZkCapsulePcsError::SourceCapCount {
                 expected: ZK_CAPSULE_PCS_SOURCE_CAP_HASHES,
@@ -158,7 +165,9 @@ impl ZkCapsulePcsMidCommitment {
         self.cap.hashes.len() * 32
     }
 
-    pub fn transcript_lanes(&self) -> Result<[Block128; 4], ZkCapsulePcsError> {
+    pub fn transcript_lanes(
+        &self,
+    ) -> Result<[Block128; 2 * ZK_CAPSULE_PCS_MID_CAP_HASHES], ZkCapsulePcsError> {
         if self.cap.hashes.len() != ZK_CAPSULE_PCS_MID_CAP_HASHES {
             return Err(ZkCapsulePcsError::MidCapCount {
                 expected: ZK_CAPSULE_PCS_MID_CAP_HASHES,
@@ -173,7 +182,7 @@ impl ZkCapsulePcsMidCommitment {
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZkCapsulePcsTailReveal {
-    pub coefficients: [Block128; TAIL_SYMBOLS],
+    pub coefficients: [Block256; TAIL_SYMBOLS],
 }
 
 impl ZkCapsulePcsTailReveal {
@@ -188,13 +197,14 @@ pub struct ZkCapsulePcsOpening {
     pub source_joint_symbols: Vec<Block128>,
     pub source_batch: SourceBatchedMerkleProof,
     /// Query-major contiguous 16-cell mid leaves.
-    pub mid_symbols: Vec<Block128>,
+    pub mid_symbols: Vec<Block256>,
     pub mid_batch: SourceBatchedMerkleProof,
 }
 
 impl ZkCapsulePcsOpening {
     pub fn byte_len(&self) -> usize {
-        (self.source_joint_symbols.len() + self.mid_symbols.len()) * 16
+        self.source_joint_symbols.len() * 16
+            + self.mid_symbols.len() * 32
             + (self.source_batch.siblings.len() + self.mid_batch.siblings.len()) * 32
     }
 }
@@ -211,9 +221,9 @@ impl ZkCapsulePcsOpening {
 /// ```
 pub struct ZkCapsulePcsSourceProverState {
     bank: Zeroizing<Vec<Block128>>,
-    companion: Zeroizing<Vec<Block128>>,
+    companion: Zeroizing<Vec<Block256>>,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
@@ -231,9 +241,9 @@ impl ZkCapsulePcsSourceProverState {
 /// into the Phase-A relation binding.
 pub struct ZkCapsulePcsOwnerBoundProverState {
     bank: Zeroizing<Vec<Block128>>,
-    companion: Zeroizing<Vec<Block128>>,
+    companion: Zeroizing<Vec<Block256>>,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
@@ -241,17 +251,17 @@ pub struct ZkCapsulePcsOwnerBoundProverState {
 /// The Owner bank claim is checked, not duplicated in this hand-off.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZkCapsulePcsPhaseABinding {
-    pub companion_claim: Block128,
+    pub companion_claim: Block256,
 }
 
 /// Source commitment state after the transparent relation and Owner bank
 /// claim have been bound, but before `gamma` exists.
 pub struct ZkCapsulePcsPhaseABoundProverState {
     bank: Zeroizing<Vec<Block128>>,
-    companion: Zeroizing<Vec<Block128>>,
-    relation: Zeroizing<Vec<Block128>>,
+    companion: Zeroizing<Vec<Block256>>,
+    relation: Zeroizing<Vec<Block256>>,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
@@ -259,45 +269,45 @@ pub struct ZkCapsulePcsPhaseABoundProverState {
 /// have already been zeroized; exactly one materialization of `U_gamma`
 /// remains for the Phase-B link and low folds.
 pub struct ZkCapsulePcsPhaseACompleteProverState {
-    virtual_oracle: Zeroizing<Vec<Block128>>,
-    gamma: Block128,
-    terminal_point: [Block128; PHASE_A_VARS],
-    terminal_oracle_value: Block128,
+    virtual_oracle: Zeroizing<Vec<Block256>>,
+    gamma: Block256,
+    terminal_point: [Block256; PHASE_A_VARS],
+    terminal_oracle_value: Block256,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
 /// The public Phase-B table linked to the exact Phase-A terminal value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkCapsulePcsPhaseBLink {
-    pub upper: [Block128; UPPER_SYMBOLS],
+    pub upper: [Block256; UPPER_SYMBOLS],
 }
 
 /// The only production state admitted to the mid-commit transition.
 pub struct ZkCapsulePcsPhaseBReadyProverState {
-    virtual_oracle: Zeroizing<Vec<Block128>>,
-    gamma: Block128,
+    virtual_oracle: Zeroizing<Vec<Block256>>,
+    gamma: Block256,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
 pub struct ZkCapsulePcsMidProverState {
-    mid_message: Zeroizing<Vec<Block128>>,
-    mid_codeword: Zeroizing<Vec<Block128>>,
+    mid_message: Zeroizing<Vec<Block256>>,
+    mid_codeword: Zeroizing<Vec<Block256>>,
     mid_tree: SourceHashMerkleTree,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
 pub struct ZkCapsulePcsTailProverState {
     pub tail: ZkCapsulePcsTailReveal,
-    mid_codeword: Zeroizing<Vec<Block128>>,
+    mid_codeword: Zeroizing<Vec<Block256>>,
     mid_tree: SourceHashMerkleTree,
     bank_codeword: Zeroizing<Vec<Block128>>,
-    companion_codeword: Zeroizing<Vec<Block128>>,
+    companion_codeword: Zeroizing<Vec<Block256>>,
     source_tree: SourceHashMerkleTree,
 }
 
@@ -346,12 +356,12 @@ pub enum ZkCapsulePcsError {
     },
     GammaEndpoint,
     OwnerBankClaimMismatch {
-        expected: Block128,
-        actual: Block128,
+        expected: Block256,
+        actual: Block256,
     },
     PhaseATerminalMismatch {
-        expected: Block128,
-        actual: Block128,
+        expected: Block256,
+        actual: Block256,
     },
     QueryMapping {
         query_index: usize,
@@ -411,8 +421,8 @@ pub fn tower_lanes_to_flat_digest(lanes: [Block128; 2]) -> SourceHash {
     digest
 }
 
-fn require_gamma(gamma: Block128) -> Result<(), ZkCapsulePcsError> {
-    if gamma == Block128::ZERO || gamma == Block128::ONE {
+fn require_gamma(gamma: Block256) -> Result<(), ZkCapsulePcsError> {
+    if gamma == Block256::ZERO || gamma == Block256::ONE {
         Err(ZkCapsulePcsError::GammaEndpoint)
     } else {
         Ok(())
@@ -422,7 +432,7 @@ fn require_gamma(gamma: Block128) -> Result<(), ZkCapsulePcsError> {
 /// Bind the lowest variable while erasing every discarded cell before the
 /// vector length shrinks. This avoids leaving folded witness material in the
 /// initialized-but-out-of-length portion of a retained allocation.
-fn fold_lowest_zeroizing(values: &mut Zeroizing<Vec<Block128>>, challenge: Block128) {
+fn fold_lowest_zeroizing(values: &mut Zeroizing<Vec<Block256>>, challenge: Block256) {
     debug_assert!(values.len().is_power_of_two() && values.len() >= 2);
     let folded_len = values.len() / 2;
     for index in 0..folded_len {
@@ -436,7 +446,7 @@ fn fold_lowest_zeroizing(values: &mut Zeroizing<Vec<Block128>>, challenge: Block
     values.truncate(folded_len);
 }
 
-fn preflight_messages(bank: &[Block128], companion: &[Block128]) -> Result<(), ZkCapsulePcsError> {
+fn preflight_messages(bank: &[Block128], companion: &[Block256]) -> Result<(), ZkCapsulePcsError> {
     if bank.len() != AFFINE_CODE_MESSAGE_LEN {
         return Err(ZkCapsulePcsError::BankLength {
             expected: AFFINE_CODE_MESSAGE_LEN,
@@ -469,15 +479,17 @@ fn preflight_queries(queries: &[usize]) -> Result<(), ZkCapsulePcsError> {
 
 fn build_source_tree(
     bank_codeword: &[Block128],
-    companion_codeword: &[Block128],
+    companion_codeword: &[Block256],
 ) -> SourceHashMerkleTree {
+    let code = ZkAffineLchCode::selected().expect("selected affine code is valid");
     let leaf_hashes = (0..ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT)
         .into_par_iter()
         .with_min_len(64)
         .map(|leaf| {
-            let joint = build_joint_source_leaf(bank_codeword, companion_codeword, leaf)
-                .expect("fixed selected source codeword shape");
-            capsule_leaf_hash(ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG, leaf, &joint)
+            let joint =
+                build_fold_normal_joint_source_leaf(&code, bank_codeword, companion_codeword, leaf)
+                    .expect("fixed selected source codeword shape");
+            capsule_leaf_hash_mixed(&joint)
         })
         .collect();
     SourceHashMerkleTree::new(
@@ -487,17 +499,15 @@ fn build_source_tree(
     )
 }
 
-fn build_mid_tree(mid_codeword: &[Block128]) -> SourceHashMerkleTree {
+fn build_mid_tree(mid_codeword: &[Block256]) -> SourceHashMerkleTree {
+    let code = ZkAffineLchCode::selected().expect("selected affine code is valid");
     let leaf_hashes = (0..ZK_CAPSULE_PCS_MID_LEAF_COUNT)
         .into_par_iter()
         .with_min_len(32)
         .map(|leaf| {
-            let start = leaf << MID_STANDARD_FOLDS;
-            capsule_leaf_hash(
-                ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG,
-                leaf,
-                &mid_codeword[start..start + (1 << MID_STANDARD_FOLDS)],
-            )
+            let leaf = build_fold_normal_mid_leaf(&code, mid_codeword, leaf)
+                .expect("fixed selected mid codeword shape");
+            capsule_leaf_hash_wide(&leaf)
         })
         .collect();
     SourceHashMerkleTree::new(
@@ -509,12 +519,12 @@ fn build_mid_tree(mid_codeword: &[Block128]) -> SourceHashMerkleTree {
 
 fn commit_prepared_messages(
     bank: Zeroizing<Vec<Block128>>,
-    companion: Zeroizing<Vec<Block128>>,
+    companion: Zeroizing<Vec<Block256>>,
 ) -> Result<(ZkCapsulePcsSourceCommitment, ZkCapsulePcsSourceProverState), ZkCapsulePcsError> {
     preflight_messages(&bank, &companion)?;
     let code = ZkAffineLchCode::selected()?;
     let bank_codeword = Zeroizing::new(code.encode(&bank)?);
-    let companion_codeword = Zeroizing::new(code.encode(&companion)?);
+    let companion_codeword = Zeroizing::new(code.encode_extension_after_low_folds(&companion, 0)?);
     let source_tree = build_source_tree(&bank_codeword, &companion_codeword);
     let commitment = ZkCapsulePcsSourceCommitment {
         cap: MerkleCap {
@@ -542,6 +552,11 @@ fn draw_fresh_field(rng: &mut (impl CryptoRng + RngCore + ?Sized)) -> Block128 {
     value
 }
 
+#[inline]
+fn draw_fresh_wide_field(rng: &mut (impl CryptoRng + RngCore + ?Sized)) -> Block256 {
+    Block256::new(draw_fresh_field(rng), draw_fresh_field(rng))
+}
+
 /// Commit one authorization state with attempt-local witness-hiding entropy.
 ///
 /// Only the exact 512-cell AuthGKR state is accepted from the caller.  Bank
@@ -565,7 +580,7 @@ pub fn zk_capsule_pcs_commit_fresh(
     bank.extend((AFFINE_STATE_LEN..AFFINE_CODE_MESSAGE_LEN).map(|_| draw_fresh_field(rng)));
     let companion = Zeroizing::new(
         (0..AFFINE_CODE_MESSAGE_LEN)
-            .map(|_| draw_fresh_field(rng))
+            .map(|_| draw_fresh_wide_field(rng))
             .collect(),
     );
     commit_prepared_messages(bank, companion)
@@ -576,7 +591,7 @@ pub fn zk_capsule_pcs_commit_fresh(
 #[cfg(test)]
 fn zk_capsule_pcs_commit_for_test(
     bank: Vec<Block128>,
-    companion: Vec<Block128>,
+    companion: Vec<Block256>,
 ) -> Result<(ZkCapsulePcsSourceCommitment, ZkCapsulePcsSourceProverState), ZkCapsulePcsError> {
     commit_prepared_messages(Zeroizing::new(bank), Zeroizing::new(companion))
 }
@@ -629,8 +644,8 @@ pub fn zk_capsule_pcs_bind_owner<T, E>(
 /// ```
 pub fn zk_capsule_pcs_bind_phase_a(
     owner_bound: ZkCapsulePcsOwnerBoundProverState,
-    relation: &[Block128],
-    expected_owner_bank_claim: Block128,
+    relation: &[Block256],
+    expected_owner_bank_claim: Block256,
 ) -> Result<
     (
         ZkCapsulePcsPhaseABinding,
@@ -676,9 +691,15 @@ pub fn zk_capsule_pcs_bind_phase_a(
 /// the raw bank, companion, and relation messages are zeroized on return.
 pub fn zk_capsule_pcs_prove_phase_a(
     bound: ZkCapsulePcsPhaseABoundProverState,
-    gamma: Block128,
-    challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof) -> Block128,
-) -> Result<(ZkPhaseAProverOutput, ZkCapsulePcsPhaseACompleteProverState), ZkCapsulePcsError> {
+    gamma: Block256,
+    challenge_after_round: impl FnMut(usize, ZkPhaseARoundProof<Block256>) -> Block256,
+) -> Result<
+    (
+        ZkPhaseAProverOutput<Block256>,
+        ZkCapsulePcsPhaseACompleteProverState,
+    ),
+    ZkCapsulePcsError,
+> {
     require_gamma(gamma)?;
     let output = prove_phase_a_adaptive(
         &bound.bank,
@@ -708,13 +729,13 @@ pub fn zk_capsule_pcs_prove_phase_a(
 /// admit the consumed state to Phase B.
 pub fn zk_capsule_pcs_link_phase_b(
     complete: ZkCapsulePcsPhaseACompleteProverState,
-    linked_terminal_value: Block128,
+    linked_terminal_value: Block256,
 ) -> Result<(ZkCapsulePcsPhaseBLink, ZkCapsulePcsPhaseBReadyProverState), ZkCapsulePcsError> {
-    let low_point: [Block128; PHASE_B_LOW_VARS] =
+    let low_point: [Block256; PHASE_B_LOW_VARS] =
         std::array::from_fn(|index| complete.terminal_point[index]);
-    let high_point: [Block128; PHASE_B_HIGH_VARS] =
+    let high_point: [Block256; PHASE_B_HIGH_VARS] =
         std::array::from_fn(|index| complete.terminal_point[PHASE_B_LOW_VARS + index]);
-    let oracle: &[Block128; AFFINE_CODE_MESSAGE_LEN] = complete
+    let oracle: &[Block256; AFFINE_CODE_MESSAGE_LEN] = complete
         .virtual_oracle
         .as_slice()
         .try_into()
@@ -757,7 +778,7 @@ pub fn zk_capsule_pcs_link_phase_b(
 /// ```
 pub fn zk_capsule_pcs_commit_mid(
     ready: ZkCapsulePcsPhaseBReadyProverState,
-    beta_source: [Block128; SOURCE_STANDARD_FOLDS],
+    beta_source: [Block256; SOURCE_STANDARD_FOLDS],
 ) -> Result<(ZkCapsulePcsMidCommitment, ZkCapsulePcsMidProverState), ZkCapsulePcsError> {
     require_gamma(ready.gamma)?;
     let code = ZkAffineLchCode::selected()?;
@@ -771,8 +792,9 @@ pub fn zk_capsule_pcs_commit_mid(
     for challenge in beta_source {
         fold_lowest_zeroizing(&mut virtual_oracle, challenge);
     }
-    let mid_codeword =
-        Zeroizing::new(code.encode_after_low_folds(&virtual_oracle, SOURCE_STANDARD_FOLDS)?);
+    let mid_codeword = Zeroizing::new(
+        code.encode_extension_after_low_folds(&virtual_oracle, SOURCE_STANDARD_FOLDS)?,
+    );
     let mid_tree = build_mid_tree(&mid_codeword);
     let commitment = ZkCapsulePcsMidCommitment {
         cap: MerkleCap {
@@ -797,8 +819,8 @@ pub fn zk_capsule_pcs_commit_mid(
 #[cfg(test)]
 fn zk_capsule_pcs_commit_mid_for_test(
     source: ZkCapsulePcsSourceProverState,
-    gamma: Block128,
-    beta_source: [Block128; SOURCE_STANDARD_FOLDS],
+    gamma: Block256,
+    beta_source: [Block256; SOURCE_STANDARD_FOLDS],
 ) -> Result<(ZkCapsulePcsMidCommitment, ZkCapsulePcsMidProverState), ZkCapsulePcsError> {
     require_gamma(gamma)?;
     let virtual_oracle = Zeroizing::new(phase_a_virtual_oracle(
@@ -821,12 +843,12 @@ fn zk_capsule_pcs_commit_mid_for_test(
 /// still needs.
 pub fn zk_capsule_pcs_reveal_tail(
     mut mid: ZkCapsulePcsMidProverState,
-    beta_mid: [Block128; MID_STANDARD_FOLDS],
+    beta_mid: [Block256; MID_STANDARD_FOLDS],
 ) -> Result<ZkCapsulePcsTailProverState, ZkCapsulePcsError> {
     for challenge in beta_mid {
         fold_lowest_zeroizing(&mut mid.mid_message, challenge);
     }
-    let coefficients: [Block128; TAIL_SYMBOLS] = mid
+    let coefficients: [Block256; TAIL_SYMBOLS] = mid
         .mid_message
         .as_slice()
         .try_into()
@@ -841,7 +863,7 @@ pub fn zk_capsule_pcs_reveal_tail(
     })
 }
 
-/// Open exactly 64 already transcript-derived source-leaf queries.  Repeated
+/// Open exactly 65 already transcript-derived source-leaf queries. Repeated
 /// queries retain query-major symbol slots while the canonical multiproofs
 /// deduplicate authenticated leaves.
 pub fn zk_capsule_pcs_open(
@@ -849,6 +871,7 @@ pub fn zk_capsule_pcs_open(
     queries: &[usize],
 ) -> Result<ZkCapsulePcsOpening, ZkCapsulePcsError> {
     preflight_queries(queries)?;
+    let code = ZkAffineLchCode::selected()?;
     let mut source_joint_symbols = Vec::with_capacity(ZK_CAPSULE_PCS_SOURCE_SYMBOLS);
     let mut mid_symbols = Vec::with_capacity(ZK_CAPSULE_PCS_MID_SYMBOLS);
     let mut source_leaves = Vec::with_capacity(ZK_CAPSULE_PCS_QUERY_COUNT);
@@ -857,13 +880,15 @@ pub fn zk_capsule_pcs_open(
     for &query in queries {
         let mapping = map_source_query_leaf(query)?;
         source_leaves.push(mapping.source_leaf_index);
-        source_joint_symbols.extend_from_slice(&build_joint_source_leaf(
+        source_joint_symbols.extend_from_slice(&build_fold_normal_joint_source_leaf(
+            &code,
             &tail_state.bank_codeword,
             &tail_state.companion_codeword,
             mapping.source_leaf_index,
         )?);
         mid_leaves.push(mapping.mid_leaf_index);
-        mid_symbols.extend_from_slice(&build_mid_leaf(
+        mid_symbols.extend_from_slice(&build_fold_normal_mid_leaf(
+            &code,
             &tail_state.mid_codeword,
             mapping.mid_leaf_index,
         )?);
@@ -899,9 +924,9 @@ pub fn zk_capsule_pcs_verify(
     source_commitment: &ZkCapsulePcsSourceCommitment,
     mid_commitment: &ZkCapsulePcsMidCommitment,
     tail: &ZkCapsulePcsTailReveal,
-    gamma: Block128,
-    beta_source: [Block128; SOURCE_STANDARD_FOLDS],
-    beta_mid: [Block128; MID_STANDARD_FOLDS],
+    gamma: Block256,
+    beta_source: [Block256; SOURCE_STANDARD_FOLDS],
+    beta_mid: [Block256; MID_STANDARD_FOLDS],
     queries: &[usize],
     opening: &ZkCapsulePcsOpening,
 ) -> Result<ZkCapsulePcsVerified, ZkCapsulePcsError> {
@@ -949,7 +974,7 @@ pub fn zk_capsule_pcs_verify(
         });
     }
 
-    let tail_codeword = code.encode_after_low_folds(
+    let tail_codeword = code.encode_extension_after_low_folds(
         &tail.coefficients,
         SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS,
     )?;
@@ -972,34 +997,26 @@ pub fn zk_capsule_pcs_verify(
             .try_into()
             .expect("source shape preflighted");
         source_leaves.push(mapping.source_leaf_index);
-        source_hashes.push(capsule_leaf_hash(
-            ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG,
-            mapping.source_leaf_index,
-            source_leaf,
-        ));
-        let source_folded = fold_joint_source_leaf(
-            &code,
-            source_leaf,
-            gamma,
-            mapping.source_leaf_index,
-            &beta_source,
-        )?;
+        source_hashes.push(capsule_leaf_hash_mixed(source_leaf));
+        let source_folded = fold_normal_joint_source_leaf(source_leaf, gamma, &beta_source);
 
         let mid_start = query_index * (1 << MID_STANDARD_FOLDS);
-        let mid_leaf: &[Block128; 1 << MID_STANDARD_FOLDS] = opening.mid_symbols
+        let mid_leaf: &[Block256; 1 << MID_STANDARD_FOLDS] = opening.mid_symbols
             [mid_start..mid_start + (1 << MID_STANDARD_FOLDS)]
             .try_into()
             .expect("mid shape preflighted");
-        if mid_leaf[mapping.mid_member_index] != source_folded {
+        if fold_normal_mid_raw_member(
+            &code,
+            mid_leaf,
+            mapping.mid_leaf_index,
+            mapping.mid_member_index,
+        )? != source_folded
+        {
             return Err(ZkCapsulePcsError::SourceToMidMismatch { query_index });
         }
         mid_leaves.push(mapping.mid_leaf_index);
-        mid_hashes.push(capsule_leaf_hash(
-            ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG,
-            mapping.mid_leaf_index,
-            mid_leaf,
-        ));
-        let mid_folded = mid_standard_fold4(&code, mid_leaf, mapping.mid_leaf_index, &beta_mid)?;
+        mid_hashes.push(capsule_leaf_hash_wide(mid_leaf));
+        let mid_folded = fold_normal_mid_leaf(mid_leaf, &beta_mid);
         if tail_codeword[mapping.mid_leaf_index] != mid_folded {
             return Err(ZkCapsulePcsError::MidToTailMismatch { query_index });
         }
@@ -1053,19 +1070,71 @@ mod tests {
             .collect()
     }
 
-    fn bank_claim(bank: &[Block128], relation: &[Block128]) -> Block128 {
+    fn wide(index: usize, domain: u128, salt: u128) -> Block256 {
+        Block256::new(
+            elem(index, domain, salt),
+            elem(index + 10_000, domain ^ 0xC1_0256, salt.rotate_left(17)),
+        )
+    }
+
+    fn bank_claim(bank: &[Block128], relation: &[Block256]) -> Block256 {
         bank.iter()
             .zip(relation)
-            .fold(Block128::ZERO, |sum, (&bank, &weight)| sum + bank * weight)
+            .fold(Block256::ZERO, |sum, (&bank, &weight)| {
+                sum + Block256::from(bank) * weight
+            })
+    }
+
+    fn exact_max_batched_siblings(tree_depth: usize, cap_count: usize, queries: usize) -> usize {
+        let mut tree = vec![vec![0usize; 2]; tree_depth + 1];
+        for depth in 1..=tree_depth {
+            let half = 1usize << (depth - 1);
+            let mut current = vec![0usize; 2 * half + 1];
+            for selected in 1..=2 * half {
+                let mut best = 0;
+                let left_min = selected.saturating_sub(half);
+                let left_max = selected.min(half);
+                for left in left_min..=left_max {
+                    let right = selected - left;
+                    let exposed_sibling = usize::from((left == 0) != (right == 0));
+                    best =
+                        best.max(tree[depth - 1][left] + tree[depth - 1][right] + exposed_sibling);
+                }
+                current[selected] = best;
+            }
+            tree[depth] = current;
+        }
+
+        let unreachable = usize::MAX;
+        let mut forest = vec![unreachable; queries + 1];
+        forest[0] = 0;
+        for _ in 0..cap_count {
+            let previous = forest;
+            forest = vec![unreachable; queries + 1];
+            for selected in 0..=queries {
+                let in_tree_max = selected.min(1usize << tree_depth);
+                forest[selected] = (0..=in_tree_max)
+                    .filter_map(|in_tree| {
+                        let prior = previous[selected - in_tree];
+                        (prior != unreachable).then(|| prior + tree[tree_depth][in_tree])
+                    })
+                    .max()
+                    .unwrap_or(unreachable);
+            }
+        }
+        forest[queries]
     }
 
     fn worst_queries() -> Vec<usize> {
         let mut queries = Vec::with_capacity(ZK_CAPSULE_PCS_QUERY_COUNT);
         for cap in 0..ZK_CAPSULE_PCS_SOURCE_CAP_HASHES {
             let base = cap << ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH;
-            queries.push(base);
-            queries.push(base + (1 << (ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH - 1)));
+            for mid_leaf_within_cap in (0..64).step_by(8) {
+                queries.push(base | (mid_leaf_within_cap << MID_STANDARD_FOLDS));
+            }
         }
+        queries.push(4 << MID_STANDARD_FOLDS);
+        assert_eq!(queries.len(), ZK_CAPSULE_PCS_QUERY_COUNT);
         queries
     }
 
@@ -1073,22 +1142,24 @@ mod tests {
         source_commitment: ZkCapsulePcsSourceCommitment,
         mid_commitment: ZkCapsulePcsMidCommitment,
         tail: ZkCapsulePcsTailReveal,
-        gamma: Block128,
-        beta_source: [Block128; SOURCE_STANDARD_FOLDS],
-        beta_mid: [Block128; MID_STANDARD_FOLDS],
+        gamma: Block256,
+        beta_source: [Block256; SOURCE_STANDARD_FOLDS],
+        beta_mid: [Block256; MID_STANDARD_FOLDS],
         queries: Vec<usize>,
         opening: ZkCapsulePcsOpening,
     }
 
     fn fixture(salt: u128, queries: Vec<usize>) -> Fixture {
         let bank = message(0xB4A9, salt ^ 0x11);
-        let companion = message(0xC09A, salt ^ 0x22);
-        let mut gamma = elem(19, 0x6A77A, salt ^ 0x33);
-        if gamma == Block128::ZERO || gamma == Block128::ONE {
-            gamma += Block128::from(2u128);
+        let companion = (0..AFFINE_CODE_MESSAGE_LEN)
+            .map(|index| wide(index, 0xC09A, salt ^ 0x22))
+            .collect();
+        let mut gamma = wide(19, 0x6A77A, salt ^ 0x33);
+        if gamma == Block256::ZERO || gamma == Block256::ONE {
+            gamma += Block256::from(2u128);
         }
-        let beta_source = std::array::from_fn(|round| elem(round + 41, 0xBE7A_03, salt ^ 0x44));
-        let beta_mid = std::array::from_fn(|round| elem(round + 61, 0xBE7A_47, salt ^ 0x55));
+        let beta_source = std::array::from_fn(|round| wide(round + 41, 0xBE7A_03, salt ^ 0x44));
+        let beta_mid = std::array::from_fn(|round| wide(round + 61, 0xBE7A_47, salt ^ 0x55));
         let (source_commitment, source_state) =
             zk_capsule_pcs_commit_for_test(bank, companion).expect("source commit");
         let (mid_commitment, mid_state) =
@@ -1157,11 +1228,11 @@ mod tests {
         assert_eq!(&first.bank_for_test()[..AFFINE_STATE_LEN], state);
         assert_eq!(&second.bank_for_test()[..AFFINE_STATE_LEN], state);
         for range in [
-            crate::zk_affine_code::AFFINE_PCS_COINS_START
-                ..crate::zk_affine_code::AFFINE_LIBRA_MASK_START,
             crate::zk_affine_code::AFFINE_LIBRA_MASK_START
                 ..crate::zk_affine_code::AFFINE_FRESH_PADDING_START,
-            crate::zk_affine_code::AFFINE_FRESH_PADDING_START..AFFINE_CODE_MESSAGE_LEN,
+            crate::zk_affine_code::AFFINE_FRESH_PADDING_START
+                ..crate::zk_affine_code::AFFINE_PCS_COINS_START,
+            crate::zk_affine_code::AFFINE_PCS_COINS_START..AFFINE_CODE_MESSAGE_LEN,
         ] {
             assert_ne!(
                 &first.bank_for_test()[range.clone()],
@@ -1183,8 +1254,8 @@ mod tests {
         assert!(matches!(
             zk_capsule_pcs_commit_mid_for_test(
                 abandoned,
-                Block128::ZERO,
-                [Block128::ZERO; SOURCE_STANDARD_FOLDS],
+                Block256::ZERO,
+                [Block256::ZERO; SOURCE_STANDARD_FOLDS],
             ),
             Err(ZkCapsulePcsError::GammaEndpoint)
         ));
@@ -1231,8 +1302,8 @@ mod tests {
     fn honest_production_typestate_runs_phase_a_link_and_mid_in_order() {
         let full = message(0x57A7E, 0x44);
         let state = &full[..AFFINE_STATE_LEN];
-        let relation: [Block128; AFFINE_CODE_MESSAGE_LEN] =
-            std::array::from_fn(|index| elem(index, 0x7E1A_710, 0xA11C_E104));
+        let relation: [Block256; AFFINE_CODE_MESSAGE_LEN] =
+            std::array::from_fn(|index| wide(index, 0x7E1A_710, 0xA11C_E104));
         let mut rng = StdRng::seed_from_u64(0xA11C_E104);
         let (source_commitment, source) =
             zk_capsule_pcs_commit_fresh(state, &mut rng).expect("fresh source");
@@ -1247,12 +1318,12 @@ mod tests {
             zk_capsule_pcs_bind_phase_a(owner_bound, &relation, owner_bank_claim)
                 .expect("bind Phase A");
 
-        let mut gamma = elem(17, 0x6A77A, 0xA11C_E104);
-        if gamma == Block128::ZERO || gamma == Block128::ONE {
-            gamma += Block128::from(2u128);
+        let mut gamma = wide(17, 0x6A77A, 0xA11C_E104);
+        if gamma == Block256::ZERO || gamma == Block256::ONE {
+            gamma += Block256::from(2u128);
         }
-        let challenges: [Block128; PHASE_A_VARS] =
-            std::array::from_fn(|round| elem(round + 31, 0xC4A1_1E6E, 0xA11C_E104));
+        let challenges: [Block256; PHASE_A_VARS] =
+            std::array::from_fn(|round| wide(round + 31, 0xC4A1_1E6E, 0xA11C_E104));
         let mut observed = Vec::new();
         let (phase_a, complete) =
             zk_capsule_pcs_prove_phase_a(bound, gamma, |round, round_proof| {
@@ -1269,11 +1340,11 @@ mod tests {
         let terminal_point = phase_a.terminal_point;
         let (phase_b_link, ready) =
             zk_capsule_pcs_link_phase_b(complete, terminal).expect("link Phase B");
-        let low: [Block128; PHASE_B_LOW_VARS] = std::array::from_fn(|index| terminal_point[index]);
+        let low: [Block256; PHASE_B_LOW_VARS] = std::array::from_fn(|index| terminal_point[index]);
         assert_eq!(evaluate_upper_at_low8(&phase_b_link.upper, &low), terminal);
 
-        let beta_source = std::array::from_fn(|round| elem(round + 41, 0xBE7A_03, 0xA11C_E104));
-        let beta_mid = std::array::from_fn(|round| elem(round + 61, 0xBE7A_47, 0xA11C_E104));
+        let beta_source = std::array::from_fn(|round| wide(round + 41, 0xBE7A_03, 0xA11C_E104));
+        let beta_mid = std::array::from_fn(|round| wide(round + 61, 0xBE7A_47, 0xA11C_E104));
         let (mid_commitment, mid) =
             zk_capsule_pcs_commit_mid(ready, beta_source).expect("typed mid commit");
         let tail_state = zk_capsule_pcs_reveal_tail(mid, beta_mid).expect("tail reveal");
@@ -1294,7 +1365,7 @@ mod tests {
 
         let _only_phase_b_ready: fn(
             ZkCapsulePcsPhaseBReadyProverState,
-            [Block128; SOURCE_STANDARD_FOLDS],
+            [Block256; SOURCE_STANDARD_FOLDS],
         ) -> Result<
             (ZkCapsulePcsMidCommitment, ZkCapsulePcsMidProverState),
             ZkCapsulePcsError,
@@ -1305,15 +1376,15 @@ mod tests {
     fn owner_bank_claim_mismatch_consumes_the_attempt_atomically() {
         let full = message(0x57A7E, 0x55);
         let state = &full[..AFFINE_STATE_LEN];
-        let relation: [Block128; AFFINE_CODE_MESSAGE_LEN] =
-            std::array::from_fn(|index| elem(index, 0x7E1A_710, 0xA11C_E105));
+        let relation: [Block256; AFFINE_CODE_MESSAGE_LEN] =
+            std::array::from_fn(|index| wide(index, 0x7E1A_710, 0xA11C_E105));
         let mut rng = StdRng::seed_from_u64(0xA11C_E105);
         let (failed_commitment, source) =
             zk_capsule_pcs_commit_fresh(state, &mut rng).expect("failed attempt source");
         let (actual, owner_bound) =
             zk_capsule_pcs_bind_owner(source, |bank| Ok::<_, ()>(bank_claim(bank, &relation)))
                 .expect("one-shot Owner handoff");
-        let expected = actual + Block128::ONE;
+        let expected = actual + Block256::ONE;
         assert!(matches!(
             zk_capsule_pcs_bind_phase_a(owner_bound, &relation, expected),
             Err(ZkCapsulePcsError::OwnerBankClaimMismatch {
@@ -1332,8 +1403,8 @@ mod tests {
     fn phase_b_link_rejects_a_terminal_value_not_produced_by_phase_a() {
         let full = message(0x57A7E, 0x66);
         let state = &full[..AFFINE_STATE_LEN];
-        let relation: [Block128; AFFINE_CODE_MESSAGE_LEN] =
-            std::array::from_fn(|index| elem(index, 0x7E1A_710, 0xA11C_E106));
+        let relation: [Block256; AFFINE_CODE_MESSAGE_LEN] =
+            std::array::from_fn(|index| wide(index, 0x7E1A_710, 0xA11C_E106));
         let mut rng = StdRng::seed_from_u64(0xA11C_E106);
         let (_, source) = zk_capsule_pcs_commit_fresh(state, &mut rng).expect("fresh source");
         let (owner_bank_claim, owner_bound) =
@@ -1341,16 +1412,16 @@ mod tests {
                 .expect("one-shot Owner handoff");
         let (_, bound) = zk_capsule_pcs_bind_phase_a(owner_bound, &relation, owner_bank_claim)
             .expect("bind Phase A");
-        let mut gamma = elem(17, 0x6A77A, 0xA11C_E106);
-        if gamma == Block128::ZERO || gamma == Block128::ONE {
-            gamma += Block128::from(2u128);
+        let mut gamma = wide(17, 0x6A77A, 0xA11C_E106);
+        if gamma == Block256::ZERO || gamma == Block256::ONE {
+            gamma += Block256::from(2u128);
         }
-        let challenges: [Block128; PHASE_A_VARS] =
-            std::array::from_fn(|round| elem(round + 31, 0xC4A1_1E6E, 0xA11C_E106));
+        let challenges: [Block256; PHASE_A_VARS] =
+            std::array::from_fn(|round| wide(round + 31, 0xC4A1_1E6E, 0xA11C_E106));
         let (phase_a, complete) =
             zk_capsule_pcs_prove_phase_a(bound, gamma, |round, _| challenges[round])
                 .expect("adaptive Phase A");
-        let bad_terminal = phase_a.terminal_oracle_value + Block128::ONE;
+        let bad_terminal = phase_a.terminal_oracle_value + Block256::ONE;
         assert!(matches!(
             zk_capsule_pcs_link_phase_b(complete, bad_terminal),
             Err(ZkCapsulePcsError::PhaseATerminalMismatch { expected, actual })
@@ -1362,13 +1433,13 @@ mod tests {
     fn selected_pcs_honest_opening_and_digest_lane_roundtrip() {
         let fixture = fixture(0xA11C_E001, worst_queries());
         let verified = verify(&fixture).expect("honest selected PCS opening");
-        assert_eq!(verified.source_hiding_rank.certified_rank, 512);
-        assert_eq!(verified.source_hiding_rank.distinct_query_count, 512);
+        assert_eq!(verified.source_hiding_rank.certified_rank, 520);
+        assert_eq!(verified.source_hiding_rank.distinct_query_count, 520);
         assert_eq!(
             fixture.source_commitment.transcript_lanes().unwrap().len(),
-            64
+            16
         );
-        assert_eq!(fixture.mid_commitment.transcript_lanes().unwrap().len(), 4);
+        assert_eq!(fixture.mid_commitment.transcript_lanes().unwrap().len(), 16);
 
         for digest in fixture
             .source_commitment
@@ -1386,18 +1457,34 @@ mod tests {
 
     #[test]
     fn canonical_batched_proofs_hit_exact_worst_counts_and_bytes() {
+        assert_eq!(
+            exact_max_batched_siblings(
+                ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                ZK_CAPSULE_PCS_SOURCE_CAP_HASHES,
+                ZK_CAPSULE_PCS_QUERY_COUNT,
+            ),
+            ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS,
+        );
+        assert_eq!(
+            exact_max_batched_siblings(
+                ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                ZK_CAPSULE_PCS_MID_CAP_HASHES,
+                ZK_CAPSULE_PCS_QUERY_COUNT,
+            ),
+            ZK_CAPSULE_PCS_WORST_MID_SIBLINGS,
+        );
         let fixture = fixture(0xA11C_E002, worst_queries());
-        assert_eq!(fixture.opening.source_batch.siblings.len(), 448);
-        assert_eq!(fixture.opening.mid_batch.siblings.len(), 192);
-        assert_eq!(fixture.opening.source_joint_symbols.len(), 1_024);
-        assert_eq!(fixture.opening.mid_symbols.len(), 1_024);
+        assert_eq!(fixture.opening.source_batch.siblings.len(), 453);
+        assert_eq!(fixture.opening.mid_batch.siblings.len(), 193);
+        assert_eq!(fixture.opening.source_joint_symbols.len(), 1_560);
+        assert_eq!(fixture.opening.mid_symbols.len(), 1_040);
         assert_eq!(
             fixture.opening.byte_len(),
             ZK_CAPSULE_PCS_WORST_OPENING_BYTES
         );
-        assert_eq!(fixture.source_commitment.byte_len(), 1_024);
-        assert_eq!(fixture.mid_commitment.byte_len(), 64);
-        assert_eq!(fixture.tail.byte_len(), 256);
+        assert_eq!(fixture.source_commitment.byte_len(), 256);
+        assert_eq!(fixture.mid_commitment.byte_len(), 256);
+        assert_eq!(fixture.tail.byte_len(), 512);
         assert_eq!(
             fixture.opening.byte_len()
                 + fixture.source_commitment.byte_len()
@@ -1412,10 +1499,10 @@ mod tests {
     fn repeated_queries_are_deduplicated_only_in_paths_and_rank() {
         let queries = vec![0x12A5; ZK_CAPSULE_PCS_QUERY_COUNT];
         let fixture = fixture(0xA11C_E003, queries);
-        assert_eq!(fixture.opening.source_batch.siblings.len(), 8);
-        assert_eq!(fixture.opening.mid_batch.siblings.len(), 8);
-        assert_eq!(fixture.opening.source_joint_symbols.len(), 1_024);
-        assert_eq!(fixture.opening.mid_symbols.len(), 1_024);
+        assert_eq!(fixture.opening.source_batch.siblings.len(), 10);
+        assert_eq!(fixture.opening.mid_batch.siblings.len(), 6);
+        assert_eq!(fixture.opening.source_joint_symbols.len(), 1_560);
+        assert_eq!(fixture.opening.mid_symbols.len(), 1_040);
         let verified = verify(&fixture).expect("repeated-query proof verifies");
         assert_eq!(verified.source_hiding_rank.distinct_query_count, 8);
         assert_eq!(verified.source_hiding_rank.certified_rank, 8);
@@ -1443,9 +1530,9 @@ mod tests {
         let check = |source: &ZkCapsulePcsSourceCommitment,
                      mid: &ZkCapsulePcsMidCommitment,
                      tail: &ZkCapsulePcsTailReveal,
-                     gamma: Block128,
-                     beta_source: [Block128; SOURCE_STANDARD_FOLDS],
-                     beta_mid: [Block128; MID_STANDARD_FOLDS],
+                     gamma: Block256,
+                     beta_source: [Block256; SOURCE_STANDARD_FOLDS],
+                     beta_mid: [Block256; MID_STANDARD_FOLDS],
                      queries: &[usize],
                      opening: &ZkCapsulePcsOpening,
                      name: &str| {
@@ -1494,7 +1581,7 @@ mod tests {
         );
 
         let mut tail = fixture.tail.clone();
-        tail.coefficients[9] += Block128::ONE;
+        tail.coefficients[9] += Block256::ONE;
         check(
             &fixture.source_commitment,
             &fixture.mid_commitment,
@@ -1522,7 +1609,7 @@ mod tests {
         );
 
         let mut opening = fixture.opening.clone();
-        opening.mid_symbols[11] += Block128::ONE;
+        opening.mid_symbols[11] += Block256::ONE;
         check(
             &fixture.source_commitment,
             &fixture.mid_commitment,
@@ -1564,7 +1651,7 @@ mod tests {
         );
 
         let mut beta_source = fixture.beta_source;
-        beta_source[1] += Block128::ONE;
+        beta_source[1] += Block256::ONE;
         check(
             &fixture.source_commitment,
             &fixture.mid_commitment,
@@ -1578,7 +1665,7 @@ mod tests {
         );
 
         let mut beta_mid = fixture.beta_mid;
-        beta_mid[2] += Block128::ONE;
+        beta_mid[2] += Block256::ONE;
         check(
             &fixture.source_commitment,
             &fixture.mid_commitment,
@@ -1595,7 +1682,7 @@ mod tests {
             &fixture.source_commitment,
             &fixture.mid_commitment,
             &fixture.tail,
-            Block128::ZERO,
+            Block256::ZERO,
             fixture.beta_source,
             fixture.beta_mid,
             &fixture.queries,

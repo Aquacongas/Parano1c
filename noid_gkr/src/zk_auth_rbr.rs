@@ -19,8 +19,9 @@ use std::sync::OnceLock;
 
 use noid_core::{Block128, TowerField};
 use noid_fri_binius::zk_affine_code::{ZkAffineCodeError, ZkAffineLchCode};
+use noid_fri_binius::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
 use noid_fri_binius::zk_capsule_algebra::{
-    JOINT_SOURCE_BANK_SYMBOLS, JOINT_SOURCE_LEAF_SYMBOLS, MID_STANDARD_FOLDS,
+    JOINT_SOURCE_BANK_SYMBOLS, JOINT_SOURCE_LOGICAL_SYMBOLS, MID_STANDARD_FOLDS,
     SOURCE_STANDARD_FOLDS, TAIL_SYMBOLS,
 };
 use noid_fri_binius::zk_phase_a::{phase_a_virtual_oracle, ZkPhaseAError};
@@ -88,9 +89,11 @@ pub const ZK_AUTH_RBR_SOURCE_MAX_RESTORATION_ERRORS: usize =
 pub const ZK_AUTH_RBR_MID_MAX_RESTORATION_ERRORS: usize =
     zk_auth_max_restoration_errors(ZK_AUTH_RBR_MID_CODEWORD_FIELDS);
 
-const _: () = assert!(JOINT_SOURCE_LEAF_SYMBOLS == 2 * JOINT_SOURCE_BANK_SYMBOLS);
+const _: () =
+    assert!(ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_symbols == 2 * JOINT_SOURCE_BANK_SYMBOLS);
 const _: () = assert!(
-    ZK_AUTH_RBR_SOURCE_LEAVES * JOINT_SOURCE_LEAF_SYMBOLS == ZK_AUTH_RBR_JOINT_SOURCE_FIELDS
+    ZK_AUTH_RBR_SOURCE_LEAVES * ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_symbols
+        == ZK_AUTH_RBR_JOINT_SOURCE_FIELDS
 );
 const _: () = assert!(
     ZK_AUTH_RBR_MID_CODEWORD_FIELDS == ZK_AUTH_RBR_RS_LAYERS[SOURCE_STANDARD_FOLDS].code_len
@@ -102,10 +105,10 @@ const _: () = assert!(ZK_AUTH_RBR_MID_MAX_RESTORATION_ERRORS == 3_918);
 const _: () = assert!(
     2 * ZK_AUTH_RESTORATION_RADIUS_NUMERATOR * 32 < 31 * ZK_AUTH_RESTORATION_RADIUS_DENOMINATOR
 );
-const _: () = assert!(ZK_AUTH_JOHNSON_LIST_RADIUS_NUMERATOR == 7);
-const _: () = assert!(ZK_AUTH_JOHNSON_LIST_RADIUS_DENOMINATOR == 10);
-const _: () = assert!(ZK_AUTH_JOHNSON_MAX_CANDIDATES == 3);
-const _: () = assert!(ZK_AUTH_JOHNSON_MAX_RESTORATION_TRIPLES == 27);
+const _: () = assert!(ZK_AUTH_JOHNSON_LIST_RADIUS_NUMERATOR == 49);
+const _: () = assert!(ZK_AUTH_JOHNSON_LIST_RADIUS_DENOMINATOR == 64);
+const _: () = assert!(ZK_AUTH_JOHNSON_MAX_CANDIDATES == 7);
+const _: () = assert!(ZK_AUTH_JOHNSON_MAX_RESTORATION_TRIPLES == 343);
 const _: () = assert!(
     ZK_AUTH_JOHNSON_LIST_RADIUS_NUMERATOR * ZK_AUTH_RESTORATION_RADIUS_DENOMINATOR
         > ZK_AUTH_RESTORATION_RADIUS_NUMERATOR * ZK_AUTH_JOHNSON_LIST_RADIUS_DENOMINATOR
@@ -132,7 +135,7 @@ pub const ZK_AUTH_RBR_RESTORATION_DOMAIN: ZkAuthRbrRestorationDomainManifest =
         source_message_fields: ZK_AUTH_RBR_SOURCE_MESSAGE_FIELDS,
         source_codeword_fields_per_oracle: ZK_AUTH_RBR_SOURCE_CODEWORD_FIELDS,
         joint_source_fields: ZK_AUTH_RBR_JOINT_SOURCE_FIELDS,
-        source_leaf_fields: JOINT_SOURCE_LEAF_SYMBOLS,
+        source_leaf_fields: JOINT_SOURCE_LOGICAL_SYMBOLS,
         source_leaves: ZK_AUTH_RBR_SOURCE_LEAVES,
         source_folds: SOURCE_STANDARD_FOLDS,
         mid_message_fields: ZK_AUTH_RBR_MID_MESSAGE_FIELDS,
@@ -363,7 +366,7 @@ impl ZkAuthLogicalSourceOracle {
         }
         let mut bank = Vec::with_capacity(ZK_AUTH_RBR_SOURCE_CODEWORD_FIELDS);
         let mut companion = Vec::with_capacity(ZK_AUTH_RBR_SOURCE_CODEWORD_FIELDS);
-        for leaf in fields.chunks_exact(JOINT_SOURCE_LEAF_SYMBOLS) {
+        for leaf in fields.chunks_exact(JOINT_SOURCE_LOGICAL_SYMBOLS) {
             for pair in leaf.chunks_exact(2) {
                 bank.push(pair[0]);
                 companion.push(pair[1]);
@@ -678,10 +681,10 @@ pub fn extract_zk_auth_knowledge_witness_from_supplied_candidate(
 /// Straight-line selection over a caller-supplied Johnson decoder list.
 ///
 /// Every candidate is re-encoded and checked against the actual fixed source
-/// bank oracle at the separate `7/10` Johnson radius, then subjected to the
+/// bank oracle at the separate `49/64` Johnson radius, then subjected to the
 /// full Auth trace/address predicate.  The first valid secret witness is
 /// returned opaquely.  The supplied list is capped by the executable Sudan
-/// dimension ledger at three candidates.  This function does not produce the
+/// dimension ledger at seven candidates.  This function does not produce the
 /// list or prove that a decoder's output is exhaustive; those properties
 /// remain explicit manifest obligations above.  It deliberately does not call
 /// or relax the unique-radius candidate constructor.  In the intended model,
@@ -840,9 +843,9 @@ impl ZkAuthJohnsonRestorationSelection {
 ///
 /// Every list is first put under zeroizing ownership, before any shape or cap
 /// error can return.  Every candidate is then independently re-encoded and
-/// rebound to its actual oracle at the inclusive `7/10` radius.  The surviving
-/// lists contain at most three candidates each, so lexicographic selection
-/// examines at most 27 triples.  A triple is accepted only if its bank passes
+/// rebound to its actual oracle at the inclusive `49/64` radius. The surviving
+/// lists contain at most seven candidates each, so lexicographic selection
+/// examines at most 343 triples. A triple is accepted only if its bank passes
 /// the complete Auth/address check and its exact
 /// `B,C -> U_gamma -> fold3 -> mid -> fold4 -> tail` chain closes.
 ///
@@ -1721,7 +1724,7 @@ mod tests {
             ),
             Err(ZkAuthRbrError::SuppliedCandidateListTooLong {
                 maximum: ZK_AUTH_JOHNSON_MAX_CANDIDATES,
-                actual: 4,
+                actual: 8,
             })
         ));
         let johnson_witness = scan_supplied_johnson_bank_candidate_list(
@@ -1875,8 +1878,8 @@ mod tests {
     #[test]
     fn supplied_johnson_lists_select_first_exact_auth_valid_triple() {
         let fixture = johnson_restoration_fixture();
-        assert_eq!(ZK_AUTH_JOHNSON_MAX_CANDIDATES, 3);
-        assert_eq!(ZK_AUTH_JOHNSON_MAX_RESTORATION_TRIPLES, 27);
+        assert_eq!(ZK_AUTH_JOHNSON_MAX_CANDIDATES, 7);
+        assert_eq!(ZK_AUTH_JOHNSON_MAX_RESTORATION_TRIPLES, 343);
         assert!(matches!(
             fixture
                 .source
@@ -1992,7 +1995,7 @@ mod tests {
     }
 
     #[test]
-    fn supplied_johnson_restoration_caps_every_candidate_list_at_three() {
+    fn supplied_johnson_restoration_caps_every_candidate_list_at_seven() {
         let source = ZkAuthLogicalSourceOracle::checked(
             vec![Block128::ZERO; ZK_AUTH_RBR_SOURCE_CODEWORD_FIELDS],
             vec![Block128::ZERO; ZK_AUTH_RBR_SOURCE_CODEWORD_FIELDS],
@@ -2028,7 +2031,7 @@ mod tests {
             Err(ZkAuthRbrError::SuppliedRestorationCandidateListTooLong {
                 domain: ZkAuthAffineRestorationDomain::SourceBank,
                 maximum: ZK_AUTH_JOHNSON_MAX_CANDIDATES,
-                actual: 4,
+                actual: 8,
             })
         ));
         assert!(matches!(
@@ -2047,7 +2050,7 @@ mod tests {
             Err(ZkAuthRbrError::SuppliedRestorationCandidateListTooLong {
                 domain: ZkAuthAffineRestorationDomain::SourceCompanion,
                 maximum: ZK_AUTH_JOHNSON_MAX_CANDIDATES,
-                actual: 4,
+                actual: 8,
             })
         ));
         assert!(matches!(
@@ -2066,7 +2069,7 @@ mod tests {
             Err(ZkAuthRbrError::SuppliedRestorationCandidateListTooLong {
                 domain: ZkAuthAffineRestorationDomain::Mid,
                 maximum: ZK_AUTH_JOHNSON_MAX_CANDIDATES,
-                actual: 4,
+                actual: 8,
             })
         ));
     }
