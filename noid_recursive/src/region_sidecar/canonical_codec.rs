@@ -7,15 +7,15 @@
 //! shape. No length, option tag, or platform-sized integer is accepted from
 //! the wire. Decoders compare the complete byte length before allocating.
 
-use noid_ivc_core::deep_chain::relations::{
-    ColumnRelationProof, ShiftDischargeProof, RELATION_DEGREE,
-};
-use noid_ivc_core::deep_chain::{MultiDeepChainWalkProof, MultiWalkLayerProof, WALK_DEGREE};
-use noid_ivc_core::field::F128;
+use noid_ivc_core::deep_chain::c1::{C1MultiDeepChainWalkProof, C1MultiWalkLayerProof};
+use noid_ivc_core::deep_chain::relations::c1::{C1ColumnRelationProof, C1ShiftDischargeProof};
+use noid_ivc_core::deep_chain::relations::RELATION_DEGREE;
+use noid_ivc_core::deep_chain::WALK_DEGREE;
+use noid_ivc_core::field::{F128, F256};
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
-use crate::acceptance::trace::region_source_binding::{
-    DuplexUnionWalkDeferredProof, MerkleUnionWalkDeferredProof, WalkAUnionWalkDeferredProof,
+use crate::acceptance::trace::region_source_binding_c1::{
+    C1DuplexUnionWalkDeferredProof, C1MerkleUnionWalkDeferredProof, C1WalkAUnionWalkDeferredProof,
 };
 
 use super::bounded_decode::{
@@ -25,6 +25,7 @@ use super::bounded_decode::{
 use super::RegionSidecarError;
 
 const F128_BYTES: usize = 16;
+const F256_BYTES: usize = 32;
 
 fn invalid() -> RegionSidecarError {
     RegionSidecarError::InvalidProof
@@ -36,79 +37,6 @@ fn add(left: usize, right: usize) -> Result<usize, RegionSidecarError> {
 
 fn mul(left: usize, right: usize) -> Result<usize, RegionSidecarError> {
     left.checked_mul(right).ok_or_else(invalid)
-}
-
-fn relation_len(shape: RelationShape) -> Result<usize, RegionSidecarError> {
-    mul(
-        add(mul(shape.rounds, RELATION_DEGREE)?, shape.values)?,
-        F128_BYTES,
-    )
-}
-
-fn shift_len(w_log: usize) -> Result<usize, RegionSidecarError> {
-    mul(add(mul(w_log, 2)?, 1)?, F128_BYTES)
-}
-
-pub(crate) fn deferred_fixed_len(
-    shape: &DeferredFixedProofShape,
-) -> Result<usize, RegionSidecarError> {
-    let mut len = 1usize;
-    len = add(
-        len,
-        relation_len(RelationShape {
-            rounds: shape.w_log,
-            values: shape.selection_values,
-        })?,
-    )?;
-    len = add(
-        len,
-        relation_len(RelationShape {
-            rounds: shape.w_log,
-            values: shape.substitution_values,
-        })?,
-    )?;
-    len = add(len, mul(shape.shifts, shift_len(shape.w_log)?)?)?;
-    if let ProofTailShape::RelationOption(Some(tail)) = shape.tail {
-        len = add(len, relation_len(tail)?)?;
-    }
-    Ok(len)
-}
-
-pub(crate) fn deferred_merkle_len(
-    shape: &DeferredMerkleProofShape,
-) -> Result<usize, RegionSidecarError> {
-    let relations = [
-        RelationShape {
-            rounds: shape.w_log,
-            values: shape.zero_values,
-        },
-        RelationShape {
-            rounds: shape.w_log,
-            values: shape.selection_values,
-        },
-        RelationShape {
-            rounds: shape.w_log,
-            values: shape.substitution_values,
-        },
-    ];
-    let mut len = 1usize;
-    for relation in relations {
-        len = add(len, relation_len(relation)?)?;
-    }
-    len = add(
-        len,
-        mul(
-            add(shape.zero_shifts, shape.shifts)?,
-            shift_len(shape.w_log)?,
-        )?,
-    )?;
-    Ok(len)
-}
-
-pub(crate) fn multi_walk_len(shape: &MultiWalkProofShape) -> Result<usize, RegionSidecarError> {
-    let round_lanes = mul(shape.w_log, WALK_DEGREE)?;
-    let next_lanes = mul(shape.instances, STATE_SIZE)?;
-    mul(mul(N_ROUNDS, add(round_lanes, next_lanes)?)?, F128_BYTES)
 }
 
 pub(crate) struct CanonicalProofReader<'a> {
@@ -147,6 +75,18 @@ impl<'a> CanonicalProofReader<'a> {
             hi: u64::from_le_bytes(bytes[8..].try_into().map_err(|_| invalid())?),
         })
     }
+
+    pub(crate) fn f256(&mut self) -> Result<F256, RegionSidecarError> {
+        let end = add(self.position, F256_BYTES)?;
+        let bytes: [u8; F256_BYTES] = self
+            .bytes
+            .get(self.position..end)
+            .ok_or_else(invalid)?
+            .try_into()
+            .map_err(|_| invalid())?;
+        self.position = end;
+        Ok(F256::from_le_bytes(bytes))
+    }
 }
 
 pub(crate) fn put_f128(out: &mut Vec<u8>, value: F128) {
@@ -154,9 +94,84 @@ pub(crate) fn put_f128(out: &mut Vec<u8>, value: F128) {
     out.extend_from_slice(&value.hi.to_le_bytes());
 }
 
-fn encode_relation(
+pub(crate) fn put_f256(out: &mut Vec<u8>, value: F256) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn c1_relation_len(shape: RelationShape) -> Result<usize, RegionSidecarError> {
+    mul(
+        add(mul(shape.rounds, RELATION_DEGREE)?, shape.values)?,
+        F256_BYTES,
+    )
+}
+
+fn c1_shift_len(w_log: usize) -> Result<usize, RegionSidecarError> {
+    mul(add(mul(w_log, 2)?, 1)?, F256_BYTES)
+}
+
+pub(crate) fn c1_deferred_fixed_len(
+    shape: &DeferredFixedProofShape,
+) -> Result<usize, RegionSidecarError> {
+    let mut len = 1usize;
+    len = add(
+        len,
+        c1_relation_len(RelationShape {
+            rounds: shape.w_log,
+            values: shape.selection_values,
+        })?,
+    )?;
+    len = add(
+        len,
+        c1_relation_len(RelationShape {
+            rounds: shape.w_log,
+            values: shape.substitution_values,
+        })?,
+    )?;
+    len = add(len, mul(shape.shifts, c1_shift_len(shape.w_log)?)?)?;
+    if let ProofTailShape::RelationOption(Some(tail)) = shape.tail {
+        len = add(len, c1_relation_len(tail)?)?;
+    }
+    Ok(len)
+}
+
+pub(crate) fn c1_deferred_merkle_len(
+    shape: &DeferredMerkleProofShape,
+) -> Result<usize, RegionSidecarError> {
+    let mut len = 1usize;
+    for relation in [
+        RelationShape {
+            rounds: shape.w_log,
+            values: shape.zero_values,
+        },
+        RelationShape {
+            rounds: shape.w_log,
+            values: shape.selection_values,
+        },
+        RelationShape {
+            rounds: shape.w_log,
+            values: shape.substitution_values,
+        },
+    ] {
+        len = add(len, c1_relation_len(relation)?)?;
+    }
+    add(
+        len,
+        mul(
+            add(shape.zero_shifts, shape.shifts)?,
+            c1_shift_len(shape.w_log)?,
+        )?,
+    )
+}
+
+pub(crate) fn c1_multi_walk_len(shape: &MultiWalkProofShape) -> Result<usize, RegionSidecarError> {
+    let round_lanes = mul(shape.w_log, WALK_DEGREE)?;
+    let next_lanes = mul(shape.instances, STATE_SIZE)?;
+    mul(mul(N_ROUNDS, add(round_lanes, next_lanes)?)?, F256_BYTES)
+}
+
+fn encode_c1_relation(
     out: &mut Vec<u8>,
-    proof: &ColumnRelationProof,
+    proof: &C1ColumnRelationProof,
     shape: RelationShape,
 ) -> Result<(), RegionSidecarError> {
     if proof.rounds.len() != shape.rounds || proof.final_values.len() != shape.values {
@@ -164,40 +179,40 @@ fn encode_relation(
     }
     for round in &proof.rounds {
         for value in round {
-            put_f128(out, *value);
+            put_f256(out, *value);
         }
     }
     for value in &proof.final_values {
-        put_f128(out, *value);
+        put_f256(out, *value);
     }
     Ok(())
 }
 
-fn decode_relation(
+fn decode_c1_relation(
     reader: &mut CanonicalProofReader<'_>,
     shape: RelationShape,
-) -> Result<ColumnRelationProof, RegionSidecarError> {
+) -> Result<C1ColumnRelationProof, RegionSidecarError> {
     let mut rounds = Vec::with_capacity(shape.rounds);
     for _ in 0..shape.rounds {
-        let mut round = [F128::ZERO; RELATION_DEGREE];
+        let mut round = [F256::ZERO; RELATION_DEGREE];
         for value in &mut round {
-            *value = reader.f128()?;
+            *value = reader.f256()?;
         }
         rounds.push(round);
     }
     let mut final_values = Vec::with_capacity(shape.values);
     for _ in 0..shape.values {
-        final_values.push(reader.f128()?);
+        final_values.push(reader.f256()?);
     }
-    Ok(ColumnRelationProof {
+    Ok(C1ColumnRelationProof {
         rounds,
         final_values,
     })
 }
 
-fn encode_shifts(
+fn encode_c1_shifts(
     out: &mut Vec<u8>,
-    proofs: &[ShiftDischargeProof],
+    proofs: &[C1ShiftDischargeProof],
     count: usize,
     w_log: usize,
 ) -> Result<(), RegionSidecarError> {
@@ -206,44 +221,49 @@ fn encode_shifts(
     }
     for proof in proofs {
         for round in &proof.rounds {
-            put_f128(out, round[0]);
-            put_f128(out, round[1]);
+            put_f256(out, round[0]);
+            put_f256(out, round[1]);
         }
-        put_f128(out, proof.final_value);
+        put_f256(out, proof.final_value);
     }
     Ok(())
 }
 
-fn decode_shifts(
+fn decode_c1_shifts(
     reader: &mut CanonicalProofReader<'_>,
     count: usize,
     w_log: usize,
-) -> Result<Vec<ShiftDischargeProof>, RegionSidecarError> {
+) -> Result<Vec<C1ShiftDischargeProof>, RegionSidecarError> {
     let mut proofs = Vec::with_capacity(count);
     for _ in 0..count {
         let mut rounds = Vec::with_capacity(w_log);
         for _ in 0..w_log {
-            rounds.push([reader.f128()?, reader.f128()?]);
+            rounds.push([reader.f256()?, reader.f256()?]);
         }
-        proofs.push(ShiftDischargeProof {
+        proofs.push(C1ShiftDischargeProof {
             rounds,
-            final_value: reader.f128()?,
+            final_value: reader.f256()?,
         });
     }
     Ok(proofs)
 }
 
-pub(crate) fn encode_duplex_deferred(
+pub(crate) fn encode_c1_duplex_deferred(
     out: &mut Vec<u8>,
     version: u8,
-    authority: &DuplexUnionWalkDeferredProof,
+    authority: &C1DuplexUnionWalkDeferredProof,
     shape: &DeferredFixedProofShape,
 ) -> Result<(), RegionSidecarError> {
-    if version != shape.version || !matches!(shape.tail, ProofTailShape::None) {
+    if version != shape.version
+        || !matches!(
+            shape.tail,
+            ProofTailShape::None | ProofTailShape::RelationOption(None)
+        )
+    {
         return Err(invalid());
     }
     out.push(version);
-    encode_relation(
+    encode_c1_relation(
         out,
         &authority.selection,
         RelationShape {
@@ -251,7 +271,7 @@ pub(crate) fn encode_duplex_deferred(
             values: shape.selection_values,
         },
     )?;
-    encode_relation(
+    encode_c1_relation(
         out,
         &authority.substitution,
         RelationShape {
@@ -259,46 +279,51 @@ pub(crate) fn encode_duplex_deferred(
             values: shape.substitution_values,
         },
     )?;
-    encode_shifts(out, &authority.shifts, shape.shifts, shape.w_log)
+    encode_c1_shifts(out, &authority.shifts, shape.shifts, shape.w_log)
 }
 
-pub(crate) fn decode_duplex_deferred(
+pub(crate) fn decode_c1_duplex_deferred(
     reader: &mut CanonicalProofReader<'_>,
     shape: &DeferredFixedProofShape,
-) -> Result<DuplexUnionWalkDeferredProof, RegionSidecarError> {
-    if reader.u8()? != shape.version || !matches!(shape.tail, ProofTailShape::None) {
+) -> Result<C1DuplexUnionWalkDeferredProof, RegionSidecarError> {
+    if reader.u8()? != shape.version
+        || !matches!(
+            shape.tail,
+            ProofTailShape::None | ProofTailShape::RelationOption(None)
+        )
+    {
         return Err(invalid());
     }
-    Ok(DuplexUnionWalkDeferredProof {
-        selection: decode_relation(
+    Ok(C1DuplexUnionWalkDeferredProof {
+        selection: decode_c1_relation(
             reader,
             RelationShape {
                 rounds: shape.w_log,
                 values: shape.selection_values,
             },
         )?,
-        substitution: decode_relation(
+        substitution: decode_c1_relation(
             reader,
             RelationShape {
                 rounds: shape.w_log,
                 values: shape.substitution_values,
             },
         )?,
-        shifts: decode_shifts(reader, shape.shifts, shape.w_log)?,
+        shifts: decode_c1_shifts(reader, shape.shifts, shape.w_log)?,
     })
 }
 
-pub(crate) fn encode_walk_a_deferred(
+pub(crate) fn encode_c1_walk_a_deferred(
     out: &mut Vec<u8>,
     version: u8,
-    authority: &WalkAUnionWalkDeferredProof,
+    authority: &C1WalkAUnionWalkDeferredProof,
     shape: &DeferredFixedProofShape,
 ) -> Result<(), RegionSidecarError> {
     if version != shape.version {
         return Err(invalid());
     }
     out.push(version);
-    encode_relation(
+    encode_c1_relation(
         out,
         &authority.selection,
         RelationShape {
@@ -306,7 +331,7 @@ pub(crate) fn encode_walk_a_deferred(
             values: shape.selection_values,
         },
     )?;
-    encode_relation(
+    encode_c1_relation(
         out,
         &authority.substitution,
         RelationShape {
@@ -314,43 +339,43 @@ pub(crate) fn encode_walk_a_deferred(
             values: shape.substitution_values,
         },
     )?;
-    encode_shifts(out, &authority.shifts, shape.shifts, shape.w_log)?;
+    encode_c1_shifts(out, &authority.shifts, shape.shifts, shape.w_log)?;
     match (shape.tail, authority.spine_exposure.as_ref()) {
-        (ProofTailShape::RelationOption(None), None) | (ProofTailShape::None, None) => Ok(()),
+        (ProofTailShape::None | ProofTailShape::RelationOption(None), None) => Ok(()),
         (ProofTailShape::RelationOption(Some(tail)), Some(proof)) => {
-            encode_relation(out, proof, tail)
+            encode_c1_relation(out, proof, tail)
         }
         _ => Err(invalid()),
     }
 }
 
-pub(crate) fn decode_walk_a_deferred(
+pub(crate) fn decode_c1_walk_a_deferred(
     reader: &mut CanonicalProofReader<'_>,
     shape: &DeferredFixedProofShape,
-) -> Result<WalkAUnionWalkDeferredProof, RegionSidecarError> {
+) -> Result<C1WalkAUnionWalkDeferredProof, RegionSidecarError> {
     if reader.u8()? != shape.version {
         return Err(invalid());
     }
-    let selection = decode_relation(
+    let selection = decode_c1_relation(
         reader,
         RelationShape {
             rounds: shape.w_log,
             values: shape.selection_values,
         },
     )?;
-    let substitution = decode_relation(
+    let substitution = decode_c1_relation(
         reader,
         RelationShape {
             rounds: shape.w_log,
             values: shape.substitution_values,
         },
     )?;
-    let shifts = decode_shifts(reader, shape.shifts, shape.w_log)?;
+    let shifts = decode_c1_shifts(reader, shape.shifts, shape.w_log)?;
     let spine_exposure = match shape.tail {
         ProofTailShape::None | ProofTailShape::RelationOption(None) => None,
-        ProofTailShape::RelationOption(Some(tail)) => Some(decode_relation(reader, tail)?),
+        ProofTailShape::RelationOption(Some(tail)) => Some(decode_c1_relation(reader, tail)?),
     };
-    Ok(WalkAUnionWalkDeferredProof {
+    Ok(C1WalkAUnionWalkDeferredProof {
         selection,
         substitution,
         shifts,
@@ -358,17 +383,17 @@ pub(crate) fn decode_walk_a_deferred(
     })
 }
 
-pub(crate) fn encode_merkle_deferred(
+pub(crate) fn encode_c1_merkle_deferred(
     out: &mut Vec<u8>,
     version: u8,
-    authority: &MerkleUnionWalkDeferredProof,
+    authority: &C1MerkleUnionWalkDeferredProof,
     shape: &DeferredMerkleProofShape,
 ) -> Result<(), RegionSidecarError> {
     if version != shape.version {
         return Err(invalid());
     }
     out.push(version);
-    encode_relation(
+    encode_c1_relation(
         out,
         &authority.zero,
         RelationShape {
@@ -376,8 +401,8 @@ pub(crate) fn encode_merkle_deferred(
             values: shape.zero_values,
         },
     )?;
-    encode_shifts(out, &authority.zero_shifts, shape.zero_shifts, shape.w_log)?;
-    encode_relation(
+    encode_c1_shifts(out, &authority.zero_shifts, shape.zero_shifts, shape.w_log)?;
+    encode_c1_relation(
         out,
         &authority.selection,
         RelationShape {
@@ -385,7 +410,7 @@ pub(crate) fn encode_merkle_deferred(
             values: shape.selection_values,
         },
     )?;
-    encode_relation(
+    encode_c1_relation(
         out,
         &authority.substitution,
         RelationShape {
@@ -393,46 +418,46 @@ pub(crate) fn encode_merkle_deferred(
             values: shape.substitution_values,
         },
     )?;
-    encode_shifts(out, &authority.shifts, shape.shifts, shape.w_log)
+    encode_c1_shifts(out, &authority.shifts, shape.shifts, shape.w_log)
 }
 
-pub(crate) fn decode_merkle_deferred(
+pub(crate) fn decode_c1_merkle_deferred(
     reader: &mut CanonicalProofReader<'_>,
     shape: &DeferredMerkleProofShape,
-) -> Result<MerkleUnionWalkDeferredProof, RegionSidecarError> {
+) -> Result<C1MerkleUnionWalkDeferredProof, RegionSidecarError> {
     if reader.u8()? != shape.version {
         return Err(invalid());
     }
-    Ok(MerkleUnionWalkDeferredProof {
-        zero: decode_relation(
+    Ok(C1MerkleUnionWalkDeferredProof {
+        zero: decode_c1_relation(
             reader,
             RelationShape {
                 rounds: shape.w_log,
                 values: shape.zero_values,
             },
         )?,
-        zero_shifts: decode_shifts(reader, shape.zero_shifts, shape.w_log)?,
-        selection: decode_relation(
+        zero_shifts: decode_c1_shifts(reader, shape.zero_shifts, shape.w_log)?,
+        selection: decode_c1_relation(
             reader,
             RelationShape {
                 rounds: shape.w_log,
                 values: shape.selection_values,
             },
         )?,
-        substitution: decode_relation(
+        substitution: decode_c1_relation(
             reader,
             RelationShape {
                 rounds: shape.w_log,
                 values: shape.substitution_values,
             },
         )?,
-        shifts: decode_shifts(reader, shape.shifts, shape.w_log)?,
+        shifts: decode_c1_shifts(reader, shape.shifts, shape.w_log)?,
     })
 }
 
-pub(crate) fn encode_multi_walk(
+pub(crate) fn encode_c1_multi_walk(
     out: &mut Vec<u8>,
-    proof: &MultiDeepChainWalkProof,
+    proof: &C1MultiDeepChainWalkProof,
     shape: &MultiWalkProofShape,
 ) -> Result<(), RegionSidecarError> {
     if proof.layers.len() != N_ROUNDS
@@ -445,44 +470,44 @@ pub(crate) fn encode_multi_walk(
     for layer in &proof.layers {
         for round in &layer.round_coeffs {
             for value in round {
-                put_f128(out, *value);
+                put_f256(out, *value);
             }
         }
         for next in &layer.next_values {
             for value in next {
-                put_f128(out, *value);
+                put_f256(out, *value);
             }
         }
     }
     Ok(())
 }
 
-pub(crate) fn decode_multi_walk(
+pub(crate) fn decode_c1_multi_walk(
     reader: &mut CanonicalProofReader<'_>,
     shape: &MultiWalkProofShape,
-) -> Result<MultiDeepChainWalkProof, RegionSidecarError> {
+) -> Result<C1MultiDeepChainWalkProof, RegionSidecarError> {
     let mut layers = Vec::with_capacity(N_ROUNDS);
     for _ in 0..N_ROUNDS {
         let mut round_coeffs = Vec::with_capacity(shape.w_log);
         for _ in 0..shape.w_log {
-            let mut round = [F128::ZERO; WALK_DEGREE];
+            let mut round = [F256::ZERO; WALK_DEGREE];
             for value in &mut round {
-                *value = reader.f128()?;
+                *value = reader.f256()?;
             }
             round_coeffs.push(round);
         }
         let mut next_values = Vec::with_capacity(shape.instances);
         for _ in 0..shape.instances {
-            let mut next = [F128::ZERO; STATE_SIZE];
+            let mut next = [F256::ZERO; STATE_SIZE];
             for value in &mut next {
-                *value = reader.f128()?;
+                *value = reader.f256()?;
             }
             next_values.push(next);
         }
-        layers.push(MultiWalkLayerProof {
+        layers.push(C1MultiWalkLayerProof {
             round_coeffs,
             next_values,
         });
     }
-    Ok(MultiDeepChainWalkProof { layers })
+    Ok(C1MultiDeepChainWalkProof { layers })
 }

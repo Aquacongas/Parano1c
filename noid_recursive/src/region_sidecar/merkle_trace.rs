@@ -17,21 +17,128 @@ use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 use crate::acceptance::trace::deep_chain::{
     verify_column_relation_trace, verify_deep_chain_walk_trace, verify_shift_discharge_trace,
-    ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace, RelationTermTrace,
-    ShiftDischargeProofTrace,
+    C1LaneClaimGroupTrace, ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace,
+    RelationTermTrace, ShiftDischargeProofTrace,
 };
 use crate::acceptance::trace::region_source_binding::{
     mds_alpha_weights, merkle_protocol_substitution_terms, merkle_protocol_zero_terms,
     MerkleProtocolFamily, MerkleUnionProof, MerkleUnionWalkDeferredProofRef,
 };
-use crate::acceptance::trace::self_verify::{FieldPostCommitTraceContext, QuirkyDirectClaimTrace};
-use crate::acceptance::trace::{mul, FieldR1csBuilder, LinExpr};
+use crate::acceptance::trace::region_source_binding_c1::{
+    verify_c1_merkle_walk_prefix_trace, verify_c1_merkle_walk_suffix_trace,
+    C1MerkleColumnClaimTrace, C1MerkleUnionTraceWalkPrefix,
+};
+use crate::acceptance::trace::self_verify::{
+    C1QuirkyDirectClaimTrace, FieldPostCommitTraceContext, QuirkyDirectClaimTrace,
+};
+use crate::acceptance::trace::{mul, ExtExpr, FieldR1csBuilder, LinExpr};
 
 use super::{
-    MerkleRegionSidecarProof, MerkleRegionVk, MerkleRegionWalkDeferredProof, RegionSidecarError,
+    C1MerkleRegionWalkDeferredProof, MerkleRegionSidecarProof, MerkleRegionVk, RegionSidecarError,
     MERKLE_REGION_COMMITTED_COLUMNS, MERKLE_REGION_SIDECAR_VERSION,
     MERKLE_SIDECAR_TRANSCRIPT_LABEL,
 };
+
+pub(crate) struct C1MerkleRegionTraceWalkContinuation<'a> {
+    vk: &'a MerkleRegionVk,
+    total_vars: usize,
+    families: Vec<MerkleProtocolFamily>,
+    prefix: C1MerkleUnionTraceWalkPrefix<'a>,
+}
+
+impl C1MerkleRegionTraceWalkContinuation<'_> {
+    pub(crate) fn walk_group(&self) -> C1LaneClaimGroupTrace {
+        self.prefix.walk_group().clone()
+    }
+
+    pub(crate) fn finish<C: FsChannelOps>(
+        self,
+        b: &mut FieldR1csBuilder,
+        context: &mut FieldPostCommitTraceContext<'_, C>,
+        walk_terminal: &C1LaneClaimGroupTrace,
+    ) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
+        if context.total_vars() != self.total_vars {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let terminal = verify_c1_merkle_walk_suffix_trace(
+            b,
+            context,
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.families,
+            self.prefix,
+            walk_terminal,
+        )?;
+        resolve_c1_merkle_terminal_claims_trace(self.vk, self.total_vars, terminal)
+    }
+}
+
+pub(crate) fn verify_c1_merkle_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    context: &mut FieldPostCommitTraceContext<'_, C>,
+    vk: &'a MerkleRegionVk,
+    proof: &'a C1MerkleRegionWalkDeferredProof,
+) -> Result<C1MerkleRegionTraceWalkContinuation<'a>, RegionSidecarError> {
+    let total_vars = context.total_vars();
+    vk.validate_certified_c1_in_witness(total_vars)?;
+    if proof.version != MERKLE_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    let families = vk.protocol_families();
+    context.observe_label(b, MERKLE_SIDECAR_TRANSCRIPT_LABEL);
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
+    let prefix = verify_c1_merkle_walk_prefix_trace(
+        b,
+        context,
+        vk.w_log,
+        &vk.fixed,
+        &[0, 1, 2, 3],
+        &families,
+        proof.authority.as_ref(),
+    )?;
+    Ok(C1MerkleRegionTraceWalkContinuation {
+        vk,
+        total_vars,
+        families,
+        prefix,
+    })
+}
+
+fn resolve_c1_merkle_terminal_claims_trace(
+    vk: &MerkleRegionVk,
+    total_vars: usize,
+    terminal: Vec<C1MerkleColumnClaimTrace>,
+) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
+    terminal
+        .into_iter()
+        .map(|claim| {
+            let slice = *vk
+                .slices
+                .get(claim.column)
+                .ok_or(RegionSidecarError::InvalidProof)?;
+            if claim.point.len() != slice.log2_len {
+                return Err(RegionSidecarError::InvalidProof);
+            }
+            let mut x_rest = claim.point;
+            x_rest.extend(
+                slice
+                    .prefix_coords(total_vars)
+                    .into_iter()
+                    .map(|value| ExtExpr::constant(noid_ivc_core::field::F256::from_base(value))),
+            );
+            Ok(C1QuirkyDirectClaimTrace {
+                z_skip: ExtExpr::zero(),
+                k_skip: 0,
+                x_rest,
+                value: claim.value,
+            })
+        })
+        .collect()
+}
 
 /// A structurally derived terminal claim on one of the shared nine columns.
 /// This is transient trace state and never serialized proof authority.
@@ -634,97 +741,6 @@ pub(crate) fn verify_merkle_union_proof_trace<C: FsChannelOps>(
         families,
         prefix,
         &walk_terminal,
-    )
-}
-
-/// High-level Walk-B continuation for an enclosing caller-owned walk.
-pub(crate) struct MerkleRegionTraceWalkContinuation<'a> {
-    vk: &'a MerkleRegionVk,
-    total_vars: usize,
-    families: Vec<MerkleProtocolFamily>,
-    prefix: MerkleUnionTraceWalkPrefix<'a>,
-}
-
-impl MerkleRegionTraceWalkContinuation<'_> {
-    pub(crate) fn walk_group(&self) -> LaneClaimGroupTrace {
-        self.prefix.walk_group().clone()
-    }
-
-    pub(crate) fn finish<C: FsChannelOps>(
-        self,
-        b: &mut FieldR1csBuilder,
-        context: &mut FieldPostCommitTraceContext<'_, C>,
-        walk_terminal: &LaneClaimGroupTrace,
-    ) -> Result<Vec<QuirkyDirectClaimTrace>, RegionSidecarError> {
-        if context.total_vars() != self.total_vars {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        let terminal = verify_merkle_union_walk_suffix_trace(
-            b,
-            context,
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.families,
-            self.prefix,
-            walk_terminal,
-        )?;
-        resolve_merkle_terminal_claims_trace(self.vk, self.total_vars, terminal)
-    }
-}
-
-/// Bind and replay a walk-deferred Walk-B child through its zero and
-/// carry-selection prefix.
-pub(crate) fn verify_merkle_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
-    b: &mut FieldR1csBuilder,
-    context: &mut FieldPostCommitTraceContext<'_, C>,
-    vk: &'a MerkleRegionVk,
-    proof: &'a MerkleRegionWalkDeferredProof,
-) -> Result<MerkleRegionTraceWalkContinuation<'a>, RegionSidecarError> {
-    let total_vars = context.total_vars();
-    preflight_merkle_region_walk_deferred_trace(vk, total_vars, proof)?;
-    let families = vk.protocol_families();
-    let deferred = proof.authority().as_ref();
-
-    context.observe_label(b, MERKLE_SIDECAR_TRANSCRIPT_LABEL);
-    crate::acceptance::trace::self_verify::observe_pinned_digest(
-        b,
-        context,
-        &vk.transcript_digest(),
-    );
-    let prefix = verify_merkle_union_walk_prefix_trace(
-        b,
-        context,
-        vk.w_log,
-        &vk.fixed,
-        &[0, 1, 2, 3],
-        &families,
-        deferred,
-    )?;
-    Ok(MerkleRegionTraceWalkContinuation {
-        vk,
-        total_vars,
-        families,
-        prefix,
-    })
-}
-
-/// Allocation-free shape check for an enclosing composite preflight.
-pub(crate) fn preflight_merkle_region_walk_deferred_trace(
-    vk: &MerkleRegionVk,
-    total_vars: usize,
-    proof: &MerkleRegionWalkDeferredProof,
-) -> Result<(), RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
-    if proof.version() != MERKLE_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    let families = vk.protocol_families();
-    preflight_merkle_deferred_authority(
-        vk.w_log,
-        &vk.fixed,
-        &[0, 1, 2, 3],
-        &families,
-        proof.authority().as_ref(),
     )
 }
 

@@ -3,18 +3,15 @@
 
 //! Post-commit proof authority for committed recursive-region columns.
 //!
-//! V1 contains recording-free vertical slices for Walk-A wallet/meta unions,
-//! the six committed columns of one duplex union (`A0,A1,C0..C3`), and the
-//! nine committed columns of one Walk-B Merkle union
-//! (`C0..C3,E0,E1,SIB0,SIB1,D`). Recording regions are intentionally
-//! excluded: their post-root transcript dependency needs a separate versioned
-//! design. Each slice's Fiat--Shamir
-//! replay must run on the SAME challenger as the enclosing FieldR1cs proof,
-//! through the `*_and_post_commit` callbacks, after that challenger has
-//! absorbed the outer witness commitment.  The sidecar then contributes its
-//! terminal column evaluations to the outer PCS-v1 batch.
+//! Production HistoryStep uses one joint C1 transcript for its three Link and
+//! six Block regions. Every algebraic challenge and proof message is in
+//! GF(2^256). The nine region prefixes share one ragged deep-chain walk, Block
+//! completes on its derived child channel, and Link completes only after the
+//! child terminal is absorbed back into the outer FieldR1cs post-commit
+//! channel. The resulting terminal evaluations are appended to the same outer
+//! PCS batch.
 //!
-//! The serialized proof contains only algebraic proof authority.  It never
+//! The serialized proof contains only algebraic proof authority. It never
 //! carries a prover-authored list of pending openings: the verifier derives
 //! every [`QuirkyDirectClaim`] from the canonical VK column slices and the
 //! replayed relation endpoints.
@@ -27,7 +24,6 @@ use noid_ivc_core::deep_chain::schedule::{
     duplex_family_refs, duplex_fixed_patterns, merkle_fixed_patterns, DuplexFamilyRefs,
     DuplexLayout, LaneSource, MerklePathFamily,
 };
-use noid_ivc_core::deep_chain::LaneClaimGroup;
 use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 use noid_ivc_core::public_io::WitnessSlice;
@@ -37,17 +33,10 @@ use crate::acceptance::trace::paired_merkle_update::{
     paired_merkle_update_fixed_patterns, PAIRED_UPDATE_STRIDE,
 };
 use crate::acceptance::trace::region_source_binding::{
-    common_period_ones, common_period_pattern, prove_duplex_union_walk_prefix_with_challenger,
-    prove_duplex_union_walk_suffix_with_challenger, prove_duplex_union_with_challenger,
-    prove_merkle_union_walk_prefix_with_challenger, prove_merkle_union_walk_suffix_with_challenger,
-    prove_merkle_union_with_challenger, verify_duplex_union_walk_prefix_with_challenger,
-    verify_duplex_union_walk_suffix_with_challenger, verify_duplex_union_with_challenger,
-    verify_merkle_union_walk_prefix_with_challenger,
-    verify_merkle_union_walk_suffix_with_challenger, verify_merkle_union_with_challenger,
-    DuplexColumnClaim, DuplexUnion, DuplexUnionProof, DuplexUnionProverWalkPrefix,
-    DuplexUnionVerifierWalkPrefix, DuplexUnionWalkDeferredProof, MerkleColumnClaim,
-    MerkleProtocolFamily, MerkleUnionProof, MerkleUnionProverWalkPrefix,
-    MerkleUnionVerifierWalkPrefix, MerkleUnionWalkDeferredProof,
+    common_period_ones, common_period_pattern, prove_duplex_union_with_challenger,
+    prove_merkle_union_with_challenger, verify_duplex_union_with_challenger,
+    verify_merkle_union_with_challenger, DuplexColumnClaim, DuplexUnion, DuplexUnionProof,
+    MerkleColumnClaim, MerkleProtocolFamily, MerkleUnionProof,
 };
 use crate::acceptance::trace::region_source_binding_c1::{
     prove_c1_duplex_walk_prefix, prove_c1_duplex_walk_suffix, prove_c1_merkle_walk_prefix,
@@ -61,7 +50,6 @@ use crate::acceptance::trace::region_source_binding_c1::{
 mod block;
 pub use block::*;
 mod bounded_decode;
-mod c1_repeat;
 mod canonical_codec;
 mod joint_c1;
 pub use bounded_decode::*;
@@ -296,73 +284,6 @@ pub struct DuplexRegionProverPlan<'a> {
     s_out: &'a [Vec<F128>; 4],
 }
 
-pub(crate) struct DuplexRegionProverWalkContinuation<'a, 'z> {
-    vk: &'a DuplexRegionVk,
-    total_vars: usize,
-    committed: [&'z [F128]; DUPLEX_REGION_COMMITTED_COLUMNS],
-    s0: &'a [Vec<F128>; 4],
-    prefix: DuplexUnionProverWalkPrefix,
-}
-
-impl DuplexRegionProverWalkContinuation<'_, '_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
-        self.s0
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<(DuplexRegionWalkDeferredProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
-        let (authority, terminal_claims) = prove_duplex_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &[],
-            &self.committed,
-            self.prefix,
-            terminal,
-            challenger,
-        );
-        let claims = resolve_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
-        Ok((DuplexRegionWalkDeferredProof::new(authority), claims))
-    }
-}
-
-pub(crate) struct DuplexRegionVerifierWalkContinuation<'a> {
-    vk: &'a DuplexRegionVk,
-    total_vars: usize,
-    prefix: DuplexUnionVerifierWalkPrefix<'a>,
-}
-
-impl DuplexRegionVerifierWalkContinuation<'_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-        let terminal_claims = verify_duplex_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &[],
-            self.prefix,
-            terminal,
-            challenger,
-        )
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-        resolve_terminal_claims(self.vk, self.total_vars, terminal_claims)
-    }
-}
-
 impl<'a> DuplexRegionProverPlan<'a> {
     pub fn new(
         vk: &'a DuplexRegionVk,
@@ -377,35 +298,6 @@ impl<'a> DuplexRegionProverPlan<'a> {
             return Err(RegionSidecarError::BadWalkColumns);
         }
         Ok(Self { vk, s0, s_out })
-    }
-
-    pub(crate) fn prove_walk_deferred_prefix<'z, Ch: Challenger>(
-        &self,
-        z: &'z [F128],
-        challenger: &mut Ch,
-    ) -> Result<DuplexRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
-        let total_vars = witness_log(z)?;
-        self.vk.validate_in_witness(total_vars)?;
-        let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
-            let slice = self.vk.slices[column];
-            &z[slice.start()..slice.start() + slice.len()]
-        });
-        bind_vk(challenger, self.vk);
-        let prefix = prove_duplex_union_walk_prefix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &committed,
-            self.s_out,
-            challenger,
-        );
-        Ok(DuplexRegionProverWalkContinuation {
-            vk: self.vk,
-            total_vars,
-            committed,
-            s0: self.s0,
-            prefix,
-        })
     }
 
     /// Run inside `prove_field_with_public_io_and_post_commit` on its passed
@@ -558,14 +450,6 @@ impl DuplexRegionSidecarProof {
     }
 }
 
-/// Serializable duplex-region authority whose walk is provided and verified
-/// by an enclosing protocol.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct DuplexRegionWalkDeferredProof {
-    version: u8,
-    authority: DuplexUnionWalkDeferredProof,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct C1DuplexRegionWalkDeferredProof {
     version: u8,
@@ -579,49 +463,14 @@ impl C1DuplexRegionWalkDeferredProof {
             authority,
         }
     }
-}
-
-impl DuplexRegionWalkDeferredProof {
-    pub(crate) fn new(authority: DuplexUnionWalkDeferredProof) -> Self {
-        Self {
-            version: DUPLEX_REGION_SIDECAR_VERSION,
-            authority,
-        }
-    }
 
     pub(crate) fn version(&self) -> u8 {
         self.version
     }
 
-    pub(crate) fn authority(&self) -> &DuplexUnionWalkDeferredProof {
+    pub(crate) fn authority(&self) -> &C1DuplexUnionWalkDeferredProof {
         &self.authority
     }
-}
-
-pub(crate) fn verify_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
-    vk: &'a DuplexRegionVk,
-    total_vars: usize,
-    proof: &'a DuplexRegionWalkDeferredProof,
-    challenger: &mut Ch,
-) -> Result<DuplexRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
-    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    bind_vk(challenger, vk);
-    let prefix = verify_duplex_union_walk_prefix_with_challenger(
-        vk.w_log,
-        &vk.fixed,
-        &vk.refs,
-        proof.authority().as_ref(),
-        challenger,
-    )
-    .map_err(|_| RegionSidecarError::InvalidProof)?;
-    Ok(DuplexRegionVerifierWalkContinuation {
-        vk,
-        total_vars,
-        prefix,
-    })
 }
 
 pub(crate) fn verify_c1_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
@@ -1090,83 +939,6 @@ pub struct MerkleRegionProverPlan<'a> {
     s_out: &'a [Vec<F128>; 4],
 }
 
-pub(crate) struct MerkleRegionProverWalkContinuation<'a, 'z> {
-    vk: &'a MerkleRegionVk,
-    total_vars: usize,
-    committed: [&'z [F128]; MERKLE_REGION_COMMITTED_COLUMNS],
-    families: Vec<MerkleProtocolFamily>,
-    s0: &'a [Vec<F128>; 4],
-    prefix: MerkleUnionProverWalkPrefix,
-}
-
-impl MerkleRegionProverWalkContinuation<'_, '_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
-        self.s0
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<(MerkleRegionWalkDeferredProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
-        let (authority, terminal_claims) = prove_merkle_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.families,
-            &self.committed,
-            self.prefix,
-            terminal,
-            challenger,
-        );
-        let claims = resolve_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
-        Ok((MerkleRegionWalkDeferredProof::new(authority), claims))
-    }
-}
-
-pub(crate) struct MerkleRegionVerifierWalkContinuation<'a> {
-    vk: &'a MerkleRegionVk,
-    total_vars: usize,
-    families: Vec<MerkleProtocolFamily>,
-    prefix: MerkleUnionVerifierWalkPrefix<'a>,
-}
-
-impl MerkleRegionVerifierWalkContinuation<'_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-        let terminal_claims = verify_merkle_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.families,
-            self.prefix,
-            terminal,
-            challenger,
-        )
-        .map_err(|error| {
-            if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
-                eprintln!("[merkle-sidecar verify] deferred suffix: {error:?}");
-            }
-            RegionSidecarError::InvalidProof
-        })?;
-        resolve_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims).map_err(|error| {
-            if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
-                eprintln!("[merkle-sidecar verify] terminal claims: {error:?}");
-            }
-            error
-        })
-    }
-}
-
 impl<'a> MerkleRegionProverPlan<'a> {
     pub fn new(
         vk: &'a MerkleRegionVk,
@@ -1181,38 +953,6 @@ impl<'a> MerkleRegionProverPlan<'a> {
             return Err(RegionSidecarError::BadWalkColumns);
         }
         Ok(Self { vk, s0, s_out })
-    }
-
-    pub(crate) fn prove_walk_deferred_prefix<'z, Ch: Challenger>(
-        &self,
-        z: &'z [F128],
-        challenger: &mut Ch,
-    ) -> Result<MerkleRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
-        let total_vars = witness_log(z)?;
-        self.vk.validate_in_witness(total_vars)?;
-        let committed: [&[F128]; MERKLE_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
-            let slice = self.vk.slices[column];
-            &z[slice.start()..slice.start() + slice.len()]
-        });
-        let families = self.vk.protocol_families();
-        bind_merkle_vk(challenger, self.vk);
-        let prefix = prove_merkle_union_walk_prefix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &[0, 1, 2, 3],
-            &families,
-            &committed,
-            self.s_out,
-            challenger,
-        );
-        Ok(MerkleRegionProverWalkContinuation {
-            vk: self.vk,
-            total_vars,
-            committed,
-            families,
-            s0: self.s0,
-            prefix,
-        })
     }
 
     /// Must run inside the enclosing FieldR1cs post-commit callback, using its
@@ -1364,56 +1104,6 @@ impl MerkleRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("merkle sidecar serialized length") as usize
     }
-
-    #[cfg(test)]
-    pub(in crate::region_sidecar) fn into_walk_deferred_parts(
-        self,
-        w_log: usize,
-    ) -> (
-        MerkleRegionWalkDeferredProof,
-        noid_ivc_core::deep_chain::DeepChainWalkProof,
-    ) {
-        let MerkleUnionProof {
-            mut zero,
-            mut zero_shifts,
-            mut selection,
-            mut walk,
-            mut substitution,
-            mut shifts,
-        } = self.authority;
-        for relation in [&mut zero, &mut selection, &mut substitution] {
-            relation.rounds.resize(
-                w_log,
-                [F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE],
-            );
-        }
-        for shift in zero_shifts.iter_mut().chain(&mut shifts) {
-            shift.rounds.resize(w_log, [F128::ZERO; 2]);
-        }
-        for layer in &mut walk.layers {
-            layer
-                .round_coeffs
-                .resize(w_log, [F128::ZERO; noid_ivc_core::deep_chain::WALK_DEGREE]);
-        }
-        (
-            MerkleRegionWalkDeferredProof::new(MerkleUnionWalkDeferredProof {
-                zero,
-                zero_shifts,
-                selection,
-                substitution,
-                shifts,
-            }),
-            walk,
-        )
-    }
-}
-
-/// Serializable Walk-B region authority whose walk is owned by an enclosing
-/// protocol.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MerkleRegionWalkDeferredProof {
-    version: u8,
-    authority: MerkleUnionWalkDeferredProof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1429,57 +1119,14 @@ impl C1MerkleRegionWalkDeferredProof {
             authority,
         }
     }
-}
-
-impl MerkleRegionWalkDeferredProof {
-    pub(crate) fn new(authority: MerkleUnionWalkDeferredProof) -> Self {
-        Self {
-            version: MERKLE_REGION_SIDECAR_VERSION,
-            authority,
-        }
-    }
 
     pub(crate) fn version(&self) -> u8 {
         self.version
     }
 
-    pub(crate) fn authority(&self) -> &MerkleUnionWalkDeferredProof {
+    pub(crate) fn authority(&self) -> &C1MerkleUnionWalkDeferredProof {
         &self.authority
     }
-}
-
-pub(crate) fn verify_merkle_region_walk_deferred_prefix<'a, Ch: Challenger>(
-    vk: &'a MerkleRegionVk,
-    total_vars: usize,
-    proof: &'a MerkleRegionWalkDeferredProof,
-    challenger: &mut Ch,
-) -> Result<MerkleRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
-    if proof.version() != MERKLE_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    let families = vk.protocol_families();
-    bind_merkle_vk(challenger, vk);
-    let prefix = verify_merkle_union_walk_prefix_with_challenger(
-        vk.w_log,
-        &vk.fixed,
-        &[0, 1, 2, 3],
-        &families,
-        proof.authority().as_ref(),
-        challenger,
-    )
-    .map_err(|error| {
-        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
-            eprintln!("[merkle-sidecar verify] deferred prefix: {error:?}");
-        }
-        RegionSidecarError::InvalidProof
-    })?;
-    Ok(MerkleRegionVerifierWalkContinuation {
-        vk,
-        total_vars,
-        families,
-        prefix,
-    })
 }
 
 pub(crate) fn verify_c1_merkle_region_walk_deferred_prefix<'a, Ch: Challenger>(
@@ -1940,7 +1587,6 @@ mod tests {
         build_merkle_path_columns, carry_selection_terms, compile_duplex, MerklePathWitness,
         TranscriptOp,
     };
-    use noid_ivc_core::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk};
     use noid_ivc_core::field_circuit::FieldR1csBuilder;
     use noid_ivc_core::lincheck::build_eq_table;
     use noid_ivc_core::pcs::{self, PcsParams};
@@ -1989,77 +1635,6 @@ mod tests {
         let (proof, _) = plan.prove(&z, &mut challenger).unwrap();
         let encoded = bincode::serialize(&proof).unwrap();
         (vk, z.len().trailing_zeros() as usize, proof, encoded)
-    }
-
-    #[test]
-    fn duplex_walk_deferred_plan_and_verifier_match_single_walk_authority() {
-        let layout = compile_duplex(&[
-            TranscriptOp::Absorb(vec![None, None, None]),
-            TranscriptOp::Squeeze(3),
-        ]);
-        let union = build_duplex_union(
-            &layout,
-            [F128::new(0xAB, 0xCD), F128::new(0xEF, 0x12)],
-            &[vec![F128::new(3, 0), F128::new(5, 0), F128::new(7, 0)]],
-        );
-        let column_len = 1usize << union.w_log;
-        let mut z =
-            vec![F128::ZERO; (DUPLEX_REGION_COMMITTED_COLUMNS * column_len).next_power_of_two()];
-        for (column, values) in union.committed.iter().enumerate() {
-            z[column * column_len..(column + 1) * column_len].copy_from_slice(values);
-        }
-        let slices = std::array::from_fn(|index| WitnessSlice {
-            log2_len: union.w_log,
-            index,
-        });
-        let vk = DuplexRegionVk::from_union([0xD5; 32], slices, &union).unwrap();
-        let plan = DuplexRegionProverPlan::new(&vk, &union.s0, &union.s_out).unwrap();
-        let domain = b"duplex-walk-deferred-parity-v1";
-
-        let mut single_ch = FsLaneChallenger::new(domain);
-        let (single, single_claims) = plan.prove(&z, &mut single_ch).unwrap();
-        let single_next = single_ch.sample_f128();
-
-        let mut phased_ch = FsLaneChallenger::new(domain);
-        let continuation = plan.prove_walk_deferred_prefix(&z, &mut phased_ch).unwrap();
-        let groups = [continuation.group().clone()];
-        let (walk, terminal) = prove_deep_chain_walk(continuation.s0(), &groups, &mut phased_ch);
-        let (deferred, phased_claims) = continuation.finish(&terminal, &mut phased_ch).unwrap();
-        let phased_next = phased_ch.sample_f128();
-
-        assert_eq!(single.authority.selection, deferred.authority.selection);
-        assert_eq!(single.authority.walk, walk);
-        assert_eq!(
-            single.authority.substitution,
-            deferred.authority.substitution
-        );
-        assert_eq!(single.authority.shifts, deferred.authority.shifts);
-        let claim_tuples = |claims: &[QuirkyDirectClaim]| {
-            claims
-                .iter()
-                .map(|claim| {
-                    (
-                        claim.z_skip,
-                        claim.k_skip,
-                        claim.x_rest.clone(),
-                        claim.value,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(claim_tuples(&single_claims), claim_tuples(&phased_claims));
-        assert_eq!(single_next, phased_next, "phased prover transcript drift");
-
-        let total_vars = z.len().trailing_zeros() as usize;
-        let mut verifier_ch = FsLaneChallenger::new(domain);
-        let verification =
-            verify_duplex_region_walk_deferred_prefix(&vk, total_vars, &deferred, &mut verifier_ch)
-                .unwrap();
-        let groups = [verification.group().clone()];
-        let terminal = verify_deep_chain_walk(vk.w_log, &groups, &walk, &mut verifier_ch).unwrap();
-        let verifier_claims = verification.finish(&terminal, &mut verifier_ch).unwrap();
-        assert_eq!(claim_tuples(&verifier_claims), claim_tuples(&phased_claims));
-        assert_eq!(verifier_ch.sample_f128(), phased_next);
     }
 
     #[test]

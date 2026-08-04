@@ -2545,7 +2545,7 @@ mod tests {
 
     /// Production-width row and transcript profile for the fused Link/Block
     /// C1 walk. Correctness is covered by the non-ignored small twin above;
-    /// this probe intentionally avoids constructing all nine output tables.
+    /// this benchmark intentionally avoids constructing all nine output tables.
     #[test]
     #[ignore = "production-width C1 recursive profile"]
     fn c1_joint_b64_recursive_row_profile() {

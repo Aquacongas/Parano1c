@@ -53,13 +53,10 @@ use super::trace::zk_authorization_candidate::{
 use super::trace::{mul, pin_eq, with_pin_gate};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator};
 use crate::region_sidecar::{
-    shape_only_block_region_sidecar_proof, shape_only_link_region_sidecar_proof,
-    verify_block_region_sidecar_post_commit,
-    verify_block_region_sidecar_post_commit_layout_captured,
-    verify_block_region_sidecar_recorded_trace_post_commit, verify_link_region_sidecar_post_commit,
-    verify_link_region_sidecar_trace_post_commit, BlockRegionPreparation, BlockRegionSidecarProof,
-    BlockRegionSidecarVk, LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk,
-    RegionSidecarError,
+    shape_only_joint_c1_region_sidecar_proof, verify_joint_c1_region_sidecar_post_commit,
+    verify_joint_c1_region_sidecar_post_commit_layout_captured,
+    verify_joint_c1_region_sidecar_trace_post_commit, BlockRegionPreparation, BlockRegionSidecarVk,
+    JointC1RegionSidecarProof, LinkRegionProverPlan, LinkRegionSidecarVk, RegionSidecarError,
 };
 
 mod freezer;
@@ -83,12 +80,11 @@ pub use relation::{
     assemble_frozen_history_step_base, assemble_frozen_history_step_recursive,
     assemble_history_step_base, assemble_history_step_recursive,
     derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
-    pin_history_step_class_bank, prepare_history_step_for_pow, probe_built_history_step_joint_c1,
-    probe_built_history_step_joint_c1_full, prove_built_history_step_terminal, prove_history_step,
-    verify_history_step_terminal, AcceptedHistoryStepTerminal, BuiltHistoryStep, FrozenHistoryStep,
-    HistoryStepError, HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepParent,
-    HistoryStepParentTranscriptLayout, HistoryStepRuntime, HistoryStepRuntimeParts,
-    HistoryStepSidecarOperation, HistoryStepTerminal, JointC1FullProofProbe, JointC1SidecarProbe,
+    pin_history_step_class_bank, prepare_history_step_for_pow, prove_built_history_step_terminal,
+    prove_history_step, verify_history_step_terminal, AcceptedHistoryStepTerminal,
+    BuiltHistoryStep, FrozenHistoryStep, HistoryStepError, HistoryStepMatrixSource,
+    HistoryStepMatrixSourceError, HistoryStepParent, HistoryStepParentTranscriptLayout,
+    HistoryStepRuntime, HistoryStepRuntimeParts, HistoryStepSidecarOperation, HistoryStepTerminal,
     PreparedHistoryStepForPow, HISTORY_STEP_WIRE_VERSION,
 };
 pub use runtime_parts_codec::{
@@ -391,12 +387,6 @@ impl std::error::Error for HistoryStepInputError {}
 pub(super) struct HistoryStepPreparations {
     recursion: HistoryStepParentRegionPreparation,
     direct_block: BlockRegionPreparation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct HistoryStepCompositeSidecarProof {
-    parent_recursion: LinkRegionSidecarProof,
-    direct_block: BlockRegionSidecarProof,
 }
 
 fn alloc_pinned_flat_digest(builder: &mut FieldR1csBuilder, digest: &[u8; 32]) -> [LinExpr; 2] {

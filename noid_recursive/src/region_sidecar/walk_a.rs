@@ -23,7 +23,6 @@ use noid_ivc_core::deep_chain::spine::{
     spine_tree_exposure_terms, spine_tree_fixed_patterns, spine_wrap_fixed_patterns,
     SPINE_TREE_SLOTS, SPINE_WRAP_SLOTS,
 };
-use noid_ivc_core::deep_chain::LaneClaimGroup;
 use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 use noid_ivc_core::public_io::WitnessSlice;
@@ -38,12 +37,8 @@ use crate::acceptance::zk_auth_capsule_schedule::{
 
 use crate::acceptance::trace::region_source_binding::{
     common_period_ones, common_period_pattern, dyadic_region_bits, pattern_in_dyadic_region,
-    prove_walk_a_union_walk_prefix_with_challenger, prove_walk_a_union_walk_suffix_with_challenger,
-    prove_walk_a_union_with_challenger, union_ref_terms,
-    verify_walk_a_union_walk_prefix_with_challenger,
-    verify_walk_a_union_walk_suffix_with_challenger, verify_walk_a_union_with_challenger,
+    prove_walk_a_union_with_challenger, union_ref_terms, verify_walk_a_union_with_challenger,
     SpineUnionSpec, SplitDuplexTailRefs, WalkAColumnClaim, WalkAUnionProof,
-    WalkAUnionProverWalkPrefix, WalkAUnionVerifierWalkPrefix, WalkAUnionWalkDeferredProof,
 };
 use crate::acceptance::trace::region_source_binding_c1::{
     prove_c1_walk_a_walk_prefix, prove_c1_walk_a_walk_suffix, verify_c1_walk_a_walk_prefix,
@@ -335,104 +330,6 @@ pub struct WalkARegionProverPlan<'a> {
     s_out: &'a [Vec<F128>; 4],
 }
 
-/// Post-VK, pre-walk prover continuation for a Walk-A child.  It owns all
-/// protocol-derived state needed by the suffix while borrowing the outer
-/// witness slices and the plan's layer-0 columns.
-pub(crate) struct WalkARegionProverWalkContinuation<'a, 'z> {
-    vk: &'a WalkARegionVk,
-    total_vars: usize,
-    protocol: CanonicalWalkAProtocol,
-    committed: Vec<&'z [F128]>,
-    exposure_owned: Option<[Vec<F128>; 4]>,
-    s0: &'a [Vec<F128>; 4],
-    prefix: WalkAUnionProverWalkPrefix,
-}
-
-impl WalkARegionProverWalkContinuation<'_, '_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
-        self.s0
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<(WalkARegionWalkDeferredProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
-        let Self {
-            vk,
-            total_vars,
-            protocol,
-            committed,
-            exposure_owned,
-            s0: _,
-            prefix,
-        } = self;
-        let exposure_refs = exposure_owned.as_ref().map(|columns| {
-            [
-                columns[0].as_slice(),
-                columns[1].as_slice(),
-                columns[2].as_slice(),
-                columns[3].as_slice(),
-            ]
-        });
-        let (authority, terminal_claims) = prove_walk_a_union_walk_suffix_with_challenger(
-            protocol.w_log,
-            &protocol.fixed,
-            &protocol.leaf_refs,
-            &protocol.split_tails,
-            protocol.es_sponge.as_ref(),
-            protocol.spine.as_ref(),
-            &committed,
-            exposure_refs.as_ref(),
-            prefix,
-            terminal,
-            challenger,
-        );
-        let claims = resolve_walk_a_terminal_claims(vk, total_vars, terminal_claims)?;
-        Ok((WalkARegionWalkDeferredProof::new(authority), claims))
-    }
-}
-
-/// Native verifier continuation.  The low-level prefix retains the exact
-/// deferred authority borrow, preventing a suffix from being finished with a
-/// different proof object.
-pub(crate) struct WalkARegionVerifierWalkContinuation<'a> {
-    vk: &'a WalkARegionVk,
-    total_vars: usize,
-    protocol: CanonicalWalkAProtocol,
-    prefix: WalkAUnionVerifierWalkPrefix<'a>,
-}
-
-impl WalkARegionVerifierWalkContinuation<'_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-        let terminal_claims = verify_walk_a_union_walk_suffix_with_challenger(
-            self.protocol.w_log,
-            &self.protocol.fixed,
-            &self.protocol.leaf_refs,
-            &self.protocol.split_tails,
-            self.protocol.es_sponge.as_ref(),
-            self.protocol.spine.as_ref(),
-            self.prefix,
-            terminal,
-            challenger,
-        )
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-        resolve_walk_a_terminal_claims(self.vk, self.total_vars, terminal_claims)
-    }
-}
-
 pub(crate) struct C1WalkARegionProverWalkContinuation<'a, 'z> {
     vk: &'a WalkARegionVk,
     total_vars: usize,
@@ -542,43 +439,6 @@ impl<'a> WalkARegionProverPlan<'a> {
         Ok(Self { vk, s0, s_out })
     }
 
-    /// Bind this child VK and prove every prefix message up to the walk
-    /// boundary.  The returned continuation exposes the exact group and
-    /// layer-0 columns to an enclosing multi-walk protocol.
-    pub(crate) fn prove_walk_deferred_prefix<'z, Ch: Challenger>(
-        &self,
-        z: &'z [F128],
-        challenger: &mut Ch,
-    ) -> Result<WalkARegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
-        let total_vars = witness_log(z)?;
-        let protocol = self.vk.validate_in_witness(total_vars)?;
-        let committed = self
-            .vk
-            .slices()
-            .iter()
-            .map(|slice| &z[slice.start()..slice.start() + slice.len()])
-            .collect::<Vec<_>>();
-        let exposure_owned = extract_spine_exposure(&protocol, &committed)?;
-        bind_walk_a_vk(challenger, self.vk);
-        let prefix = prove_walk_a_union_walk_prefix_with_challenger(
-            protocol.w_log,
-            &protocol.fixed,
-            &protocol.meta_c,
-            &committed,
-            self.s_out,
-            challenger,
-        );
-        Ok(WalkARegionProverWalkContinuation {
-            vk: self.vk,
-            total_vars,
-            protocol,
-            committed,
-            exposure_owned,
-            s0: self.s0,
-            prefix,
-        })
-    }
-
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
@@ -679,36 +539,10 @@ impl WalkARegionSidecarProof {
     }
 }
 
-/// Serializable Walk-A region authority whose deep-chain walk is owned by an
-/// enclosing protocol. Unlike [`WalkARegionSidecarProof`], this type has no
-/// embedded or ignored walk field.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct WalkARegionWalkDeferredProof {
-    version: u8,
-    authority: WalkAUnionWalkDeferredProof,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct C1WalkARegionWalkDeferredProof {
     version: u8,
     authority: C1WalkAUnionWalkDeferredProof,
-}
-
-impl WalkARegionWalkDeferredProof {
-    pub(crate) fn new(authority: WalkAUnionWalkDeferredProof) -> Self {
-        Self {
-            version: WALK_A_REGION_SIDECAR_VERSION,
-            authority,
-        }
-    }
-
-    pub(crate) fn version(&self) -> u8 {
-        self.version
-    }
-
-    pub(crate) fn authority(&self) -> &WalkAUnionWalkDeferredProof {
-        &self.authority
-    }
 }
 
 impl C1WalkARegionWalkDeferredProof {
@@ -786,36 +620,6 @@ pub(super) fn walk_a_bounded_shape(
 ) -> Result<FixedProofShape, RegionSidecarError> {
     let protocol = vk.validate_in_witness(total_vars)?;
     Ok(walk_a_proof_shape(&protocol))
-}
-
-/// Bind and verify a walk-deferred Walk-A region proof through its selection
-/// prefix.  The continuation owns the proof borrow and can only be finished
-/// against the terminal supplied by the enclosing walk.
-pub(crate) fn verify_walk_a_region_walk_deferred_prefix<'a, Ch: Challenger>(
-    vk: &'a WalkARegionVk,
-    total_vars: usize,
-    proof: &'a WalkARegionWalkDeferredProof,
-    challenger: &mut Ch,
-) -> Result<WalkARegionVerifierWalkContinuation<'a>, RegionSidecarError> {
-    let protocol = vk.validate_in_witness(total_vars)?;
-    if proof.version() != WALK_A_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    bind_walk_a_vk(challenger, vk);
-    let prefix = verify_walk_a_union_walk_prefix_with_challenger(
-        protocol.w_log,
-        &protocol.fixed,
-        &protocol.meta_c,
-        proof.authority().as_ref(),
-        challenger,
-    )
-    .map_err(|_| RegionSidecarError::InvalidProof)?;
-    Ok(WalkARegionVerifierWalkContinuation {
-        vk,
-        total_vars,
-        protocol,
-        prefix,
-    })
 }
 
 pub(crate) fn verify_c1_walk_a_region_walk_deferred_prefix<'a, Ch: Challenger>(
@@ -2076,7 +1880,7 @@ pub(in crate::region_sidecar) mod tests {
         }
     }
 
-    fn assert_legacy_parity(fixture: &Fixture) {
+    fn assert_reference_parity(fixture: &Fixture) {
         let protocol = canonical_protocol(fixture.descriptor).unwrap();
         let committed = fixture
             .committed
@@ -2092,7 +1896,7 @@ pub(in crate::region_sidecar) mod tests {
                 columns[3].as_slice(),
             ]
         });
-        let legacy = run_union_native(
+        let reference = run_union_native(
             &committed,
             &fixture.s0,
             &fixture.s_out,
@@ -2103,9 +1907,9 @@ pub(in crate::region_sidecar) mod tests {
             protocol.spine.as_ref(),
             exposure_refs.as_ref(),
             protocol.w_log,
-            b"walk-a-legacy-parity",
+            b"walk-a-reference-parity",
         );
-        let mut challenger = FsLaneChallenger::new(b"walk-a-legacy-parity");
+        let mut challenger = FsLaneChallenger::new(b"walk-a-reference-parity");
         let (authority, claims) = prove_walk_a_union_with_challenger(
             protocol.w_log,
             &protocol.fixed,
@@ -2120,29 +1924,29 @@ pub(in crate::region_sidecar) mod tests {
             exposure_refs.as_ref(),
             &mut challenger,
         );
-        assert_eq!(authority.selection, legacy.sel_proof);
-        assert_eq!(authority.walk, legacy.walk_proof);
-        assert_eq!(authority.substitution, legacy.sub_proof);
-        assert_eq!(authority.spine_exposure, legacy.spine_expo_proof);
-        assert_eq!(authority.shifts.len(), legacy.shifts.len());
-        for (proof, (_, _, legacy_proof)) in authority.shifts.iter().zip(&legacy.shifts) {
-            assert_eq!(proof, legacy_proof);
+        assert_eq!(authority.selection, reference.sel_proof);
+        assert_eq!(authority.walk, reference.walk_proof);
+        assert_eq!(authority.substitution, reference.sub_proof);
+        assert_eq!(authority.spine_exposure, reference.spine_expo_proof);
+        assert_eq!(authority.shifts.len(), reference.shifts.len());
+        for (proof, (_, _, reference_proof)) in authority.shifts.iter().zip(&reference.shifts) {
+            assert_eq!(proof, reference_proof);
         }
-        let legacy_claims = legacy
+        let reference_claims = reference
             .pending
             .iter()
-            .chain(&legacy.spine_expo_pending)
+            .chain(&reference.spine_expo_pending)
             .map(|(column, point, value)| (*column, point.clone(), *value))
             .collect::<Vec<_>>();
         let claims = claims
             .into_iter()
             .map(|claim| (claim.column, claim.point, claim.value))
             .collect::<Vec<_>>();
-        assert_eq!(claims, legacy_claims);
+        assert_eq!(claims, reference_claims);
     }
 
     #[test]
-    fn wallet_meta_variants_roundtrip_and_match_legacy_tuple_order() {
+    fn wallet_meta_variants_roundtrip_and_match_reference_tuple_order() {
         let wallet = wallet_fixture();
         let es = meta_fixture(true, false);
         let spine = meta_fixture(false, true);
@@ -2157,10 +1961,10 @@ pub(in crate::region_sidecar) mod tests {
         let (_, _, both_proof) = direct_roundtrip(&both);
         assert!(both_proof.authority.spine_exposure.is_some());
 
-        assert_legacy_parity(&wallet);
-        assert_legacy_parity(&es);
-        assert_legacy_parity(&spine);
-        assert_legacy_parity(&both);
+        assert_reference_parity(&wallet);
+        assert_reference_parity(&es);
+        assert_reference_parity(&spine);
+        assert_reference_parity(&both);
     }
 
     #[test]

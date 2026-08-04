@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Artifact format-v2 sizing probe: measures whether shift-invariant
+//! Artifact format-v2 sizing analysis: measures whether shift-invariant
 //! re-serialization (per-row entry counts, zigzag column deltas, varint
 //! value indices, planar streams) lets zstd reach the gadget repetition
 //! that absolute `u32` column indices currently break.

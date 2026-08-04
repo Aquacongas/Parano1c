@@ -2763,7 +2763,12 @@ pub struct FieldPostCommitTraceContext<'a, C> {
     total_vars: usize,
     channel: &'a mut C,
     claims: Vec<QuirkyDirectClaimTrace>,
-    wide_response_low: bool,
+    c1_claims: Vec<C1QuirkyDirectClaimTrace>,
+}
+
+struct FieldPostCommitTraceClaims {
+    base: Vec<QuirkyDirectClaimTrace>,
+    c1: Vec<C1QuirkyDirectClaimTrace>,
 }
 
 impl<'a, C> FieldPostCommitTraceContext<'a, C> {
@@ -2773,12 +2778,15 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
             total_vars,
             channel,
             claims: Vec::new(),
-            wide_response_low: false,
+            c1_claims: Vec::new(),
         }
     }
 
-    fn finish(self) -> Vec<QuirkyDirectClaimTrace> {
-        self.claims
+    fn finish(self) -> FieldPostCommitTraceClaims {
+        FieldPostCommitTraceClaims {
+            base: self.claims,
+            c1: self.c1_claims,
+        }
     }
 
     pub fn commitment_root(&self) -> &'a FlatDigestExpr {
@@ -2797,16 +2805,16 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
         self.claims.extend(claims);
     }
 
-    pub fn claim_count(&self) -> usize {
-        self.claims.len()
+    pub fn append_c1_claim(&mut self, claim: C1QuirkyDirectClaimTrace) {
+        self.c1_claims.push(claim);
     }
 
-    /// Switch scalar algebra to the uniform low coordinate of canonically
-    /// framed C1 responses.  Sidecar repetition scopes this around one whole
-    /// base-field transcript and restores the ordinary profile before
-    /// returning to the enclosing Field verifier.
-    pub(crate) fn set_wide_response_low(&mut self, enabled: bool) {
-        self.wide_response_low = enabled;
+    pub fn append_c1_claims(&mut self, claims: impl IntoIterator<Item = C1QuirkyDirectClaimTrace>) {
+        self.c1_claims.extend(claims);
+    }
+
+    pub fn claim_count(&self) -> usize {
+        self.claims.len() + self.c1_claims.len()
     }
 
     /// Open a CHILD post-commit context over a different channel (the
@@ -2822,23 +2830,13 @@ impl<'a, C> FieldPostCommitTraceContext<'a, C> {
         FieldPostCommitTraceContext::new(self.commitment_root, self.total_vars, channel)
     }
 
-    /// Detached context for SCRATCH replays (schedule derivation, recording
-    /// prefill).  Nothing built through it enters a real proof: the claims
-    /// are dropped by the caller and the commitment root is never read by
-    /// the recorded child protocols.
-    pub(crate) fn detached(
-        commitment_root: &'a FlatDigestExpr,
-        total_vars: usize,
-        channel: &'a mut C,
-    ) -> Self {
-        Self::new(commitment_root, total_vars, channel)
-    }
-
     /// Adopt one class-local child replay into the enclosing PCS batch.
     /// HistoryStep instantiates both parent classes explicitly, so selection
     /// happens at the verifier-arm gate rather than by rewriting claims.
     pub(crate) fn adopt_child_claims<C2>(&mut self, child: FieldPostCommitTraceContext<'_, C2>) {
-        self.claims.extend(child.finish());
+        let child = child.finish();
+        self.claims.extend(child.base);
+        self.c1_claims.extend(child.c1);
     }
 }
 
@@ -2864,23 +2862,11 @@ impl<C: FsChannelOps> FsChannelOps for FieldPostCommitTraceContext<'_, C> {
     }
 
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
-        if self.wide_response_low {
-            self.channel.sample_f256(b).lo
-        } else {
-            self.channel.sample_f128(b)
-        }
+        self.channel.sample_f128(b)
     }
 
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
-        if self.wide_response_low {
-            self.channel
-                .sample_f256_vec(b, n)
-                .into_iter()
-                .map(|challenge| challenge.lo)
-                .collect()
-        } else {
-            self.channel.sample_f128_vec(b, n)
-        }
+        self.channel.sample_f128_vec(b, n)
     }
 
     fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
@@ -3601,6 +3587,7 @@ where
     claims.extend(io_claims);
     claims.extend(
         auxiliary_claims
+            .base
             .into_iter()
             .map(|claim| C1QuirkyDirectClaimTrace {
                 z_skip: ExtExpr::from_base(claim.z_skip),
@@ -3609,6 +3596,7 @@ where
                 value: ExtExpr::from_base(claim.value),
             }),
     );
+    claims.extend(auxiliary_claims.c1);
     verify_opening_batch_quirky_direct_c1_trace_region(
         b,
         channel,
@@ -3918,7 +3906,12 @@ where
             observe_flat_digest(b, channel, post_commit_class_digest);
             let mut context = FieldPostCommitTraceContext::new(commitment_root, shape.m, channel);
             post_commit(b, &mut context);
-            context.finish()
+            let claims = context.finish();
+            assert!(
+                claims.c1.is_empty(),
+                "base-field proof cannot consume extension-field auxiliary claims"
+            );
+            claims.base
         },
     )
 }

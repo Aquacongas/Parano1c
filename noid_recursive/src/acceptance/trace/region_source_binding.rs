@@ -3269,10 +3269,10 @@ mod split_walk_a_layout_tests {
         );
         // Pick cells not covered by the copy constraints, so rejection comes
         // specifically from the canonical-ghost pins in every committed col.
-        let ghost_probe_offsets = [0usize, 0, 0, 0, 0, 0, 1, 1, 1];
+        let ghost_mutation_offsets = [0usize, 0, 0, 0, 0, 0, 1, 1, 1];
         for column in 0..9 {
             let mut bad = witness.clone();
-            bad[slices[column].start() + local_ghost + ghost_probe_offsets[column]] += F128::ONE;
+            bad[slices[column].start() + local_ghost + ghost_mutation_offsets[column]] += F128::ONE;
             assert!(
                 !r1cs.satisfies(&bad),
                 "local overhang mutation accepted in committed column {column}"
@@ -3724,9 +3724,7 @@ pub(crate) struct WalkAUnionWalkDeferredProof {
     pub(crate) spine_exposure: Option<ColumnRelationProof>,
 }
 
-/// Borrowed view shared by the legacy single-walk wrapper and a genuinely
-/// walk-deferred authority.  Keeping this view borrowed avoids cloning the
-/// relation and shift proofs merely to enter the phased verifier.
+/// Borrowed view of an embedded standalone Walk-A authority.
 #[derive(Clone, Copy)]
 pub(crate) struct WalkAUnionWalkDeferredProofRef<'a> {
     pub(crate) selection: &'a ColumnRelationProof,
@@ -3737,17 +3735,6 @@ pub(crate) struct WalkAUnionWalkDeferredProofRef<'a> {
 
 impl WalkAUnionProof {
     pub(crate) fn walk_deferred(&self) -> WalkAUnionWalkDeferredProofRef<'_> {
-        WalkAUnionWalkDeferredProofRef {
-            selection: &self.selection,
-            substitution: &self.substitution,
-            shifts: &self.shifts,
-            spine_exposure: self.spine_exposure.as_ref(),
-        }
-    }
-}
-
-impl WalkAUnionWalkDeferredProof {
-    pub(crate) fn as_ref(&self) -> WalkAUnionWalkDeferredProofRef<'_> {
         WalkAUnionWalkDeferredProofRef {
             selection: &self.selection,
             substitution: &self.substitution,
@@ -5048,18 +5035,6 @@ pub(crate) struct MerkleUnionWalkDeferredProofRef<'a> {
 
 impl MerkleUnionProof {
     pub(crate) fn walk_deferred(&self) -> MerkleUnionWalkDeferredProofRef<'_> {
-        MerkleUnionWalkDeferredProofRef {
-            zero: &self.zero,
-            zero_shifts: &self.zero_shifts,
-            selection: &self.selection,
-            substitution: &self.substitution,
-            shifts: &self.shifts,
-        }
-    }
-}
-
-impl MerkleUnionWalkDeferredProof {
-    pub(crate) fn as_ref(&self) -> MerkleUnionWalkDeferredProofRef<'_> {
         MerkleUnionWalkDeferredProofRef {
             zero: &self.zero,
             zero_shifts: &self.zero_shifts,
@@ -6721,16 +6696,6 @@ impl DuplexUnionProof {
     }
 }
 
-impl DuplexUnionWalkDeferredProof {
-    pub(crate) fn as_ref(&self) -> DuplexUnionWalkDeferredProofRef<'_> {
-        DuplexUnionWalkDeferredProofRef {
-            selection: &self.selection,
-            substitution: &self.substitution,
-            shifts: &self.shifts,
-        }
-    }
-}
-
 pub(crate) struct DuplexUnionProverWalkPrefix {
     selection: ColumnRelationProof,
     pending: Vec<DuplexColumnClaim>,
@@ -6866,30 +6831,6 @@ pub(crate) fn prove_duplex_union_walk_suffix_with_challenger<Ch: Challenger>(
         terminal,
         challenger,
         |alpha| duplex_terms_from_refs(refs, rec_refs, alpha),
-    )
-}
-
-/// Selected-recording suffix. The selector has already been transcript-bound
-/// by the caller and is also returned as a committed scalar opening there.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn prove_duplex_union_walk_suffix_selected_with_challenger<Ch: Challenger>(
-    w_log: usize,
-    fixed: &[FixedPattern],
-    sets: &[DuplexFamilyRefs],
-    selector: F128,
-    committed: &[&[F128]],
-    prefix: DuplexUnionProverWalkPrefix,
-    terminal: &LaneClaimGroup,
-    challenger: &mut Ch,
-) -> (DuplexUnionWalkDeferredProof, Vec<DuplexColumnClaim>) {
-    prove_duplex_union_walk_suffix_with_term_builder(
-        w_log,
-        fixed,
-        committed,
-        prefix,
-        terminal,
-        challenger,
-        |alpha| duplex_substitution_terms_selected(sets, selector, alpha),
     )
 }
 
@@ -7040,27 +6981,6 @@ pub(crate) fn verify_duplex_union_walk_suffix_with_challenger<Ch: Challenger>(
         terminal,
         challenger,
         |alpha| duplex_terms_from_refs(refs, rec_refs, alpha),
-    )
-}
-
-/// Verifier twin of
-/// [`prove_duplex_union_walk_suffix_selected_with_challenger`].
-pub(crate) fn verify_duplex_union_walk_suffix_selected_with_challenger<Ch: Challenger>(
-    w_log: usize,
-    fixed: &[FixedPattern],
-    sets: &[DuplexFamilyRefs],
-    selector: F128,
-    prefix: DuplexUnionVerifierWalkPrefix<'_>,
-    terminal: &LaneClaimGroup,
-    challenger: &mut Ch,
-) -> Result<Vec<DuplexColumnClaim>, DuplexUnionVerifyError> {
-    verify_duplex_union_walk_suffix_with_term_builder(
-        w_log,
-        fixed,
-        prefix,
-        terminal,
-        challenger,
-        |alpha| duplex_substitution_terms_selected(sets, selector, alpha),
     )
 }
 
@@ -7287,8 +7207,8 @@ pub(crate) fn duplex_sub_terms_trace(
     (terms, ap)
 }
 
-/// Trace twin of [`duplex_substitution_terms_multi`] (same term order).
-pub(crate) fn duplex_sub_terms_trace_multi(
+#[cfg(test)]
+fn duplex_sub_terms_trace_multi(
     b: &mut FieldR1csBuilder,
     sets: &[DuplexFamilyRefs],
     alpha: &LinExpr,
@@ -7318,53 +7238,6 @@ pub(crate) fn duplex_sub_terms_trace_multi(
                 factors: vec![ColRef::Fixed(refs.consts[j])],
             });
         }
-    }
-    (terms, ap)
-}
-
-/// Trace twin of [`duplex_substitution_terms_selected`]. The selector is a
-/// boolean proof wire whose matching scalar witness cell is discharged by the
-/// enclosing post-commit opening batch.
-pub(crate) fn duplex_sub_terms_trace_selected(
-    b: &mut FieldR1csBuilder,
-    sets: &[DuplexFamilyRefs],
-    selector: &LinExpr,
-    alpha: &LinExpr,
-) -> (Vec<RelationTermTrace>, Vec<LinExpr>) {
-    assert!(!sets.is_empty() && sets.len() % 2 == 0);
-    let (m, ap) = mds_alpha_weights(b, alpha);
-    let selected_m: Vec<LinExpr> = (0..STATE_SIZE)
-        .map(|lane| mul(b, &m[lane], selector))
-        .collect();
-    let mut terms = Vec::new();
-    for j in 0..STATE_SIZE {
-        terms.push(RelationTermTrace {
-            coeff: m[j].clone(),
-            factors: vec![ColRef::CommittedShift(sets[0].c[j])],
-        });
-    }
-    let append =
-        |terms: &mut Vec<RelationTermTrace>, refs: &DuplexFamilyRefs, weights: &[LinExpr]| {
-            for j in 0..STATE_SIZE {
-                terms.push(RelationTermTrace {
-                    coeff: weights[j].clone(),
-                    factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
-                });
-                if j < 2 {
-                    terms.push(RelationTermTrace {
-                        coeff: weights[j].clone(),
-                        factors: vec![ColRef::Fixed(refs.abs[j]), ColRef::Committed(refs.a[j])],
-                    });
-                }
-                terms.push(RelationTermTrace {
-                    coeff: weights[j].clone(),
-                    factors: vec![ColRef::Fixed(refs.consts[j])],
-                });
-            }
-        };
-    for pair in sets.chunks_exact(2) {
-        append(&mut terms, &pair[0], &m);
-        append(&mut terms, &pair[1], &selected_m);
     }
     (terms, ap)
 }

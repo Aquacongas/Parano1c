@@ -2735,7 +2735,7 @@ mod tests {
     /// Claims need not be honest for measuring the prover kernel in a release
     /// build; the regular round-trip tests above cover the authenticated path.
     #[test]
-    #[ignore = "production-width performance probe"]
+    #[ignore = "production-width performance benchmark"]
     fn ragged_m22_three_child_micro_profile() {
         let w_logs = [14usize, 15, 17];
         let instances = w_logs

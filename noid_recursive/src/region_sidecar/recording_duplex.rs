@@ -9,7 +9,7 @@
 //! Every block of the union is one recorded child transcript (a compiled
 //! [`DuplexLayout`] over the union-recorder capacity IV), gated to its own
 //! dyadic offset. A V5 selected instance carries the authenticated parent
-//! arm's block-sidecar child and `[R]_prev` transcript. The other arm remains
+//! arm's joint Block child and `[R]_prev` transcript. The other arm remains
 //! in the class-fixed layout table, so one verification key covers both
 //! parent classes without adding another committed recording region.
 //! The serialized child authority reuses the duplex
@@ -24,42 +24,30 @@ use noid_ivc_core::deep_chain::schedule::{
     carry_selection_terms, duplex_family_refs, duplex_fixed_patterns, DuplexFamilyRefs,
     DuplexLayout,
 };
-use noid_ivc_core::deep_chain::LaneClaimGroup;
 use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_circuit::{FsChannelOps, FsChannelUnionRecorder};
-use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
+use noid_ivc_core::pcs::C1QuirkyDirectClaim;
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
-use crate::acceptance::trace::deep_chain::{
-    verify_column_relation_trace, verify_shift_discharge_trace, ColumnRelationProofTrace,
-    LaneClaimGroupTrace, ShiftDischargeProofTrace,
-};
+use crate::acceptance::trace::deep_chain::C1LaneClaimGroupTrace;
 use crate::acceptance::trace::region_source_binding::{
-    duplex_sub_terms_trace_multi, duplex_sub_terms_trace_selected,
-    duplex_substitution_terms_selected, duplex_substitution_terms_sets,
-    prove_duplex_union_walk_prefix_with_challenger,
-    prove_duplex_union_walk_suffix_selected_with_challenger,
-    prove_duplex_union_walk_suffix_with_challenger, rec_hi_bits,
-    verify_duplex_union_walk_prefix_with_challenger,
-    verify_duplex_union_walk_suffix_selected_with_challenger,
-    verify_duplex_union_walk_suffix_with_challenger, DuplexColumnClaim,
-    DuplexUnionProverWalkPrefix, DuplexUnionVerifierWalkPrefix, DuplexUnionWalkDeferredProof,
+    duplex_substitution_terms_selected, duplex_substitution_terms_sets, rec_hi_bits,
 };
 use crate::acceptance::trace::region_source_binding_c1::{
     prove_c1_duplex_walk_prefix, prove_c1_duplex_walk_suffix, prove_c1_duplex_walk_suffix_selected,
-    verify_c1_duplex_walk_prefix, verify_c1_duplex_walk_suffix,
-    verify_c1_duplex_walk_suffix_selected, C1DuplexColumnClaim, C1DuplexProverWalkPrefix,
-    C1DuplexUnionWalkDeferredProof, C1DuplexVerifierWalkPrefix,
+    verify_c1_duplex_walk_prefix, verify_c1_duplex_walk_prefix_trace, verify_c1_duplex_walk_suffix,
+    verify_c1_duplex_walk_suffix_selected, verify_c1_duplex_walk_suffix_selected_trace,
+    verify_c1_duplex_walk_suffix_trace, C1DuplexColumnClaim, C1DuplexColumnClaimTrace,
+    C1DuplexProverWalkPrefix, C1DuplexUnionTraceWalkPrefix, C1DuplexUnionWalkDeferredProof,
+    C1DuplexVerifierWalkPrefix,
 };
-use crate::acceptance::trace::self_verify::{FieldPostCommitTraceContext, QuirkyDirectClaimTrace};
-use crate::acceptance::trace::{mul, FieldR1csBuilder, LinExpr};
+use crate::acceptance::trace::self_verify::{
+    C1QuirkyDirectClaimTrace, FieldPostCommitTraceContext,
+};
+use crate::acceptance::trace::{ExtExpr, FieldR1csBuilder, LinExpr};
 
-use super::trace::{
-    preflight_duplex_deferred_authority, verify_duplex_union_walk_prefix_trace,
-    DuplexColumnClaimTrace, DuplexUnionTraceWalkPrefix,
-};
 use super::{
     duplex_layout_digest, push_usize, RegionSidecarError, RegionWalkEndpoints,
     DUPLEX_REGION_COMMITTED_COLUMNS, DUPLEX_REGION_SIDECAR_VERSION,
@@ -108,30 +96,6 @@ pub struct RecordingDuplexRegionVk {
 }
 
 impl RecordingDuplexRegionVk {
-    #[cfg(test)]
-    pub(crate) fn new(
-        purpose: [u8; 32],
-        w_log: usize,
-        slices: [WitnessSlice; DUPLEX_REGION_COMMITTED_COLUMNS],
-        blocks: Vec<(DuplexLayout, usize)>,
-    ) -> Result<Self, RegionSidecarError> {
-        let (fixed, refs, rec_refs) = canonical_recording_fixed(w_log, &blocks)?;
-        let layout_digest = recording_layout_digest(w_log, &blocks, None);
-        let vk = Self {
-            purpose,
-            w_log,
-            slices,
-            blocks,
-            selected: None,
-            fixed,
-            refs,
-            rec_refs,
-            layout_digest,
-        };
-        vk.validate_structure()?;
-        Ok(vk)
-    }
-
     /// One fixed key for two recording-layout alternatives.  Corresponding
     /// roles share their dyadic offset and block size; the fixed bank stores
     /// arm 0 plus the characteristic-two arm delta.
@@ -518,41 +482,6 @@ fn bind_recording_selector<Ch: Challenger>(challenger: &mut Ch, selector: F128) 
     challenger.observe_f128(selector);
 }
 
-fn resolve_recording_terminal_claims(
-    vk: &RecordingDuplexRegionVk,
-    total_vars: usize,
-    selector: F128,
-    terminal: Vec<DuplexColumnClaim>,
-) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-    let mut claims = Vec::with_capacity(terminal.len() + usize::from(vk.is_selected()));
-    for claim in terminal {
-        let slice = *vk
-            .slices
-            .get(claim.column)
-            .ok_or(RegionSidecarError::InvalidProof)?;
-        if claim.point.len() != slice.log2_len {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        let mut x_rest = claim.point;
-        x_rest.extend(slice.prefix_coords(total_vars));
-        claims.push(QuirkyDirectClaim {
-            z_skip: F128::ZERO,
-            k_skip: 0,
-            x_rest,
-            value: claim.value,
-        });
-    }
-    if let Some(slice) = vk.selector_slice() {
-        claims.push(QuirkyDirectClaim {
-            z_skip: F128::ZERO,
-            k_skip: 0,
-            x_rest: slice.prefix_coords(total_vars),
-            value: selector,
-        });
-    }
-    Ok(claims)
-}
-
 fn resolve_c1_recording_terminal_claims(
     vk: &RecordingDuplexRegionVk,
     total_vars: usize,
@@ -597,41 +526,11 @@ fn resolve_c1_recording_terminal_claims(
     Ok(claims)
 }
 
-/// Recording authority plus the arm selector that chooses its fixed-layout
-/// bank.  The selector is transcript-bound and independently discharged as a
-/// one-cell opening of the enclosing Field witness.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct RecordingDuplexRegionWalkDeferredProof {
-    selector: F128,
-    authority: super::DuplexRegionWalkDeferredProof,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct C1RecordingDuplexRegionWalkDeferredProof {
     selector: F128,
     version: u8,
     authority: C1DuplexUnionWalkDeferredProof,
-}
-
-impl RecordingDuplexRegionWalkDeferredProof {
-    pub(crate) fn new(selector: F128, authority: DuplexUnionWalkDeferredProof) -> Self {
-        Self {
-            selector,
-            authority: super::DuplexRegionWalkDeferredProof::new(authority),
-        }
-    }
-
-    pub(crate) fn selector(&self) -> F128 {
-        self.selector
-    }
-
-    pub(crate) fn version(&self) -> u8 {
-        self.authority.version()
-    }
-
-    pub(crate) fn authority(&self) -> &DuplexUnionWalkDeferredProof {
-        self.authority.authority()
-    }
 }
 
 impl C1RecordingDuplexRegionWalkDeferredProof {
@@ -664,71 +563,6 @@ pub struct RecordingDuplexRegionProverPlan<'a> {
     vk: &'a RecordingDuplexRegionVk,
     s0: &'a [Vec<F128>; STATE_SIZE],
     s_out: &'a [Vec<F128>; STATE_SIZE],
-}
-
-pub(crate) struct RecordingDuplexProverWalkContinuation<'a, 'z> {
-    vk: &'a RecordingDuplexRegionVk,
-    total_vars: usize,
-    committed: [&'z [F128]; DUPLEX_REGION_COMMITTED_COLUMNS],
-    s0: &'a [Vec<F128>; STATE_SIZE],
-    selector: F128,
-    prefix: DuplexUnionProverWalkPrefix,
-}
-
-impl RecordingDuplexProverWalkContinuation<'_, '_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn s0(&self) -> &[Vec<F128>; STATE_SIZE] {
-        self.s0
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<
-        (
-            RecordingDuplexRegionWalkDeferredProof,
-            Vec<QuirkyDirectClaim>,
-        ),
-        RegionSidecarError,
-    > {
-        let (authority, terminal_claims) = if self.vk.is_selected() {
-            prove_duplex_union_walk_suffix_selected_with_challenger(
-                self.vk.w_log,
-                &self.vk.fixed,
-                &recording_ref_sets(self.vk),
-                self.selector,
-                &self.committed,
-                self.prefix,
-                terminal,
-                challenger,
-            )
-        } else {
-            prove_duplex_union_walk_suffix_with_challenger(
-                self.vk.w_log,
-                &self.vk.fixed,
-                &self.vk.refs,
-                &self.vk.rec_refs,
-                &self.committed,
-                self.prefix,
-                terminal,
-                challenger,
-            )
-        };
-        let claims = resolve_recording_terminal_claims(
-            self.vk,
-            self.total_vars,
-            self.selector,
-            terminal_claims,
-        )?;
-        Ok((
-            RecordingDuplexRegionWalkDeferredProof::new(self.selector, authority),
-            claims,
-        ))
-    }
 }
 
 pub(crate) struct C1RecordingDuplexProverWalkContinuation<'a, 'z> {
@@ -812,48 +646,6 @@ impl<'a> RecordingDuplexRegionProverPlan<'a> {
         Ok(Self { vk, s0, s_out })
     }
 
-    pub(crate) fn prove_walk_deferred_prefix<'z, Ch: Challenger>(
-        &self,
-        z: &'z [F128],
-        challenger: &mut Ch,
-    ) -> Result<RecordingDuplexProverWalkContinuation<'a, 'z>, RegionSidecarError> {
-        if z.is_empty() || !z.len().is_power_of_two() {
-            return Err(RegionSidecarError::WitnessShape);
-        }
-        let total_vars = z.len().trailing_zeros() as usize;
-        self.vk.validate_in_witness(total_vars)?;
-        let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
-            let slice = self.vk.slices[column];
-            &z[slice.start()..slice.start() + slice.len()]
-        });
-        let selector = if let Some(slice) = self.vk.selector_slice() {
-            z[slice.start()]
-        } else {
-            F128::ZERO
-        };
-        if selector != F128::ZERO && selector != F128::ONE {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        bind_recording_vk(challenger, self.vk);
-        bind_recording_selector(challenger, selector);
-        let prefix = prove_duplex_union_walk_prefix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &committed,
-            self.s_out,
-            challenger,
-        );
-        Ok(RecordingDuplexProverWalkContinuation {
-            vk: self.vk,
-            total_vars,
-            committed,
-            s0: self.s0,
-            selector,
-            prefix,
-        })
-    }
-
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
@@ -900,49 +692,6 @@ impl<'a> RecordingDuplexRegionProverPlan<'a> {
 // ---------------------------------------------------------------------------
 // Native verifier
 // ---------------------------------------------------------------------------
-
-pub(crate) struct RecordingDuplexVerifierWalkContinuation<'a> {
-    vk: &'a RecordingDuplexRegionVk,
-    total_vars: usize,
-    selector: F128,
-    prefix: DuplexUnionVerifierWalkPrefix<'a>,
-}
-
-impl RecordingDuplexVerifierWalkContinuation<'_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-        let terminal_claims = if self.vk.is_selected() {
-            verify_duplex_union_walk_suffix_selected_with_challenger(
-                self.vk.w_log,
-                &self.vk.fixed,
-                &recording_ref_sets(self.vk),
-                self.selector,
-                self.prefix,
-                terminal,
-                challenger,
-            )
-        } else {
-            verify_duplex_union_walk_suffix_with_challenger(
-                self.vk.w_log,
-                &self.vk.fixed,
-                &self.vk.refs,
-                &self.vk.rec_refs,
-                self.prefix,
-                terminal,
-                challenger,
-            )
-        }
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-        resolve_recording_terminal_claims(self.vk, self.total_vars, self.selector, terminal_claims)
-    }
-}
 
 pub(crate) struct C1RecordingDuplexVerifierWalkContinuation<'a> {
     vk: &'a RecordingDuplexRegionVk,
@@ -992,31 +741,6 @@ impl C1RecordingDuplexVerifierWalkContinuation<'_> {
     }
 }
 
-pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
-    vk: &'a RecordingDuplexRegionVk,
-    total_vars: usize,
-    proof: &'a RecordingDuplexRegionWalkDeferredProof,
-    challenger: &mut Ch,
-) -> Result<RecordingDuplexVerifierWalkContinuation<'a>, RegionSidecarError> {
-    preflight_recording_duplex_region_walk_deferred(vk, total_vars, proof)?;
-    bind_recording_vk(challenger, vk);
-    bind_recording_selector(challenger, proof.selector());
-    let prefix = verify_duplex_union_walk_prefix_with_challenger(
-        vk.w_log,
-        &vk.fixed,
-        &vk.refs,
-        proof.authority().as_ref(),
-        challenger,
-    )
-    .map_err(|_| RegionSidecarError::InvalidProof)?;
-    Ok(RecordingDuplexVerifierWalkContinuation {
-        vk,
-        total_vars,
-        selector: proof.selector(),
-        prefix,
-    })
-}
-
 pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
     vk: &'a RecordingDuplexRegionVk,
     total_vars: usize,
@@ -1061,45 +785,19 @@ pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix<'a, Ch: Cha
     })
 }
 
-/// Allocation-free shape gate.  Recording sets never change the claimed
-/// column set, so the walk-deferred wire dimensions equal the recording-free
-/// duplex child's and the shared single-set preflight is exact.
-pub(crate) fn preflight_recording_duplex_region_walk_deferred(
-    vk: &RecordingDuplexRegionVk,
-    total_vars: usize,
-    proof: &RecordingDuplexRegionWalkDeferredProof,
-) -> Result<(), RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
-    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    if (vk.is_selected() && proof.selector() != F128::ZERO && proof.selector() != F128::ONE)
-        || (!vk.is_selected() && proof.selector() != F128::ZERO)
-    {
-        return Err(RegionSidecarError::InvalidProof);
-    }
-    let multi = claimed_refs(&vk.substitution_terms(F128::ONE, F128::ONE));
-    let deferred = proof.authority().as_ref();
-    preflight_duplex_deferred_authority(vk.w_log, &vk.refs, deferred)?;
-    if deferred.substitution.final_values.len() != multi.len() {
-        return Err(RegionSidecarError::InvalidProof);
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Trace twins
 // ---------------------------------------------------------------------------
 
-pub(crate) struct RecordingDuplexTraceWalkContinuation<'a> {
+pub(crate) struct C1RecordingDuplexTraceWalkContinuation<'a> {
     vk: &'a RecordingDuplexRegionVk,
     total_vars: usize,
     selector: LinExpr,
-    prefix: DuplexUnionTraceWalkPrefix<'a>,
+    prefix: C1DuplexUnionTraceWalkPrefix<'a>,
 }
 
-impl RecordingDuplexTraceWalkContinuation<'_> {
-    pub(crate) fn walk_group(&self) -> LaneClaimGroupTrace {
+impl C1RecordingDuplexTraceWalkContinuation<'_> {
+    pub(crate) fn walk_group(&self) -> C1LaneClaimGroupTrace {
         self.prefix.walk_group().clone()
     }
 
@@ -1107,22 +805,38 @@ impl RecordingDuplexTraceWalkContinuation<'_> {
         self,
         b: &mut FieldR1csBuilder,
         context: &mut FieldPostCommitTraceContext<'_, C>,
-        walk_terminal: &LaneClaimGroupTrace,
-    ) -> Result<Vec<QuirkyDirectClaimTrace>, RegionSidecarError> {
+        walk_terminal: &C1LaneClaimGroupTrace,
+    ) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
         if context.total_vars() != self.total_vars {
             return Err(RegionSidecarError::InvalidProof);
         }
-        let terminal = verify_recording_duplex_suffix_trace(
-            b,
-            context,
-            self.vk,
-            &self.selector,
-            self.prefix,
-            walk_terminal,
-        )?;
+        let selector = ExtExpr::from_base(self.selector.clone());
+        let terminal = if self.vk.is_selected() {
+            verify_c1_duplex_walk_suffix_selected_trace(
+                b,
+                context,
+                self.vk.w_log,
+                &self.vk.fixed,
+                &recording_ref_sets(self.vk),
+                &selector,
+                self.prefix,
+                walk_terminal,
+            )?
+        } else {
+            verify_c1_duplex_walk_suffix_trace(
+                b,
+                context,
+                self.vk.w_log,
+                &self.vk.fixed,
+                &self.vk.refs,
+                &self.vk.rec_refs,
+                self.prefix,
+                walk_terminal,
+            )?
+        };
         let mut claims = terminal
             .into_iter()
-            .map(|claim| {
+            .map(|claim: C1DuplexColumnClaimTrace| {
                 let slice = *self
                     .vk
                     .slices
@@ -1136,10 +850,10 @@ impl RecordingDuplexTraceWalkContinuation<'_> {
                     slice
                         .prefix_coords(self.total_vars)
                         .into_iter()
-                        .map(LinExpr::constant),
+                        .map(|value| ExtExpr::constant(F256::from_base(value))),
                 );
-                Ok(QuirkyDirectClaimTrace {
-                    z_skip: LinExpr::zero(),
+                Ok(C1QuirkyDirectClaimTrace {
+                    z_skip: ExtExpr::zero(),
                     k_skip: 0,
                     x_rest,
                     value: claim.value,
@@ -1147,30 +861,35 @@ impl RecordingDuplexTraceWalkContinuation<'_> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(slice) = self.vk.selector_slice() {
-            claims.push(QuirkyDirectClaimTrace {
-                z_skip: LinExpr::zero(),
+            claims.push(C1QuirkyDirectClaimTrace {
+                z_skip: ExtExpr::zero(),
                 k_skip: 0,
                 x_rest: slice
                     .prefix_coords(self.total_vars)
                     .into_iter()
-                    .map(LinExpr::constant)
+                    .map(|value| ExtExpr::constant(F256::from_base(value)))
                     .collect(),
-                value: self.selector,
+                value: selector,
             });
         }
         Ok(claims)
     }
 }
 
-/// Bind and replay a walk-deferred recording child through carry selection.
-pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
+pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     context: &mut FieldPostCommitTraceContext<'_, C>,
     vk: &'a RecordingDuplexRegionVk,
-    proof: &'a RecordingDuplexRegionWalkDeferredProof,
-) -> Result<RecordingDuplexTraceWalkContinuation<'a>, RegionSidecarError> {
+    proof: &'a C1RecordingDuplexRegionWalkDeferredProof,
+) -> Result<C1RecordingDuplexTraceWalkContinuation<'a>, RegionSidecarError> {
     let total_vars = context.total_vars();
-    preflight_recording_duplex_region_walk_deferred(vk, total_vars, proof)?;
+    vk.validate_certified_c1_in_witness(total_vars)?;
+    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION
+        || (vk.is_selected() && proof.selector() != F128::ZERO && proof.selector() != F128::ONE)
+        || (!vk.is_selected() && proof.selector() != F128::ZERO)
+    {
+        return Err(RegionSidecarError::InvalidProof);
+    }
     context.observe_label(b, RECORDING_DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
     crate::acceptance::trace::self_verify::observe_pinned_digest(
         b,
@@ -1184,7 +903,7 @@ pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix_trace<'a, C: F
     };
     context.observe_label(b, RECORDING_DUPLEX_SELECTOR_TRANSCRIPT_LABEL);
     context.observe_f128(b, &selector);
-    let prefix = verify_duplex_union_walk_prefix_trace(
+    let prefix = verify_c1_duplex_walk_prefix_trace(
         b,
         context,
         vk.w_log,
@@ -1192,98 +911,12 @@ pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix_trace<'a, C: F
         &vk.refs,
         proof.authority().as_ref(),
     )?;
-    Ok(RecordingDuplexTraceWalkContinuation {
+    Ok(C1RecordingDuplexTraceWalkContinuation {
         vk,
         total_vars,
         selector,
         prefix,
     })
-}
-
-/// Multi-set trace suffix: substitution terms carry every gated pattern set
-/// (the primary block plus each further recording block) while the claimed
-/// column set stays the six A/C columns.
-fn verify_recording_duplex_suffix_trace<C: FsChannelOps>(
-    b: &mut FieldR1csBuilder,
-    channel: &mut C,
-    vk: &RecordingDuplexRegionVk,
-    selector: &LinExpr,
-    prefix: DuplexUnionTraceWalkPrefix<'_>,
-    walk_terminal: &LaneClaimGroupTrace,
-) -> Result<Vec<DuplexColumnClaimTrace>, RegionSidecarError> {
-    if walk_terminal.point.len() != vk.w_log {
-        return Err(RegionSidecarError::InvalidProof);
-    }
-    let (proof, mut terminal_claims) = prefix.into_parts();
-
-    let alpha = channel.sample_f128(b);
-    // Mirror the native `duplex_terms_from_refs` dispatch exactly: a
-    // single-block union keeps the original single-set term order, while a
-    // multi-block union uses the multi-set form (the relation header absorbs
-    // the term structure, so the order is transcript-significant).
-    let (substitution_terms, alpha_powers) = if vk.is_selected() {
-        duplex_sub_terms_trace_selected(b, &recording_ref_sets(vk), selector, &alpha)
-    } else if vk.rec_refs.is_empty() {
-        crate::acceptance::trace::region_source_binding::duplex_sub_terms_trace(b, &vk.refs, &alpha)
-    } else {
-        let sets = recording_ref_sets(vk);
-        duplex_sub_terms_trace_multi(b, &sets, &alpha)
-    };
-    let substitution_refs = claimed_refs(&vk.substitution_terms(F128::ONE, F128::ONE));
-    let mut target = LinExpr::zero();
-    for lane in 0..STATE_SIZE {
-        target = target.add(&mul(b, &alpha_powers[lane], &walk_terminal.values[lane]));
-    }
-    let substitution =
-        ColumnRelationProofTrace::alloc(b, proof.substitution, vk.w_log, substitution_refs.len());
-    let substitution_point = verify_column_relation_trace(
-        b,
-        channel,
-        vk.w_log,
-        &target,
-        &walk_terminal.point,
-        &substitution_terms,
-        &vk.fixed,
-        &substitution,
-    );
-
-    let mut shift_cursor = 0usize;
-    for (reference, value) in substitution_refs.iter().zip(&substitution.final_values) {
-        match reference {
-            ColRef::Committed(column) => terminal_claims.push(DuplexColumnClaimTrace {
-                column: *column,
-                point: substitution_point.clone(),
-                value: value.clone(),
-            }),
-            ColRef::CommittedShift(column) => {
-                let native_shift = proof
-                    .shifts
-                    .get(shift_cursor)
-                    .ok_or(RegionSidecarError::InvalidProof)?;
-                shift_cursor += 1;
-                let shift = ShiftDischargeProofTrace::alloc(b, native_shift, vk.w_log);
-                let point = verify_shift_discharge_trace(
-                    b,
-                    channel,
-                    vk.w_log,
-                    &substitution_point,
-                    value,
-                    0,
-                    &shift,
-                );
-                terminal_claims.push(DuplexColumnClaimTrace {
-                    column: *column,
-                    point,
-                    value: shift.final_value,
-                });
-            }
-            _ => return Err(RegionSidecarError::InvalidProof),
-        }
-    }
-    if shift_cursor != proof.shifts.len() {
-        return Err(RegionSidecarError::InvalidProof);
-    }
-    Ok(terminal_claims)
 }
 
 /// Shared bounded-decode dimensions: identical to the recording-free duplex

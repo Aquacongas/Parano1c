@@ -943,7 +943,7 @@ pub fn verify_ragged_deep_chain_walk<C: Challenger>(
 mod tests {
     use super::*;
     use crate::challenger::FsLaneChallenger;
-    use crate::deep_chain::{LaneClaimGroup, apply_round, prove_ragged_multi_deep_chain_walk};
+    use crate::deep_chain::apply_round;
 
     struct Rng(u64);
 
@@ -1042,11 +1042,11 @@ mod tests {
         assert!(verify_ragged_deep_chain_walk(&w_logs, &groups, &bad, &mut verifier).is_err());
     }
 
-    /// Isolated production-width probe. Claims are intentionally arbitrary:
+    /// Isolated production-width benchmark. Claims are intentionally arbitrary:
     /// this measures the prover kernel, while the small test above verifies
     /// the complete authenticated relation.
     #[test]
-    #[ignore = "production-width C1 performance probe"]
+    #[ignore = "production-width C1 performance benchmark"]
     fn genuine_c1_joint_b64_sidecar_micro_profile() {
         let w_logs = [14usize, 15, 17, 17, 14, 16, 17, 13, 14];
         let inputs = w_logs
@@ -1074,52 +1074,5 @@ mod tests {
         );
         assert_eq!(proof.layers.len(), N_ROUNDS);
         assert_eq!(terminals.len(), w_logs.len());
-    }
-
-    #[test]
-    #[ignore = "production-width legacy two-pass performance probe"]
-    fn legacy_two_pass_b64_sidecar_micro_profile() {
-        let w_logs = [14usize, 15, 17, 17, 14, 16, 17, 13, 14];
-        let inputs = w_logs
-            .iter()
-            .enumerate()
-            .map(|(child, &w_log)| random_columns(w_log, 0xC1_1E64 + child as u64))
-            .collect::<Vec<_>>();
-        let references = inputs.iter().collect::<Vec<_>>();
-        let mut rng = Rng(0xC1_1E6F);
-        let groups = w_logs
-            .iter()
-            .map(|&w_log| {
-                vec![LaneClaimGroup {
-                    point: (0..w_log).map(|_| rng.f128()).collect(),
-                    values: std::array::from_fn(|_| rng.f128()),
-                }]
-            })
-            .collect::<Vec<_>>();
-        let started = std::time::Instant::now();
-        for repetition in 0..2 {
-            let mut link_channel = FsLaneChallenger::new(match repetition {
-                0 => b"legacy-two-pass-link-0",
-                _ => b"legacy-two-pass-link-1",
-            });
-            let _ = prove_ragged_multi_deep_chain_walk(
-                &references[..3],
-                &groups[..3],
-                &mut link_channel,
-            );
-            let mut block_channel = FsLaneChallenger::new(match repetition {
-                0 => b"legacy-two-pass-block-0",
-                _ => b"legacy-two-pass-block-1",
-            });
-            let _ = prove_ragged_multi_deep_chain_walk(
-                &references[3..],
-                &groups[3..],
-                &mut block_channel,
-            );
-        }
-        eprintln!(
-            "NOIDH legacy-two-pass-B64-sidecars elapsed_ms={}",
-            started.elapsed().as_millis(),
-        );
     }
 }

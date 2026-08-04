@@ -43,25 +43,20 @@ use noid_miner::history_step_artifacts::{
 };
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 use noid_recursive::acceptance::history_step::{
-    assemble_history_step_base, assemble_history_step_recursive, HistoryStepParent,
+    assemble_history_step_recursive, HistoryStepParent,
 };
 use noid_recursive::{
     canonical_history_step_shape, decode_verify_history_step_terminal,
-    encode_history_step_terminal, probe_built_history_step_joint_c1,
-    probe_built_history_step_joint_c1_full, prove_built_history_step_terminal, prove_history_step,
+    encode_history_step_terminal, prove_built_history_step_terminal, prove_history_step,
     CanonicalHistoryStepClassId, ChainAccumulator, HistoryStepBlockInput, HistoryStepMatrixLease,
     HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepRuntime, HistoryStepTerminal,
-    JointC1FullProofProbe, HISTORY_STEP_CLASS_COUNT,
+    HISTORY_STEP_CLASS_COUNT,
 };
 
 const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
 const PACK_DIRECTORY_ENV: &str = "NOID_HISTORY_STEP_PACK_DIR";
 const BENCH_FILTER_ENV: &str = "NOID_HISTORY_STEP_BENCH_FILTER";
 const BENCH_SAMPLES_ENV: &str = "NOID_HISTORY_STEP_BENCH_SAMPLES";
-const JOINT_C1_PROBE_ENV: &str = "NOID_HISTORY_STEP_JOINT_C1_PROBE";
-const JOINT_C1_ONLY_ENV: &str = "NOID_HISTORY_STEP_JOINT_C1_ONLY";
-const JOINT_C1_FULL_ENV: &str = "NOID_HISTORY_STEP_JOINT_C1_FULL";
-const JOINT_C1_COMPARE_FULL_ENV: &str = "NOID_HISTORY_STEP_JOINT_C1_COMPARE_FULL";
 const NODE_CPU_POOL_ENV: &str = "NOID_HISTORY_STEP_NODE_CPU_POOL";
 const METADATA_DIGEST_ENV: &str = "NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
 const LEAF_DIGESTS_ENV: &str = "NOID_HISTORY_STEP_PACK_LEAF_DIGESTS";
@@ -261,21 +256,6 @@ fn node_cpu_pool_enabled() -> bool {
     std::env::var_os(NODE_CPU_POOL_ENV).is_some()
 }
 
-fn probe_joint_c1_full(
-    runtime: &HistoryStepRuntime,
-    built: &noid_recursive::BuiltHistoryStep,
-) -> Result<JointC1FullProofProbe, String> {
-    let result = if node_cpu_pool_enabled() {
-        noid_miner::install_history_step_phase_cpu(|| {
-            probe_built_history_step_joint_c1_full(runtime, built)
-        })
-        .map_err(|error| format!("enter production HistoryStep CPU pool: {error}"))?
-    } else {
-        probe_built_history_step_joint_c1_full(runtime, built)
-    };
-    result.map_err(|error| format!("probe full joint C1 proof: {error}"))
-}
-
 fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), String> {
     let root = PathBuf::from(
         std::env::var_os(PACK_DIRECTORY_ENV)
@@ -389,18 +369,6 @@ fn benchmark_tier<const TIER: usize>(
     let class = built.class_id();
     let wires = built.useful_rows();
 
-    if std::env::var_os(JOINT_C1_PROBE_ENV).is_some() {
-        let probe = probe_built_history_step_joint_c1(&built)
-            .map_err(|error| format!("probe honest B{TIER} joint C1 sidecar: {error}"))?;
-        println!(
-            "B{TIER} joint_c1_sidecar prove_ms={:.3} verify_ms={:.3} proof_bytes={} opening_claims={}",
-            probe.prove_micros as f64 / 1_000.0,
-            probe.verify_micros as f64 / 1_000.0,
-            probe.proof_bytes,
-            probe.opening_claims,
-        );
-    }
-
     let prove_started = Instant::now();
     let terminal = prove_built_history_step_terminal(runtime, &built)
         .map_err(|error| format!("prove honest B{TIER} benchmark: {error}"))?;
@@ -464,32 +432,6 @@ fn benchmark_tier_samples<const TIER: usize>(
     sample_count: usize,
     mut fixture: impl FnMut() -> Result<PreparedHistoryStepTierFixture<TIER>, String>,
 ) -> Result<(), String> {
-    if std::env::var_os(JOINT_C1_FULL_ENV).is_some() {
-        for sample in 0..sample_count {
-            let (_, input) = finish_fixture(fixture()?)?;
-            let assemble_started = Instant::now();
-            let parent = HistoryStepParent::new(runtime, parent)
-                .map_err(|error| format!("bind honest B{TIER} joint C1 parent: {error}"))?;
-            let built = assemble_history_step_recursive(runtime, parent, input)
-                .map_err(|error| format!("assemble honest B{TIER} joint C1 proof: {error}"))?;
-            let assemble_ms = assemble_started.elapsed().as_millis();
-            let probe = probe_joint_c1_full(runtime, &built)
-                .map_err(|error| format!("probe honest B{TIER} full joint C1 proof: {error}"))?;
-            println!(
-                "B{TIER} joint_c1_full sample={}/{} wires={} assemble_ms={} prove_ms={:.3} verify_ms={:.3} field_proof_bytes={} sidecar_proof_bytes={} opening_claims={}",
-                sample + 1,
-                sample_count,
-                built.useful_rows(),
-                assemble_ms,
-                probe.prove_micros as f64 / 1_000.0,
-                probe.verify_micros as f64 / 1_000.0,
-                probe.field_proof_bytes,
-                probe.sidecar_proof_bytes,
-                probe.opening_claims,
-            );
-        }
-        return Ok(());
-    }
     let mut measurements = Vec::with_capacity(sample_count);
     for sample in 0..sample_count {
         let measurement = benchmark_tier(runtime, parent, fixture()?)?;
@@ -531,76 +473,6 @@ fn run() -> Result<(), String> {
     let (runtime, source) = load_runtime()?;
     let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)?;
     let c00 = CanonicalHistoryStepClassId::new(0).expect("B64 class");
-    if std::env::var_os(JOINT_C1_ONLY_ENV).is_some() {
-        let (selected, parent_slot) = filter.unwrap_or((c00, 0));
-        source.load_checked(selected)?;
-        let genesis = noid_recursive::genesis_accumulator();
-        let built = if selected == c00 {
-            let step = provider
-                .next_backbone(&genesis)?
-                .ok_or_else(|| "honest backbone has no launch step".to_owned())?;
-            let PreparedHistoryStepBackboneInput::B64(fixture) = step.input else {
-                return Err("honest backbone launch step is not B64".to_owned());
-            };
-            let (_, input) = finish_fixture(fixture)?;
-            assemble_history_step_base(&runtime, input)
-                .map_err(|error| format!("assemble launch B64 joint C1 probe: {error}"))?
-        } else {
-            source.load_checked(c00)?;
-            let (_, parent) = build_parent(&runtime, &mut provider, parent_slot)?;
-            source.load_checked(selected)?;
-            source.load_checked(parent.class_id())?;
-            let fixture = provider.b255(selected, parent.accumulator())?;
-            let (_, input) = finish_fixture(fixture)?;
-            let parent = HistoryStepParent::new(&runtime, &parent)
-                .map_err(|error| format!("bind B255 joint C1 parent: {error}"))?;
-            assemble_history_step_recursive(&runtime, parent, input)
-                .map_err(|error| format!("assemble B255 joint C1 probe: {error}"))?
-        };
-        let tier = if selected == c00 { 64 } else { 255 };
-        for sample in 0..sample_count {
-            if std::env::var_os(JOINT_C1_FULL_ENV).is_some() {
-                let probe = probe_joint_c1_full(&runtime, &built).map_err(|error| {
-                    format!("probe launch B{tier} full joint C1 proof: {error}")
-                })?;
-                println!(
-                    "B{tier} joint_c1_full sample={}/{} prove_ms={:.3} verify_ms={:.3} field_proof_bytes={} sidecar_proof_bytes={} opening_claims={}",
-                    sample + 1,
-                    sample_count,
-                    probe.prove_micros as f64 / 1_000.0,
-                    probe.verify_micros as f64 / 1_000.0,
-                    probe.field_proof_bytes,
-                    probe.sidecar_proof_bytes,
-                    probe.opening_claims,
-                );
-                continue;
-            }
-            let probe = probe_built_history_step_joint_c1(&built)
-                .map_err(|error| format!("probe launch B{tier} joint C1 sidecar: {error}"))?;
-            println!(
-                "B{tier} joint_c1_only sample={}/{} prove_ms={:.3} verify_ms={:.3} proof_bytes={} opening_claims={}",
-                sample + 1,
-                sample_count,
-                probe.prove_micros as f64 / 1_000.0,
-                probe.verify_micros as f64 / 1_000.0,
-                probe.proof_bytes,
-                probe.opening_claims,
-            );
-        }
-        if std::env::var_os(JOINT_C1_COMPARE_FULL_ENV).is_some() {
-            let started = Instant::now();
-            let terminal = prove_built_history_step_terminal(&runtime, &built)
-                .map_err(|error| format!("prove launch B64 comparison terminal: {error}"))?;
-            println!(
-                "B64 current_full_compare prove_ms={:.3} terminal_bytes={}",
-                started.elapsed().as_secs_f64() * 1e3,
-                encode_history_step_terminal(&runtime, &terminal)
-                    .map_err(|error| format!("encode launch B64 comparison terminal: {error}"))?
-                    .len(),
-            );
-        }
-        return Ok(());
-    }
     let target_parent_slot = filter.map_or(0, |(_, parent_slot)| parent_slot);
     // Authenticate and convert outside every reported assembly interval. The
     // production node receives the same packed layout from its release build;

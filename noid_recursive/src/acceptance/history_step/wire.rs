@@ -22,9 +22,8 @@ use crate::acceptance::history_step_bank::{
     history_step_bank_block_accumulator, CanonicalHistoryStepClassId, HISTORY_STEP_CLASS_COUNT,
 };
 use crate::region_sidecar::{
-    canonical_block_region_sidecar_len, canonical_link_region_sidecar_len,
-    decode_block_region_sidecar_canonical, decode_link_region_sidecar_canonical,
-    encode_block_region_sidecar_canonical, encode_link_region_sidecar_canonical,
+    canonical_joint_c1_region_sidecar_len, decode_joint_c1_region_sidecar_canonical,
+    encode_joint_c1_region_sidecar_canonical,
 };
 
 const PREFIX_BYTES: usize = 42;
@@ -156,11 +155,8 @@ fn terminal_len_for_class(
     len = add(len, field_proof_len(entry.shape(), entry.pcs_params())?)?;
     len = add(
         len,
-        canonical_link_region_sidecar_len(runtime.parent_recursion_vk(), entry.shape().m)?,
-    )?;
-    len = add(
-        len,
-        canonical_block_region_sidecar_len(
+        canonical_joint_c1_region_sidecar_len(
+            runtime.parent_recursion_vk(),
             runtime
                 .direct_block_vk(class.current_slot())
                 .ok_or(HistoryStepError::RuntimeBlockVk(class.current_slot()))?,
@@ -538,19 +534,16 @@ pub fn encode_history_step_terminal(
     validate_terminal_metadata(runtime, terminal, None)?;
     let entry = runtime.bank().entry(terminal.class_id);
     let expected = terminal_len_for_class(runtime, terminal.class_id)?;
-    let parent_sidecar = encode_link_region_sidecar_canonical(
+    let block_vk = runtime
+        .direct_block_vk(terminal.class_id.current_slot())
+        .ok_or(HistoryStepError::RuntimeBlockVk(
+            terminal.class_id.current_slot(),
+        ))?;
+    let sidecar = encode_joint_c1_region_sidecar_canonical(
         runtime.parent_recursion_vk(),
+        block_vk,
         entry.shape().m,
-        &terminal.proof.sidecar.parent_recursion,
-    )?;
-    let block_sidecar = encode_block_region_sidecar_canonical(
-        runtime
-            .direct_block_vk(terminal.class_id.current_slot())
-            .ok_or(HistoryStepError::RuntimeBlockVk(
-                terminal.class_id.current_slot(),
-            ))?,
-        entry.shape().m,
-        &terminal.proof.sidecar.direct_block,
+        &terminal.proof.sidecar,
     )?;
     let mut out = Vec::with_capacity(expected);
     out.push(HISTORY_STEP_WIRE_VERSION);
@@ -565,8 +558,7 @@ pub fn encode_history_step_terminal(
         entry.shape(),
         entry.pcs_params(),
     )?;
-    out.extend_from_slice(&parent_sidecar);
-    out.extend_from_slice(&block_sidecar);
+    out.extend_from_slice(&sidecar);
     if out.len() != expected {
         return Err(HistoryStepError::WireLength {
             expected,
@@ -610,19 +602,20 @@ pub fn decode_history_step_terminal(
     let commitment_root = reader.hash()?;
     let io = decode_f128_vec(&mut reader, runtime.bank().spec().io_len)?;
     let field_proof = decode_field_proof(&mut reader, entry.shape(), entry.pcs_params())?;
-    let parent_len =
-        canonical_link_region_sidecar_len(runtime.parent_recursion_vk(), entry.shape().m)?;
-    let parent_recursion = decode_link_region_sidecar_canonical(
-        runtime.parent_recursion_vk(),
-        entry.shape().m,
-        reader.take(parent_len)?,
-    )?;
     let block_vk = runtime
         .direct_block_vk(class_id.current_slot())
         .ok_or(HistoryStepError::RuntimeBlockVk(class_id.current_slot()))?;
-    let block_len = canonical_block_region_sidecar_len(block_vk, entry.shape().m)?;
-    let direct_block =
-        decode_block_region_sidecar_canonical(block_vk, entry.shape().m, reader.take(block_len)?)?;
+    let sidecar_len = canonical_joint_c1_region_sidecar_len(
+        runtime.parent_recursion_vk(),
+        block_vk,
+        entry.shape().m,
+    )?;
+    let sidecar = decode_joint_c1_region_sidecar_canonical(
+        runtime.parent_recursion_vk(),
+        block_vk,
+        entry.shape().m,
+        reader.take(sidecar_len)?,
+    )?;
     reader.finish()?;
     let proof = HistoryStepProof {
         field_proof,
@@ -631,10 +624,7 @@ pub fn decode_history_step_terminal(
             params: entry.pcs_params().clone(),
         },
         io,
-        sidecar: HistoryStepCompositeSidecarProof {
-            parent_recursion,
-            direct_block,
-        },
+        sidecar,
     };
     let accumulator = history_step_bank_block_accumulator(runtime.bank(), &proof.io)?;
     let terminal = HistoryStepTerminal {

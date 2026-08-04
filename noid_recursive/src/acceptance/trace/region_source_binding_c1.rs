@@ -28,6 +28,9 @@ use super::region_source_binding::{
 };
 use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 
+mod trace_impl;
+pub(crate) use trace_impl::*;
+
 fn c1_carry_selection_terms(columns: &[usize; STATE_SIZE], beta: F256) -> Vec<C1RelationTerm> {
     let mut terms = Vec::with_capacity(2 * STATE_SIZE);
     let mut power = F256::ONE;

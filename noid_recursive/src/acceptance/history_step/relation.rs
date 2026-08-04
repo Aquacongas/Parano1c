@@ -3,8 +3,8 @@
 
 //! Self-recursive `HistoryStep` relation.
 //!
-//! A recursive transition verifies the complete previous
-//! composite envelope (parent recursion plus its direct Block sidecar),
+//! A recursive transition verifies the complete previous joint C1 envelope,
+//! including parent recursion and its direct Block authority,
 //! carries the complete pinned two-class matrix bank, folds the fresh parent
 //! claim into the exact authenticated class lane, and returns a
 //! consuming terminal decision rather than a boolean acceptance shortcut.
@@ -22,10 +22,9 @@ use crate::acceptance::history_step_bank::{
     HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN, HISTORY_STEP_CLASS_COUNT,
     HISTORY_STEP_TIER_SLOT_COUNT,
 };
-use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::deep_chain::schedule::TranscriptOp;
 use noid_ivc_core::field_circuit::{f128_from_u128, ExtExpr};
-pub const HISTORY_STEP_WIRE_VERSION: u8 = 3;
+pub const HISTORY_STEP_WIRE_VERSION: u8 = 4;
 
 const _: () = assert!(
     HISTORY_STEP_WIRE_VERSION == noid_chain::history_step::HISTORY_STEP_TERMINAL_VERSION,
@@ -34,13 +33,10 @@ const _: () = assert!(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HistoryStepSidecarOperation {
-    BaseShapeOnlyParentRecursion,
-    BaseShapeOnlyDirectBlock,
-    ScratchParentRecursionReplay,
-    ScratchDirectBlockReplay,
+    BaseShapeOnlyJointC1,
+    ScratchJointC1Replay,
     PrepareParentColumns,
-    ParentRecursionTraceReplay,
-    ParentDirectBlockTraceReplay,
+    ParentJointC1TraceReplay,
     FinalizeParentRegion,
     FinalizeCurrentDirectBlock,
 }
@@ -48,13 +44,10 @@ pub enum HistoryStepSidecarOperation {
 impl core::fmt::Display for HistoryStepSidecarOperation {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(match self {
-            Self::BaseShapeOnlyParentRecursion => "base shape-only parent-Link proof",
-            Self::BaseShapeOnlyDirectBlock => "base shape-only direct-Block proof",
-            Self::ScratchParentRecursionReplay => "scratch parent-Link replay",
-            Self::ScratchDirectBlockReplay => "scratch direct-Block replay",
+            Self::BaseShapeOnlyJointC1 => "base shape-only joint C1 proof",
+            Self::ScratchJointC1Replay => "scratch joint C1 replay",
             Self::PrepareParentColumns => "parent-column preparation",
-            Self::ParentRecursionTraceReplay => "parent-Link trace replay",
-            Self::ParentDirectBlockTraceReplay => "parent direct-Block trace replay",
+            Self::ParentJointC1TraceReplay => "parent joint C1 trace replay",
             Self::FinalizeParentRegion => "parent-region finalization",
             Self::FinalizeCurrentDirectBlock => "current direct-Block finalization",
         })
@@ -130,7 +123,7 @@ impl core::fmt::Display for HistoryStepError {
                 f.write_str("HistoryStep current start is not the parent terminal")
             }
             Self::ParentRecording => f.write_str("HistoryStep parent transcript recording drift"),
-            Self::ClassPin => f.write_str("HistoryStep composite class pin mismatch"),
+            Self::ClassPin => f.write_str("HistoryStep class pin mismatch"),
             Self::PcsParams => f.write_str("HistoryStep PCS parameters mismatch"),
             Self::RuntimeMatrix(class) => write!(
                 f,
@@ -447,28 +440,17 @@ fn history_step_query_lane_count(params: &PcsParams) -> usize {
 pub fn derive_history_step_runtime_parts(
     direct_block_vks: [BlockRegionSidecarVk; HISTORY_STEP_TIER_SLOT_COUNT],
 ) -> Result<HistoryStepRuntimeParts, HistoryStepError> {
-    let child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] = (0
-        ..HISTORY_STEP_TIER_SLOT_COUNT)
-        .map(|slot| {
-            let class =
-                CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
-            crate::region_sidecar::derive_block_sidecar_recording_layout(
-                &direct_block_vks[slot],
-                canonical_history_step_shape(class).m,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .try_into()
-        .map_err(|_| HistoryStepError::RuntimeLayout)?;
     let parent_params: [PcsParams; HISTORY_STEP_TIER_SLOT_COUNT] = std::array::from_fn(|slot| {
         canonical_history_step_pcs_params(
             CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot"),
         )
     });
+    let mut child_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
+        std::array::from_fn(|_| placeholder_history_step_recording_layout(1usize << 14));
     let mut r_prev_layouts: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] =
         std::array::from_fn(|_| placeholder_history_step_recording_layout(1usize << 14));
 
-    for _ in 0..8 {
+    for _ in 0..16 {
         let geometry = HistoryStepParentGeometry::new(
             &parent_params,
             child_layouts.to_vec(),
@@ -493,7 +475,8 @@ pub fn derive_history_step_runtime_parts(
             Box::new(RejectingHistoryStepMatrixSource),
             parts.clone(),
         )?;
-        let mut derived = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
+        let mut derived_children = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
+        let mut derived_r_prev = Vec::with_capacity(HISTORY_STEP_TIER_SLOT_COUNT);
         for slot in 0..HISTORY_STEP_TIER_SLOT_COUNT {
             let class_id =
                 CanonicalHistoryStepClassId::new(slot).expect("canonical HistoryStep tier slot");
@@ -507,18 +490,13 @@ pub fn derive_history_step_runtime_parts(
                     params: entry.pcs_params().clone(),
                 },
                 io: vec![F128::ZERO; runtime.bank().spec().io_len],
-                sidecar: HistoryStepCompositeSidecarProof {
-                    parent_recursion: shape_only_link_region_sidecar_proof(
-                        runtime.parent_recursion_vk(),
-                        entry.shape().m,
-                    )?,
-                    direct_block: shape_only_block_region_sidecar_proof(
-                        runtime
-                            .direct_block_vk(slot)
-                            .ok_or(HistoryStepError::RuntimeBlockVk(slot))?,
-                        entry.shape().m,
-                    )?,
-                },
+                sidecar: shape_only_joint_c1_region_sidecar_proof(
+                    runtime.parent_recursion_vk(),
+                    runtime
+                        .direct_block_vk(slot)
+                        .ok_or(HistoryStepError::RuntimeBlockVk(slot))?,
+                    entry.shape().m,
+                )?,
             };
             let complete = run_scratch_parent_recording_pass(
                 &runtime,
@@ -527,22 +505,21 @@ pub fn derive_history_step_runtime_parts(
                 &entry.matrix_digest(),
                 &entry.post_commit_digest(),
             )?;
-            if complete
-                .child
-                .as_ref()
-                .is_none_or(|recording| &recording.layout != &child_layouts[slot])
-            {
-                return Err(HistoryStepError::ParentRecording);
-            }
-            derived.push(complete.r_prev.layout);
+            let child = complete.child.ok_or(HistoryStepError::ParentRecording)?;
+            derived_children.push(child.layout);
+            derived_r_prev.push(complete.r_prev.layout);
         }
-        let derived: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] = derived
+        let derived_children: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] = derived_children
             .try_into()
             .map_err(|_| HistoryStepError::RuntimeLayout)?;
-        if derived == r_prev_layouts {
+        let derived_r_prev: [DuplexLayout; HISTORY_STEP_TIER_SLOT_COUNT] = derived_r_prev
+            .try_into()
+            .map_err(|_| HistoryStepError::RuntimeLayout)?;
+        if derived_children == child_layouts && derived_r_prev == r_prev_layouts {
             return Ok(parts);
         }
-        r_prev_layouts = derived;
+        child_layouts = derived_children;
+        r_prev_layouts = derived_r_prev;
     }
     Err(HistoryStepError::RuntimeLayout)
 }
@@ -701,163 +678,6 @@ impl BuiltHistoryStep {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JointC1SidecarProbe {
-    pub prove_micros: u128,
-    pub verify_micros: u128,
-    pub proof_bytes: usize,
-    pub opening_claims: usize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct JointC1FullProofProbe {
-    pub prove_micros: u128,
-    pub verify_micros: u128,
-    pub field_proof_bytes: usize,
-    pub sidecar_proof_bytes: usize,
-    pub opening_claims: usize,
-}
-
-/// Native correctness and timing probe for the single-pass C1 Link+Block
-/// sidecar. It deliberately excludes the enclosing Field proof and final PCS
-/// batch so the sidecar replacement can be compared in isolation before its
-/// recursive trace and wire codec become consensus authority.
-pub fn probe_built_history_step_joint_c1(
-    built: &BuiltHistoryStep,
-) -> Result<JointC1SidecarProbe, HistoryStepError> {
-    let parent_plan = LinkRegionProverPlan::new(
-        built.preparations.recursion.vk(),
-        built.preparations.recursion.prover_input(),
-    )?;
-    let block_plan = built.preparations.direct_block.prover_plan()?;
-    let total_vars = built.witness.len().trailing_zeros() as usize;
-
-    let mut prover = FsLaneChallenger::new_c1(b"history-step-joint-c1-native-probe");
-    let prove_started = std::time::Instant::now();
-    let (proof, prover_claims) = crate::region_sidecar::prove_joint_c1_region_sidecar(
-        &parent_plan,
-        &block_plan,
-        &built.witness,
-        &mut prover,
-    )?;
-    let prove_micros = prove_started.elapsed().as_micros();
-
-    let mut verifier = FsLaneChallenger::new_c1(b"history-step-joint-c1-native-probe");
-    let verify_started = std::time::Instant::now();
-    let verifier_claims = crate::region_sidecar::verify_joint_c1_region_sidecar(
-        built.preparations.recursion.vk(),
-        built.preparations.direct_block.vk(),
-        total_vars,
-        &proof,
-        &mut verifier,
-    )?;
-    let verify_micros = verify_started.elapsed().as_micros();
-    if prover_claims != verifier_claims || prover.sample_f256() != verifier.sample_f256() {
-        return Err(HistoryStepError::Region(RegionSidecarError::InvalidProof));
-    }
-    Ok(JointC1SidecarProbe {
-        prove_micros,
-        verify_micros,
-        proof_bytes: proof.byte_len(),
-        opening_claims: prover_claims.len(),
-    })
-}
-
-/// Full native experiment for the joint C1 sidecar, including the enclosing
-/// Field proof and the single shared C1 PCS opening batch. This does not alter
-/// the persisted HistoryStep wire type while the recursive trace is still
-/// being migrated.
-pub fn probe_built_history_step_joint_c1_full(
-    runtime: &HistoryStepRuntime,
-    built: &BuiltHistoryStep,
-) -> Result<JointC1FullProofProbe, HistoryStepError> {
-    validate_built_against_bank(runtime, built, &built.matrix)?;
-    let entry = runtime.bank().entry(built.class_id);
-    let parent_plan = LinkRegionProverPlan::new(
-        built.preparations.recursion.vk(),
-        built.preparations.recursion.prover_input(),
-    )?;
-    let block_plan = built.preparations.direct_block.prover_plan()?;
-    let mut opening_claims = 0usize;
-    let prove_started = std::time::Instant::now();
-    let mut prover = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
-    macro_rules! prove_with_matrix {
-        ($prove:path, $matrix:expr) => {{
-            $prove(
-                $matrix,
-                &built.witness,
-                &built.pcs_params,
-                &built.spec,
-                &built.io,
-                &entry.post_commit_digest(),
-                &mut prover,
-                |context| -> Result<_, RegionSidecarError> {
-                    let (proof, claims) = crate::region_sidecar::prove_joint_c1_region_sidecar(
-                        &parent_plan,
-                        &block_plan,
-                        context.witness(),
-                        context,
-                    )?;
-                    opening_claims = claims.len();
-                    context.append_c1_claims(claims);
-                    Ok(proof)
-                },
-            )
-        }};
-    }
-    let (field_proof, sidecar, commitment, prover_claim) = match &built.matrix {
-        HistoryStepMatrixLease::Resident(matrix) => prove_with_matrix!(
-            prove_field_c1_with_public_io_and_post_commit_context,
-            matrix.as_ref()
-        ),
-        HistoryStepMatrixLease::Compact(matrix) => prove_with_matrix!(
-            prove_field_compact_c1_with_public_io_and_post_commit_context,
-            matrix.as_ref()
-        ),
-    };
-    let sidecar = sidecar?;
-    let prove_micros = prove_started.elapsed().as_micros();
-
-    let verify_started = std::time::Instant::now();
-    let mut verifier = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
-    let (verifier_claim, _fresh) = verify_field_c1_deferred_matrix_with_post_commit_context(
-        &entry.shape(),
-        &entry.matrix_digest(),
-        &commitment,
-        &field_proof,
-        runtime.bank().spec(),
-        &built.io,
-        &entry.post_commit_digest(),
-        &sidecar,
-        &mut verifier,
-        |proof, context| {
-            let claims = crate::region_sidecar::verify_joint_c1_region_sidecar(
-                built.preparations.recursion.vk(),
-                built.preparations.direct_block.vk(),
-                context.total_vars(),
-                proof,
-                context,
-            )
-            .map_err(|_| VerifyError::Auxiliary)?;
-            context.append_c1_claims(claims);
-            Ok(())
-        },
-    )?;
-    let verify_micros = verify_started.elapsed().as_micros();
-    if prover_claim != verifier_claim || prover.sample_f256() != verifier.sample_f256() {
-        return Err(HistoryStepError::Verify(VerifyError::Auxiliary));
-    }
-
-    Ok(JointC1FullProofProbe {
-        prove_micros,
-        verify_micros,
-        field_proof_bytes: bincode::serialized_size(&field_proof)
-            .expect("C1 field proof serialized length") as usize,
-        sidecar_proof_bytes: sidecar.byte_len(),
-        opening_claims,
-    })
-}
-
 /// Full frozen relation emitted only for release matrix construction. Runtime
 /// block production uses [`BuiltHistoryStep`] and never materializes CSR rows.
 pub struct FrozenHistoryStep {
@@ -898,7 +718,7 @@ pub struct HistoryStepProof {
     pub(super) field_proof: C1FieldR1csProof,
     pub(super) commitment: Commitment,
     pub(super) io: Vec<F128>,
-    pub(super) sidecar: HistoryStepCompositeSidecarProof,
+    pub(super) sidecar: JointC1RegionSidecarProof,
 }
 
 impl HistoryStepProof {
@@ -1253,34 +1073,21 @@ fn run_scratch_parent_recording_pass(
         &io,
         &post_commit_digest,
         Some(&mut obligations),
-        |builder, context| {
-            if let Err(error) = verify_link_region_sidecar_trace_post_commit(
-                builder,
-                context,
-                runtime.parent_recursion_vk(),
-                &envelope.sidecar.parent_recursion,
-            ) {
+        |builder, context| match verify_joint_c1_region_sidecar_trace_post_commit(
+            builder,
+            context,
+            runtime.parent_recursion_vk(),
+            runtime
+                .direct_block_vk(class_id.current_slot())
+                .expect("canonical parent arm has a direct-Block VK"),
+            &envelope.sidecar,
+        ) {
+            Ok(recording) => child_recording = Some(recording),
+            Err(error) => {
                 sidecar_result = Err(HistoryStepError::sidecar(
-                    HistoryStepSidecarOperation::ScratchParentRecursionReplay,
+                    HistoryStepSidecarOperation::ScratchJointC1Replay,
                     error,
-                ));
-                return;
-            }
-            match verify_block_region_sidecar_recorded_trace_post_commit(
-                builder,
-                context,
-                runtime
-                    .direct_block_vk(class_id.current_slot())
-                    .expect("canonical parent arm has a direct-Block VK"),
-                &envelope.sidecar.direct_block,
-            ) {
-                Ok(recording) => child_recording = Some(recording),
-                Err(error) => {
-                    sidecar_result = Err(HistoryStepError::sidecar(
-                        HistoryStepSidecarOperation::ScratchDirectBlockReplay,
-                        error,
-                    ))
-                }
+                ))
             }
         },
     );
@@ -1322,30 +1129,16 @@ fn shape_only_parent_arm(
             params: entry.pcs_params().clone(),
         },
         io,
-        sidecar: HistoryStepCompositeSidecarProof {
-            parent_recursion: shape_only_link_region_sidecar_proof(
-                runtime.parent_recursion_vk(),
-                entry.shape().m,
-            )
-            .map_err(|source| {
-                HistoryStepError::sidecar(
-                    HistoryStepSidecarOperation::BaseShapeOnlyParentRecursion,
-                    source,
-                )
-            })?,
-            direct_block: shape_only_block_region_sidecar_proof(
-                runtime
-                    .direct_block_vk(class_id.current_slot())
-                    .ok_or(HistoryStepError::RuntimeBlockVk(class_id.current_slot()))?,
-                entry.shape().m,
-            )
-            .map_err(|source| {
-                HistoryStepError::sidecar(
-                    HistoryStepSidecarOperation::BaseShapeOnlyDirectBlock,
-                    source,
-                )
-            })?,
-        },
+        sidecar: shape_only_joint_c1_region_sidecar_proof(
+            runtime.parent_recursion_vk(),
+            runtime
+                .direct_block_vk(class_id.current_slot())
+                .ok_or(HistoryStepError::RuntimeBlockVk(class_id.current_slot()))?,
+            entry.shape().m,
+        )
+        .map_err(|source| {
+            HistoryStepError::sidecar(HistoryStepSidecarOperation::BaseShapeOnlyJointC1, source)
+        })?,
     };
     let scratch = run_scratch_parent_recording_pass(
         runtime,
@@ -1415,21 +1208,16 @@ fn prepare_parent_replay<'a>(
         &envelope.sidecar,
         &mut challenger,
         |sidecar, context| {
-            verify_link_region_sidecar_post_commit(
+            let recording = verify_joint_c1_region_sidecar_post_commit_layout_captured(
                 runtime.parent_recursion_vk(),
-                &sidecar.parent_recursion,
-                context,
-            )
-            .map_err(|error| auxiliary_sidecar_error("parent Link", error))?;
-            let (_, recording) = verify_block_region_sidecar_post_commit_layout_captured(
                 runtime
                     .direct_block_vk(live_slot)
                     .ok_or(VerifyError::Auxiliary)?,
-                &sidecar.direct_block,
+                sidecar,
                 context,
                 child_layout.clone(),
             )
-            .map_err(|error| auxiliary_sidecar_error("parent direct Block", error))?;
+            .map_err(|error| auxiliary_sidecar_error("parent joint C1 sidecar", error))?;
             child_recording = Some(recording);
             Ok(())
         },
@@ -1612,8 +1400,8 @@ fn prepare_history_step_recursive<'a, const TIER: usize>(
 }
 
 /// Prove one witness-only HistoryStep against the exact matrix lease paired
-/// with it during assembly. Both composite sidecars run inside the single
-/// outer Field post-commit context.
+/// with it during assembly. The joint C1 sidecar runs inside the single outer
+/// Field post-commit context.
 pub fn prove_built_history_step(
     runtime: &HistoryStepRuntime,
     built: &BuiltHistoryStep,
@@ -1637,13 +1425,15 @@ pub fn prove_built_history_step(
                 &built.io,
                 &entry.post_commit_digest(),
                 &mut challenger,
-                |context| -> Result<HistoryStepCompositeSidecarProof, RegionSidecarError> {
-                    let parent_recursion = parent_plan.prove_post_commit(context)?;
-                    let direct_block = direct_block_plan.prove_post_commit(context)?;
-                    Ok(HistoryStepCompositeSidecarProof {
-                        parent_recursion,
-                        direct_block,
-                    })
+                |context| -> Result<JointC1RegionSidecarProof, RegionSidecarError> {
+                    let (proof, claims) = crate::region_sidecar::prove_joint_c1_region_sidecar(
+                        &parent_plan,
+                        &direct_block_plan,
+                        context.witness(),
+                        context,
+                    )?;
+                    context.append_c1_claims(claims);
+                    Ok(proof)
                 },
             )
         }};
@@ -1696,20 +1486,15 @@ pub fn verify_history_step_pending(
         &envelope.sidecar,
         &mut challenger,
         |sidecar, context| {
-            verify_link_region_sidecar_post_commit(
+            verify_joint_c1_region_sidecar_post_commit(
                 runtime.parent_recursion_vk(),
-                &sidecar.parent_recursion,
-                context,
-            )
-            .map_err(|error| auxiliary_sidecar_error("tip Link", error))?;
-            verify_block_region_sidecar_post_commit(
                 runtime
                     .direct_block_vk(class_id.current_slot())
                     .ok_or(VerifyError::Auxiliary)?,
-                &sidecar.direct_block,
+                sidecar,
                 context,
             )
-            .map_err(|error| auxiliary_sidecar_error("tip direct Block", error))?;
+            .map_err(|error| auxiliary_sidecar_error("tip joint C1 sidecar", error))?;
             Ok(())
         },
     )?;
@@ -2055,34 +1840,21 @@ fn prepare_history_step_assembly<const TIER: usize>(
                 &prev_io,
                 &post_commit_digest,
                 Some(&mut arm_obligations),
-                |builder, context| {
-                    if let Err(error) = verify_link_region_sidecar_trace_post_commit(
-                        builder,
-                        context,
-                        runtime.parent_recursion_vk(),
-                        &arm_envelope.sidecar.parent_recursion,
-                    ) {
+                |builder, context| match verify_joint_c1_region_sidecar_trace_post_commit(
+                    builder,
+                    context,
+                    runtime.parent_recursion_vk(),
+                    runtime
+                        .direct_block_vk(slot)
+                        .expect("canonical parent arm has a direct-Block VK"),
+                    &arm_envelope.sidecar,
+                ) {
+                    Ok(recording) => recorded_child = Some(recording),
+                    Err(error) => {
                         sidecar_result = Err(HistoryStepError::sidecar(
-                            HistoryStepSidecarOperation::ParentRecursionTraceReplay,
+                            HistoryStepSidecarOperation::ParentJointC1TraceReplay,
                             error,
-                        ));
-                        return;
-                    }
-                    match verify_block_region_sidecar_recorded_trace_post_commit(
-                        builder,
-                        context,
-                        runtime
-                            .direct_block_vk(slot)
-                            .expect("canonical parent arm has a direct-Block VK"),
-                        &arm_envelope.sidecar.direct_block,
-                    ) {
-                        Ok(recording) => recorded_child = Some(recording),
-                        Err(error) => {
-                            sidecar_result = Err(HistoryStepError::sidecar(
-                                HistoryStepSidecarOperation::ParentDirectBlockTraceReplay,
-                                error,
-                            ))
-                        }
+                        ))
                     }
                 },
             )
