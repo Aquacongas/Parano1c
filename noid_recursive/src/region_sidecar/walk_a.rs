@@ -3,7 +3,10 @@
 
 //! Recording-free post-commit authority for Walk-A leaf unions.
 
+use std::sync::Arc;
+
 use noid_ivc_core::challenger::Challenger;
+use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 use noid_ivc_core::deep_chain::capsule_leaf::{
     c1_capsule_leaf_fixed_patterns, capsule_leaf_fixed_patterns, capsule_leaf_iv_flat,
     C1CapsuleLeafKind, C1_CAPSULE_LEAF_STRIDE, CAPSULE_LEAF_STRIDE,
@@ -21,8 +24,8 @@ use noid_ivc_core::deep_chain::spine::{
     SPINE_TREE_SLOTS, SPINE_WRAP_SLOTS,
 };
 use noid_ivc_core::deep_chain::LaneClaimGroup;
-use noid_ivc_core::field::F128;
-use noid_ivc_core::pcs::QuirkyDirectClaim;
+use noid_ivc_core::field::{F128, F256};
+use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
@@ -41,6 +44,11 @@ use crate::acceptance::trace::region_source_binding::{
     verify_walk_a_union_walk_suffix_with_challenger, verify_walk_a_union_with_challenger,
     SpineUnionSpec, SplitDuplexTailRefs, WalkAColumnClaim, WalkAUnionProof,
     WalkAUnionProverWalkPrefix, WalkAUnionVerifierWalkPrefix, WalkAUnionWalkDeferredProof,
+};
+use crate::acceptance::trace::region_source_binding_c1::{
+    prove_c1_walk_a_walk_prefix, prove_c1_walk_a_walk_suffix, verify_c1_walk_a_walk_prefix,
+    verify_c1_walk_a_walk_suffix, C1WalkAColumnClaim, C1WalkAProverWalkPrefix,
+    C1WalkAUnionWalkDeferredProof, C1WalkAVerifierWalkPrefix,
 };
 
 use super::bounded_decode::{
@@ -142,7 +150,7 @@ impl WalkARegionSlices {
 #[derive(Clone, Debug)]
 struct CanonicalWalkAProtocol {
     w_log: usize,
-    fixed: Vec<FixedPattern>,
+    fixed: Arc<[FixedPattern]>,
     meta_c: [usize; 4],
     leaf_refs: Vec<(SpongeLeafRefs, usize)>,
     split_tails: Vec<SplitDuplexTailRefs>,
@@ -152,15 +160,29 @@ struct CanonicalWalkAProtocol {
 }
 
 /// Canonical verification key for one recording-free Walk-A vertical.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct WalkARegionVk {
     purpose: [u8; 32],
     descriptor: WalkARegionDescriptor,
     w_log: usize,
     slices: WalkARegionSlices,
-    fixed: Vec<FixedPattern>,
+    fixed: Arc<[FixedPattern]>,
     layout_digest: [u8; 32],
+    protocol: Arc<CanonicalWalkAProtocol>,
 }
+
+impl PartialEq for WalkARegionVk {
+    fn eq(&self, other: &Self) -> bool {
+        self.purpose == other.purpose
+            && self.descriptor == other.descriptor
+            && self.w_log == other.w_log
+            && self.slices == other.slices
+            && self.fixed == other.fixed
+            && self.layout_digest == other.layout_digest
+    }
+}
+
+impl Eq for WalkARegionVk {}
 
 impl WalkARegionVk {
     pub fn new_wallet(
@@ -199,15 +221,16 @@ impl WalkARegionVk {
         descriptor: WalkARegionDescriptor,
         slices: WalkARegionSlices,
     ) -> Result<Self, RegionSidecarError> {
-        let protocol = canonical_protocol(descriptor)?;
+        let protocol = Arc::new(canonical_protocol(descriptor)?);
         let layout_digest = walk_a_layout_digest(descriptor, &protocol);
         let vk = Self {
             purpose,
             descriptor,
             w_log: protocol.w_log,
             slices,
-            fixed: protocol.fixed,
+            fixed: Arc::clone(&protocol.fixed),
             layout_digest,
+            protocol,
         };
         vk.validate_structure()?;
         Ok(vk)
@@ -288,6 +311,19 @@ impl WalkARegionVk {
             return Err(RegionSidecarError::BadSlice);
         }
         Ok(protocol)
+    }
+
+    /// Per-proof C1 access to the protocol certified by the checked VK
+    /// constructor. The only statement-dependent condition is that every
+    /// committed slice fits the enclosing witness.
+    fn certified_c1_protocol_in_witness(
+        &self,
+        total_vars: usize,
+    ) -> Result<Arc<CanonicalWalkAProtocol>, RegionSidecarError> {
+        if self.slices().iter().any(|slice| !slice.fits(total_vars)) {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        Ok(Arc::clone(&self.protocol))
     }
 }
 
@@ -397,6 +433,99 @@ impl WalkARegionVerifierWalkContinuation<'_> {
     }
 }
 
+pub(crate) struct C1WalkARegionProverWalkContinuation<'a, 'z> {
+    vk: &'a WalkARegionVk,
+    total_vars: usize,
+    protocol: CanonicalWalkAProtocol,
+    committed: Vec<&'z [F128]>,
+    exposure_owned: Option<[Vec<F128>; 4]>,
+    s0: &'a [Vec<F128>; 4],
+    prefix: C1WalkAProverWalkPrefix,
+}
+
+impl C1WalkARegionProverWalkContinuation<'_, '_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
+        self.s0
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<(C1WalkARegionWalkDeferredProof, Vec<C1QuirkyDirectClaim>), RegionSidecarError>
+    {
+        let Self {
+            vk,
+            total_vars,
+            protocol,
+            committed,
+            exposure_owned,
+            s0: _,
+            prefix,
+        } = self;
+        let exposure_refs = exposure_owned.as_ref().map(|columns| {
+            [
+                columns[0].as_slice(),
+                columns[1].as_slice(),
+                columns[2].as_slice(),
+                columns[3].as_slice(),
+            ]
+        });
+        let (authority, terminal_claims) = prove_c1_walk_a_walk_suffix(
+            protocol.w_log,
+            &protocol.fixed,
+            &protocol.leaf_refs,
+            &protocol.split_tails,
+            protocol.es_sponge.as_ref(),
+            protocol.spine.as_ref(),
+            &committed,
+            exposure_refs.as_ref(),
+            prefix,
+            terminal,
+            challenger,
+        );
+        let claims = resolve_c1_walk_a_terminal_claims(vk, total_vars, terminal_claims)?;
+        Ok((C1WalkARegionWalkDeferredProof::new(authority), claims))
+    }
+}
+
+pub(crate) struct C1WalkARegionVerifierWalkContinuation<'a> {
+    vk: &'a WalkARegionVk,
+    total_vars: usize,
+    protocol: Arc<CanonicalWalkAProtocol>,
+    prefix: C1WalkAVerifierWalkPrefix<'a>,
+}
+
+impl C1WalkARegionVerifierWalkContinuation<'_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let terminal_claims = verify_c1_walk_a_walk_suffix(
+            self.protocol.w_log,
+            &self.protocol.fixed,
+            &self.protocol.leaf_refs,
+            &self.protocol.split_tails,
+            self.protocol.es_sponge.as_ref(),
+            self.protocol.spine.as_ref(),
+            self.prefix,
+            terminal,
+            challenger,
+        )
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+        resolve_c1_walk_a_terminal_claims(self.vk, self.total_vars, terminal_claims)
+    }
+}
+
 impl<'a> WalkARegionProverPlan<'a> {
     pub fn new(
         vk: &'a WalkARegionVk,
@@ -440,6 +569,40 @@ impl<'a> WalkARegionProverPlan<'a> {
             challenger,
         );
         Ok(WalkARegionProverWalkContinuation {
+            vk: self.vk,
+            total_vars,
+            protocol,
+            committed,
+            exposure_owned,
+            s0: self.s0,
+            prefix,
+        })
+    }
+
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1WalkARegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        let total_vars = witness_log(z)?;
+        let protocol = self.vk.validate_in_witness(total_vars)?;
+        let committed = self
+            .vk
+            .slices()
+            .iter()
+            .map(|slice| &z[slice.start()..slice.start() + slice.len()])
+            .collect::<Vec<_>>();
+        let exposure_owned = extract_spine_exposure(&protocol, &committed)?;
+        bind_walk_a_vk(challenger, self.vk);
+        let prefix = prove_c1_walk_a_walk_prefix(
+            protocol.w_log,
+            &protocol.fixed,
+            &protocol.meta_c,
+            &committed,
+            self.s_out,
+            challenger,
+        );
+        Ok(C1WalkARegionProverWalkContinuation {
             vk: self.vk,
             total_vars,
             protocol,
@@ -525,6 +688,12 @@ pub(crate) struct WalkARegionWalkDeferredProof {
     authority: WalkAUnionWalkDeferredProof,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct C1WalkARegionWalkDeferredProof {
+    version: u8,
+    authority: C1WalkAUnionWalkDeferredProof,
+}
+
 impl WalkARegionWalkDeferredProof {
     pub(crate) fn new(authority: WalkAUnionWalkDeferredProof) -> Self {
         Self {
@@ -538,6 +707,23 @@ impl WalkARegionWalkDeferredProof {
     }
 
     pub(crate) fn authority(&self) -> &WalkAUnionWalkDeferredProof {
+        &self.authority
+    }
+}
+
+impl C1WalkARegionWalkDeferredProof {
+    pub(crate) fn new(authority: C1WalkAUnionWalkDeferredProof) -> Self {
+        Self {
+            version: WALK_A_REGION_SIDECAR_VERSION,
+            authority,
+        }
+    }
+
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub(crate) fn authority(&self) -> &C1WalkAUnionWalkDeferredProof {
         &self.authority
     }
 }
@@ -625,6 +811,46 @@ pub(crate) fn verify_walk_a_region_walk_deferred_prefix<'a, Ch: Challenger>(
     )
     .map_err(|_| RegionSidecarError::InvalidProof)?;
     Ok(WalkARegionVerifierWalkContinuation {
+        vk,
+        total_vars,
+        protocol,
+        prefix,
+    })
+}
+
+pub(crate) fn verify_c1_walk_a_region_walk_deferred_prefix<'a, Ch: Challenger>(
+    vk: &'a WalkARegionVk,
+    total_vars: usize,
+    proof: &'a C1WalkARegionWalkDeferredProof,
+    challenger: &mut Ch,
+) -> Result<C1WalkARegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let protocol = vk.certified_c1_protocol_in_witness(total_vars)?;
+    let validate_micros = total_started.elapsed().as_micros();
+    if proof.version() != WALK_A_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    bind_walk_a_vk(challenger, vk);
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+    let prefix_started = std::time::Instant::now();
+    let prefix = verify_c1_walk_a_walk_prefix(
+        protocol.w_log,
+        &protocol.fixed,
+        &protocol.meta_c,
+        proof.authority().as_ref(),
+        challenger,
+    )
+    .map_err(|_| RegionSidecarError::InvalidProof)?;
+    if timing {
+        eprintln!(
+            "[walk-a-c1 prefix] w_log={} validate_us={validate_micros} bind_us={bind_micros} proof_us={} total_us={}",
+            protocol.w_log,
+            prefix_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1WalkARegionVerifierWalkContinuation {
         vk,
         total_vars,
         protocol,
@@ -810,7 +1036,7 @@ fn canonical_protocol(
                 ];
                 let protocol = CanonicalWalkAProtocol {
                     w_log,
-                    fixed,
+                    fixed: fixed.into(),
                     meta_c: std::array::from_fn(|lane| WALLET_C0 + lane),
                     leaf_refs,
                     split_tails,
@@ -864,7 +1090,7 @@ fn canonical_protocol(
             }
             CanonicalWalkAProtocol {
                 w_log,
-                fixed,
+                fixed: fixed.into(),
                 meta_c: std::array::from_fn(|lane| WALLET_C0 + lane),
                 leaf_refs,
                 split_tails: Vec::new(),
@@ -1099,7 +1325,7 @@ fn canonical_meta_protocol(
 
     Ok(CanonicalWalkAProtocol {
         w_log,
-        fixed,
+        fixed: fixed.into(),
         meta_c: std::array::from_fn(|lane| META_C0 + lane),
         leaf_refs,
         split_tails: Vec::new(),
@@ -1199,6 +1425,37 @@ fn resolve_walk_a_terminal_claims(
     Ok(claims)
 }
 
+fn resolve_c1_walk_a_terminal_claims(
+    vk: &WalkARegionVk,
+    total_vars: usize,
+    terminal: Vec<C1WalkAColumnClaim>,
+) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+    let slices = vk.slices();
+    let mut claims = Vec::with_capacity(terminal.len());
+    for claim in terminal {
+        let slice = *slices
+            .get(claim.column)
+            .ok_or(RegionSidecarError::InvalidProof)?;
+        if claim.point.len() != slice.log2_len {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let mut x_rest = claim.point;
+        x_rest.extend(
+            slice
+                .prefix_coords(total_vars)
+                .into_iter()
+                .map(F256::from_base),
+        );
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
+            k_skip: 0,
+            x_rest,
+            value: claim.value,
+        });
+    }
+    Ok(claims)
+}
+
 fn bind_walk_a_vk<Ch: Challenger>(challenger: &mut Ch, vk: &WalkARegionVk) {
     challenger.observe_label(WALK_A_SIDECAR_TRANSCRIPT_LABEL);
     challenger.observe_bytes(&vk.transcript_digest());
@@ -1261,7 +1518,7 @@ fn walk_a_layout_digest(
         }
     }
     push_usize(&mut bytes, protocol.fixed.len());
-    for pattern in &protocol.fixed {
+    for pattern in protocol.fixed.iter() {
         encode_fixed_pattern(&mut bytes, pattern);
     }
     poseidon2b_hash_byte_slices(WALK_A_LAYOUT_DIGEST_DOMAIN, &[&bytes])
@@ -2259,7 +2516,7 @@ pub(in crate::region_sidecar) mod tests {
         };
         assert!(verify(&bad_vk, &decoded).is_err(), "descriptor mutation");
         let mut bad_vk = vk.clone();
-        bad_vk.fixed[0].table[0] += F128::ONE;
+        Arc::make_mut(&mut bad_vk.fixed)[0].table[0] += F128::ONE;
         assert!(verify(&bad_vk, &decoded).is_err(), "fixed-table mutation");
         let mut bad_vk = vk.clone();
         if let WalkARegionSlices::Wallet(slices) = &mut bad_vk.slices {

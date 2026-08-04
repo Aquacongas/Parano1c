@@ -11,15 +11,18 @@
 //! Recording blocks (including B-to-A transcript hosting) have no V1
 //! representation.
 
+use std::sync::Arc;
+
 use noid_ivc_core::challenger::Challenger;
+use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 use noid_ivc_core::deep_chain::relations::FixedPattern;
 use noid_ivc_core::deep_chain::schedule::{
     compile_duplex, duplex_family_refs, DuplexFamilyRefs, DuplexLayout, TranscriptOp,
 };
 use noid_ivc_core::deep_chain::LaneClaimGroup;
-use noid_ivc_core::field::F128;
+use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_circuit::FsChannelOps;
-use noid_ivc_core::pcs::QuirkyDirectClaim;
+use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
 use noid_ivc_prover::field_prover::FieldPostCommitProverContext;
@@ -32,6 +35,11 @@ use crate::acceptance::trace::region_source_binding::{
     verify_duplex_union_walk_suffix_with_challenger, verify_duplex_union_with_challenger,
     DuplexColumnClaim, DuplexUnion, DuplexUnionProof, DuplexUnionProverWalkPrefix,
     DuplexUnionVerifierWalkPrefix, DuplexUnionWalkDeferredProof, SubChannel,
+};
+use crate::acceptance::trace::region_source_binding_c1::{
+    prove_c1_duplex_walk_prefix, prove_c1_duplex_walk_suffix, verify_c1_duplex_walk_prefix,
+    verify_c1_duplex_walk_suffix, C1DuplexColumnClaim, C1DuplexProverWalkPrefix,
+    C1DuplexUnionWalkDeferredProof, C1DuplexVerifierWalkPrefix,
 };
 use crate::acceptance::trace::self_verify::{FieldPostCommitTraceContext, QuirkyDirectClaimTrace};
 use crate::acceptance::trace::{FieldR1csBuilder, LinExpr};
@@ -168,14 +176,14 @@ struct CanonicalCombinedDuplexProtocol {
     common_s_log: usize,
     block_log: usize,
     w_log: usize,
-    fixed: Vec<FixedPattern>,
+    fixed: Arc<[FixedPattern]>,
     refs: DuplexFamilyRefs,
     layout: DuplexLayout,
 }
 
 /// Canonical verification key for one recording-free heterogeneous duplex
 /// vertical.  The six slices are `A0,A1,C0..C3` in that exact contiguous order.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CombinedDuplexRegionVk {
     purpose: [u8; 32],
     descriptor: CombinedDuplexRegionDescriptor,
@@ -183,9 +191,25 @@ pub struct CombinedDuplexRegionVk {
     block_log: usize,
     w_log: usize,
     slices: [WitnessSlice; COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS],
-    fixed: Vec<FixedPattern>,
+    fixed: Arc<[FixedPattern]>,
     layout_digest: [u8; 32],
+    protocol: Arc<CanonicalCombinedDuplexProtocol>,
 }
+
+impl PartialEq for CombinedDuplexRegionVk {
+    fn eq(&self, other: &Self) -> bool {
+        self.purpose == other.purpose
+            && self.descriptor == other.descriptor
+            && self.common_s_log == other.common_s_log
+            && self.block_log == other.block_log
+            && self.w_log == other.w_log
+            && self.slices == other.slices
+            && self.fixed == other.fixed
+            && self.layout_digest == other.layout_digest
+    }
+}
+
+impl Eq for CombinedDuplexRegionVk {}
 
 impl CombinedDuplexRegionVk {
     pub fn new(
@@ -193,7 +217,7 @@ impl CombinedDuplexRegionVk {
         descriptor: CombinedDuplexRegionDescriptor,
         slices: [WitnessSlice; COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS],
     ) -> Result<Self, RegionSidecarError> {
-        let protocol = canonical_protocol(&descriptor)?;
+        let protocol = Arc::new(canonical_protocol(&descriptor)?);
         let layout_digest = combined_duplex_protocol_digest(&descriptor, &protocol);
         let vk = Self {
             purpose,
@@ -202,8 +226,9 @@ impl CombinedDuplexRegionVk {
             block_log: protocol.block_log,
             w_log: protocol.w_log,
             slices,
-            fixed: protocol.fixed,
+            fixed: Arc::clone(&protocol.fixed),
             layout_digest,
+            protocol,
         };
         vk.validate_structure()?;
         Ok(vk)
@@ -231,7 +256,7 @@ impl CombinedDuplexRegionVk {
         if union.w_log != protocol.w_log
             || union.block_log != protocol.block_log
             || union.refs != protocol.refs
-            || union.fixed != protocol.fixed
+            || union.fixed.as_slice() != protocol.fixed.as_ref()
             || !layouts_equal(&union.layout, &protocol.layout)
             || union
                 .committed
@@ -329,6 +354,20 @@ impl CombinedDuplexRegionVk {
             return Err(RegionSidecarError::BadSlice);
         }
         Ok(protocol)
+    }
+
+    /// Hot C1 path for a VK whose private fields were populated only by the
+    /// checked constructors above. Structural regeneration remains in
+    /// `validate_structure`; per-proof verification only needs to bind the
+    /// already-certified protocol to the enclosing witness width.
+    fn certified_c1_protocol_in_witness(
+        &self,
+        total_vars: usize,
+    ) -> Result<Arc<CanonicalCombinedDuplexProtocol>, RegionSidecarError> {
+        if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        Ok(Arc::clone(&self.protocol))
     }
 }
 
@@ -432,6 +471,84 @@ impl CombinedDuplexRegionVerifierWalkContinuation<'_> {
     }
 }
 
+pub(crate) struct C1CombinedDuplexRegionProverWalkContinuation<'a, 'z> {
+    vk: &'a CombinedDuplexRegionVk,
+    total_vars: usize,
+    committed: [&'z [F128]; COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS],
+    s0: &'a [Vec<F128>; 4],
+    prefix: C1DuplexProverWalkPrefix,
+}
+
+impl C1CombinedDuplexRegionProverWalkContinuation<'_, '_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
+        self.s0
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<
+        (
+            C1CombinedDuplexRegionWalkDeferredProof,
+            Vec<C1QuirkyDirectClaim>,
+        ),
+        RegionSidecarError,
+    > {
+        let protocol = self.vk.validate_structure()?;
+        let (authority, terminal_claims) = prove_c1_duplex_walk_suffix(
+            protocol.w_log,
+            &protocol.fixed,
+            &protocol.refs,
+            &[],
+            &self.committed,
+            self.prefix,
+            terminal,
+            challenger,
+        );
+        let claims = resolve_c1_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
+        Ok((
+            C1CombinedDuplexRegionWalkDeferredProof::new(authority),
+            claims,
+        ))
+    }
+}
+
+pub(crate) struct C1CombinedDuplexRegionVerifierWalkContinuation<'a> {
+    vk: &'a CombinedDuplexRegionVk,
+    total_vars: usize,
+    protocol: Arc<CanonicalCombinedDuplexProtocol>,
+    prefix: C1DuplexVerifierWalkPrefix<'a>,
+}
+
+impl C1CombinedDuplexRegionVerifierWalkContinuation<'_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let terminal_claims = verify_c1_duplex_walk_suffix(
+            self.protocol.w_log,
+            &self.protocol.fixed,
+            &self.protocol.refs,
+            &[],
+            self.prefix,
+            terminal,
+            challenger,
+        )
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+        resolve_c1_terminal_claims(self.vk, self.total_vars, terminal_claims)
+    }
+}
+
 impl<'a> CombinedDuplexRegionProverPlan<'a> {
     pub fn new(
         vk: &'a CombinedDuplexRegionVk,
@@ -476,6 +593,36 @@ impl<'a> CombinedDuplexRegionProverPlan<'a> {
             challenger,
         );
         Ok(CombinedDuplexRegionProverWalkContinuation {
+            vk: self.vk,
+            total_vars,
+            committed,
+            s0: self.s0,
+            prefix,
+        })
+    }
+
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1CombinedDuplexRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        let total_vars = witness_log(z)?;
+        let protocol = self.vk.validate_in_witness(total_vars)?;
+        let committed: [&[F128]; COMBINED_DUPLEX_REGION_COMMITTED_COLUMNS] =
+            std::array::from_fn(|column| {
+                let slice = self.vk.slices[column];
+                &z[slice.start()..slice.start() + slice.len()]
+            });
+        bind_combined_duplex_vk(challenger, self.vk);
+        let prefix = prove_c1_duplex_walk_prefix(
+            protocol.w_log,
+            &protocol.fixed,
+            &protocol.refs,
+            &committed,
+            self.s_out,
+            challenger,
+        );
+        Ok(C1CombinedDuplexRegionProverWalkContinuation {
             vk: self.vk,
             total_vars,
             committed,
@@ -584,6 +731,12 @@ pub(crate) struct CombinedDuplexRegionWalkDeferredProof {
     authority: DuplexUnionWalkDeferredProof,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct C1CombinedDuplexRegionWalkDeferredProof {
+    version: u8,
+    authority: C1DuplexUnionWalkDeferredProof,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 impl CombinedDuplexRegionWalkDeferredProof {
     pub(crate) fn new(authority: DuplexUnionWalkDeferredProof) -> Self {
@@ -604,6 +757,23 @@ impl CombinedDuplexRegionWalkDeferredProof {
     pub(crate) fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("combined duplex deferred sidecar serialized length")
             as usize
+    }
+}
+
+impl C1CombinedDuplexRegionWalkDeferredProof {
+    pub(crate) fn new(authority: C1DuplexUnionWalkDeferredProof) -> Self {
+        Self {
+            version: COMBINED_DUPLEX_REGION_SIDECAR_VERSION,
+            authority,
+        }
+    }
+
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub(crate) fn authority(&self) -> &C1DuplexUnionWalkDeferredProof {
+        &self.authority
     }
 }
 
@@ -729,6 +899,46 @@ pub(crate) fn verify_combined_duplex_region_walk_deferred_prefix<'a, Ch: Challen
     )
     .map_err(|_| RegionSidecarError::InvalidProof)?;
     Ok(CombinedDuplexRegionVerifierWalkContinuation {
+        vk,
+        total_vars,
+        protocol,
+        prefix,
+    })
+}
+
+pub(crate) fn verify_c1_combined_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
+    vk: &'a CombinedDuplexRegionVk,
+    total_vars: usize,
+    proof: &'a C1CombinedDuplexRegionWalkDeferredProof,
+    challenger: &mut Ch,
+) -> Result<C1CombinedDuplexRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let protocol = vk.certified_c1_protocol_in_witness(total_vars)?;
+    let validate_micros = total_started.elapsed().as_micros();
+    if proof.version() != COMBINED_DUPLEX_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    bind_combined_duplex_vk(challenger, vk);
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+    let prefix_started = std::time::Instant::now();
+    let prefix = verify_c1_duplex_walk_prefix(
+        protocol.w_log,
+        &protocol.fixed,
+        &protocol.refs,
+        proof.authority().as_ref(),
+        challenger,
+    )
+    .map_err(|_| RegionSidecarError::InvalidProof)?;
+    if timing {
+        eprintln!(
+            "[combined-duplex-c1 prefix] w_log={} validate_us={validate_micros} bind_us={bind_micros} proof_us={} total_us={}",
+            protocol.w_log,
+            prefix_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1CombinedDuplexRegionVerifierWalkContinuation {
         vk,
         total_vars,
         protocol,
@@ -1017,7 +1227,7 @@ fn canonical_protocol(
         common_s_log,
         block_log,
         w_log,
-        fixed,
+        fixed: fixed.into(),
         refs: duplex_family_refs(0, 0),
         layout,
     })
@@ -1148,7 +1358,7 @@ fn combined_duplex_protocol_digest(
     }
     bytes.extend_from_slice(&super::duplex_layout_digest(&protocol.layout));
     push_usize(&mut bytes, protocol.fixed.len());
-    for pattern in &protocol.fixed {
+    for pattern in protocol.fixed.iter() {
         push_usize(&mut bytes, pattern.low_log);
         push_usize(&mut bytes, pattern.table.len());
         for value in &pattern.table {
@@ -1190,6 +1400,37 @@ fn resolve_terminal_claims(
         x_rest.extend(slice.prefix_coords(total_vars));
         claims.push(QuirkyDirectClaim {
             z_skip: F128::ZERO,
+            k_skip: 0,
+            x_rest,
+            value: claim.value,
+        });
+    }
+    Ok(claims)
+}
+
+fn resolve_c1_terminal_claims(
+    vk: &CombinedDuplexRegionVk,
+    total_vars: usize,
+    terminal: Vec<C1DuplexColumnClaim>,
+) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+    let mut claims = Vec::with_capacity(terminal.len());
+    for claim in terminal {
+        let slice = *vk
+            .slices
+            .get(claim.column)
+            .ok_or(RegionSidecarError::InvalidProof)?;
+        if claim.point.len() != slice.log2_len {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let mut x_rest = claim.point;
+        x_rest.extend(
+            slice
+                .prefix_coords(total_vars)
+                .into_iter()
+                .map(F256::from_base),
+        );
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
             k_skip: 0,
             x_rest,
             value: claim.value,

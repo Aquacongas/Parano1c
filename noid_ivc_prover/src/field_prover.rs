@@ -57,6 +57,7 @@ pub struct FieldPostCommitProverContext<'a, Ch> {
     total_vars: usize,
     challenger: &'a mut Ch,
     claims: Vec<QuirkyDirectClaim>,
+    c1_claims: Vec<C1QuirkyDirectClaim>,
 }
 
 impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
@@ -72,11 +73,20 @@ impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
             total_vars,
             challenger,
             claims: Vec::new(),
+            c1_claims: Vec::new(),
         }
     }
 
     fn finish(self) -> Vec<QuirkyDirectClaim> {
+        assert!(
+            self.c1_claims.is_empty(),
+            "extension-field claims require a C1 enclosing proof"
+        );
         self.claims
+    }
+
+    fn finish_c1(self) -> (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>) {
+        (self.claims, self.c1_claims)
     }
 
     pub fn witness(&self) -> &'a [F128] {
@@ -99,8 +109,20 @@ impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
         self.claims.extend(claims);
     }
 
+    pub fn append_c1_claim(&mut self, claim: C1QuirkyDirectClaim) {
+        self.c1_claims.push(claim);
+    }
+
+    pub fn append_c1_claims(&mut self, claims: impl IntoIterator<Item = C1QuirkyDirectClaim>) {
+        self.c1_claims.extend(claims);
+    }
+
     pub fn claim_count(&self) -> usize {
         self.claims.len()
+    }
+
+    pub fn c1_claim_count(&self) -> usize {
+        self.c1_claims.len()
     }
 }
 
@@ -198,7 +220,7 @@ pub fn prove_field_c1<Ch: Challenger>(
         None,
         false,
         challenger,
-        |_, _, _| ((), Vec::new()),
+        |_, _, _| ((), (Vec::new(), Vec::new())),
     );
     debug_assert!(capture.is_none());
     (proof, commitment, claim)
@@ -240,7 +262,7 @@ pub fn prove_field_compact_c1<Ch: Challenger>(
         None,
         false,
         challenger,
-        |_, _, _| ((), Vec::new()),
+        |_, _, _| ((), (Vec::new(), Vec::new())),
     );
     debug_assert!(capture.is_none());
     (proof, commitment, claim)
@@ -264,7 +286,7 @@ pub fn prove_field_c1_capturing_fresh<Ch: Challenger>(
         None,
         true,
         challenger,
-        |_, _, _| ((), Vec::new()),
+        |_, _, _| ((), (Vec::new(), Vec::new())),
     );
     (
         proof,
@@ -292,7 +314,7 @@ pub fn prove_field_compact_c1_capturing_fresh<Ch: Challenger>(
         None,
         true,
         challenger,
-        |_, _, _| ((), Vec::new()),
+        |_, _, _| ((), (Vec::new(), Vec::new())),
     );
     (
         proof,
@@ -333,7 +355,7 @@ where
             let mut context =
                 FieldPostCommitProverContext::new(witness, commitment, r1cs.m, challenger);
             let auxiliary = post_commit(&mut context);
-            (auxiliary, context.finish())
+            (auxiliary, context.finish_c1())
         },
     );
     debug_assert!(capture.is_none());
@@ -370,7 +392,7 @@ where
             let mut context =
                 FieldPostCommitProverContext::new(witness, commitment, total_vars, challenger);
             let auxiliary = post_commit(&mut context);
-            (auxiliary, context.finish())
+            (auxiliary, context.finish_c1())
         },
     );
     debug_assert!(capture.is_none());
@@ -395,8 +417,23 @@ fn prove_field_c1_inner<R, Ch, Aux, PostCommit>(
 where
     R: FieldProverRelation,
     Ch: Challenger,
-    PostCommit: FnOnce(&[F128], &Commitment, &mut Ch) -> (Aux, Vec<QuirkyDirectClaim>),
+    PostCommit: FnOnce(
+        &[F128],
+        &Commitment,
+        &mut Ch,
+    ) -> (Aux, (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>)),
 {
+    let timing = std::env::var_os("NOIDH_FIELD_PROVE_TIMING").is_some();
+    let mut phase = std::time::Instant::now();
+    let lap = |label: &str, phase: &mut std::time::Instant| {
+        if timing {
+            eprintln!(
+                "[field-c1-prover] {label}: {:.1} ms",
+                phase.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        *phase = std::time::Instant::now();
+    };
     let shape = r1cs.field_shape();
     let useful_rows = r1cs.useful_rows();
     let width = 1usize << shape.k_log;
@@ -408,6 +445,7 @@ where
     assert_eq!(pcs_params.m, shape.m + pcs::LOG_PACKING);
 
     let (commitment, prover_data) = pcs::commit(witness, pcs_params);
+    lap("PCS commit", &mut phase);
     bind_statement_field_parts_c1(challenger, &r1cs.field_statement_digest(), &commitment);
 
     let io_claims = match public_io {
@@ -417,14 +455,19 @@ where
         }
         None => Vec::new(),
     };
-    let (auxiliary, auxiliary_claims) = post_commit(witness, &commitment, challenger);
+    lap("statement and public IO", &mut phase);
+    let (auxiliary, (auxiliary_claims, auxiliary_c1_claims)) =
+        post_commit(witness, &commitment, challenger);
+    lap("post-commit auxiliary", &mut phase);
 
     let a = r1cs.apply_a_relation(witness);
     let b = r1cs.apply_b_relation(witness);
+    lap("apply A/B", &mut phase);
     let (zerocheck_proof, zerocheck_claim) =
         zerocheck::field_c1::prove(&a, &b, witness, shape.m, challenger);
     drop(a);
     drop(b);
+    lap("zerocheck", &mut phase);
 
     let inner_rest_len = shape.k_log - shape.k_skip;
     let lincheck_point = lincheck::c1::C1QuirkyPoint {
@@ -459,6 +502,7 @@ where
         );
         (proof, claim, None)
     };
+    lap("lincheck", &mut phase);
 
     let ab = C1ZClaim {
         point: lincheck::c1::C1QuirkyPoint {
@@ -498,8 +542,10 @@ where
                 value: F256::from_base(claim.value),
             }),
     );
+    claims.extend(auxiliary_c1_claims);
     let pcs_open =
         pcs::open_batch_quirky_direct_c1(witness, &prover_data, &commitment, &claims, challenger);
+    lap("PCS open", &mut phase);
 
     (
         C1FieldR1csProof {

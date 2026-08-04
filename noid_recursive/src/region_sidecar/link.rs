@@ -46,13 +46,14 @@
 //! digest feeds its own preimage.
 
 use noid_ivc_core::challenger::Challenger;
+use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 use noid_ivc_core::deep_chain::{
     prove_ragged_multi_deep_chain_walk, verify_ragged_multi_deep_chain_walk,
     MultiDeepChainWalkProof,
 };
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::FsChannelOps;
-use noid_ivc_core::pcs::{PcsParams, QuirkyDirectClaim};
+use noid_ivc_core::pcs::{C1QuirkyDirectClaim, PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::public_io::PublicIoSpec;
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
 use noid_ivc_prover::field_prover::FieldPostCommitProverContext;
@@ -75,21 +76,25 @@ use super::bounded_decode::{
 use super::c1_repeat::{WideResponseLowChallenger, SIDECAR_C1_REPETITIONS};
 use super::combined_duplex::{
     combined_walk_deferred_bounded_shape, preflight_combined_duplex_region_walk_deferred_trace,
+    verify_c1_combined_duplex_region_walk_deferred_prefix,
     verify_combined_duplex_region_walk_deferred_prefix,
     verify_combined_duplex_region_walk_deferred_prefix_trace,
-    CombinedDuplexRegionWalkDeferredProof,
+    C1CombinedDuplexRegionWalkDeferredProof, CombinedDuplexRegionWalkDeferredProof,
 };
 use super::recording_duplex::{
     preflight_recording_duplex_region_walk_deferred, recording_duplex_bounded_shape,
-    validate_recording_endpoints, verify_recording_duplex_region_walk_deferred_prefix,
-    verify_recording_duplex_region_walk_deferred_prefix_trace, RecordingDuplexRegionProverPlan,
+    validate_recording_endpoints, verify_c1_recording_duplex_region_walk_deferred_prefix,
+    verify_recording_duplex_region_walk_deferred_prefix,
+    verify_recording_duplex_region_walk_deferred_prefix_trace,
+    C1RecordingDuplexRegionWalkDeferredProof, RecordingDuplexRegionProverPlan,
     RecordingDuplexRegionVk, RecordingDuplexRegionWalkDeferredProof,
 };
 use super::{
-    preflight_merkle_region_walk_deferred_trace, verify_merkle_region_walk_deferred_prefix,
-    verify_merkle_region_walk_deferred_prefix_trace, CombinedDuplexRegionProverPlan,
-    CombinedDuplexRegionVk, MerkleRegionProverPlan, MerkleRegionVk, MerkleRegionWalkDeferredProof,
-    RegionSidecarError, RegionWalkEndpoints,
+    preflight_merkle_region_walk_deferred_trace, verify_c1_merkle_region_walk_deferred_prefix,
+    verify_merkle_region_walk_deferred_prefix, verify_merkle_region_walk_deferred_prefix_trace,
+    C1MerkleRegionWalkDeferredProof, CombinedDuplexRegionProverPlan, CombinedDuplexRegionVk,
+    MerkleRegionProverPlan, MerkleRegionVk, MerkleRegionWalkDeferredProof, RegionSidecarError,
+    RegionWalkEndpoints,
 };
 
 pub const LINK_REGION_SIDECAR_VERSION: u8 = 5;
@@ -257,6 +262,73 @@ pub struct LinkRegionProverPlan<'a> {
     input: &'a LinkRegionProverInput,
 }
 
+pub(crate) struct C1LinkRegionProverWalkContinuation<'a, 'z> {
+    leaf_a: super::combined_duplex::C1CombinedDuplexRegionProverWalkContinuation<'a, 'z>,
+    path_b: super::C1MerkleRegionProverWalkContinuation<'a, 'z>,
+    rec_c: super::recording_duplex::C1RecordingDuplexProverWalkContinuation<'a, 'z>,
+}
+
+impl C1LinkRegionProverWalkContinuation<'_, '_> {
+    pub(crate) fn groups(&self) -> [C1LaneClaimGroup; 3] {
+        [
+            self.leaf_a.group().clone(),
+            self.path_b.group().clone(),
+            self.rec_c.group().clone(),
+        ]
+    }
+
+    pub(crate) fn states(&self) -> [&[Vec<F128>; 4]; 3] {
+        [self.leaf_a.s0(), self.path_b.s0(), self.rec_c.s0()]
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminals: &[C1LaneClaimGroup; 3],
+        challenger: &mut Ch,
+    ) -> Result<(C1LinkRegionWalkDeferredProof, Vec<C1QuirkyDirectClaim>), RegionSidecarError> {
+        let (leaf_a, mut claims) = self.leaf_a.finish(&terminals[0], challenger)?;
+        let (path_b, child_claims) = self.path_b.finish(&terminals[1], challenger)?;
+        claims.extend(child_claims);
+        let (rec_c, child_claims) = self.rec_c.finish(&terminals[2], challenger)?;
+        claims.extend(child_claims);
+        Ok((
+            C1LinkRegionWalkDeferredProof {
+                leaf_a,
+                path_b,
+                rec_c,
+            },
+            claims,
+        ))
+    }
+}
+
+pub(crate) struct C1LinkRegionVerifierWalkContinuation<'a> {
+    leaf_a: super::combined_duplex::C1CombinedDuplexRegionVerifierWalkContinuation<'a>,
+    path_b: super::C1MerkleRegionVerifierWalkContinuation<'a>,
+    rec_c: super::recording_duplex::C1RecordingDuplexVerifierWalkContinuation<'a>,
+}
+
+impl C1LinkRegionVerifierWalkContinuation<'_> {
+    pub(crate) fn groups(&self) -> [C1LaneClaimGroup; 3] {
+        [
+            self.leaf_a.group().clone(),
+            self.path_b.group().clone(),
+            self.rec_c.group().clone(),
+        ]
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminals: &[C1LaneClaimGroup; 3],
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let mut claims = self.leaf_a.finish(&terminals[0], challenger)?;
+        claims.extend(self.path_b.finish(&terminals[1], challenger)?);
+        claims.extend(self.rec_c.finish(&terminals[2], challenger)?);
+        Ok(claims)
+    }
+}
+
 impl<'a> LinkRegionProverPlan<'a> {
     pub fn new(
         vk: &'a LinkRegionSidecarVk,
@@ -265,6 +337,34 @@ impl<'a> LinkRegionProverPlan<'a> {
         vk.validate_roles()?;
         input.validate(vk)?;
         Ok(Self { vk, input })
+    }
+
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1LinkRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        bind_link_vk(challenger, self.vk);
+        let leaf_plan = CombinedDuplexRegionProverPlan::new(
+            self.vk.leaf_a(),
+            self.input.leaf_a.s0(),
+            self.input.leaf_a.s_out(),
+        )?;
+        let path_plan = MerkleRegionProverPlan::new(
+            self.vk.path_b(),
+            self.input.path_b.s0(),
+            self.input.path_b.s_out(),
+        )?;
+        let rec_plan = RecordingDuplexRegionProverPlan::new(
+            self.vk.rec_c(),
+            self.input.rec_c.s0(),
+            self.input.rec_c.s_out(),
+        )?;
+        Ok(C1LinkRegionProverWalkContinuation {
+            leaf_a: leaf_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            path_b: path_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            rec_c: rec_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+        })
     }
 
     fn prove_repetition<Ch: Challenger>(
@@ -377,6 +477,62 @@ struct LinkRegionSidecarRepetitionProof {
     path_b: MerkleRegionWalkDeferredProof,
     rec_c: RecordingDuplexRegionWalkDeferredProof,
     walk: MultiDeepChainWalkProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct C1LinkRegionWalkDeferredProof {
+    leaf_a: C1CombinedDuplexRegionWalkDeferredProof,
+    path_b: C1MerkleRegionWalkDeferredProof,
+    rec_c: C1RecordingDuplexRegionWalkDeferredProof,
+}
+
+pub(crate) fn verify_c1_link_region_walk_deferred_prefix<'a, Ch: Challenger>(
+    vk: &'a LinkRegionSidecarVk,
+    total_vars: usize,
+    proof: &'a C1LinkRegionWalkDeferredProof,
+    challenger: &mut Ch,
+) -> Result<C1LinkRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    vk.validate_roles()?;
+    let validate_micros = total_started.elapsed().as_micros();
+    bind_link_vk(challenger, vk);
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+    let leaf_started = std::time::Instant::now();
+    let leaf_a = verify_c1_combined_duplex_region_walk_deferred_prefix(
+        vk.leaf_a(),
+        total_vars,
+        &proof.leaf_a,
+        challenger,
+    )?;
+    let leaf_micros = leaf_started.elapsed().as_micros();
+    let path_started = std::time::Instant::now();
+    let path_b = verify_c1_merkle_region_walk_deferred_prefix(
+        vk.path_b(),
+        total_vars,
+        &proof.path_b,
+        challenger,
+    )?;
+    let path_micros = path_started.elapsed().as_micros();
+    let recording_started = std::time::Instant::now();
+    let rec_c = verify_c1_recording_duplex_region_walk_deferred_prefix(
+        vk.rec_c(),
+        total_vars,
+        &proof.rec_c,
+        challenger,
+    )?;
+    let recording_micros = recording_started.elapsed().as_micros();
+    if timing {
+        eprintln!(
+            "[link-c1 prefix] validate_us={validate_micros} bind_us={bind_micros} leaf_us={leaf_micros} path_us={path_micros} recording_us={recording_micros} total_us={}",
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1LinkRegionVerifierWalkContinuation {
+        leaf_a,
+        path_b,
+        rec_c,
+    })
 }
 
 /// Fixed V5 link sidecar.  All three children retain their complete

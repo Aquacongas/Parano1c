@@ -39,6 +39,7 @@ pub struct FieldPostCommitVerifierContext<'a, Ch> {
     total_vars: usize,
     challenger: &'a mut Ch,
     claims: Vec<pcs::QuirkyDirectClaim>,
+    c1_claims: Vec<pcs::C1QuirkyDirectClaim>,
 }
 
 impl<'a, Ch> FieldPostCommitVerifierContext<'a, Ch> {
@@ -48,11 +49,20 @@ impl<'a, Ch> FieldPostCommitVerifierContext<'a, Ch> {
             total_vars,
             challenger,
             claims: Vec::new(),
+            c1_claims: Vec::new(),
         }
     }
 
     fn finish(self) -> Vec<pcs::QuirkyDirectClaim> {
+        assert!(
+            self.c1_claims.is_empty(),
+            "extension-field claims require a C1 enclosing proof"
+        );
         self.claims
+    }
+
+    fn finish_c1(self) -> (Vec<pcs::QuirkyDirectClaim>, Vec<pcs::C1QuirkyDirectClaim>) {
+        (self.claims, self.c1_claims)
     }
 
     pub fn commitment(&self) -> &'a Commitment {
@@ -71,8 +81,20 @@ impl<'a, Ch> FieldPostCommitVerifierContext<'a, Ch> {
         self.claims.extend(claims);
     }
 
+    pub fn append_c1_claim(&mut self, claim: pcs::C1QuirkyDirectClaim) {
+        self.c1_claims.push(claim);
+    }
+
+    pub fn append_c1_claims(&mut self, claims: impl IntoIterator<Item = pcs::C1QuirkyDirectClaim>) {
+        self.c1_claims.extend(claims);
+    }
+
     pub fn claim_count(&self) -> usize {
         self.claims.len()
+    }
+
+    pub fn c1_claim_count(&self) -> usize {
+        self.c1_claims.len()
     }
 }
 
@@ -915,7 +937,7 @@ where
                 let mut context =
                     FieldPostCommitVerifierContext::new(commitment, shape.m, challenger);
                 post_commit(auxiliary, &mut context)?;
-                Ok(context.finish())
+                Ok(context.finish_c1())
             },
         )
     })
@@ -930,7 +952,13 @@ fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
     spec: &crate::public_io::PublicIoSpec,
     io: &[crate::field::F128],
     challenger: &mut Ch,
-    post_commit: impl FnOnce(&Commitment, &mut Ch) -> Result<Vec<pcs::QuirkyDirectClaim>, VerifyError>,
+    post_commit: impl FnOnce(
+        &Commitment,
+        &mut Ch,
+    ) -> Result<
+        (Vec<pcs::QuirkyDirectClaim>, Vec<pcs::C1QuirkyDirectClaim>),
+        VerifyError,
+    >,
 ) -> Result<
     (
         crate::proof::C1R1csClaim,
@@ -938,6 +966,8 @@ fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
     ),
     VerifyError,
 > {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
     if commitment.params.m != shape.m + pcs::LOG_PACKING
         || commitment.params.log_batch_size + pcs::LOG_PACKING > commitment.params.m
     {
@@ -946,16 +976,22 @@ fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
 
     crate::proof::bind_statement_field_parts_c1(challenger, statement_digest, commitment);
     let io_claims = crate::public_io::bind_public_io_c1(challenger, spec, io, shape.m);
-    let auxiliary_claims = post_commit(commitment, challenger)?;
+    let prefix_micros = total_started.elapsed().as_micros();
+    let auxiliary_started = std::time::Instant::now();
+    let (auxiliary_claims, auxiliary_c1_claims) = post_commit(commitment, challenger)?;
+    let auxiliary_micros = auxiliary_started.elapsed().as_micros();
 
+    let zerocheck_started = std::time::Instant::now();
     let zerocheck_claim = zerocheck::field_c1::verify(shape.m, &proof.zerocheck, challenger)
         .map_err(VerifyError::Zerocheck)?;
+    let zerocheck_micros = zerocheck_started.elapsed().as_micros();
     let inner_rest_len = shape.k_log - shape.k_skip;
     let lincheck_point = lincheck::c1::C1QuirkyPoint {
         z_skip: zerocheck_claim.z,
         x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
         x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
     };
+    let lincheck_started = std::time::Instant::now();
     let (lincheck_claim, fresh) = lincheck::c1::verify_deferred(
         shape.m,
         shape.k_log,
@@ -968,7 +1004,9 @@ fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
         challenger,
     )
     .map_err(VerifyError::Lincheck)?;
+    let lincheck_micros = lincheck_started.elapsed().as_micros();
 
+    let claims_started = std::time::Instant::now();
     let ab = crate::proof::C1ZClaim {
         point: lincheck::c1::C1QuirkyPoint {
             z_skip: lincheck_claim.r_inner_skip,
@@ -1015,6 +1053,7 @@ fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
                 value: F256::from_base(claim.value),
             }),
     );
+    claims.extend(auxiliary_c1_claims);
     let refs = claims
         .iter()
         .map(|claim| pcs::C1QuirkyDirectClaimRef {
@@ -1024,8 +1063,18 @@ fn verify_field_c1_deferred_matrix_inner<Ch: Challenger>(
             value: claim.value,
         })
         .collect::<Vec<_>>();
+    let claims_micros = claims_started.elapsed().as_micros();
+    let pcs_started = std::time::Instant::now();
     pcs::verify_opening_batch_quirky_direct_c1(commitment, &refs, &proof.pcs_open, challenger)
         .map_err(VerifyError::PcsAb)?;
+    let pcs_micros = pcs_started.elapsed().as_micros();
+
+    if timing {
+        eprintln!(
+            "[field-c1 verify] prefix_us={prefix_micros} auxiliary_us={auxiliary_micros} zerocheck_us={zerocheck_micros} lincheck_us={lincheck_micros} claims_us={claims_micros} pcs_us={pcs_micros} total_us={}",
+            total_started.elapsed().as_micros(),
+        );
+    }
 
     Ok((crate::proof::C1R1csClaim { ab, c }, fresh))
 }

@@ -16,6 +16,7 @@ use noid_fri_binius::zk_capsule_pcs::{
     ZK_CAPSULE_PCS_MID_PATH_DEPTH, ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
 };
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
+use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 use noid_ivc_core::deep_chain::capsule_leaf::raw_flat_lane;
 use noid_ivc_core::deep_chain::schedule::{
     duplex_family_refs, duplex_fixed_patterns, flat_of_tower_u128,
@@ -30,7 +31,7 @@ use noid_ivc_core::field_circuit::{
     FsChannelOps, FsChannelUnionRecorder, LayoutRecordedChannel, LayoutRecordingChallenger,
     RecordedChannel,
 };
-use noid_ivc_core::pcs::{PcsParams, QuirkyDirectClaim};
+use noid_ivc_core::pcs::{C1QuirkyDirectClaim, PcsParams, QuirkyDirectClaim};
 use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_ivc_core::verifier::FieldPostCommitVerifierContext;
 use noid_ivc_prover::field_prover::FieldPostCommitProverContext;
@@ -63,10 +64,13 @@ use super::c1_repeat::{WideResponseLowChallenger, SIDECAR_C1_REPETITIONS};
 use super::walk_a::walk_a_bounded_shape;
 use super::{
     preflight_duplex_region_walk_deferred_trace, preflight_merkle_region_walk_deferred_trace,
-    preflight_walk_a_region_walk_deferred_trace, verify_duplex_region_walk_deferred_prefix,
-    verify_duplex_region_walk_deferred_prefix_trace, verify_merkle_region_walk_deferred_prefix,
-    verify_merkle_region_walk_deferred_prefix_trace, verify_walk_a_region_walk_deferred_prefix,
-    verify_walk_a_region_walk_deferred_prefix_trace, DuplexRegionProverPlan, DuplexRegionVk,
+    preflight_walk_a_region_walk_deferred_trace, verify_c1_duplex_region_walk_deferred_prefix,
+    verify_c1_merkle_region_walk_deferred_prefix, verify_c1_walk_a_region_walk_deferred_prefix,
+    verify_duplex_region_walk_deferred_prefix, verify_duplex_region_walk_deferred_prefix_trace,
+    verify_merkle_region_walk_deferred_prefix, verify_merkle_region_walk_deferred_prefix_trace,
+    verify_walk_a_region_walk_deferred_prefix, verify_walk_a_region_walk_deferred_prefix_trace,
+    C1DuplexRegionWalkDeferredProof, C1MerkleRegionWalkDeferredProof,
+    C1WalkARegionWalkDeferredProof, DuplexRegionProverPlan, DuplexRegionVk,
     DuplexRegionWalkDeferredProof, MerkleRegionProverPlan, MerkleRegionVk,
     MerkleRegionWalkDeferredProof, RegionSidecarError, WalkARegionProverPlan, WalkARegionVk,
     WalkARegionWalkDeferredProof,
@@ -817,6 +821,105 @@ pub struct BlockRegionProverPlan<'a> {
     input: &'a BlockRegionProverInput,
 }
 
+pub(crate) struct C1BlockRegionProverWalkContinuation<'a, 'z> {
+    wallet_a: super::C1WalkARegionProverWalkContinuation<'a, 'z>,
+    meta_a: super::C1WalkARegionProverWalkContinuation<'a, 'z>,
+    wallet_b: super::C1MerkleRegionProverWalkContinuation<'a, 'z>,
+    meta_b: super::C1MerkleRegionProverWalkContinuation<'a, 'z>,
+    owner_c: super::C1DuplexRegionProverWalkContinuation<'a, 'z>,
+    main_c: super::C1DuplexRegionProverWalkContinuation<'a, 'z>,
+}
+
+impl C1BlockRegionProverWalkContinuation<'_, '_> {
+    pub(crate) fn groups(&self) -> [C1LaneClaimGroup; 6] {
+        [
+            self.wallet_a.group().clone(),
+            self.meta_a.group().clone(),
+            self.wallet_b.group().clone(),
+            self.meta_b.group().clone(),
+            self.owner_c.group().clone(),
+            self.main_c.group().clone(),
+        ]
+    }
+
+    pub(crate) fn states(&self) -> [&[Vec<F128>; 4]; 6] {
+        [
+            self.wallet_a.s0(),
+            self.meta_a.s0(),
+            self.wallet_b.s0(),
+            self.meta_b.s0(),
+            self.owner_c.s0(),
+            self.main_c.s0(),
+        ]
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminals: &[C1LaneClaimGroup; 6],
+        challenger: &mut Ch,
+    ) -> Result<(C1BlockRegionWalkDeferredProof, Vec<C1QuirkyDirectClaim>), RegionSidecarError>
+    {
+        let (wallet_a, mut claims) = self.wallet_a.finish(&terminals[0], challenger)?;
+        let (meta_a, child_claims) = self.meta_a.finish(&terminals[1], challenger)?;
+        claims.extend(child_claims);
+        let (wallet_b, child_claims) = self.wallet_b.finish(&terminals[2], challenger)?;
+        claims.extend(child_claims);
+        let (meta_b, child_claims) = self.meta_b.finish(&terminals[3], challenger)?;
+        claims.extend(child_claims);
+        let (owner_c, child_claims) = self.owner_c.finish(&terminals[4], challenger)?;
+        claims.extend(child_claims);
+        let (main_c, child_claims) = self.main_c.finish(&terminals[5], challenger)?;
+        claims.extend(child_claims);
+        Ok((
+            C1BlockRegionWalkDeferredProof {
+                wallet_a,
+                meta_a,
+                wallet_b,
+                meta_b,
+                owner_c,
+                main_c,
+            },
+            claims,
+        ))
+    }
+}
+
+pub(crate) struct C1BlockRegionVerifierWalkContinuation<'a> {
+    wallet_a: super::C1WalkARegionVerifierWalkContinuation<'a>,
+    meta_a: super::C1WalkARegionVerifierWalkContinuation<'a>,
+    wallet_b: super::C1MerkleRegionVerifierWalkContinuation<'a>,
+    meta_b: super::C1MerkleRegionVerifierWalkContinuation<'a>,
+    owner_c: super::C1DuplexRegionVerifierWalkContinuation<'a>,
+    main_c: super::C1DuplexRegionVerifierWalkContinuation<'a>,
+}
+
+impl C1BlockRegionVerifierWalkContinuation<'_> {
+    pub(crate) fn groups(&self) -> [C1LaneClaimGroup; 6] {
+        [
+            self.wallet_a.group().clone(),
+            self.meta_a.group().clone(),
+            self.wallet_b.group().clone(),
+            self.meta_b.group().clone(),
+            self.owner_c.group().clone(),
+            self.main_c.group().clone(),
+        ]
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminals: &[C1LaneClaimGroup; 6],
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let mut claims = self.wallet_a.finish(&terminals[0], challenger)?;
+        claims.extend(self.meta_a.finish(&terminals[1], challenger)?);
+        claims.extend(self.wallet_b.finish(&terminals[2], challenger)?);
+        claims.extend(self.meta_b.finish(&terminals[3], challenger)?);
+        claims.extend(self.owner_c.finish(&terminals[4], challenger)?);
+        claims.extend(self.main_c.finish(&terminals[5], challenger)?);
+        Ok(claims)
+    }
+}
+
 /// Owning handoff from block-trace assembly to the causally post-commit
 /// prover.  Keeping the VK and its validated endpoint input together avoids
 /// cross-class wiring when a built block is queued for proving.
@@ -897,6 +1000,52 @@ impl<'a> BlockRegionProverPlan<'a> {
     ) -> Result<Self, RegionSidecarError> {
         input.validate_selected_zk(vk)?;
         Ok(Self { vk, input })
+    }
+
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1BlockRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        bind_block_vk(challenger, self.vk);
+        let wallet_a_plan = WalkARegionProverPlan::new(
+            self.vk.wallet_a(),
+            self.input.wallet_a.s0(),
+            self.input.wallet_a.s_out(),
+        )?;
+        let meta_a_plan = WalkARegionProverPlan::new(
+            self.vk.meta_a(),
+            self.input.meta_a.s0(),
+            self.input.meta_a.s_out(),
+        )?;
+        let wallet_b_plan = MerkleRegionProverPlan::new(
+            self.vk.wallet_b(),
+            self.input.wallet_b.s0(),
+            self.input.wallet_b.s_out(),
+        )?;
+        let meta_b_plan = MerkleRegionProverPlan::new(
+            self.vk.meta_b(),
+            self.input.meta_b.s0(),
+            self.input.meta_b.s_out(),
+        )?;
+        let owner_c_plan = DuplexRegionProverPlan::new(
+            self.vk.owner_c(),
+            self.input.owner_c.s0(),
+            self.input.owner_c.s_out(),
+        )?;
+        let main_c_plan = DuplexRegionProverPlan::new(
+            self.vk.main_c(),
+            self.input.main_c.s0(),
+            self.input.main_c.s_out(),
+        )?;
+        Ok(C1BlockRegionProverWalkContinuation {
+            wallet_a: wallet_a_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            meta_a: meta_a_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            wallet_b: wallet_b_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            meta_b: meta_b_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            owner_c: owner_c_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+            main_c: main_c_plan.prove_c1_walk_deferred_prefix(z, challenger)?,
+        })
     }
 
     fn prove_repetition<Ch: Challenger>(
@@ -1096,6 +1245,94 @@ struct BlockRegionSidecarRepetitionProof {
     owner_c: DuplexRegionWalkDeferredProof,
     main_c: DuplexRegionWalkDeferredProof,
     walk: MultiDeepChainWalkProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct C1BlockRegionWalkDeferredProof {
+    wallet_a: C1WalkARegionWalkDeferredProof,
+    meta_a: C1WalkARegionWalkDeferredProof,
+    wallet_b: C1MerkleRegionWalkDeferredProof,
+    meta_b: C1MerkleRegionWalkDeferredProof,
+    owner_c: C1DuplexRegionWalkDeferredProof,
+    main_c: C1DuplexRegionWalkDeferredProof,
+}
+
+pub(crate) fn verify_c1_block_region_walk_deferred_prefix<'a, Ch: Challenger>(
+    vk: &'a BlockRegionSidecarVk,
+    total_vars: usize,
+    proof: &'a C1BlockRegionWalkDeferredProof,
+    challenger: &mut Ch,
+) -> Result<C1BlockRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    vk.validate_selected_zk_roles()?;
+    let validate_micros = total_started.elapsed().as_micros();
+    bind_block_vk(challenger, vk);
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+
+    let wallet_a_started = std::time::Instant::now();
+    let wallet_a = verify_c1_walk_a_region_walk_deferred_prefix(
+        vk.wallet_a(),
+        total_vars,
+        &proof.wallet_a,
+        challenger,
+    )?;
+    let wallet_a_micros = wallet_a_started.elapsed().as_micros();
+    let meta_a_started = std::time::Instant::now();
+    let meta_a = verify_c1_walk_a_region_walk_deferred_prefix(
+        vk.meta_a(),
+        total_vars,
+        &proof.meta_a,
+        challenger,
+    )?;
+    let meta_a_micros = meta_a_started.elapsed().as_micros();
+    let wallet_b_started = std::time::Instant::now();
+    let wallet_b = verify_c1_merkle_region_walk_deferred_prefix(
+        vk.wallet_b(),
+        total_vars,
+        &proof.wallet_b,
+        challenger,
+    )?;
+    let wallet_b_micros = wallet_b_started.elapsed().as_micros();
+    let meta_b_started = std::time::Instant::now();
+    let meta_b = verify_c1_merkle_region_walk_deferred_prefix(
+        vk.meta_b(),
+        total_vars,
+        &proof.meta_b,
+        challenger,
+    )?;
+    let meta_b_micros = meta_b_started.elapsed().as_micros();
+    let owner_c_started = std::time::Instant::now();
+    let owner_c = verify_c1_duplex_region_walk_deferred_prefix(
+        vk.owner_c(),
+        total_vars,
+        &proof.owner_c,
+        challenger,
+    )?;
+    let owner_c_micros = owner_c_started.elapsed().as_micros();
+    let main_c_started = std::time::Instant::now();
+    let main_c = verify_c1_duplex_region_walk_deferred_prefix(
+        vk.main_c(),
+        total_vars,
+        &proof.main_c,
+        challenger,
+    )?;
+    let main_c_micros = main_c_started.elapsed().as_micros();
+
+    if timing {
+        eprintln!(
+            "[block-c1 prefix] validate_us={validate_micros} bind_us={bind_micros} wallet_a_us={wallet_a_micros} meta_a_us={meta_a_micros} wallet_b_us={wallet_b_micros} meta_b_us={meta_b_micros} owner_c_us={owner_c_micros} main_c_us={main_c_micros} total_us={}",
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1BlockRegionVerifierWalkContinuation {
+        wallet_a,
+        meta_a,
+        wallet_b,
+        meta_b,
+        owner_c,
+        main_c,
+    })
 }
 
 /// The fixed-shape selected-ZK V6 block sidecar envelope.

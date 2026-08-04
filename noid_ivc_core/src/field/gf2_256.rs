@@ -203,13 +203,63 @@ impl Mul for F256 {
 
     #[inline(always)]
     fn mul(self, rhs: Self) -> Self {
-        let v0 = self.lo * rhs.lo;
-        let v1 = self.hi * rhs.hi;
-        let v_sum = (self.lo + self.hi) * (rhs.lo + rhs.hi);
-        Self {
-            lo: v0 + v1 * Self::EXTENSION_TAU,
-            hi: v0 + v_sum,
+        #[cfg(target_arch = "x86_64")]
+        if noid_core::cpu::avx2_vpclmul_available() {
+            // SAFETY: the runtime gate requires AVX2 and VPCLMULQDQ.
+            return unsafe { mul_f256_avx2(self, rhs) };
         }
+        mul_f256_portable(self, rhs)
+    }
+}
+
+#[inline(always)]
+fn mul_f256_portable(left: F256, right: F256) -> F256 {
+    let v0 = left.lo * right.lo;
+    let v1 = left.hi * right.hi;
+    let v_sum = (left.lo + left.hi) * (right.lo + right.hi);
+    F256 {
+        lo: v0 + v1 * F256::EXTENSION_TAU,
+        hi: v0 + v_sum,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,vpclmulqdq")]
+unsafe fn mul_f256_avx2(left: F256, right: F256) -> F256 {
+    use noid_core::packed::{PackedBlock128, clmul_avx2::packed_mul_flat_avx2};
+
+    #[inline(always)]
+    fn packed(low: F128, high: F128) -> PackedBlock128 {
+        PackedBlock128::from_array([
+            Block128((low.lo as u128) | ((low.hi as u128) << 64)),
+            Block128((high.lo as u128) | ((high.hi as u128) << 64)),
+        ])
+    }
+
+    #[inline(always)]
+    fn unpack(value: PackedBlock128) -> [F128; 2] {
+        value.to_array().map(|value| {
+            let value = value.0;
+            F128::new(value as u64, (value >> 64) as u64)
+        })
+    }
+
+    // First vector lane computes lo*lo and the second computes hi*hi.
+    let first =
+        unsafe { packed_mul_flat_avx2(packed(left.lo, left.hi), packed(right.lo, right.hi)) };
+    let [v0, v1] = unpack(first);
+    // Compute the Karatsuba cross product and the fixed extension reduction
+    // in parallel, retaining both GF(2^128) products in vector registers.
+    let second = unsafe {
+        packed_mul_flat_avx2(
+            packed(left.lo + left.hi, v1),
+            packed(right.lo + right.hi, F256::EXTENSION_TAU),
+        )
+    };
+    let [v_sum, v1_tau] = unpack(second);
+    F256 {
+        lo: v0 + v1_tau,
+        hi: v0 + v_sum,
     }
 }
 
@@ -271,6 +321,23 @@ mod tests {
             assert_eq!(F256::from_tower(a.to_tower() + b.to_tower()), a + b);
             assert_eq!(F256::from_tower(a.to_tower() * b.to_tower()), a * b);
             assert_eq!(a.scale_base(b.lo), a * F256::from_base(b.lo));
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_vpclmul_matches_portable_multiplication() {
+        if !noid_core::cpu::avx2_vpclmul_available() {
+            return;
+        }
+
+        let mut rng = TestRng(0xC1_A72_256);
+        for _ in 0..4096 {
+            let left = rng.next_f256();
+            let right = rng.next_f256();
+            // SAFETY: the runtime gate above requires AVX2 and VPCLMULQDQ.
+            let accelerated = unsafe { mul_f256_avx2(left, right) };
+            assert_eq!(accelerated, mul_f256_portable(left, right));
         }
     }
 

@@ -83,11 +83,12 @@ pub use relation::{
     assemble_frozen_history_step_base, assemble_frozen_history_step_recursive,
     assemble_history_step_base, assemble_history_step_recursive,
     derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
-    pin_history_step_class_bank, prepare_history_step_for_pow, prove_built_history_step_terminal,
-    prove_history_step, verify_history_step_terminal, AcceptedHistoryStepTerminal,
-    BuiltHistoryStep, FrozenHistoryStep, HistoryStepError, HistoryStepMatrixSource,
-    HistoryStepMatrixSourceError, HistoryStepParent, HistoryStepParentTranscriptLayout,
-    HistoryStepRuntime, HistoryStepRuntimeParts, HistoryStepSidecarOperation, HistoryStepTerminal,
+    pin_history_step_class_bank, prepare_history_step_for_pow, probe_built_history_step_joint_c1,
+    probe_built_history_step_joint_c1_full, prove_built_history_step_terminal, prove_history_step,
+    verify_history_step_terminal, AcceptedHistoryStepTerminal, BuiltHistoryStep, FrozenHistoryStep,
+    HistoryStepError, HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepParent,
+    HistoryStepParentTranscriptLayout, HistoryStepRuntime, HistoryStepRuntimeParts,
+    HistoryStepSidecarOperation, HistoryStepTerminal, JointC1FullProofProbe, JointC1SidecarProbe,
     PreparedHistoryStepForPow, HISTORY_STEP_WIRE_VERSION,
 };
 pub use runtime_parts_codec::{

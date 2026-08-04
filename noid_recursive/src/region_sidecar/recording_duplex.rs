@@ -18,15 +18,16 @@
 //! substitution / shift dimensions equal the recording-free duplex child.
 
 use noid_ivc_core::challenger::Challenger;
+use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 use noid_ivc_core::deep_chain::relations::{claimed_refs, ColRef, FixedPattern};
 use noid_ivc_core::deep_chain::schedule::{
     carry_selection_terms, duplex_family_refs, duplex_fixed_patterns, DuplexFamilyRefs,
     DuplexLayout,
 };
 use noid_ivc_core::deep_chain::LaneClaimGroup;
-use noid_ivc_core::field::F128;
+use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_circuit::{FsChannelOps, FsChannelUnionRecorder};
-use noid_ivc_core::pcs::QuirkyDirectClaim;
+use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
@@ -45,6 +46,12 @@ use crate::acceptance::trace::region_source_binding::{
     verify_duplex_union_walk_suffix_selected_with_challenger,
     verify_duplex_union_walk_suffix_with_challenger, DuplexColumnClaim,
     DuplexUnionProverWalkPrefix, DuplexUnionVerifierWalkPrefix, DuplexUnionWalkDeferredProof,
+};
+use crate::acceptance::trace::region_source_binding_c1::{
+    prove_c1_duplex_walk_prefix, prove_c1_duplex_walk_suffix, prove_c1_duplex_walk_suffix_selected,
+    verify_c1_duplex_walk_prefix, verify_c1_duplex_walk_suffix,
+    verify_c1_duplex_walk_suffix_selected, C1DuplexColumnClaim, C1DuplexProverWalkPrefix,
+    C1DuplexUnionWalkDeferredProof, C1DuplexVerifierWalkPrefix,
 };
 use crate::acceptance::trace::self_verify::{FieldPostCommitTraceContext, QuirkyDirectClaimTrace};
 use crate::acceptance::trace::{mul, FieldR1csBuilder, LinExpr};
@@ -242,6 +249,25 @@ impl RecordingDuplexRegionVk {
 
     fn validate_in_witness(&self, total_vars: usize) -> Result<(), RegionSidecarError> {
         self.validate_structure()?;
+        if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        if self
+            .selector_slice()
+            .is_some_and(|slice| slice.log2_len != 0 || !slice.fits(total_vars))
+        {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        Ok(())
+    }
+
+    /// Per-proof witness gate for a recording VK already authenticated by
+    /// `new` or `new_selected`. The expensive fixed-bank reconstruction is a
+    /// constructor obligation, not adversarial proof work.
+    fn validate_certified_c1_in_witness(
+        &self,
+        total_vars: usize,
+    ) -> Result<(), RegionSidecarError> {
         if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
             return Err(RegionSidecarError::BadSlice);
         }
@@ -527,6 +553,50 @@ fn resolve_recording_terminal_claims(
     Ok(claims)
 }
 
+fn resolve_c1_recording_terminal_claims(
+    vk: &RecordingDuplexRegionVk,
+    total_vars: usize,
+    selector: F128,
+    terminal: Vec<C1DuplexColumnClaim>,
+) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+    let mut claims = Vec::with_capacity(terminal.len() + usize::from(vk.is_selected()));
+    for claim in terminal {
+        let slice = *vk
+            .slices
+            .get(claim.column)
+            .ok_or(RegionSidecarError::InvalidProof)?;
+        if claim.point.len() != slice.log2_len {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let mut x_rest = claim.point;
+        x_rest.extend(
+            slice
+                .prefix_coords(total_vars)
+                .into_iter()
+                .map(F256::from_base),
+        );
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
+            k_skip: 0,
+            x_rest,
+            value: claim.value,
+        });
+    }
+    if let Some(slice) = vk.selector_slice() {
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
+            k_skip: 0,
+            x_rest: slice
+                .prefix_coords(total_vars)
+                .into_iter()
+                .map(F256::from_base)
+                .collect(),
+            value: F256::from_base(selector),
+        });
+    }
+    Ok(claims)
+}
+
 /// Recording authority plus the arm selector that chooses its fixed-layout
 /// bank.  The selector is transcript-bound and independently discharged as a
 /// one-cell opening of the enclosing Field witness.
@@ -534,6 +604,13 @@ fn resolve_recording_terminal_claims(
 pub(crate) struct RecordingDuplexRegionWalkDeferredProof {
     selector: F128,
     authority: super::DuplexRegionWalkDeferredProof,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct C1RecordingDuplexRegionWalkDeferredProof {
+    selector: F128,
+    version: u8,
+    authority: C1DuplexUnionWalkDeferredProof,
 }
 
 impl RecordingDuplexRegionWalkDeferredProof {
@@ -554,6 +631,28 @@ impl RecordingDuplexRegionWalkDeferredProof {
 
     pub(crate) fn authority(&self) -> &DuplexUnionWalkDeferredProof {
         self.authority.authority()
+    }
+}
+
+impl C1RecordingDuplexRegionWalkDeferredProof {
+    pub(crate) fn new(selector: F128, authority: C1DuplexUnionWalkDeferredProof) -> Self {
+        Self {
+            selector,
+            version: DUPLEX_REGION_SIDECAR_VERSION,
+            authority,
+        }
+    }
+
+    pub(crate) fn selector(&self) -> F128 {
+        self.selector
+    }
+
+    pub(crate) fn version(&self) -> u8 {
+        self.version
+    }
+
+    pub(crate) fn authority(&self) -> &C1DuplexUnionWalkDeferredProof {
+        &self.authority
     }
 }
 
@@ -632,6 +731,71 @@ impl RecordingDuplexProverWalkContinuation<'_, '_> {
     }
 }
 
+pub(crate) struct C1RecordingDuplexProverWalkContinuation<'a, 'z> {
+    vk: &'a RecordingDuplexRegionVk,
+    total_vars: usize,
+    committed: [&'z [F128]; DUPLEX_REGION_COMMITTED_COLUMNS],
+    s0: &'a [Vec<F128>; STATE_SIZE],
+    selector: F128,
+    prefix: C1DuplexProverWalkPrefix,
+}
+
+impl C1RecordingDuplexProverWalkContinuation<'_, '_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn s0(&self) -> &[Vec<F128>; STATE_SIZE] {
+        self.s0
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<
+        (
+            C1RecordingDuplexRegionWalkDeferredProof,
+            Vec<C1QuirkyDirectClaim>,
+        ),
+        RegionSidecarError,
+    > {
+        let (authority, terminal_claims) = if self.vk.is_selected() {
+            prove_c1_duplex_walk_suffix_selected(
+                self.vk.w_log,
+                &self.vk.fixed,
+                &recording_ref_sets(self.vk),
+                self.selector,
+                &self.committed,
+                self.prefix,
+                terminal,
+                challenger,
+            )
+        } else {
+            prove_c1_duplex_walk_suffix(
+                self.vk.w_log,
+                &self.vk.fixed,
+                &self.vk.refs,
+                &self.vk.rec_refs,
+                &self.committed,
+                self.prefix,
+                terminal,
+                challenger,
+            )
+        };
+        let claims = resolve_c1_recording_terminal_claims(
+            self.vk,
+            self.total_vars,
+            self.selector,
+            terminal_claims,
+        )?;
+        Ok((
+            C1RecordingDuplexRegionWalkDeferredProof::new(self.selector, authority),
+            claims,
+        ))
+    }
+}
+
 impl<'a> RecordingDuplexRegionProverPlan<'a> {
     pub fn new(
         vk: &'a RecordingDuplexRegionVk,
@@ -689,6 +853,48 @@ impl<'a> RecordingDuplexRegionProverPlan<'a> {
             prefix,
         })
     }
+
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1RecordingDuplexProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        if z.is_empty() || !z.len().is_power_of_two() {
+            return Err(RegionSidecarError::WitnessShape);
+        }
+        let total_vars = z.len().trailing_zeros() as usize;
+        self.vk.validate_in_witness(total_vars)?;
+        let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
+            let slice = self.vk.slices[column];
+            &z[slice.start()..slice.start() + slice.len()]
+        });
+        let selector = if let Some(slice) = self.vk.selector_slice() {
+            z[slice.start()]
+        } else {
+            F128::ZERO
+        };
+        if selector != F128::ZERO && selector != F128::ONE {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        bind_recording_vk(challenger, self.vk);
+        bind_recording_selector(challenger, selector);
+        let prefix = prove_c1_duplex_walk_prefix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.vk.refs,
+            &committed,
+            self.s_out,
+            challenger,
+        );
+        Ok(C1RecordingDuplexProverWalkContinuation {
+            vk: self.vk,
+            total_vars,
+            committed,
+            s0: self.s0,
+            selector,
+            prefix,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -738,6 +944,54 @@ impl RecordingDuplexVerifierWalkContinuation<'_> {
     }
 }
 
+pub(crate) struct C1RecordingDuplexVerifierWalkContinuation<'a> {
+    vk: &'a RecordingDuplexRegionVk,
+    total_vars: usize,
+    selector: F128,
+    prefix: C1DuplexVerifierWalkPrefix<'a>,
+}
+
+impl C1RecordingDuplexVerifierWalkContinuation<'_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let terminal_claims = if self.vk.is_selected() {
+            verify_c1_duplex_walk_suffix_selected(
+                self.vk.w_log,
+                &self.vk.fixed,
+                &recording_ref_sets(self.vk),
+                self.selector,
+                self.prefix,
+                terminal,
+                challenger,
+            )
+        } else {
+            verify_c1_duplex_walk_suffix(
+                self.vk.w_log,
+                &self.vk.fixed,
+                &self.vk.refs,
+                &self.vk.rec_refs,
+                self.prefix,
+                terminal,
+                challenger,
+            )
+        }
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+        resolve_c1_recording_terminal_claims(
+            self.vk,
+            self.total_vars,
+            self.selector,
+            terminal_claims,
+        )
+    }
+}
+
 pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
     vk: &'a RecordingDuplexRegionVk,
     total_vars: usize,
@@ -756,6 +1010,50 @@ pub(crate) fn verify_recording_duplex_region_walk_deferred_prefix<'a, Ch: Challe
     )
     .map_err(|_| RegionSidecarError::InvalidProof)?;
     Ok(RecordingDuplexVerifierWalkContinuation {
+        vk,
+        total_vars,
+        selector: proof.selector(),
+        prefix,
+    })
+}
+
+pub(crate) fn verify_c1_recording_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
+    vk: &'a RecordingDuplexRegionVk,
+    total_vars: usize,
+    proof: &'a C1RecordingDuplexRegionWalkDeferredProof,
+    challenger: &mut Ch,
+) -> Result<C1RecordingDuplexVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    vk.validate_certified_c1_in_witness(total_vars)?;
+    let validate_micros = total_started.elapsed().as_micros();
+    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION
+        || (vk.is_selected() && proof.selector() != F128::ZERO && proof.selector() != F128::ONE)
+        || (!vk.is_selected() && proof.selector() != F128::ZERO)
+    {
+        return Err(RegionSidecarError::InvalidProof);
+    }
+    bind_recording_vk(challenger, vk);
+    bind_recording_selector(challenger, proof.selector());
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+    let prefix_started = std::time::Instant::now();
+    let prefix = verify_c1_duplex_walk_prefix(
+        vk.w_log,
+        &vk.fixed,
+        &vk.refs,
+        proof.authority().as_ref(),
+        challenger,
+    )
+    .map_err(|_| RegionSidecarError::InvalidProof)?;
+    if timing {
+        eprintln!(
+            "[recording-duplex-c1 prefix] w_log={} validate_us={validate_micros} bind_us={bind_micros} proof_us={} total_us={}",
+            vk.w_log,
+            prefix_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1RecordingDuplexVerifierWalkContinuation {
         vk,
         total_vars,
         selector: proof.selector(),

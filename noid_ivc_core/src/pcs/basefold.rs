@@ -1890,6 +1890,10 @@ pub fn verify_c1<Ch: Challenger>(
     log_batch_size: usize,
     challenger: &mut Ch,
 ) -> Result<Vec<F256>, VerifyError> {
+    use rayon::prelude::*;
+
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
     if proof.round_messages.len() != log_msg_len || log_batch_size > log_msg_len {
         return Err(VerifyError::InvalidProofShape);
     }
@@ -1965,125 +1969,142 @@ pub fn verify_c1<Ch: Challenger>(
     let first_arity = arities.first().copied().unwrap_or(0);
     let initial_leaf_f128 = num_ntts;
     let post_row_batch_leaf_f256 = 1usize << first_arity;
+    let prefix_micros = total_started.elapsed().as_micros();
+    let queries_started = std::time::Instant::now();
 
-    for (query_index, query) in proof.queries.iter().enumerate() {
-        if query.position != positions[query_index] {
-            return Err(VerifyError::FoldMismatch {
-                query_index,
-                epoch: 0,
-            });
-        }
-        if query.initial_leaf.len() != initial_leaf_f128
-            || query.initial_path.len() != k_code
-            || query.epoch_leaves.len() != num_fri_commits
-            || query.epoch_paths.len() != num_fri_commits
-        {
-            return Err(VerifyError::InvalidProofShape);
-        }
-        let initial_hash = merkle::hash_leaf(&f128_slice_to_bytes(&query.initial_leaf));
-        if !merkle::verify_merkle_proof(
-            initial_codeword_root,
-            &initial_hash,
-            query.position,
-            &query.initial_path,
-        ) {
-            return Err(VerifyError::InitialMerkleFailed { query_index });
-        }
-
-        let post_row_batch_value =
-            row_batch_fold_one_c1(&query.initial_leaf, &challenges[..log_batch_size]);
-        let fri_challenge_start = log_batch_size;
-        let mut cumulative_arity = first_arity;
-        let mut expected = if arities.is_empty() {
-            post_row_batch_value
-        } else {
-            if query.post_row_batch_leaf.len() != post_row_batch_leaf_f256
-                || query.post_row_batch_path.len() != k_code - first_arity
-            {
-                return Err(VerifyError::InvalidProofShape);
-            }
-            let leaf_index = query.position >> first_arity;
-            let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(&query.post_row_batch_leaf));
-            if !merkle::verify_merkle_proof(
-                &proof.post_row_batch_commit.root,
-                &leaf_hash,
-                leaf_index,
-                &query.post_row_batch_path,
-            ) {
-                return Err(VerifyError::InitialMerkleFailed { query_index });
-            }
-            let offset = query.position & ((1usize << first_arity) - 1);
-            if query.post_row_batch_leaf[offset] != post_row_batch_value {
+    // Query positions are transcript-bound above. Every opening can now be
+    // checked independently through the node's bounded Rayon pool. Collect
+    // indexed results before returning an error so rejection remains ordered
+    // by query index even though the work itself is parallel.
+    let query_results = proof
+        .queries
+        .par_iter()
+        .enumerate()
+        .map(|(query_index, query)| -> Result<(), VerifyError> {
+            if query.position != positions[query_index] {
                 return Err(VerifyError::FoldMismatch {
                     query_index,
                     epoch: 0,
                 });
             }
-            fri_fold_coset_c1(
-                &query.post_row_batch_leaf,
-                &challenges[fri_challenge_start..fri_challenge_start + first_arity],
-                ntt,
-                k_code,
-                leaf_index,
-            )
-        };
-
-        for epoch in 0..num_fri_commits {
-            let leaf = &query.epoch_leaves[epoch];
-            let next_arity = arities[epoch + 1];
-            if leaf.len() != 1usize << next_arity {
+            if query.initial_leaf.len() != initial_leaf_f128
+                || query.initial_path.len() != k_code
+                || query.epoch_leaves.len() != num_fri_commits
+                || query.epoch_paths.len() != num_fri_commits
+            {
                 return Err(VerifyError::InvalidProofShape);
             }
-            let position_at_layer = query.position >> cumulative_arity;
-            let leaf_index = position_at_layer >> next_arity;
-            let offset = position_at_layer & ((1usize << next_arity) - 1);
-            if query.epoch_paths[epoch].len() != k_code - cumulative_arity - next_arity {
-                return Err(VerifyError::InvalidProofShape);
-            }
-            let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(leaf));
+            let initial_hash = merkle::hash_leaf(&f128_slice_to_bytes(&query.initial_leaf));
             if !merkle::verify_merkle_proof(
-                &proof.round_commitments[epoch].root,
-                &leaf_hash,
-                leaf_index,
-                &query.epoch_paths[epoch],
+                initial_codeword_root,
+                &initial_hash,
+                query.position,
+                &query.initial_path,
             ) {
-                return Err(VerifyError::RoundMerkleFailed { query_index, epoch });
+                return Err(VerifyError::InitialMerkleFailed { query_index });
             }
-            if leaf[offset] != expected {
-                return Err(VerifyError::FoldMismatch { query_index, epoch });
-            }
-            let input_layer = k_code - cumulative_arity;
-            expected = fri_fold_coset_c1(
-                leaf,
-                &challenges[fri_challenge_start + cumulative_arity
-                    ..fri_challenge_start + cumulative_arity + next_arity],
-                ntt,
-                input_layer,
-                leaf_index,
-            );
-            cumulative_arity += next_arity;
-        }
 
-        if let Some((_, tail_cumulative_arity)) = tail_layout {
-            debug_assert_eq!(cumulative_arity, tail_cumulative_arity);
-            let tail_position = query.position >> cumulative_arity;
-            if proof.plaintext_tail[tail_position] != expected {
-                return Err(VerifyError::FoldMismatch {
-                    query_index,
-                    epoch: num_fri_commits,
-                });
+            let post_row_batch_value =
+                row_batch_fold_one_c1(&query.initial_leaf, &challenges[..log_batch_size]);
+            let fri_challenge_start = log_batch_size;
+            let mut cumulative_arity = first_arity;
+            let mut expected = if arities.is_empty() {
+                post_row_batch_value
+            } else {
+                if query.post_row_batch_leaf.len() != post_row_batch_leaf_f256
+                    || query.post_row_batch_path.len() != k_code - first_arity
+                {
+                    return Err(VerifyError::InvalidProofShape);
+                }
+                let leaf_index = query.position >> first_arity;
+                let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(&query.post_row_batch_leaf));
+                if !merkle::verify_merkle_proof(
+                    &proof.post_row_batch_commit.root,
+                    &leaf_hash,
+                    leaf_index,
+                    &query.post_row_batch_path,
+                ) {
+                    return Err(VerifyError::InitialMerkleFailed { query_index });
+                }
+                let offset = query.position & ((1usize << first_arity) - 1);
+                if query.post_row_batch_leaf[offset] != post_row_batch_value {
+                    return Err(VerifyError::FoldMismatch {
+                        query_index,
+                        epoch: 0,
+                    });
+                }
+                fri_fold_coset_c1(
+                    &query.post_row_batch_leaf,
+                    &challenges[fri_challenge_start..fri_challenge_start + first_arity],
+                    ntt,
+                    k_code,
+                    leaf_index,
+                )
+            };
+
+            for epoch in 0..num_fri_commits {
+                let leaf = &query.epoch_leaves[epoch];
+                let next_arity = arities[epoch + 1];
+                if leaf.len() != 1usize << next_arity {
+                    return Err(VerifyError::InvalidProofShape);
+                }
+                let position_at_layer = query.position >> cumulative_arity;
+                let leaf_index = position_at_layer >> next_arity;
+                let offset = position_at_layer & ((1usize << next_arity) - 1);
+                if query.epoch_paths[epoch].len() != k_code - cumulative_arity - next_arity {
+                    return Err(VerifyError::InvalidProofShape);
+                }
+                let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(leaf));
+                if !merkle::verify_merkle_proof(
+                    &proof.round_commitments[epoch].root,
+                    &leaf_hash,
+                    leaf_index,
+                    &query.epoch_paths[epoch],
+                ) {
+                    return Err(VerifyError::RoundMerkleFailed { query_index, epoch });
+                }
+                if leaf[offset] != expected {
+                    return Err(VerifyError::FoldMismatch { query_index, epoch });
+                }
+                let input_layer = k_code - cumulative_arity;
+                expected = fri_fold_coset_c1(
+                    leaf,
+                    &challenges[fri_challenge_start + cumulative_arity
+                        ..fri_challenge_start + cumulative_arity + next_arity],
+                    ntt,
+                    input_layer,
+                    leaf_index,
+                );
+                cumulative_arity += next_arity;
             }
-        } else {
-            let final_position = query.position >> cumulative_arity;
-            if proof.final_codeword[final_position] != expected {
-                return Err(VerifyError::FoldMismatch {
-                    query_index,
-                    epoch: num_fri_commits,
-                });
+
+            if let Some((_, tail_cumulative_arity)) = tail_layout {
+                debug_assert_eq!(cumulative_arity, tail_cumulative_arity);
+                let tail_position = query.position >> cumulative_arity;
+                if proof.plaintext_tail[tail_position] != expected {
+                    return Err(VerifyError::FoldMismatch {
+                        query_index,
+                        epoch: num_fri_commits,
+                    });
+                }
+            } else {
+                let final_position = query.position >> cumulative_arity;
+                if proof.final_codeword[final_position] != expected {
+                    return Err(VerifyError::FoldMismatch {
+                        query_index,
+                        epoch: num_fri_commits,
+                    });
+                }
             }
-        }
+            Ok(())
+        })
+        .collect::<Vec<_>>();
+    for result in query_results {
+        result?;
     }
+    let queries_micros = queries_started.elapsed().as_micros();
 
+    let tail_started = std::time::Instant::now();
     if let Some((tail_len, tail_cumulative_arity)) = tail_layout {
         let remaining = log_dim - tail_cumulative_arity;
         let coset_len = 1usize << remaining;
@@ -2107,6 +2128,13 @@ pub fn verify_c1<Ch: Challenger>(
                 });
             }
         }
+    }
+    if timing {
+        eprintln!(
+            "[basefold-c1 verify] prefix_us={prefix_micros} queries_us={queries_micros} tail_us={} total_us={}",
+            tail_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
     }
 
     Ok(challenges)

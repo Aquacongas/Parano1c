@@ -162,7 +162,7 @@ pub struct QuirkyDirectClaimRef<'a> {
 
 /// C1 quirky opening claim. The committed vector remains F128-valued, while
 /// the point and claimed evaluation live in the extension challenge field.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct C1QuirkyDirectClaim {
     pub z_skip: F256,
     pub k_skip: usize,
@@ -544,6 +544,8 @@ pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
     proof: &C1BaseFoldProof,
     challenger: &mut Ch,
 ) -> Result<(), VerifyError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
     assert!(!claims.is_empty(), "need at least one C1 claim");
     let log_length = commitment.params.m - LOG_PACKING;
     for claim in claims {
@@ -565,7 +567,9 @@ pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
         .iter()
         .zip(&gammas)
         .fold(F256::ZERO, |sum, (claim, &gamma)| sum + gamma * claim.value);
+    let transcript_micros = total_started.elapsed().as_micros();
 
+    let basefold_started = std::time::Instant::now();
     let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
     let challenges = basefold::verify_c1(
         target,
@@ -578,7 +582,9 @@ pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
         challenger,
     )
     .map_err(VerifyError::BaseFold)?;
+    let basefold_micros = basefold_started.elapsed().as_micros();
 
+    let final_b_started = std::time::Instant::now();
     let eq_eval = |left: &[F256], right: &[F256]| {
         assert_eq!(left.len(), right.len());
         left.iter()
@@ -600,6 +606,13 @@ pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
     }
     if expected_final_b != proof.final_b {
         return Err(VerifyError::FinalBMismatch);
+    }
+    if timing {
+        eprintln!(
+            "[pcs-c1 verify] transcript_us={transcript_micros} basefold_us={basefold_micros} final_b_us={} total_us={}",
+            final_b_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
     }
     Ok(())
 }

@@ -51,6 +51,7 @@ pub mod permutation_network;
 pub mod public_arithmetic;
 pub mod r_pcs_region;
 pub mod region_source_binding;
+pub mod region_source_binding_c1;
 pub mod segment_compaction;
 pub mod self_verify;
 pub mod tx_body_spine;

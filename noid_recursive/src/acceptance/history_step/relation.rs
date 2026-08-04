@@ -22,6 +22,7 @@ use crate::acceptance::history_step_bank::{
     HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN, HISTORY_STEP_CLASS_COUNT,
     HISTORY_STEP_TIER_SLOT_COUNT,
 };
+use noid_ivc_core::challenger::Challenger;
 use noid_ivc_core::deep_chain::schedule::TranscriptOp;
 use noid_ivc_core::field_circuit::{f128_from_u128, ExtExpr};
 pub const HISTORY_STEP_WIRE_VERSION: u8 = 3;
@@ -698,6 +699,163 @@ impl BuiltHistoryStep {
     pub fn direct_block_vk(&self) -> &BlockRegionSidecarVk {
         self.preparations.direct_block.vk()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JointC1SidecarProbe {
+    pub prove_micros: u128,
+    pub verify_micros: u128,
+    pub proof_bytes: usize,
+    pub opening_claims: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JointC1FullProofProbe {
+    pub prove_micros: u128,
+    pub verify_micros: u128,
+    pub field_proof_bytes: usize,
+    pub sidecar_proof_bytes: usize,
+    pub opening_claims: usize,
+}
+
+/// Native correctness and timing probe for the single-pass C1 Link+Block
+/// sidecar. It deliberately excludes the enclosing Field proof and final PCS
+/// batch so the sidecar replacement can be compared in isolation before its
+/// recursive trace and wire codec become consensus authority.
+pub fn probe_built_history_step_joint_c1(
+    built: &BuiltHistoryStep,
+) -> Result<JointC1SidecarProbe, HistoryStepError> {
+    let parent_plan = LinkRegionProverPlan::new(
+        built.preparations.recursion.vk(),
+        built.preparations.recursion.prover_input(),
+    )?;
+    let block_plan = built.preparations.direct_block.prover_plan()?;
+    let total_vars = built.witness.len().trailing_zeros() as usize;
+
+    let mut prover = FsLaneChallenger::new_c1(b"history-step-joint-c1-native-probe");
+    let prove_started = std::time::Instant::now();
+    let (proof, prover_claims) = crate::region_sidecar::prove_joint_c1_region_sidecar(
+        &parent_plan,
+        &block_plan,
+        &built.witness,
+        &mut prover,
+    )?;
+    let prove_micros = prove_started.elapsed().as_micros();
+
+    let mut verifier = FsLaneChallenger::new_c1(b"history-step-joint-c1-native-probe");
+    let verify_started = std::time::Instant::now();
+    let verifier_claims = crate::region_sidecar::verify_joint_c1_region_sidecar(
+        built.preparations.recursion.vk(),
+        built.preparations.direct_block.vk(),
+        total_vars,
+        &proof,
+        &mut verifier,
+    )?;
+    let verify_micros = verify_started.elapsed().as_micros();
+    if prover_claims != verifier_claims || prover.sample_f256() != verifier.sample_f256() {
+        return Err(HistoryStepError::Region(RegionSidecarError::InvalidProof));
+    }
+    Ok(JointC1SidecarProbe {
+        prove_micros,
+        verify_micros,
+        proof_bytes: proof.byte_len(),
+        opening_claims: prover_claims.len(),
+    })
+}
+
+/// Full native experiment for the joint C1 sidecar, including the enclosing
+/// Field proof and the single shared C1 PCS opening batch. This does not alter
+/// the persisted HistoryStep wire type while the recursive trace is still
+/// being migrated.
+pub fn probe_built_history_step_joint_c1_full(
+    runtime: &HistoryStepRuntime,
+    built: &BuiltHistoryStep,
+) -> Result<JointC1FullProofProbe, HistoryStepError> {
+    validate_built_against_bank(runtime, built, &built.matrix)?;
+    let entry = runtime.bank().entry(built.class_id);
+    let parent_plan = LinkRegionProverPlan::new(
+        built.preparations.recursion.vk(),
+        built.preparations.recursion.prover_input(),
+    )?;
+    let block_plan = built.preparations.direct_block.prover_plan()?;
+    let mut opening_claims = 0usize;
+    let prove_started = std::time::Instant::now();
+    let mut prover = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
+    macro_rules! prove_with_matrix {
+        ($prove:path, $matrix:expr) => {{
+            $prove(
+                $matrix,
+                &built.witness,
+                &built.pcs_params,
+                &built.spec,
+                &built.io,
+                &entry.post_commit_digest(),
+                &mut prover,
+                |context| -> Result<_, RegionSidecarError> {
+                    let (proof, claims) = crate::region_sidecar::prove_joint_c1_region_sidecar(
+                        &parent_plan,
+                        &block_plan,
+                        context.witness(),
+                        context,
+                    )?;
+                    opening_claims = claims.len();
+                    context.append_c1_claims(claims);
+                    Ok(proof)
+                },
+            )
+        }};
+    }
+    let (field_proof, sidecar, commitment, prover_claim) = match &built.matrix {
+        HistoryStepMatrixLease::Resident(matrix) => prove_with_matrix!(
+            prove_field_c1_with_public_io_and_post_commit_context,
+            matrix.as_ref()
+        ),
+        HistoryStepMatrixLease::Compact(matrix) => prove_with_matrix!(
+            prove_field_compact_c1_with_public_io_and_post_commit_context,
+            matrix.as_ref()
+        ),
+    };
+    let sidecar = sidecar?;
+    let prove_micros = prove_started.elapsed().as_micros();
+
+    let verify_started = std::time::Instant::now();
+    let mut verifier = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
+    let (verifier_claim, _fresh) = verify_field_c1_deferred_matrix_with_post_commit_context(
+        &entry.shape(),
+        &entry.matrix_digest(),
+        &commitment,
+        &field_proof,
+        runtime.bank().spec(),
+        &built.io,
+        &entry.post_commit_digest(),
+        &sidecar,
+        &mut verifier,
+        |proof, context| {
+            let claims = crate::region_sidecar::verify_joint_c1_region_sidecar(
+                built.preparations.recursion.vk(),
+                built.preparations.direct_block.vk(),
+                context.total_vars(),
+                proof,
+                context,
+            )
+            .map_err(|_| VerifyError::Auxiliary)?;
+            context.append_c1_claims(claims);
+            Ok(())
+        },
+    )?;
+    let verify_micros = verify_started.elapsed().as_micros();
+    if prover_claim != verifier_claim || prover.sample_f256() != verifier.sample_f256() {
+        return Err(HistoryStepError::Verify(VerifyError::Auxiliary));
+    }
+
+    Ok(JointC1FullProofProbe {
+        prove_micros,
+        verify_micros,
+        field_proof_bytes: bincode::serialized_size(&field_proof)
+            .expect("C1 field proof serialized length") as usize,
+        sidecar_proof_bytes: sidecar.byte_len(),
+        opening_claims,
+    })
 }
 
 /// Full frozen relation emitted only for release matrix construction. Runtime
