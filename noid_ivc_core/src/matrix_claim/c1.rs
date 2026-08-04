@@ -360,6 +360,74 @@ fn round_coefficients_two_products(
         )
 }
 
+/// Phase-one coefficient kernel with the final stacked A/B coordinate kept
+/// factored out of both weight tables. The fresh weights are
+/// `[alpha * base, base]`; the incoming equality weights are
+/// `[(1 + point) * base, point * base]`. Folding those two affine factors
+/// into the corresponding A/B value halves produces exactly the same two
+/// coefficients without materializing either doubled weight table.
+fn round_coefficients_two_stacked_products(
+    u_base: &[F256],
+    alpha: F256,
+    g_v: &[F256],
+    incoming_base: &[F256],
+    incoming_stack_point: F256,
+    g_e: &[F256],
+) -> [F256; 2] {
+    let side_len = u_base.len();
+    debug_assert!(side_len > 1);
+    debug_assert_eq!(incoming_base.len(), side_len);
+    debug_assert_eq!(g_v.len(), 2 * side_len);
+    debug_assert_eq!(g_e.len(), 2 * side_len);
+    let half = side_len / 2;
+    (0..half)
+        .into_par_iter()
+        .map(|index| {
+            let low = 2 * index;
+            let high = low + 1;
+
+            let fresh_value_low = alpha * g_v[low] + g_v[side_len + low];
+            let fresh_value_delta =
+                alpha * (g_v[low] + g_v[high]) + g_v[side_len + low] + g_v[side_len + high];
+            let incoming_value_low =
+                g_e[low] + incoming_stack_point * (g_e[low] + g_e[side_len + low]);
+            let incoming_value_delta = g_e[low]
+                + g_e[high]
+                + incoming_stack_point
+                    * (g_e[low] + g_e[high] + g_e[side_len + low] + g_e[side_len + high]);
+
+            [
+                u_base[low] * fresh_value_low + incoming_base[low] * incoming_value_low,
+                (u_base[low] + u_base[high]) * fresh_value_delta
+                    + (incoming_base[low] + incoming_base[high]) * incoming_value_delta,
+            ]
+        })
+        .reduce(
+            || [F256::ZERO; 2],
+            |left, right| [left[0] + right[0], left[1] + right[1]],
+        )
+}
+
+fn final_stacked_round_coefficients(
+    u_base: F256,
+    alpha: F256,
+    g_v: &[F256],
+    incoming_base: F256,
+    incoming_stack_point: F256,
+    g_e: &[F256],
+) -> [F256; 2] {
+    debug_assert_eq!(g_v.len(), 2);
+    debug_assert_eq!(g_e.len(), 2);
+    let u_low = u_base * alpha;
+    let u_high = u_base;
+    let incoming_low = incoming_base * (F256::ONE + incoming_stack_point);
+    let incoming_high = incoming_base * incoming_stack_point;
+    [
+        u_low * g_v[0] + incoming_low * g_e[0],
+        (u_low + u_high) * (g_v[0] + g_v[1]) + (incoming_low + incoming_high) * (g_e[0] + g_e[1]),
+    ]
+}
+
 fn round_coefficients_one_product(weights: &[F256], values: &[F256]) -> [F256; 2] {
     let half = weights.len() / 2;
     (0..half)
@@ -403,6 +471,7 @@ fn mix_and_round_coefficients_one_product(
         )
 }
 
+#[cfg(test)]
 fn run_phase<Ch: Challenger>(
     mut claim: F256,
     mut w1: Vec<F256>,
@@ -430,6 +499,76 @@ fn run_phase<Ch: Challenger>(
         (g2, spare) = fold_table_pairs_reusing(g2, spare, challenge);
     }
     (rounds, point, claim, [w1[0], g1[0], w2[0], g2[0]])
+}
+
+fn run_phase_stacked<Ch: Challenger>(
+    mut claim: F256,
+    mut u_base: Vec<F256>,
+    alpha: F256,
+    mut g_v: Vec<F256>,
+    mut incoming_base: Vec<F256>,
+    incoming_stack_point: F256,
+    mut g_e: Vec<F256>,
+    channel: &mut Ch,
+) -> (Vec<[F256; 2]>, Vec<F256>, F256, [F256; 4]) {
+    debug_assert_eq!(u_base.len(), incoming_base.len());
+    debug_assert_eq!(g_v.len(), 2 * u_base.len());
+    debug_assert_eq!(g_e.len(), 2 * u_base.len());
+    let rounds_count = u_base.len().trailing_zeros() as usize + 1;
+    let mut rounds = Vec::with_capacity(rounds_count);
+    let mut point = Vec::with_capacity(rounds_count);
+    let mut spare = Vec::new();
+
+    while u_base.len() > 1 {
+        let [constant, quadratic] = round_coefficients_two_stacked_products(
+            &u_base,
+            alpha,
+            &g_v,
+            &incoming_base,
+            incoming_stack_point,
+            &g_e,
+        );
+        let linear = claim + quadratic;
+        let wire = [constant, quadratic];
+        channel.observe_f256_slice(&wire);
+        let challenge = channel.sample_f256();
+        claim = (quadratic * challenge + linear) * challenge + constant;
+        rounds.push(wire);
+        point.push(challenge);
+        (u_base, spare) = fold_table_pairs_reusing(u_base, spare, challenge);
+        (g_v, spare) = fold_table_pairs_reusing(g_v, spare, challenge);
+        (incoming_base, spare) = fold_table_pairs_reusing(incoming_base, spare, challenge);
+        (g_e, spare) = fold_table_pairs_reusing(g_e, spare, challenge);
+    }
+
+    let [constant, quadratic] = final_stacked_round_coefficients(
+        u_base[0],
+        alpha,
+        &g_v,
+        incoming_base[0],
+        incoming_stack_point,
+        &g_e,
+    );
+    let linear = claim + quadratic;
+    let wire = [constant, quadratic];
+    channel.observe_f256_slice(&wire);
+    let challenge = channel.sample_f256();
+    claim = (quadratic * challenge + linear) * challenge + constant;
+    rounds.push(wire);
+    point.push(challenge);
+
+    let u_final = u_base[0] * (alpha + challenge * (alpha + F256::ONE));
+    let incoming_low = F256::ONE + incoming_stack_point;
+    let incoming_final =
+        incoming_base[0] * (incoming_low + challenge * (incoming_low + incoming_stack_point));
+    (g_v, spare) = fold_table_pairs_reusing(g_v, spare, challenge);
+    (g_e, _) = fold_table_pairs_reusing(g_e, spare, challenge);
+    (
+        rounds,
+        point,
+        claim,
+        [u_final, g_v[0], incoming_final, g_e[0]],
+    )
 }
 
 fn run_phase_one_product<Ch: Challenger>(
@@ -468,34 +607,37 @@ fn build_eq_table_scaled(point: &[F256], scale: F256) -> Vec<F256> {
     for (round, &challenge) in point.iter().enumerate() {
         let length = 1usize << round;
         output.resize(2 * length, F256::ZERO);
-        for index in 0..length {
-            let value = output[index];
-            output[index + length] = value * challenge;
-            output[index] = value * (F256::ONE + challenge);
+        let one_plus = F256::ONE + challenge;
+        let (low, high) = output.split_at_mut(length);
+        if length >= 4096 {
+            low.par_iter_mut()
+                .zip(high.par_iter_mut())
+                .for_each(|(low, high)| {
+                    let value = *low;
+                    *high = value * challenge;
+                    *low = value * one_plus;
+                });
+        } else {
+            for (low, high) in low.iter_mut().zip(high.iter_mut()) {
+                let value = *low;
+                *high = value * challenge;
+                *low = value * one_plus;
+            }
         }
     }
     output
 }
 
-fn build_stacked_u_weights(
-    k_log: usize,
-    k_skip: usize,
-    alpha: F256,
-    lambda: &[F256],
-    rest: &[F256],
-) -> Vec<F256> {
+fn build_u_base_weights(k_log: usize, k_skip: usize, lambda: &[F256], rest: &[F256]) -> Vec<F256> {
     let width = 1usize << k_log;
     let low_count = 1usize << k_skip;
-    let mut output = vec![F256::ZERO; 2 * width];
-    let (a, b) = output.split_at_mut(width);
-    a.par_chunks_mut(low_count)
-        .zip(b.par_chunks_mut(low_count))
+    let mut output = vec![F256::ZERO; width];
+    output
+        .par_chunks_mut(low_count)
         .zip(rest.par_iter())
-        .for_each(|((a, b), &rest_weight)| {
-            for ((a, b), &low_weight) in a.iter_mut().zip(b).zip(lambda) {
-                let base = low_weight * rest_weight;
-                *a = alpha * base;
-                *b = base;
+        .for_each(|(chunk, &rest_weight)| {
+            for (output, &low_weight) in chunk.iter_mut().zip(lambda) {
+                *output = low_weight * rest_weight;
             }
         });
     output
@@ -658,6 +800,10 @@ fn prove_from_rows<Ch: Challenger>(
     gate: bool,
     channel: &mut Ch,
 ) -> (C1MatrixFoldProof, C1MatrixAccClaim) {
+    let timing = std::env::var_os("NOIDH_MATRIX_FOLD_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    let storage = rows.storage_name();
+    let gate_enabled = gate;
     let k_log = rows.k_log();
     let k_skip = rows.k_skip();
     let width = 1usize << k_log;
@@ -671,6 +817,7 @@ fn prove_from_rows<Ch: Challenger>(
     let gamma = channel.sample_f256();
     let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
 
+    let tables_started = std::time::Instant::now();
     let rest = build_eq_table(&fresh.r_inner_rest);
     let low_count = 1usize << k_skip;
     let mut v_table = vec![F256::ZERO; width];
@@ -683,19 +830,35 @@ fn prove_from_rows<Ch: Challenger>(
             }
         });
     let e_c = build_eq_table(incoming_column);
+    let tables_ms = tables_started.elapsed().as_millis();
 
+    let row_images_started = std::time::Instant::now();
     let mut g_v = vec![F256::ZERO; 2 * width];
     let mut g_e = vec![F256::ZERO; 2 * width];
     rows.fill_row_images_c1(&v_table, &e_c, &mut g_v, &mut g_e);
+    let row_images_ms = row_images_started.elapsed().as_millis();
 
+    let phase1_weights_started = std::time::Instant::now();
     let lambda = lagrange_weights(k_skip, fresh.z_skip, 0);
     let inner = build_eq_table(&fresh.x_inner_rest);
-    let w_u = build_stacked_u_weights(k_log, k_skip, fresh.alpha, &lambda, &inner);
+    let u_base = build_u_base_weights(k_log, k_skip, &lambda, &inner);
     let gamma_gate = gamma * gate;
-    let incoming_row_weights = build_eq_table_scaled(incoming_row, gamma_gate);
+    let incoming_base = build_eq_table_scaled(&incoming_row[..k_log], gamma_gate);
+    let incoming_stack_point = incoming_row[k_log];
+    let phase1_weights_ms = phase1_weights_started.elapsed().as_millis();
     let phase1_target = fresh.value + gamma_gate * incoming.value;
-    let (phase1_rounds, rho, phase1_claim, phase1_finals) =
-        run_phase(phase1_target, w_u, g_v, incoming_row_weights, g_e, channel);
+    let phase1_started = std::time::Instant::now();
+    let (phase1_rounds, rho, phase1_claim, phase1_finals) = run_phase_stacked(
+        phase1_target,
+        u_base,
+        fresh.alpha,
+        g_v,
+        incoming_base,
+        incoming_stack_point,
+        g_e,
+        channel,
+    );
+    let phase1_ms = phase1_started.elapsed().as_millis();
     let g_v = phase1_finals[1];
     let g_e = phase1_finals[3];
     debug_assert_eq!(
@@ -706,18 +869,31 @@ fn prove_from_rows<Ch: Challenger>(
     channel.observe_f256(g_e);
     let delta = channel.sample_f256();
 
+    let column_image_started = std::time::Instant::now();
     let equality = FactoredEqTable::new(&rho);
     let h = rows.weighted_column_image_c1(&equality);
+    let column_image_ms = column_image_started.elapsed().as_millis();
     let delta_gate = delta * gate;
     let mut phase2_weights = v_table;
+    let phase2_mix_started = std::time::Instant::now();
     let first_round =
         mix_and_round_coefficients_one_product(&mut phase2_weights, &e_c, &h, delta_gate);
+    let phase2_mix_ms = phase2_mix_started.elapsed().as_millis();
     let phase2_target = g_v + delta_gate * g_e;
+    let phase2_started = std::time::Instant::now();
     let (phase2_rounds, sigma, phase2_claim, phase2_finals) =
         run_phase_one_product(phase2_target, phase2_weights, h, Some(first_round), channel);
+    let phase2_ms = phase2_started.elapsed().as_millis();
     let final_matrix_eval = phase2_finals[1];
     debug_assert_eq!(phase2_finals[0] * final_matrix_eval, phase2_claim);
     channel.observe_f256(final_matrix_eval);
+
+    if timing {
+        eprintln!(
+            "[matrix-fold-c1] storage={storage} k_log={k_log} gate={gate_enabled} tables={tables_ms}ms row-images={row_images_ms}ms phase1-weights={phase1_weights_ms}ms phase1={phase1_ms}ms column-image={column_image_ms}ms phase2-mix={phase2_mix_ms}ms phase2-round0=fused phase2={phase2_ms}ms total={}ms",
+            total_started.elapsed().as_millis()
+        );
+    }
 
     let mut point = rho;
     point.extend(sigma);
@@ -1028,6 +1204,66 @@ mod tests {
             F128::new(seed, seed.rotate_left(7)),
             F128::new(!seed, seed ^ 0xC1),
         )
+    }
+
+    #[test]
+    fn factored_stacked_phase_matches_dense_phase() {
+        for k_log in 1..=8 {
+            let width = 1usize << k_log;
+            let alpha = value(0x1000 + k_log as u64);
+            let stack_point = value(0x2000 + k_log as u64);
+            let u_base = (0..width)
+                .map(|index| value(0x3000 + index as u64))
+                .collect::<Vec<_>>();
+            let incoming_base = (0..width)
+                .map(|index| value(0x4000 + index as u64))
+                .collect::<Vec<_>>();
+            let g_v = (0..2 * width)
+                .map(|index| value(0x5000 + index as u64))
+                .collect::<Vec<_>>();
+            let g_e = (0..2 * width)
+                .map(|index| value(0x6000 + index as u64))
+                .collect::<Vec<_>>();
+
+            let mut u_dense = Vec::with_capacity(2 * width);
+            u_dense.extend(u_base.iter().map(|&weight| alpha * weight));
+            u_dense.extend_from_slice(&u_base);
+            let mut incoming_dense = Vec::with_capacity(2 * width);
+            incoming_dense.extend(
+                incoming_base
+                    .iter()
+                    .map(|&weight| (F256::ONE + stack_point) * weight),
+            );
+            incoming_dense.extend(incoming_base.iter().map(|&weight| stack_point * weight));
+            let claim = u_dense
+                .iter()
+                .zip(&g_v)
+                .chain(incoming_dense.iter().zip(&g_e))
+                .fold(F256::ZERO, |sum, (&weight, &entry)| sum + weight * entry);
+
+            let mut dense_channel = FsLaneChallenger::new_c1(b"matrix-fold-c1-stacked-test");
+            let dense = run_phase(
+                claim,
+                u_dense,
+                g_v.clone(),
+                incoming_dense,
+                g_e.clone(),
+                &mut dense_channel,
+            );
+            let mut factored_channel = FsLaneChallenger::new_c1(b"matrix-fold-c1-stacked-test");
+            let factored = run_phase_stacked(
+                claim,
+                u_base,
+                alpha,
+                g_v,
+                incoming_base,
+                stack_point,
+                g_e,
+                &mut factored_channel,
+            );
+            assert_eq!(factored, dense);
+            assert_eq!(factored_channel.sample_f256(), dense_channel.sample_f256());
+        }
     }
 
     #[test]

@@ -40,10 +40,21 @@ pub(crate) fn build_eq_table(point: &[F256]) -> Vec<F256> {
         let one_plus = F256::ONE + challenge;
         let len = 1usize << index;
         out.resize(2 * len, F256::ZERO);
-        for slot in 0..len {
-            let value = out[slot];
-            out[slot + len] = value * challenge;
-            out[slot] = value * one_plus;
+        let (low, high) = out.split_at_mut(len);
+        if len >= 4096 {
+            low.par_iter_mut()
+                .zip(high.par_iter_mut())
+                .for_each(|(low, high)| {
+                    let value = *low;
+                    *high = value * challenge;
+                    *low = value * one_plus;
+                });
+        } else {
+            for (low, high) in low.iter_mut().zip(high.iter_mut()) {
+                let value = *low;
+                *high = value * challenge;
+                *low = value * one_plus;
+            }
         }
     }
     out

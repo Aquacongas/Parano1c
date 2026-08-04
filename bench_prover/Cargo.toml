@@ -58,3 +58,7 @@ harness = false
 [[bench]]
 name = "history_step_proof"
 harness = false
+
+[[bench]]
+name = "matrix_claim_c1"
+harness = false
