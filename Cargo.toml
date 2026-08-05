@@ -12,6 +12,7 @@ members = [
     "noid_gkr",
     "noid_block",
     "noid_recursive",
+    "noid_soundness",
     # Node Infrastructure
     "noid_mempool",
     "noid_miner",

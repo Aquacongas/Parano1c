@@ -71,6 +71,12 @@ pub const DUPLEX_REGION_SIDECAR_VERSION: u8 = 1;
 pub const DUPLEX_REGION_COMMITTED_COLUMNS: usize = 6;
 pub const MERKLE_REGION_SIDECAR_VERSION: u8 = 1;
 pub const MERKLE_REGION_COMMITTED_COLUMNS: usize = 9;
+/// Number of Link claim groups in the production joint C1 History walk.
+pub const JOINT_C1_LINK_GROUPS: usize = 3;
+/// Number of Block claim groups in the production joint C1 History walk.
+pub const JOINT_C1_BLOCK_GROUPS: usize = 6;
+/// Total claim groups sharing each joint C1 deep-chain batching challenge.
+pub const JOINT_C1_GROUPS: usize = JOINT_C1_LINK_GROUPS + JOINT_C1_BLOCK_GROUPS;
 pub const MAX_MERKLE_PATTERN_LOG: usize = 20;
 const MAX_MERKLE_FAMILIES: usize = 64;
 const MAX_MERKLE_FIXED_CELLS: usize = 1 << 22;

@@ -521,7 +521,7 @@ struct Cli {
 
     /// Permit isolated block production without a peer quorum.
     /// Used for the first network node and explicit local-chain testing.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     genesis: bool,
 
     /// Miner payout address (canonical bech32m, beginning with `o1`).

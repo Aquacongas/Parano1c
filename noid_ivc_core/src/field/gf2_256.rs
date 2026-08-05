@@ -28,6 +28,9 @@ pub const F256_EXTENSION_TAU: F128 = F128 {
     hi: 0xB9E8_0FCC_7CA8_FE72,
 };
 
+/// Exact min-entropy of the C1 trace-one challenge support.
+pub const C1_CHALLENGE_MIN_ENTROPY_BITS: u32 = 255;
+
 /// One element of GF(2^256), in two flat GF(2^128) coordinates.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(C, align(16))]

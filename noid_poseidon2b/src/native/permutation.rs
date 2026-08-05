@@ -15,6 +15,7 @@ use noid_core::{
 use zeroize::Zeroize;
 
 pub const STATE_SIZE: usize = 4;
+pub const SBOX_EXPONENT: usize = 7;
 pub const F_ROUNDS: usize = 8;
 pub const P_ROUNDS: usize = 58;
 pub const N_ROUNDS: usize = F_ROUNDS + P_ROUNDS;

@@ -42,7 +42,7 @@ use super::link::{
     verify_c1_link_region_walk_deferred_prefix_trace, C1LinkRegionWalkDeferredProof,
     LinkRegionProverPlan, LinkRegionSidecarVk,
 };
-use super::RegionSidecarError;
+use super::{RegionSidecarError, JOINT_C1_BLOCK_GROUPS, JOINT_C1_GROUPS, JOINT_C1_LINK_GROUPS};
 
 pub(crate) const JOINT_C1_SIDECAR_VERSION: u8 = 1;
 const JOINT_C1_TRANSCRIPT_LABEL: &[u8] = b"history-region-sidecar-joint-c1-v1";
@@ -62,7 +62,7 @@ pub(crate) fn shape_only_joint_c1_region_sidecar_proof(
 ) -> Result<JointC1RegionSidecarProof, RegionSidecarError> {
     let link = shape_only_c1_link_region_walk_deferred_proof(link_vk, total_vars)?;
     let block = shape_only_c1_block_region_walk_deferred_proof(block_vk, total_vars)?;
-    let w_logs = [
+    let w_logs: [usize; JOINT_C1_GROUPS] = [
         link_vk.leaf_a().w_log(),
         link_vk.path_b().w_log(),
         link_vk.rec_c().w_log(),
@@ -371,9 +371,9 @@ pub(crate) fn prove_joint_c1_region_sidecar<Ch: Challenger>(
     let (walk, terminals) = prove_ragged_deep_chain_walk(&states, &groups, &mut child);
     lap("nine-child walk", &mut stage);
     let mut terminals = terminals.into_iter();
-    let link_terminals: [C1LaneClaimGroup; 3] =
+    let link_terminals: [C1LaneClaimGroup; JOINT_C1_LINK_GROUPS] =
         std::array::from_fn(|_| terminals.next().expect("three Link walk terminals"));
-    let block_terminals: [C1LaneClaimGroup; 6] =
+    let block_terminals: [C1LaneClaimGroup; JOINT_C1_BLOCK_GROUPS] =
         std::array::from_fn(|_| terminals.next().expect("six Block walk terminals"));
     assert!(terminals.next().is_none(), "nine joint walk terminals");
 
@@ -463,9 +463,9 @@ where
         .map_err(|_| RegionSidecarError::InvalidProof)?;
     let walk_micros = walk_started.elapsed().as_micros();
     let mut terminals = terminals.into_iter();
-    let link_terminals: [C1LaneClaimGroup; 3] =
+    let link_terminals: [C1LaneClaimGroup; JOINT_C1_LINK_GROUPS] =
         std::array::from_fn(|_| terminals.next().expect("three Link walk terminals"));
-    let block_terminals: [C1LaneClaimGroup; 6] =
+    let block_terminals: [C1LaneClaimGroup; JOINT_C1_BLOCK_GROUPS] =
         std::array::from_fn(|_| terminals.next().expect("six Block walk terminals"));
     if terminals.next().is_some() {
         return Err(RegionSidecarError::InvalidProof);
@@ -570,7 +570,7 @@ pub(crate) fn verify_joint_c1_region_sidecar_trace_post_commit<C: FsChannelOps>(
     }
     let walk = C1MultiDeepChainWalkProofTrace::alloc_ragged(b, &proof.walk, &w_logs);
     let terminals = verify_c1_ragged_deep_chain_walk_trace(b, &mut child, &w_logs, &groups, &walk);
-    if terminals.len() != 9 {
+    if terminals.len() != JOINT_C1_GROUPS {
         return Err(RegionSidecarError::InvalidProof);
     }
     let mut terminals = terminals.into_iter();
