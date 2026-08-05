@@ -463,7 +463,7 @@ fn mempool_tx_info(entry: noid_mempool::MempoolEntryMetadata) -> MempoolTxInfo {
         n_inputs: usize::from(entry.n_inputs),
         n_outputs: usize::from(entry.n_outputs),
         page_count,
-        minimum_proof_class: if requires_b255_miner { "B255" } else { "B64" }.to_owned(),
+        minimum_proof_class: if requires_b255_miner { "B255" } else { "B25" }.to_owned(),
         requires_b255_miner,
         admitted_height: entry.admitted_height,
         has_authorization: entry.has_authorization,
@@ -894,7 +894,7 @@ pub struct RpcHandler {
     /// Wakes the internal miner when a dynamic wallet payout changes.
     mining_template_changes: tokio::sync::broadcast::Sender<()>,
     /// Node-side proof capacity for external PoW templates. External workers
-    /// do not choose the B64/B255 class.
+    /// do not choose the B25/B255 class.
     external_mining_capacity: Arc<Mutex<AdaptiveProofCapacity>>,
 }
 
@@ -1268,7 +1268,7 @@ impl RpcHandler {
 
         let proof_class = prepared.proof_class();
         let user_pages = prepared.user_page_count();
-        let (previous_page_limit, next_page_limit, b64_prepare_ms_ewma, b255_prepare_ms_ewma) = {
+        let (previous_page_limit, next_page_limit, b25_prepare_ms_ewma, b255_prepare_ms_ewma) = {
             let mut capacity = self
                 .external_mining_capacity
                 .lock()
@@ -1278,7 +1278,7 @@ impl RpcHandler {
             (
                 previous,
                 capacity.page_limit(),
-                capacity.prepare_ms_ewma(noid_chain::consensus::paged_spend::BlockProofClass::B64),
+                capacity.prepare_ms_ewma(noid_chain::consensus::paged_spend::BlockProofClass::B25),
                 capacity.prepare_ms_ewma(noid_chain::consensus::paged_spend::BlockProofClass::B255),
             )
         };
@@ -1290,7 +1290,7 @@ impl RpcHandler {
             previous_page_limit,
             next_page_limit,
             history_step_ms = prepare_elapsed.as_millis(),
-            b64_prepare_ms_ewma,
+            b25_prepare_ms_ewma,
             b255_prepare_ms_ewma,
             "external mining template proved"
         );
@@ -1932,7 +1932,7 @@ impl ParanoidApiServer for RpcHandler {
             .sum::<u128>()
             .to_string();
         let proof_class = match stream.proof_class {
-            noid_chain::consensus::BlockProofClass::B64 => "B64 / m23",
+            noid_chain::consensus::BlockProofClass::B25 => "B25 / m22",
             noid_chain::consensus::BlockProofClass::B255 => "B255 / m24",
         }
         .to_string();
@@ -2985,7 +2985,7 @@ mod tests {
     }
 
     #[test]
-    fn mempool_status_exposes_the_exact_b64_b255_boundary() {
+    fn mempool_status_exposes_the_exact_b25_b255_boundary() {
         let metadata = |page_count| noid_mempool::MempoolEntryMetadata {
             tx_hash: noid_poseidon2b::primitives::TxBodyHash([page_count as u8; 32]),
             fee_micronoid: 7,
@@ -2997,13 +2997,13 @@ mod tests {
             has_authorization: true,
         };
 
-        let b64 = mempool_tx_info(metadata(64));
-        assert_eq!(b64.page_count, 64);
-        assert_eq!(b64.minimum_proof_class, "B64");
-        assert!(!b64.requires_b255_miner);
+        let b25 = mempool_tx_info(metadata(25));
+        assert_eq!(b25.page_count, 25);
+        assert_eq!(b25.minimum_proof_class, "B25");
+        assert!(!b25.requires_b255_miner);
 
-        let b255 = mempool_tx_info(metadata(65));
-        assert_eq!(b255.page_count, 65);
+        let b255 = mempool_tx_info(metadata(26));
+        assert_eq!(b255.page_count, 26);
         assert_eq!(b255.minimum_proof_class, "B255");
         assert!(b255.requires_b255_miner);
     }

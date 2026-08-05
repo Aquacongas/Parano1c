@@ -1175,7 +1175,7 @@ mod tests {
         );
         assert_eq!(schedules.owner_sidecar_layout().slots.len(), 1 << 7);
         assert_eq!(schedules.main_sidecar_layout().slots.len(), 1 << 8);
-        for tier in [64usize, 255] {
+        for tier in [25usize, 255] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             assert_eq!(geometry.auth_tiles << 7, 1 << geometry.owner_w_log);
             assert_eq!(geometry.auth_tiles << 8, 1 << geometry.main_w_log);

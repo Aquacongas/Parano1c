@@ -2515,7 +2515,7 @@ fn mock_block_details(height: u64) -> BlockDetailsSnapshot {
             alloc_counter: 1_284_162,
         },
         retained: Some(RetainedBlockSnapshot {
-            proof_class: "B64 / m23".into(),
+            proof_class: "B25 / m22".into(),
             logical_transactions: 2,
             user_pages: 2,
             live_inputs: 9,
@@ -3135,7 +3135,7 @@ mod tests {
     }
 
     #[test]
-    fn mock_consolidation_quote_obeys_the_b64_boundary() {
+    fn mock_consolidation_quote_obeys_the_b25_boundary() {
         let plan = mock_consolidation_plan();
         assert_eq!(plan.input_count, WALLET_CONSOLIDATION_INPUT_LIMIT);
         assert_eq!(plan.selected_input_slots.len(), plan.input_count);

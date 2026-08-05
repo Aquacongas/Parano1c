@@ -40,10 +40,9 @@ anyhow      = "1"
 thiserror   = "1"
 
 # HistoryStep is dominated by two large cross-crate prover phases. Thin LTO
-# plus one codegen unit removes enough abstraction/codegen overhead to keep the
-# sustained B64 p95 below the 15-second cadence target on the reference AVX2
-# laptop. This changes executable code only; proof relations and frozen matrix
-# bytes remain identical.
+# plus one codegen unit removes cross-crate abstraction and codegen overhead.
+# This changes executable code only; proof relations and frozen matrix bytes
+# remain identical.
 [profile.release]
 lto = "thin"
 codegen-units = 1

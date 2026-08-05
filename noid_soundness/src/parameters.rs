@@ -83,7 +83,7 @@ impl ProductionParameters {
             })
         };
 
-        let history_classes = [history_class(64)?, history_class(255)?];
+        let history_classes = [history_class(25)?, history_class(255)?];
         if history_classes[0].inverse_rate != history_classes[1].inverse_rate {
             return Err("production History classes use different rates".to_string());
         }
@@ -155,13 +155,13 @@ mod tests {
     #[test]
     fn both_recursive_history_classes_are_covered() {
         let classes = ProductionParameters::load().unwrap().history_classes;
-        assert_eq!(classes[0].tier, 64);
-        assert_eq!(classes[0].message_log2, 18);
-        assert_eq!(classes[0].codeword_log2, 20);
-        assert_eq!(classes[0].codeword_len, 1 << 20);
+        assert_eq!(classes[0].tier, 25);
+        assert_eq!(classes[0].message_log2, 17);
+        assert_eq!(classes[0].codeword_log2, 19);
+        assert_eq!(classes[0].codeword_len, 1 << 19);
         assert_eq!(classes[0].inverse_rate, 4);
-        assert_eq!(classes[0].plaintext_tail_len, 256);
-        assert_eq!(classes[0].fri_arities, [4, 4, 4, 4, 2]);
+        assert_eq!(classes[0].plaintext_tail_len, 128);
+        assert_eq!(classes[0].fri_arities, [4, 4, 4, 4, 1]);
         assert_eq!(classes[1].tier, 255);
         assert_eq!(classes[1].message_log2, 19);
         assert_eq!(classes[1].codeword_log2, 21);

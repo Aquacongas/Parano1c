@@ -106,14 +106,14 @@ pub struct NodeSettingsSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatrixClass {
-    B64,
+    B25,
     B255,
 }
 
 impl MatrixClass {
     pub const fn cli_value(self) -> &'static str {
         match self {
-            Self::B64 => "b64",
+            Self::B25 => "b25",
             Self::B255 => "b255",
         }
     }

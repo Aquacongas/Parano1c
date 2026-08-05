@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fresh 128-transaction mempool competition between two production miners."""
+"""Fresh 50-transaction mempool competition between two production miners."""
 
 import datetime
 import json
@@ -254,7 +254,7 @@ def main():
         parent = funder.info()
 
         # Stop only the future miners. The connected funder retains the exact
-        # 128-intent snapshot and serves it symmetrically when both miners
+        # 50-intent snapshot and serves it symmetrically when both miners
         # restart together on the same canonical parent.
         miner_a.request_stop()
         miner_b.request_stop()
@@ -332,13 +332,14 @@ def main():
             )
         distribution = {height: len(items) for height, items in sorted(by_height.items())}
         require(
-            sorted(distribution.values()) == [64, 64],
-            f"canonical B64 chain did not contain two full batches: {distribution}",
+            sorted(distribution.values())
+            == [shared.LOWER_CLASS_PAGES, shared.LOWER_CLASS_PAGES],
+            f"canonical B25 chain did not contain two full batches: {distribution}",
         )
         for height, items in by_height.items():
             positions = {position for _, position in items}
             require(
-                positions == set(range(1, 65)),
+                positions == set(range(1, shared.LOWER_CLASS_PAGES + 1)),
                 f"canonical tx positions at h{height} are incomplete",
             )
 
@@ -354,9 +355,13 @@ def main():
         }
         for name, log in (("miner-a", log_a), ("miner-b", log_b)):
             require(
-                re.search(r"mining template ready .*n_txs=65 .*max_user_pages=64", log)
+                re.search(
+                    rf"mining template ready .*n_txs={shared.LOWER_CLASS_PAGES + 1} "
+                    rf".*max_user_pages={shared.LOWER_CLASS_PAGES}",
+                    log,
+                )
                 is not None,
-                f"{name} never entered the full B64 race",
+                f"{name} never entered the full B25 race",
             )
             require(
                 re.search(
@@ -364,7 +369,7 @@ def main():
                     log,
                 )
                 is not None,
-                f"{name} did not receive the exact 128-intent snapshot",
+                f"{name} did not receive the exact {shared.SPAM_COUNT}-intent snapshot",
             )
         require(
             sum(len(blocks) for blocks in accepted.values()) >= 2,

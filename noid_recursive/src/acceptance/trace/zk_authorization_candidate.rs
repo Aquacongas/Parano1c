@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Selected-ZK authorization trace and private production B255 bridge over
+//! Selected-ZK authorization trace and private selected-class bridge over
 //! transcript and Wallet-B aliases.
 //!
 //! Its raw-slice tile adapter is private.  Shape-compatible [`WitnessSlice`]
@@ -603,7 +603,7 @@ impl SelectedZkAuthorizationProofBatch {
         match slot.kind() {
             CanonicalSelectedZkAuthorizationSlotKind::Live => &self.live_entries[index],
             CanonicalSelectedZkAuthorizationSlotKind::Ghost
-            | CanonicalSelectedZkAuthorizationSlotKind::Pad255 => &self.ghost_entry,
+            | CanonicalSelectedZkAuthorizationSlotKind::Pad => &self.ghost_entry,
         }
     }
 
@@ -688,7 +688,7 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
                 prepared.live_entries[index].statement()
             }
             CanonicalSelectedZkAuthorizationSlotKind::Ghost
-            | CanonicalSelectedZkAuthorizationSlotKind::Pad255 => prepared.ghost_entry.statement(),
+            | CanonicalSelectedZkAuthorizationSlotKind::Pad => prepared.ghost_entry.statement(),
         };
         assert_eq!(
             statement,
@@ -716,7 +716,7 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZkAuthorizationAllTilesTraceError {
     /// Every selected class has exactly its canonical dyadic authorization
-    /// capacity; B255 alone includes the dead PAD at index 255.
+    /// capacity, including every dead PAD above the physical page tier.
     StatementCount { expected: usize, actual: usize },
     Tile {
         index: usize,
@@ -792,11 +792,7 @@ fn materialize_selected_zk_authorization_statements(
             if let Some((tx_body_hash, expected_address)) = slot.body_aliases() {
                 return selected_zk_statement_from_body_aliases(tx_body_hash, expected_address);
             }
-            assert_eq!(index + 1, canonical.len());
-            assert_eq!(
-                slot.kind(),
-                CanonicalSelectedZkAuthorizationSlotKind::Pad255
-            );
+            assert_eq!(slot.kind(), CanonicalSelectedZkAuthorizationSlotKind::Pad);
             let native = canonical_selected_zk_ghost_statement();
             assert_eq!(slot.native_statement(), native);
             SelectedZkAuthorizationStatementTrace {
@@ -859,16 +855,13 @@ fn bind_selected_zk_authorization_all_tiles_trace(
     let meta_b = *vk.meta_b().slices();
 
     let ghost_statement = canonical_selected_zk_ghost_statement();
-    if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_PAGES {
-        assert_eq!(
-            canonical.slot(geometry.auth_tiles - 1).native_statement(),
-            ghost_statement
-        );
+    for index in geometry.tier..geometry.auth_tiles {
+        assert_eq!(canonical.slot(index).native_statement(), ghost_statement);
     }
     let fallback = canonical
         .slot(0)
         .body_aliases()
-        .expect("B255 slot zero is body-backed");
+        .expect("selected slot zero is body-backed");
     let preview = (0..canonical.len())
         .map(|index| {
             let slot = canonical.slot(index);
@@ -898,9 +891,8 @@ fn bind_selected_zk_authorization_all_tiles_trace(
                     assert!(slot.body_aliases().is_some());
                     assert_eq!(slot.native_statement(), ghost_statement);
                 }
-                CanonicalSelectedZkAuthorizationSlotKind::Pad255 => {
-                    assert_eq!(geometry.tier, 255);
-                    assert_eq!(index + 1, geometry.auth_tiles);
+                CanonicalSelectedZkAuthorizationSlotKind::Pad => {
+                    assert!(index >= geometry.tier && index < geometry.auth_tiles);
                     assert_eq!(live, F128::ZERO);
                     assert!(slot.body_aliases().is_none());
                     assert_eq!(slot.native_statement(), ghost_statement);
@@ -3402,7 +3394,7 @@ mod tests {
 
     #[test]
     fn selected_two_class_all_tiles_row_ledger_is_exact() {
-        for (tier, expected_rows) in [(64, 1_058_304), (255, 4_233_216)] {
+        for (tier, expected_rows) in [(25, 529_152), (255, 4_233_216)] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             assert_eq!(
                 geometry.auth_tiles * ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS,

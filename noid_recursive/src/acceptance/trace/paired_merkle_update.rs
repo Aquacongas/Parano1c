@@ -11,10 +11,10 @@
 //! ```
 //!
 //! The nine logical committed columns are, in order,
-//! `C0..C3, E0, E1, SIB0, SIB1, D`.  `new-even` copies `SIB/D` from the
-//! preceding `old-even` through a shift-2 consistency relation.  The two
-//! independent digest chains avoid a shift-3 by using otherwise idle odd
-//! `E` cells as bridges:
+//! `C0..C3, E0, E1, SIB0, SIB1, D`. Each level repeats `SIB/D` across its
+//! four slots, and a predecessor-shift consistency relation ties the three
+//! adjacent copies to the old-even source. The two independent digest chains
+//! avoid a shift-3 by using otherwise idle odd `E` cells as bridges:
 //!
 //! - `new-odd.E = old-odd.C` carries the old parent to the next old level;
 //! - the next `old-odd.E = previous new-odd.C` carries the new parent to
@@ -180,20 +180,19 @@ pub fn build_paired_merkle_update_columns(
         e[1][base + 2] = witness.new_entry[1];
         for level in 0..PAIRED_UPDATE_DEPTH {
             let old_even = base + PAIRED_UPDATE_SLOTS_PER_LEVEL * level;
-            let new_even = old_even + 2;
             for lane in 0..2 {
-                sib[lane][old_even] = witness.siblings[level][lane];
-                // A physically duplicated cell, algebraically tied by the
-                // NEW_EVEN shift-2 consistency relation below.
-                sib[lane][new_even] = witness.siblings[level][lane];
+                for slot in old_even..old_even + PAIRED_UPDATE_SLOTS_PER_LEVEL {
+                    sib[lane][slot] = witness.siblings[level][lane];
+                }
             }
             let direction = if witness.directions[level] {
                 F128::ONE
             } else {
                 F128::ZERO
             };
-            d[old_even] = direction;
-            d[new_even] = direction;
+            for slot in old_even..old_even + PAIRED_UPDATE_SLOTS_PER_LEVEL {
+                d[slot] = direction;
+            }
         }
     }
 
@@ -286,7 +285,7 @@ pub struct PairedMerkleUpdateRefs {
     pub odd_start: usize,
     pub odd_nonstart: usize,
     pub old_even: usize,
-    pub new_even: usize,
+    pub copy_step: usize,
     pub bridge: usize,
     pub iv: [usize; 2],
 }
@@ -308,7 +307,7 @@ pub fn paired_merkle_update_refs(
         odd_start: fixed_base + 4,
         odd_nonstart: fixed_base + 5,
         old_even: fixed_base + 6,
-        new_even: fixed_base + 7,
+        copy_step: fixed_base + 7,
         bridge: fixed_base + 8,
         iv: [fixed_base + 9, fixed_base + 10],
     }
@@ -324,7 +323,7 @@ pub fn paired_merkle_update_fixed_patterns(iv_flat: [F128; 2]) -> Vec<FixedPatte
     let mut odd_start = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
     let mut odd_nonstart = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
     let mut old_even = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
-    let mut new_even = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
+    let mut copy_step = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
     let mut bridge = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
     let mut iv0 = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
     let mut iv1 = vec![F128::ZERO; PAIRED_UPDATE_STRIDE];
@@ -350,7 +349,9 @@ pub fn paired_merkle_update_fixed_patterns(iv_flat: [F128; 2]) -> Vec<FixedPatte
             }
         }
         old_even[base] = F128::ONE;
-        new_even[base + 2] = F128::ONE;
+        for at in base + 1..base + PAIRED_UPDATE_SLOTS_PER_LEVEL {
+            copy_step[at] = F128::ONE;
+        }
         bridge[base + 3] = F128::ONE;
         if level > 0 {
             bridge[base + 1] = F128::ONE;
@@ -366,15 +367,15 @@ pub fn paired_merkle_update_fixed_patterns(iv_flat: [F128; 2]) -> Vec<FixedPatte
         pattern(odd_start),
         pattern(odd_nonstart),
         pattern(old_even),
-        pattern(new_even),
+        pattern(copy_step),
         pattern(bridge),
         pattern(iv0),
         pattern(iv1),
     ]
 }
 
-/// Zero relation for direction booleanity, odd-E bridges, and the physical
-/// new-even copies of the one native sibling/direction source.  Independent
+/// Zero relation for direction booleanity, odd-E bridges, and the adjacent
+/// sibling/direction copy chain within each four-slot level. Independent
 /// equations use powers of a post-commitment mixing challenge.
 ///
 /// Soundness requires all nine committed columns to be committed and absorbed
@@ -420,20 +421,20 @@ pub fn paired_merkle_update_consistency_terms(
     for lane in 0..2 {
         equation(
             vec![
-                ColRef::Fixed(refs.new_even),
+                ColRef::Fixed(refs.copy_step),
                 ColRef::Committed(refs.sib[lane]),
             ],
             vec![
-                ColRef::Fixed(refs.new_even),
-                ColRef::CommittedShift2(refs.sib[lane]),
+                ColRef::Fixed(refs.copy_step),
+                ColRef::CommittedShift(refs.sib[lane]),
             ],
         );
     }
     equation(
-        vec![ColRef::Fixed(refs.new_even), ColRef::Committed(refs.d)],
+        vec![ColRef::Fixed(refs.copy_step), ColRef::Committed(refs.d)],
         vec![
-            ColRef::Fixed(refs.new_even),
-            ColRef::CommittedShift2(refs.d),
+            ColRef::Fixed(refs.copy_step),
+            ColRef::CommittedShift(refs.d),
         ],
     );
     terms
@@ -919,14 +920,13 @@ mod tests {
         bad_new_bridge.e[1][5] += F128::ONE;
         assert!(!consistency_relation_holds(&bad_new_bridge));
 
-        // Keep the old/new direction copies equal so this failure isolates the
+        // Keep the direction-copy chain equal so this failure isolates the
         // old-even booleanity equation.
         let mut non_boolean = build_paired_merkle_update_columns(&[update], iv_flat(), 6);
         let value = flat_of_tower_u128(2);
         assert_ne!(value, F128::ZERO);
         assert_ne!(value, F128::ONE);
-        non_boolean.d[0] = value;
-        non_boolean.d[2] = value;
+        non_boolean.d[..PAIRED_UPDATE_SLOTS_PER_LEVEL].fill(value);
         assert!(!consistency_relation_holds(&non_boolean));
     }
 

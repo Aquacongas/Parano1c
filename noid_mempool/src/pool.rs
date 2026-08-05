@@ -427,7 +427,7 @@ impl AsyncMempool {
     ///
     /// The scan remains bounded by the consensus block maximum. Filtering is
     /// performed while entries are borrowed under the pool lock, so a
-    /// memory-governed B64 template does not first clone up to 255 cached proof
+    /// memory-governed B25 template does not first clone up to 255 cached proof
     /// bundles and discard the excess.
     pub async fn select_for_block_at_anchor(
         &self,

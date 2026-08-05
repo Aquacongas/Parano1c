@@ -1047,15 +1047,15 @@ mod tests {
     /// the complete authenticated relation.
     #[test]
     #[ignore = "production-width C1 performance benchmark"]
-    fn genuine_c1_joint_b64_sidecar_micro_profile() {
-        let w_logs = [14usize, 15, 17, 17, 14, 16, 17, 13, 14];
+    fn genuine_c1_joint_b25_sidecar_micro_profile() {
+        let w_logs = [14usize, 15, 17, 16, 12, 15, 16, 12, 13];
         let inputs = w_logs
             .iter()
             .enumerate()
-            .map(|(child, &w_log)| random_columns(w_log, 0xC1_B640 + child as u64))
+            .map(|(child, &w_log)| random_columns(w_log, 0xC1_2500 + child as u64))
             .collect::<Vec<_>>();
         let references = inputs.iter().collect::<Vec<_>>();
-        let mut rng = Rng(0xC1_B64F);
+        let mut rng = Rng(0xC1_25FF);
         let groups = w_logs
             .iter()
             .map(|&w_log| C1LaneClaimGroup {
@@ -1064,10 +1064,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let started = std::time::Instant::now();
-        let mut channel = FsLaneChallenger::new_c1(b"genuine-c1-joint-b64-sidecar-micro");
+        let mut channel = FsLaneChallenger::new_c1(b"genuine-c1-joint-b25-sidecar-micro");
         let (proof, terminals) = prove_ragged_deep_chain_walk(&references, &groups, &mut channel);
         eprintln!(
-            "NOIDH genuine-C1 joint-B64-sidecar elapsed_ms={} layers={} terminals={}",
+            "NOIDH genuine-C1 joint-B25-sidecar elapsed_ms={} layers={} terminals={}",
             started.elapsed().as_millis(),
             proof.layers.len(),
             terminals.len(),

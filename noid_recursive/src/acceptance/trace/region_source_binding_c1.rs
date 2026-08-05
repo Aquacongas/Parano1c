@@ -118,18 +118,61 @@ fn c1_merkle_zero_terms(families: &[MerkleProtocolFamily], lambda: F256) -> Vec<
     }
     for family in families {
         if let MerkleProtocolFamily::PairedUpdate { refs, .. } = family {
-            push_terms(
-                &mut terms,
-                F256::ONE,
-                [
+            let mut weight = F256::ONE;
+            for (left, right) in [
+                (
                     vec![
                         ColRef::Fixed(refs.old_even),
                         ColRef::Committed(refs.d),
                         ColRef::Committed(refs.d),
                     ],
                     vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
-                ],
-            );
+                ),
+                (
+                    vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[0])],
+                    vec![
+                        ColRef::Fixed(refs.bridge),
+                        ColRef::CommittedShift2(refs.c[0]),
+                    ],
+                ),
+                (
+                    vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[1])],
+                    vec![
+                        ColRef::Fixed(refs.bridge),
+                        ColRef::CommittedShift2(refs.c[1]),
+                    ],
+                ),
+                (
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::Committed(refs.sib[0]),
+                    ],
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::CommittedShift(refs.sib[0]),
+                    ],
+                ),
+                (
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::Committed(refs.sib[1]),
+                    ],
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::CommittedShift(refs.sib[1]),
+                    ],
+                ),
+                (
+                    vec![ColRef::Fixed(refs.copy_step), ColRef::Committed(refs.d)],
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::CommittedShift(refs.d),
+                    ],
+                ),
+            ] {
+                push_terms(&mut terms, weight, [left, right]);
+                weight *= lambda;
+            }
         }
     }
     terms

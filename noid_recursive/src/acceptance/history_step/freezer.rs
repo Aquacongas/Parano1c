@@ -29,28 +29,28 @@ use crate::acceptance::history_step_bank::{
 /// One consuming backbone witness. The variant is the compile-time Block tier;
 /// no runtime tier value can disagree with its relation type.
 pub enum HistoryStepFreezeInput {
-    B64(HistoryStepBlockInput<64>),
+    B25(HistoryStepBlockInput<25>),
     B255(HistoryStepBlockInput<255>),
 }
 
 impl HistoryStepFreezeInput {
     fn current_slot(&self) -> usize {
         match self {
-            Self::B64(_) => 0,
+            Self::B25(_) => 0,
             Self::B255(_) => 1,
         }
     }
 
     fn start_accumulator(&self) -> &ChainAccumulator {
         match self {
-            Self::B64(input) => input.start_accumulator(),
+            Self::B25(input) => input.start_accumulator(),
             Self::B255(input) => input.start_accumulator(),
         }
     }
 
     fn end_accumulator(&self) -> &ChainAccumulator {
         match self {
-            Self::B64(input) => input.end_accumulator(),
+            Self::B25(input) => input.end_accumulator(),
             Self::B255(input) => input.end_accumulator(),
         }
     }
@@ -67,11 +67,11 @@ pub trait HistoryStepFreezeInputProvider {
         expected_start: &ChainAccumulator,
     ) -> Result<Option<HistoryStepFreezeInput>, Self::Error>;
 
-    fn b64(
+    fn b25(
         &mut self,
         class: CanonicalHistoryStepClassId,
         expected_start: &ChainAccumulator,
-    ) -> Result<HistoryStepBlockInput<64>, Self::Error>;
+    ) -> Result<HistoryStepBlockInput<25>, Self::Error>;
 
     fn b255(
         &mut self,
@@ -258,7 +258,7 @@ fn prove_input(
     input: HistoryStepFreezeInput,
 ) -> Result<HistoryStepTerminal, HistoryStepError> {
     match input {
-        HistoryStepFreezeInput::B64(input) => prove_history_step(runtime, parent, input),
+        HistoryStepFreezeInput::B25(input) => prove_history_step(runtime, parent, input),
         HistoryStepFreezeInput::B255(input) => prove_history_step(runtime, parent, input),
     }
 }
@@ -281,7 +281,7 @@ fn assemble_input(
         };
     }
     match input {
-        HistoryStepFreezeInput::B64(input) => assemble!(input),
+        HistoryStepFreezeInput::B25(input) => assemble!(input),
         HistoryStepFreezeInput::B255(input) => assemble!(input),
     }
 }
@@ -312,7 +312,7 @@ where
             let class =
                 CanonicalHistoryStepClassId::new(slot).expect("backbone tier slot is canonical");
             let vk = match input {
-                HistoryStepFreezeInput::B64(input) => derive_history_step_direct_block_vk(input),
+                HistoryStepFreezeInput::B25(input) => derive_history_step_direct_block_vk(input),
                 HistoryStepFreezeInput::B255(input) => derive_history_step_direct_block_vk(input),
             }
             .map_err(|source| {
@@ -388,10 +388,10 @@ where
     if checkpoints[slot].replace(tip).is_some() {
         return Err(HistoryStepFreezeError::Backbone);
     }
-    let [Some(b64), Some(b255)] = checkpoints else {
+    let [Some(b25), Some(b255)] = checkpoints else {
         return Err(HistoryStepFreezeError::Backbone);
     };
-    Ok([b64, b255])
+    Ok([b25, b255])
 }
 
 fn class_input<P, S>(
@@ -403,7 +403,7 @@ where
     P: HistoryStepFreezeInputProvider,
 {
     match class.current_slot() {
-        0 => provider.b64(class, start).map(HistoryStepFreezeInput::B64),
+        0 => provider.b25(class, start).map(HistoryStepFreezeInput::B25),
         1 => provider
             .b255(class, start)
             .map(HistoryStepFreezeInput::B255),
@@ -430,7 +430,7 @@ where
         let started = Instant::now();
         let class =
             CanonicalHistoryStepClassId::from_index(index).expect("fixed HistoryStep class index");
-        // Freeze against the B64 checkpoint, then rebuild against every other
+        // Freeze against the B25 checkpoint, then rebuild against every other
         // parent checkpoint below. The two-arm relation must make those
         // matrices byte-identical for a fixed current class.
         let parent = &checkpoints[0];

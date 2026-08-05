@@ -31,8 +31,7 @@ impl ShapeClass {
         noid_chain::consensus::params::block_class_spend_capacity(self.tier)
     }
 
-    /// Authorization slots are power-of-two padded; B255 therefore carries
-    /// one canonical dead authorization slot.
+    /// Authorization slots are padded to the next power of two.
     pub fn authorization_capacity(self) -> usize {
         self.tier.next_power_of_two()
     }
@@ -55,7 +54,7 @@ impl ShapeClass {
     /// Physical bitmap-selected rows scanned by the stable compactor: ten
     /// positions per user body, the primary coinbase mint, and two
     /// fixed-position development-payout candidates gated by the schedule.
-    /// The B255 authorization PAD slot is deliberately not an action slot.
+    /// Dyadic authorization PAD slots are deliberately not action slots.
     pub fn action_candidate_capacity(self) -> usize {
         self.tier * noid_tx::TX_ACTIONS + 3
     }
@@ -109,7 +108,7 @@ impl ShapeClass {
     }
 }
 
-/// Every current class in canonical ladder order: B64, B255.
+/// Every current class in canonical ladder order: B25, B255.
 pub fn enumerate_shape_classes() -> impl Iterator<Item = ShapeClass> {
     noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS
         .into_iter()
@@ -127,7 +126,7 @@ mod tests {
         let classes: Vec<_> = enumerate_shape_classes().collect();
         assert_eq!(
             classes.iter().map(|class| class.tier).collect::<Vec<_>>(),
-            [64, 255]
+            [25, 255]
         );
         let digests: std::collections::HashSet<_> = classes
             .iter()
@@ -136,8 +135,8 @@ mod tests {
             .collect();
         assert_eq!(digests.len(), classes.len());
 
-        assert_eq!(ShapeClass::for_page_count(0).unwrap().tier, 64);
-        assert_eq!(ShapeClass::for_page_count(65).unwrap().tier, 255);
+        assert_eq!(ShapeClass::for_page_count(0).unwrap().tier, 25);
+        assert_eq!(ShapeClass::for_page_count(26).unwrap().tier, 255);
         assert!(ShapeClass::for_page_count(256).is_none());
         assert_eq!(
             ShapeClass::for_page_count(255).unwrap().spend_capacity(),
@@ -183,7 +182,7 @@ mod tests {
             .collect();
         assert_eq!(
             table,
-            [(64, 641, 11_405, 12_045), (255, 1_531, 22_468, 23_998)]
+            [(25, 251, 6_029, 6_279), (255, 1_531, 22_468, 23_998)]
         );
     }
 
@@ -199,7 +198,7 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(table, [(64, 643, 1_024, 641), (255, 2_553, 4_096, 1_531)]);
+        assert_eq!(table, [(25, 253, 256, 251), (255, 2_553, 4_096, 1_531)]);
     }
 
     #[test]
@@ -213,6 +212,6 @@ mod tests {
                 )
             })
             .collect();
-        assert_eq!(table, [(64, 641, 256), (255, 1_531, 256)]);
+        assert_eq!(table, [(25, 251, 251), (255, 1_531, 256)]);
     }
 }

@@ -648,7 +648,7 @@ fn history_step_terminal_metadata(bytes: &[u8]) -> Option<(u64, [u8; 32], usize)
 
 fn history_step_class_slot(effective_page_count: usize) -> Option<usize> {
     match crate::consensus::paged_spend::BlockProofClass::for_page_count(effective_page_count)? {
-        crate::consensus::paged_spend::BlockProofClass::B64 => Some(0),
+        crate::consensus::paged_spend::BlockProofClass::B25 => Some(0),
         crate::consensus::paged_spend::BlockProofClass::B255 => Some(1),
     }
 }

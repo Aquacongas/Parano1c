@@ -65,9 +65,9 @@ pub const BLOCK_MAX_DISTINCT_SEGMENTS: usize = 256;
 
 /// The two launch proof classes, indexed by effective page positions.
 /// Physical user pages count one each and a live development payout counts
-/// one; the primary coinbase is excluded. Counts through 64 use B64 and
-/// 65 through 255 use B255. Logical groups/capsules never select the class.
-pub const BLOCK_PAGE_CLASS_TIERS: [usize; 2] = [64, 255];
+/// one; the primary coinbase is excluded. Counts through 25 use B25 and
+/// 26 through 255 use B255. Logical groups/capsules never select the class.
+pub const BLOCK_PAGE_CLASS_TIERS: [usize; 2] = [25, 255];
 
 /// Smallest tier in `tiers` holding `count`, or None past the top tier.
 #[inline]
@@ -333,10 +333,10 @@ mod tests {
 
     #[test]
     fn history_step_page_classes_are_exact() {
-        assert_eq!(BLOCK_PAGE_CLASS_TIERS, [64, 255]);
-        assert_eq!(block_page_class_tier(0), Some(64));
-        assert_eq!(block_page_class_tier(64), Some(64));
-        assert_eq!(block_page_class_tier(65), Some(255));
+        assert_eq!(BLOCK_PAGE_CLASS_TIERS, [25, 255]);
+        assert_eq!(block_page_class_tier(0), Some(25));
+        assert_eq!(block_page_class_tier(25), Some(25));
+        assert_eq!(block_page_class_tier(26), Some(255));
         assert_eq!(block_page_class_tier(255), Some(255));
         assert_eq!(block_page_class_tier(256), None);
         assert_eq!(block_class_spend_capacity(255), BLOCK_MAX_LIVE_INPUTS);

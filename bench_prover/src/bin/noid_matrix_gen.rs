@@ -7,7 +7,7 @@
 //!
 //! The fixture provider starts at the real genesis state, mines every header,
 //! verifies every wallet authorization and materializes every backbone state.
-//! It saves the exact B64 and B255 parent boundaries, then forks native-valid
+//! It saves the exact B25 and B255 parent boundaries, then forks native-valid
 //! children for both current classes. The two resulting matrices are assembled
 //! from native-valid block witnesses rather than shape-only or synthetic inputs.
 
@@ -274,7 +274,7 @@ fn main() {
     println!("  pack:          {}", version.display());
     println!("  rayon threads: {}", rayon::current_num_threads());
     println!("  witnesses:     real genesis chain + two exact parent checkpoints");
-    println!("  classes:       2 (B64/m23 and B255/m24)");
+    println!("  classes:       2 (B25/m22 and B255/m24)");
     println!("\nBuilding and exporting canonical matrices:");
 
     let started = Instant::now();

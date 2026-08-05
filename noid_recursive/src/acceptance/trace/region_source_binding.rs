@@ -79,9 +79,10 @@ use super::fri_pcs::mle_evaluate_small_trace;
 #[cfg(test)]
 use super::paired_merkle_update::paired_merkle_update_fixed_patterns;
 use super::paired_merkle_update::{
-    build_paired_merkle_update_columns, paired_merkle_update_refs,
-    paired_merkle_update_substitution_terms, paired_update_root_offsets, PairedMerkleUpdateRefs,
-    PAIRED_UPDATE_DEPTH, PAIRED_UPDATE_SLOTS_PER_LEVEL, PAIRED_UPDATE_STRIDE,
+    build_paired_merkle_update_columns, paired_merkle_update_consistency_terms,
+    paired_merkle_update_refs, paired_merkle_update_substitution_terms, paired_update_root_offsets,
+    PairedMerkleUpdateRefs, PAIRED_UPDATE_DEPTH, PAIRED_UPDATE_SLOTS_PER_LEVEL,
+    PAIRED_UPDATE_STRIDE,
 };
 use super::{mul, pin_eq};
 use crate::acceptance::zk_auth_capsule_schedule::{
@@ -215,8 +216,8 @@ pub struct PairedLocalExactStateCells {
     pub new_entry: [LinExpr; 2],
     pub old_root: [LinExpr; 2],
     pub new_root: [LinExpr; 2],
-    /// One old-even direction cell per level. The paired new-even copy is
-    /// tied to it by exact Stage-2 equality constraints.
+    /// One old-even direction cell per level. The committed four-slot copy
+    /// chain is enforced by the post-commit Merkle relation.
     pub directions: [LinExpr; PAIRED_UPDATE_DEPTH],
 }
 
@@ -275,7 +276,7 @@ pub fn auth_pcs_main_c_sidecar_purpose() -> [u8; 32] {
 }
 
 // Selected-ZK column counts shared by both canonical geometries. Domain
-// logs and class capacities come from the exact V4 geometry certificate in
+// logs and class capacities come from the exact geometry certificate in
 // `region_sidecar::block`; lower tiers never allocate B255-sized columns.
 const SELECTED_ZK_REGION_QUERY_LOG: usize = 6;
 const SELECTED_ZK_REGION_CORE_QUERY_COUNT: usize = 1 << SELECTED_ZK_REGION_QUERY_LOG;
@@ -1158,7 +1159,6 @@ fn build_auth_pcs_meta_region_draft(
 /// makes the exact copy/overhang pins and the typed handoff part of the same
 /// metadata-only construction boundary as the raw columns.
 fn bind_auth_pcs_meta_paired_handoff(
-    b: &mut FieldR1csBuilder,
     meta_b_slices: &[WitnessSlice],
     meta_b: Option<&TiledWalkLayout>,
     paired_bases: Option<[usize; 2]>,
@@ -1169,16 +1169,6 @@ fn bind_auth_pcs_meta_paired_handoff(
         let layout = meta_b.expect("paired carrier needs meta-B slices");
         let bases = paired_bases.expect("paired family bases");
         let caps = paired_caps_per_block.expect("paired family capacities");
-        pin_paired_consistency_cells(b, meta_b_slices, layout, bases, caps);
-        pin_paired_overhang_ghost_cells(
-            b,
-            meta_b_slices,
-            layout,
-            bases,
-            caps,
-            [paired.touched_capacity, paired.segment_capacity],
-            iv_flat_of_tag(TAG_EXSTNOD),
-        );
         paired_exact_state_cells(meta_b_slices, layout, bases, caps, paired)
     })
 }
@@ -1566,11 +1556,11 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     assert_eq!(meta_b_slices[0].start(), allocation_ledger.meta_b);
     assert_eq!(b.num_wires(), allocation_ledger.after);
 
-    // Complete every unchanged Meta closure in the canonical legacy order:
-    // paired copy/overhang first, then the Meta-A/B statement-cell pins.
+    // Export only the class-bounded paired prefix, then bind the Meta-A/B
+    // statement cells. Ceil-tiling overhang is internal committed witness and
+    // cannot reach the typed handoff.
     let before_paired_closure = b.num_wires();
     let paired = bind_auth_pcs_meta_paired_handoff(
-        b,
         &meta_b_slices,
         Some(meta_b_layout),
         paired_bases,
@@ -1578,16 +1568,10 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         Some(&es.paired),
     )
     .expect("selected paired Meta preflight made the handoff mandatory");
-    let allocated_updates = geometry.auth_tiles
-        * (geometry.paired_caps_per_block[0] + geometry.paired_caps_per_block[1]);
-    let class_updates = geometry.touched_capacity + geometry.segment_capacity;
-    let consistency_rows_per_update = 7 * PAIRED_UPDATE_DEPTH - 2;
-    let expected_paired_rows = consistency_rows_per_update * allocated_updates
-        + 9 * PAIRED_UPDATE_STRIDE * (allocated_updates - class_updates);
     assert_eq!(
         b.num_wires() - before_paired_closure,
-        expected_paired_rows,
-        "selected paired copy/overhang ledger"
+        0,
+        "selected paired handoff must allocate no rows"
     );
     let before_statement_pins = b.num_wires();
     pin_stage2_cells(b, &meta_a_slices, &cell_pins_meta);
@@ -1738,7 +1722,7 @@ mod selected_zk_common_allocator_tests {
     #[test]
     fn selected_lower_classes_keep_their_own_committed_domains() {
         for (tier, expected_cells, expected_span, class_m) in [
-            (64usize, 2_834_432usize, 2_834_432usize, 23usize),
+            (25usize, 1_384_448usize, 1_384_448usize, 22usize),
             (255, 7_536_640, 7_536_640, 24),
         ] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
@@ -2233,9 +2217,10 @@ fn paired_update_base(
     base
 }
 
-/// Exact (non challenge-mixed) copy constraints of the paired primitive:
-/// old-even SIB/D → new-even and both lane bridges `E(w)=C(w-2)` on every
-/// allocated local/upper update, including K-tile overhang ghosts.
+/// Test-only exact reference for the paired consistency relation. Production
+/// discharges these equalities against the committed columns in the
+/// post-commit Merkle sidecar.
+#[cfg(test)]
 fn pin_paired_consistency_cells(
     b: &mut FieldR1csBuilder,
     slices: &[WitnessSlice],
@@ -2253,13 +2238,14 @@ fn pin_paired_consistency_cells(
                     + update * PAIRED_UPDATE_STRIDE;
                 for level in 0..PAIRED_UPDATE_DEPTH {
                     let old_even = base + level * PAIRED_UPDATE_SLOTS_PER_LEVEL;
-                    let new_even = old_even + 2;
                     for col in [6usize, 7, 8] {
-                        pin_eq(
-                            b,
-                            &slot_cell(&slices[col], old_even),
-                            &slot_cell(&slices[col], new_even),
-                        );
+                        for offset in 1..PAIRED_UPDATE_SLOTS_PER_LEVEL {
+                            pin_eq(
+                                b,
+                                &slot_cell(&slices[col], old_even + offset - 1),
+                                &slot_cell(&slices[col], old_even + offset),
+                            );
+                        }
                     }
                     for lane in 0..2 {
                         // new-odd E carries this level's old-odd C.
@@ -2283,11 +2269,12 @@ fn pin_paired_consistency_cells(
     }
 }
 
-/// Bind the ceil-tiling suffix of each paired family to the native builder's
-/// canonical ghost update. The fixed walk matrix remains class-constant: this
-/// is a Stage-2 exact-cell hardening over only the non-exported update suffix.
+/// Test-only reference that binds the ceil-tiling suffix of each paired family
+/// to the native builder's canonical ghost update. Production leaves this
+/// non-exported committed suffix internal to the sound paired-walk relation.
 ///
 /// One overhang update costs exactly `9 * PAIRED_UPDATE_STRIDE = 576` rows.
+#[cfg(test)]
 fn pin_paired_overhang_ghost_cells(
     b: &mut FieldR1csBuilder,
     slices: &[WitnessSlice],
@@ -2854,6 +2841,73 @@ mod split_walk_a_layout_tests {
     }
 
     #[test]
+    fn merkle_postcommit_rejects_each_paired_consistency_mutation() {
+        let w_log = 6;
+        let iv = iv_flat_of_tag(TAG_EXSTNOD);
+        let columns = build_paired_merkle_update_columns(&[paired_witness(0x51de)], iv, w_log);
+        let committed = vec![
+            columns.c[0].clone(),
+            columns.c[1].clone(),
+            columns.c[2].clone(),
+            columns.c[3].clone(),
+            columns.e[0].clone(),
+            columns.e[1].clone(),
+            columns.sib[0].clone(),
+            columns.sib[1].clone(),
+            columns.d.clone(),
+        ];
+        let mut fixed = paired_merkle_update_fixed_patterns(iv);
+        fixed.push(common_period_ones(0, PAIRED_UPDATE_STRIDE, w_log));
+        let families = [MerkleProtocolFamily::paired_update(0)];
+
+        for (column, slot, domain, label) in [
+            (
+                4usize,
+                3usize,
+                b"paired-bad-e-bridge".as_slice(),
+                "E bridge",
+            ),
+            (6, 2, b"paired-bad-sibling-copy".as_slice(), "sibling copy"),
+            (
+                8,
+                2,
+                b"paired-bad-direction-copy".as_slice(),
+                "direction copy",
+            ),
+        ] {
+            let mut malformed = committed.clone();
+            malformed[column][slot] += F128::ONE;
+            let malformed_refs = malformed.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let mut prover = FsLaneChallenger::new(domain);
+            let (proof, _) = prove_merkle_union_with_challenger(
+                w_log,
+                &fixed,
+                &[0, 1, 2, 3],
+                &families,
+                &malformed_refs,
+                &columns.s0,
+                &columns.s_out,
+                &mut prover,
+            );
+            let mut verifier = FsLaneChallenger::new(domain);
+            assert!(
+                matches!(
+                    verify_merkle_union_with_challenger(
+                        w_log,
+                        &fixed,
+                        &[0, 1, 2, 3],
+                        &families,
+                        &proof,
+                        &mut verifier,
+                    ),
+                    Err(MerkleUnionVerifyError::Zero(_))
+                ),
+                "{label} mutation escaped the post-commit zero relation"
+            );
+        }
+    }
+
+    #[test]
     fn merkle_postcommit_protocol_matches_mixed_production_meta_b_order() {
         let w_log = 8;
         let block_log = 8;
@@ -3145,7 +3199,7 @@ mod split_walk_a_layout_tests {
     }
 
     #[test]
-    fn paired_k2_overhang_is_canonical_and_stays_outside_handoff() {
+    fn paired_k2_reference_pins_cover_overhang_and_handoff_stops_at_capacity() {
         let k = 2usize;
         let class_capacities = [3usize, 1usize];
         let caps_per_block = [2usize, 1usize];
@@ -3204,7 +3258,7 @@ mod split_walk_a_layout_tests {
         );
         assert_eq!(
             b.num_wires() - before_copies,
-            110 * 6,
+            206 * 6,
             "exact copies cover all four local/upper tiles"
         );
         let before_ghosts = b.num_wires();
@@ -3241,6 +3295,58 @@ mod split_walk_a_layout_tests {
         );
         assert_eq!(handoff.local.len(), class_capacities[0]);
         assert_eq!(handoff.upper.len(), class_capacities[1]);
+        for (ordinal, cells) in handoff.local.iter().enumerate() {
+            let base = paired_update_base(&layout, layout.bases[0], caps_per_block[0], ordinal);
+            let [old_root, new_root] = paired_update_root_offsets(PAIRED_UPDATE_DEPTH);
+            for lane in 0..2 {
+                assert_eq!(cells.old_entry[lane], slot_cell(&slices[4 + lane], base));
+                assert_eq!(
+                    cells.new_entry[lane],
+                    slot_cell(&slices[4 + lane], base + 2)
+                );
+                assert_eq!(
+                    cells.old_root[lane],
+                    slot_cell(&slices[lane], base + old_root)
+                );
+                assert_eq!(
+                    cells.new_root[lane],
+                    slot_cell(&slices[lane], base + new_root)
+                );
+            }
+            for level in 0..PAIRED_UPDATE_DEPTH {
+                assert_eq!(
+                    cells.directions[level],
+                    slot_cell(&slices[8], base + level * PAIRED_UPDATE_SLOTS_PER_LEVEL,)
+                );
+            }
+        }
+        for (ordinal, cells) in handoff.upper.iter().enumerate() {
+            let base = paired_update_base(&layout, layout.bases[1], caps_per_block[1], ordinal);
+            for lane in 0..2 {
+                assert_eq!(cells.old_entry[lane], slot_cell(&slices[4 + lane], base));
+                assert_eq!(
+                    cells.new_entry[lane],
+                    slot_cell(&slices[4 + lane], base + 2)
+                );
+            }
+            for level in 0..PAIRED_UPDATE_DEPTH {
+                let [old_root, new_root] = paired_update_root_offsets(level + 1);
+                for lane in 0..2 {
+                    assert_eq!(
+                        cells.old_roots[level][lane],
+                        slot_cell(&slices[lane], base + old_root)
+                    );
+                    assert_eq!(
+                        cells.new_roots[level][lane],
+                        slot_cell(&slices[lane], base + new_root)
+                    );
+                }
+                assert_eq!(
+                    cells.directions[level],
+                    slot_cell(&slices[8], base + level * PAIRED_UPDATE_SLOTS_PER_LEVEL,)
+                );
+            }
+        }
 
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));
@@ -3267,12 +3373,17 @@ mod split_walk_a_layout_tests {
             caps_per_block[0],
             class_capacities[0],
         );
-        // Pick cells not covered by the copy constraints, so rejection comes
-        // specifically from the canonical-ghost pins in every committed col.
-        let ghost_mutation_offsets = [0usize, 0, 0, 0, 0, 0, 1, 1, 1];
+        // Preserve the SIB/D copy chain while mutating those columns, so every
+        // rejection below comes specifically from the canonical-ghost pins.
         for column in 0..9 {
             let mut bad = witness.clone();
-            bad[slices[column].start() + local_ghost + ghost_mutation_offsets[column]] += F128::ONE;
+            if column < 6 {
+                bad[slices[column].start() + local_ghost] += F128::ONE;
+            } else {
+                for offset in 0..PAIRED_UPDATE_SLOTS_PER_LEVEL {
+                    bad[slices[column].start() + local_ghost + offset] += F128::ONE;
+                }
+            }
             assert!(
                 !r1cs.satisfies(&bad),
                 "local overhang mutation accepted in committed column {column}"
@@ -3292,8 +3403,8 @@ mod split_walk_a_layout_tests {
             "upper overhang mutation accepted"
         );
 
-        // Mutating a real new-even D without its old-even source exercises the
-        // exact D-copy constraint at the K-tile boundary.
+        // Mutating one interior D cell exercises the exact copy-chain reference
+        // at the K-tile boundary.
         let mut bad_d_copy = witness;
         bad_d_copy[slices[8].start() + last_live + 2] += F128::ONE;
         assert!(
@@ -3400,7 +3511,7 @@ mod split_walk_a_layout_tests {
         assert!(leg_pins.is_empty(), "paired family has no legacy leg pins");
         let before = b.num_wires();
         pin_paired_consistency_cells(&mut b, &slices, &layout, [0, 64], [1, 1]);
-        assert_eq!(b.num_wires() - before, 220, "110 exact copies per update");
+        assert_eq!(b.num_wires() - before, 412, "206 exact rows per update");
         let handoff = paired_exact_state_cells(&slices, &layout, [0, 64], [1, 1], &paired);
         assert_eq!(handoff.local.len(), 1);
         assert_eq!(handoff.upper.len(), 1);
@@ -4637,21 +4748,7 @@ fn union_zero_terms(
         t.extend(ff_merkle_chain_terms(&spec.refs, lambda));
     }
     for spec in paired_specs {
-        t.push(RelationTerm {
-            coeff: F128::ONE,
-            factors: vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-                ColRef::Committed(spec.refs.d),
-            ],
-        });
-        t.push(RelationTerm {
-            coeff: F128::ONE,
-            factors: vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-            ],
-        });
+        t.extend(paired_merkle_update_consistency_terms(&spec.refs, lambda));
     }
     t
 }
@@ -4699,22 +4796,71 @@ fn union_zero_terms_trace(
             }
         }
     }
+    let mut paired_weights = vec![LinExpr::constant(F128::ONE)];
+    for _ in 1..6 {
+        let next = mul(b, paired_weights.last().expect("paired weight"), lambda);
+        paired_weights.push(next);
+    }
     for spec in paired_specs {
-        for factors in [
-            vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-                ColRef::Committed(spec.refs.d),
-            ],
-            vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-            ],
-        ] {
-            t.push(RelationTermTrace {
-                coeff: LinExpr::constant(F128::ONE),
-                factors,
-            });
+        let refs = &spec.refs;
+        let equations = [
+            (
+                vec![
+                    ColRef::Fixed(refs.old_even),
+                    ColRef::Committed(refs.d),
+                    ColRef::Committed(refs.d),
+                ],
+                vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
+            ),
+            (
+                vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[0])],
+                vec![
+                    ColRef::Fixed(refs.bridge),
+                    ColRef::CommittedShift2(refs.c[0]),
+                ],
+            ),
+            (
+                vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[1])],
+                vec![
+                    ColRef::Fixed(refs.bridge),
+                    ColRef::CommittedShift2(refs.c[1]),
+                ],
+            ),
+            (
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::Committed(refs.sib[0]),
+                ],
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::CommittedShift(refs.sib[0]),
+                ],
+            ),
+            (
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::Committed(refs.sib[1]),
+                ],
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::CommittedShift(refs.sib[1]),
+                ],
+            ),
+            (
+                vec![ColRef::Fixed(refs.copy_step), ColRef::Committed(refs.d)],
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::CommittedShift(refs.d),
+                ],
+            ),
+        ];
+        for (weight, (left, right)) in paired_weights.iter().zip(equations) {
+            for factors in [left, right] {
+                t.push(RelationTermTrace {
+                    coeff: weight.clone(),
+                    factors,
+                });
+            }
         }
     }
     t
@@ -4770,8 +4916,8 @@ fn union_sub_terms_native(
 }
 
 /// Trace-coefficient twin of `paired_merkle_update_substitution_terms`.
-/// Exact SIB/D copies and E bridges are intentionally absent here: they are
-/// direct Stage-2 cell equalities, never challenge-mixed relation terms.
+/// SIB/D copies and E bridges belong to the post-commit consistency relation,
+/// so the substitution relation intentionally does not duplicate them.
 #[cfg(test)]
 fn paired_substitution_terms_trace(
     m: &[LinExpr],
@@ -5108,18 +5254,7 @@ pub(crate) fn merkle_protocol_zero_terms(
     }
     for family in families {
         if let MerkleProtocolFamily::PairedUpdate { refs, .. } = family {
-            terms.push(RelationTerm {
-                coeff: F128::ONE,
-                factors: vec![
-                    ColRef::Fixed(refs.old_even),
-                    ColRef::Committed(refs.d),
-                    ColRef::Committed(refs.d),
-                ],
-            });
-            terms.push(RelationTerm {
-                coeff: F128::ONE,
-                factors: vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
-            });
+            terms.extend(paired_merkle_update_consistency_terms(refs, lambda));
         }
     }
     terms

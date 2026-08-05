@@ -12,17 +12,17 @@
 //! ```
 //!
 //! Set `NOID_HISTORY_STEP_BENCH_FILTER=B255` (or `c01`) to run B255 after a
-//! B64 parent. Use `B255-B255` for the B255-parent case. With no filter, both
+//! B25 parent. Use `B255-B255` for the B255-parent case. With no filter, both
 //! launch classes run. `NOID_HISTORY_STEP_BENCH_SAMPLES=N` reuses the proved
 //! parent and authenticated matrix pack for N production samples, then reports
 //! nearest-rank p50/p95 values; the default is one sample.
 //!
-//! Honest native-valid fixtures and matrix assembly are setup.  Each reported
-//! `prove_ms` covers only production HistoryStep proof + terminal creation —
-//! in the nonce-free pipeline this entire cost sits before PoW; the post-nonce
-//! path is one native PoW check plus the atomic commit and is measured live
-//! as `nonce_to_commit_ms`.  `verify_ms` covers bounded wire decode and
-//! complete terminal verification.
+//! Transaction construction, wallet proving, block-template construction and
+//! matrix authentication are setup. `history_step_ms` covers the node's
+//! remaining production work: parent-terminal decoding, bounded input and
+//! authorization preparation, recursive assembly, nonce sealing, proof
+//! construction and terminal encoding. `verify_ms` covers bounded wire decode
+//! and complete terminal verification.
 
 use std::collections::VecDeque;
 use std::fs::File;
@@ -42,12 +42,10 @@ use noid_miner::history_step_artifacts::{
     HISTORY_STEP_RUNTIME_METADATA_MAX_BYTES,
 };
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
-use noid_recursive::acceptance::history_step::{
-    assemble_history_step_recursive, HistoryStepParent,
-};
 use noid_recursive::{
-    canonical_history_step_shape, decode_verify_history_step_terminal,
-    encode_history_step_terminal, prove_built_history_step_terminal, prove_history_step,
+    canonical_history_step_shape, decode_history_step_terminal,
+    decode_verify_history_step_terminal, encode_history_step_terminal,
+    prepare_history_step_for_pow, prove_built_history_step_terminal, prove_history_step,
     CanonicalHistoryStepClassId, ChainAccumulator, HistoryStepBlockInput, HistoryStepMatrixLease,
     HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepRuntime, HistoryStepTerminal,
     HISTORY_STEP_CLASS_COUNT,
@@ -57,7 +55,6 @@ const FIXTURE_SEED: u128 = 0x4849_5354_4550_5f56_31;
 const PACK_DIRECTORY_ENV: &str = "NOID_HISTORY_STEP_PACK_DIR";
 const BENCH_FILTER_ENV: &str = "NOID_HISTORY_STEP_BENCH_FILTER";
 const BENCH_SAMPLES_ENV: &str = "NOID_HISTORY_STEP_BENCH_SAMPLES";
-const NODE_CPU_POOL_ENV: &str = "NOID_HISTORY_STEP_NODE_CPU_POOL";
 const METADATA_DIGEST_ENV: &str = "NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST";
 const LEAF_DIGESTS_ENV: &str = "NOID_HISTORY_STEP_PACK_LEAF_DIGESTS";
 const MAX_COMPRESSED_MATRIX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -214,13 +211,13 @@ fn benchmark_filter() -> Result<Option<(CanonicalHistoryStepClassId, usize)>, St
     };
     let class = |slot: usize| CanonicalHistoryStepClassId::new(slot).expect("canonical tier slot");
     let case = match value.trim().to_ascii_lowercase().as_str() {
-        "b64" | "64" | "c00" => (class(0), 0),
+        "b25" | "25" | "c00" => (class(0), 0),
         "b255" | "255" | "c01" => (class(1), 0),
-        "b64-b255" => (class(0), 1),
+        "b25-b255" => (class(0), 1),
         "b255-b255" => (class(1), 1),
         _ => {
             return Err(format!(
-                "{BENCH_FILTER_ENV} must be one of B64/c00, B255/c01, B64-B255, or B255-B255",
+                "{BENCH_FILTER_ENV} must be one of B25/c00, B255/c01, B25-B255, or B255-B255",
             ));
         }
     };
@@ -250,10 +247,6 @@ fn benchmark_sample_count() -> Result<usize, String> {
         return Err(format!("{BENCH_SAMPLES_ENV} must be an integer in 1..=100"));
     }
     Ok(samples)
-}
-
-fn node_cpu_pool_enabled() -> bool {
-    std::env::var_os(NODE_CPU_POOL_ENV).is_some()
 }
 
 fn load_runtime() -> Result<(HistoryStepRuntime, Arc<PinnedDiskMatrixSource>), String> {
@@ -299,6 +292,17 @@ fn finish_fixture<const TIER: usize>(
         .map_err(|error| format!("finish honest B{TIER} fixture: {error}"))
 }
 
+fn finish_fixture_template<const TIER: usize>(
+    fixture: PreparedHistoryStepTierFixture<TIER>,
+) -> Result<(noid_chain::Block, HistoryStepBlockInput<TIER>, u128), String> {
+    let (witness, nonce, start, end) = fixture.into_parts();
+    let (mut block, input) = witness
+        .finish_template(&start, &end)
+        .map_err(|error| format!("finish honest B{TIER} template fixture: {error}"))?;
+    block.header.nonce = nonce;
+    Ok((block, input, nonce))
+}
+
 fn prove_parent_step<const TIER: usize>(
     runtime: &HistoryStepRuntime,
     parent: Option<&HistoryStepTerminal>,
@@ -323,7 +327,7 @@ fn build_parent(
         })?;
         let capture = step.capture_parent_slot;
         let (block, terminal) = match step.input {
-            PreparedHistoryStepBackboneInput::B64(fixture) => {
+            PreparedHistoryStepBackboneInput::B25(fixture) => {
                 prove_parent_step(runtime, parent.as_ref(), fixture)?
             }
             PreparedHistoryStepBackboneInput::B255(fixture) => {
@@ -341,41 +345,51 @@ fn build_parent(
 #[derive(Clone, Copy)]
 struct TierMeasurement {
     class_index: usize,
+    user_pages: usize,
     wires: usize,
-    assemble_ms: u128,
-    prove_ms: u128,
+    parent_decode_ms: u128,
+    input_preparation_ms: u128,
+    staged_assembly_ms: u128,
+    prove_encode_ms: u128,
+    history_step_ms: u128,
     verify_ms: u128,
     terminal_bytes: usize,
 }
 
-impl TierMeasurement {
-    fn prepare_ms(self) -> u128 {
-        self.assemble_ms + self.prove_ms
-    }
-}
-
 fn benchmark_tier<const TIER: usize>(
     runtime: &HistoryStepRuntime,
-    parent: &HistoryStepTerminal,
+    parent_bytes: &[u8],
     fixture: PreparedHistoryStepTierFixture<TIER>,
 ) -> Result<TierMeasurement, String> {
-    let (block, input) = finish_fixture(fixture)?;
+    let input_preparation = fixture.input_preparation();
+    let input_preparation_ms = input_preparation.as_millis();
+    let user_pages = fixture.user_pages();
+    let history_step_started = Instant::now();
+
+    let parent_decode_started = Instant::now();
+    let parent = decode_history_step_terminal(runtime, parent_bytes)
+        .map_err(|error| format!("decode honest B{TIER} benchmark parent: {error}"))?;
+    let parent_decode_ms = parent_decode_started.elapsed().as_millis();
+
+    let (block, input, nonce) = finish_fixture_template(fixture)?;
+
     let assemble_started = Instant::now();
-    let parent = HistoryStepParent::new(runtime, parent)
-        .map_err(|error| format!("bind honest B{TIER} benchmark parent: {error}"))?;
-    let built = assemble_history_step_recursive(runtime, parent, input)
-        .map_err(|error| format!("assemble honest B{TIER} benchmark: {error}"))?;
-    let assemble_ms = assemble_started.elapsed().as_millis();
-    let class = built.class_id();
-    let wires = built.useful_rows();
+    let prepared = prepare_history_step_for_pow(runtime, Some(&parent), input)
+        .map_err(|error| format!("stage honest B{TIER} benchmark: {error}"))?;
+    let staged_assembly_ms = assemble_started.elapsed().as_millis();
 
     let prove_started = Instant::now();
+    let built = prepared
+        .seal_nonce(runtime, nonce)
+        .map_err(|error| format!("seal honest B{TIER} benchmark: {error}"))?;
+    let class = built.class_id();
+    let wires = built.useful_rows();
     let terminal = prove_built_history_step_terminal(runtime, &built)
         .map_err(|error| format!("prove honest B{TIER} benchmark: {error}"))?;
-    let prove_ms = prove_started.elapsed().as_millis();
-
     let encoded = encode_history_step_terminal(runtime, &terminal)
         .map_err(|error| format!("encode honest B{TIER} terminal: {error}"))?;
+    let prove_encode_ms = prove_started.elapsed().as_millis();
+    let history_step_ms = (input_preparation + history_step_started.elapsed()).as_millis();
     let terminal_bytes = encoded.len();
     let epoch_anchor = noid_chain::consensus::genesis_header();
     let verify_started = Instant::now();
@@ -389,9 +403,13 @@ fn benchmark_tier<const TIER: usize>(
 
     Ok(TierMeasurement {
         class_index: class.index(),
+        user_pages,
         wires,
-        assemble_ms,
-        prove_ms,
+        parent_decode_ms,
+        input_preparation_ms,
+        staged_assembly_ms,
+        prove_encode_ms,
+        history_step_ms,
         verify_ms,
         terminal_bytes,
     })
@@ -414,13 +432,16 @@ fn report_samples<const TIER: usize>(measurements: &[TierMeasurement]) {
         let values: Vec<_> = measurements.iter().copied().map(select).collect();
         (nearest_rank(values.clone(), 50), nearest_rank(values, 95))
     };
-    let (assemble_p50, assemble_p95) = metric(|sample| sample.assemble_ms);
-    let (prove_p50, prove_p95) = metric(|sample| sample.prove_ms);
-    let (prepare_p50, prepare_p95) = metric(TierMeasurement::prepare_ms);
+    let (assembly_p50, assembly_p95) = metric(|sample| sample.staged_assembly_ms);
+    let (parent_decode_p50, parent_decode_p95) = metric(|sample| sample.parent_decode_ms);
+    let (input_p50, input_p95) = metric(|sample| sample.input_preparation_ms);
+    let (prove_p50, prove_p95) = metric(|sample| sample.prove_encode_ms);
+    let (history_step_p50, history_step_p95) = metric(|sample| sample.history_step_ms);
     let (verify_p50, verify_p95) = metric(|sample| sample.verify_ms);
     println!(
-        "B{TIER} summary samples={} wires={} assemble_p50_ms={assemble_p50} assemble_p95_ms={assemble_p95} prove_p50_ms={prove_p50} prove_p95_ms={prove_p95} prepare_p50_ms={prepare_p50} prepare_p95_ms={prepare_p95} verify_p50_ms={verify_p50} verify_p95_ms={verify_p95} terminal_bytes={}",
+        "B{TIER} summary samples={} user_pages={} wires={} parent_decode_p50_ms={parent_decode_p50} parent_decode_p95_ms={parent_decode_p95} input_preparation_p50_ms={input_p50} input_preparation_p95_ms={input_p95} staged_assembly_p50_ms={assembly_p50} staged_assembly_p95_ms={assembly_p95} prove_encode_p50_ms={prove_p50} prove_encode_p95_ms={prove_p95} history_step_p50_ms={history_step_p50} history_step_p95_ms={history_step_p95} verify_p50_ms={verify_p50} verify_p95_ms={verify_p95} terminal_bytes={}",
         measurements.len(),
+        measurements[0].user_pages,
         measurements[0].wires,
         measurements[0].terminal_bytes,
     );
@@ -432,18 +453,23 @@ fn benchmark_tier_samples<const TIER: usize>(
     sample_count: usize,
     mut fixture: impl FnMut() -> Result<PreparedHistoryStepTierFixture<TIER>, String>,
 ) -> Result<(), String> {
+    let parent_bytes = encode_history_step_terminal(runtime, parent)
+        .map_err(|error| format!("encode B{TIER} benchmark parent: {error}"))?;
     let mut measurements = Vec::with_capacity(sample_count);
     for sample in 0..sample_count {
-        let measurement = benchmark_tier(runtime, parent, fixture()?)?;
+        let measurement = benchmark_tier(runtime, &parent_bytes, fixture()?)?;
         println!(
-            "B{TIER} class=c{:02} sample={}/{} wires={} assemble_ms={} prove_ms={} prepare_ms={} verify_ms={} terminal_bytes={}",
+            "B{TIER} class=c{:02} sample={}/{} user_pages={} wires={} parent_decode_ms={} input_preparation_ms={} staged_assembly_ms={} prove_encode_ms={} history_step_ms={} verify_ms={} terminal_bytes={}",
             measurement.class_index,
             sample + 1,
             sample_count,
+            measurement.user_pages,
             measurement.wires,
-            measurement.assemble_ms,
-            measurement.prove_ms,
-            measurement.prepare_ms(),
+            measurement.parent_decode_ms,
+            measurement.input_preparation_ms,
+            measurement.staged_assembly_ms,
+            measurement.prove_encode_ms,
+            measurement.history_step_ms,
             measurement.verify_ms,
             measurement.terminal_bytes,
         );
@@ -452,6 +478,7 @@ fn benchmark_tier_samples<const TIER: usize>(
     let expected = measurements[0];
     if measurements.iter().any(|measurement| {
         measurement.class_index != expected.class_index
+            || measurement.user_pages != expected.user_pages
             || measurement.wires != expected.wires
             || measurement.terminal_bytes != expected.terminal_bytes
     }) {
@@ -461,18 +488,12 @@ fn benchmark_tier_samples<const TIER: usize>(
     Ok(())
 }
 
-fn run() -> Result<(), String> {
-    if node_cpu_pool_enabled() {
-        noid_miner::configure_process_cpu_budget(noid_miner::ProcessCpuBudgetMode::ProofOnly)
-            .map_err(|error| format!("configure production CPU pool: {error}"))?;
-    } else {
-        noid_ivc_prover::init_perf_thread_pool();
-    }
+fn run_on_production_pool() -> Result<(), String> {
     let filter = benchmark_filter()?;
     let sample_count = benchmark_sample_count()?;
     let (runtime, source) = load_runtime()?;
     let mut provider = HonestHistoryStepFixtureProvider::new(FIXTURE_SEED)?;
-    let c00 = CanonicalHistoryStepClassId::new(0).expect("B64 class");
+    let c00 = CanonicalHistoryStepClassId::new(0).expect("B25 class");
     let target_parent_slot = filter.map_or(0, |(_, parent_slot)| parent_slot);
     // Authenticate and convert outside every reported assembly interval. The
     // production node receives the same packed layout from its release build;
@@ -503,15 +524,13 @@ fn run() -> Result<(), String> {
     let parent_class = parent.class_id();
     // The production LRU holds exactly two matrices. Preload current first
     // and the exact parent class second before every timed recursive build;
-    // this remains
-    // correct when the unfiltered benchmark advances through several tiers
-    // and would otherwise evict the parent while admitting the next current
-    // class.
+    // this remains correct when the unfiltered benchmark advances to B255 and
+    // would otherwise evict the parent while admitting the current class.
     if class_is_selected(filter, c00) {
         source.load_checked(c00)?;
         source.load_checked(parent_class)?;
         benchmark_tier_samples(&runtime, &parent, sample_count, || {
-            provider.b64(c00, parent_accumulator)
+            provider.b25_coinbase_only(c00, parent_accumulator)
         })?;
     }
     let c01 = CanonicalHistoryStepClassId::new(1).expect("B255 class");
@@ -523,6 +542,19 @@ fn run() -> Result<(), String> {
         })?;
     }
     Ok(())
+}
+
+fn run() -> Result<(), String> {
+    let cpu_plan =
+        noid_miner::configure_process_cpu_budget(noid_miner::ProcessCpuBudgetMode::ProofOnly)
+            .map_err(|error| format!("configure production CPU pool: {error}"))?;
+    let hardware = noid_core::cpu::ProductionHardwareReport::detect();
+    println!(
+        "HistoryStep benchmark backend={} threads={}",
+        hardware.backend, cpu_plan.history_step_phase_threads,
+    );
+    noid_miner::install_history_step_phase_cpu(run_on_production_pool)
+        .map_err(|error| format!("enter production HistoryStep CPU phase: {error}"))?
 }
 
 fn main() {

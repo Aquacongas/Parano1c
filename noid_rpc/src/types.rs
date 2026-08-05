@@ -335,8 +335,8 @@ pub struct WalletSendResult {
 /// Maximum number of active-owner UTXOs merged by one GUI consolidation.
 ///
 /// The protocol supports larger paged spends, but keeping the wallet action at
-/// the B64 boundary bounds interactive proving latency and leaves additional
-/// UTXOs untouched for a later consolidation.
+/// 64 inputs bounds interactive proving latency, remains comfortably inside
+/// B25 page capacity and leaves additional UTXOs for a later consolidation.
 pub const WALLET_CONSOLIDATION_INPUT_LIMIT: usize = 64;
 
 /// Exact live consolidation quote produced from the active wallet snapshot.

@@ -9,7 +9,7 @@
 //! scalars. It then closes on one fixed full absorb block. All four resulting
 //! sponge-state lanes are shared wires into the Main channel before `sigma`
 //! and `gamma`; they are never serialized.
-//! This executable schedule/bridge contract is consumed by the selected B255
+//! This executable schedule/bridge contract is consumed by the selected-class
 //! recursive assembly.
 
 use noid_ivc_core::deep_chain::capsule_leaf::{C1_CAPSULE_MID_SLOTS, C1_CAPSULE_SOURCE_SLOTS};

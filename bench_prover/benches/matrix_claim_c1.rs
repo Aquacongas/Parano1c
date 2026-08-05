@@ -3,7 +3,7 @@
 
 //! Direct production C1 matrix-fold benchmark.
 //!
-//! This loads and authenticates the B64 matrix from a completed HistoryStep
+//! This loads and authenticates the B25 matrix from a completed HistoryStep
 //! pack, constructs deterministic valid claims, and times only the native
 //! fold and its matrix-free verifier. It deliberately avoids building the
 //! multi-block HistoryStep fixture backbone.
@@ -52,7 +52,7 @@ fn read_regular_bounded(path: &std::path::Path, max_bytes: u64) -> Result<Vec<u8
     Ok(bytes)
 }
 
-fn load_b64_matrix() -> Result<CompactFieldR1cs, String> {
+fn load_b25_matrix() -> Result<CompactFieldR1cs, String> {
     let root = PathBuf::from(
         std::env::var_os(PACK_DIRECTORY_ENV)
             .ok_or_else(|| format!("{PACK_DIRECTORY_ENV} is required"))?,
@@ -72,7 +72,7 @@ fn load_b64_matrix() -> Result<CompactFieldR1cs, String> {
         .map_err(|_| "runtime metadata digest width".to_owned())?;
     let runtime = noid_miner::decode_history_step_runtime_metadata_pinned(&metadata, digest)
         .map_err(|error| format!("authenticate {}: {error}", metadata_path.display()))?;
-    let class = CanonicalHistoryStepClassId::new(0).expect("B64 class is canonical");
+    let class = CanonicalHistoryStepClassId::new(0).expect("B25 class is canonical");
     let matrix_path = version.join(history_step_matrix_file_name(class));
     let compressed = read_regular_bounded(&matrix_path, MAX_COMPRESSED_MATRIX_BYTES)?;
     let mut decoder = zstd::stream::read::Decoder::new(BufReader::new(compressed.as_slice()))
@@ -164,7 +164,7 @@ fn run() -> Result<(), String> {
     } else {
         noid_ivc_prover::init_perf_thread_pool();
     }
-    let mut matrix = load_b64_matrix()?;
+    let mut matrix = load_b25_matrix()?;
     let (fresh, incoming) = valid_claims(&mut matrix)?;
     let shape = matrix.shape();
     for sample in 1..=sample_count()? {
@@ -190,7 +190,7 @@ fn run() -> Result<(), String> {
             return Err("matrix-fold prover/verifier transcript drift".to_owned());
         }
         println!(
-            "B64 matrix-fold-c1 sample={sample} k_log={} prove_ms={prove_ms} verify_us={verify_us}",
+            "B25 matrix-fold-c1 sample={sample} k_log={} prove_ms={prove_ms} verify_us={verify_us}",
             shape.k_log
         );
     }

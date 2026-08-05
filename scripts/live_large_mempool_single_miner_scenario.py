@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Fresh 128-transaction mempool drain by one production B64 miner.
+"""Fresh 50-transaction mempool drain by one production B25 miner.
 
 The setup grows independent wallet UTXOs through confirmed self-splits; no
 saved chain fixture or debug-only node path is used.  Mining is then stopped,
-128 non-conflicting one-page transactions are admitted and relayed, and a
+50 non-conflicting one-page transactions are admitted and relayed, and a
 single miner must drain them without loss.  On the baseline laptop the
-expected production shape is two 64-user-page B64 blocks.
+expected production shape is two 25-user-page B25 blocks.
 """
 
 import datetime
@@ -30,7 +30,9 @@ BASE = Path(
 )
 BASE_PORT = int(os.environ.get("NOID_LIVE_LARGE_MEMPOOL_SINGLE_BASE_PORT", "21800"))
 INITIAL_HEIGHT = 4
-SPAM_COUNT = 128
+LOWER_CLASS_PAGES = 25
+LOWER_PROOF_CLASS = "B25"
+SPAM_COUNT = 2 * LOWER_CLASS_PAGES
 SPAM_AMOUNT = 100_000
 SPLIT_ROUNDS = (
     (4, 20_000_000),
@@ -374,12 +376,12 @@ def main():
         distribution = {height: len(items) for height, items in sorted(by_height.items())}
         require(sum(distribution.values()) == SPAM_COUNT, f"confirmation count mismatch: {distribution}")
         require(
-            all(count <= 64 for count in distribution.values()),
-            f"B64 miner exceeded 64 user transactions: {distribution}",
+            all(count <= LOWER_CLASS_PAGES for count in distribution.values()),
+            f"B25 miner exceeded {LOWER_CLASS_PAGES} user transactions: {distribution}",
         )
         require(
-            sorted(distribution.values()) == [64, 64],
-            f"single B64 miner failed to use two full blocks: {distribution}",
+            sorted(distribution.values()) == [LOWER_CLASS_PAGES, LOWER_CLASS_PAGES],
+            f"single B25 miner failed to use two full blocks: {distribution}",
         )
         for height, items in by_height.items():
             positions = {position for _, position in items}
@@ -390,11 +392,13 @@ def main():
 
         final_miner_text = log_text(final_miner_label)
         mined_blocks = parse_mined_blocks(final_miner_text)
-        full_blocks = [block for block in mined_blocks if block["user_pages"] == 64]
-        require(len(full_blocks) >= 2, f"miner log lacks two full B64 blocks: {mined_blocks}")
+        full_blocks = [
+            block for block in mined_blocks if block["user_pages"] == LOWER_CLASS_PAGES
+        ]
+        require(len(full_blocks) >= 2, f"miner log lacks two full B25 blocks: {mined_blocks}")
         require(
-            all(block["proof_class"] == "B64" for block in full_blocks),
-            f"64-page blocks used the wrong proof class: {full_blocks}",
+            all(block["proof_class"] == LOWER_PROOF_CLASS for block in full_blocks),
+            f"25-page blocks used the wrong proof class: {full_blocks}",
         )
         require(
             re.search(
@@ -402,7 +406,7 @@ def main():
                 final_miner_text,
             )
             is not None,
-            "single miner did not receive the exact 128-transaction peer snapshot",
+            f"single miner did not receive the exact {SPAM_COUNT}-transaction peer snapshot",
         )
 
         for label in phase_logs:
@@ -426,7 +430,7 @@ def main():
                 "fee_counts": dict(Counter(send["fee_micronoid"] for send in spam_sends)),
             }
         )
-        print(f"[PASS] one B64 miner drained 128 TXs as {distribution}", flush=True)
+        print(f"[PASS] one B25 miner drained {SPAM_COUNT} TXs as {distribution}", flush=True)
     except Exception as caught:
         error = caught
         summary["status"] = "failed"

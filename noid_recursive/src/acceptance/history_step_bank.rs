@@ -4,7 +4,7 @@
 //! Canonical class bank for the atomic `HistoryStep` relation.
 //!
 //! A `HistoryStep` class is selected by the current block
-//! physical-page tier. The launch bank has exactly B64 and B255. Every class
+//! physical-page tier. The launch bank has exactly B25 and B255. Every class
 //! exposes the same public-IO layout:
 //!
 //! * the exact ordered matrix and post-commit class whitelists;
@@ -102,13 +102,13 @@ impl HistoryStepMatrixLease {
 }
 
 /// Frozen outer dimensions selected solely by the current physical-page
-/// class. Both matrices contain the same two-arm B64/B255 parent selector, so
+/// class. Both matrices contain the same two-arm B25/B255 parent selector, so
 /// parent shape changes witness data rather than the current matrix identity.
-pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] = [23, 24];
+pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] = [22, 24];
 
 const _: () = assert!(
     HISTORY_STEP_CURRENT_CLASS_MS[0]
-        == noid_chain::consensus::paged_spend::BlockProofClass::B64.outer_m()
+        == noid_chain::consensus::paged_spend::BlockProofClass::B25.outer_m()
         && HISTORY_STEP_CURRENT_CLASS_MS[1]
             == noid_chain::consensus::paged_spend::BlockProofClass::B255.outer_m(),
     "HistoryStep and consensus proof-class dimensions must match"
@@ -571,7 +571,7 @@ fn write_bank_pins(bank: &PinnedHistoryStepClassBank, io: &mut [F128]) {
 /// Canonical base terminal before any predecessor matrix has been folded.
 /// The caller supplies the block accumulator reached from the exact genesis
 /// parent boundary; all matrix lanes start dead. The current block selects
-/// either the B64 or B255 launch class.
+/// either the B25 or B255 launch class.
 pub fn history_step_bank_base_output_io(
     bank: &PinnedHistoryStepClassBank,
     class_id: CanonicalHistoryStepClassId,
@@ -1414,7 +1414,7 @@ mod tests {
         let first = CanonicalHistoryStepClassId::new(0).unwrap();
         let last = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(first.index(), 0);
-        assert_eq!(first.current_tier(), 64);
+        assert_eq!(first.current_tier(), 25);
         assert_eq!(last.index(), 1);
         assert_eq!(last.current_tier(), 255);
         assert!(CanonicalHistoryStepClassId::new(2).is_none());
@@ -1450,7 +1450,7 @@ mod tests {
             bank.entry(CanonicalHistoryStepClassId::new(0).unwrap())
                 .shape()
                 .m,
-            23
+            22
         );
         let class = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(bank.entry(class).shape().m, 24);

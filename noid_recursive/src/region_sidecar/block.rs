@@ -82,7 +82,7 @@ pub(crate) struct SelectedZkBlockRegionVkSlices {
 /// Exact selected authorization geometry for one canonical block class.
 ///
 /// The two entries below are protocol certificates, not estimates. Keeping
-/// them explicit prevents B64 from silently inheriting B255's 256
+/// them explicit prevents B25 from silently inheriting B255's 256
 /// authorization tiles and RAM footprint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SelectedZkBlockGeometry {
@@ -109,26 +109,26 @@ pub(crate) struct SelectedZkBlockGeometry {
 
 pub(crate) const fn selected_zk_block_geometry(tier: usize) -> Option<SelectedZkBlockGeometry> {
     let geometry = match tier {
-        64 => SelectedZkBlockGeometry {
-            tier: 64,
-            auth_tiles: 64,
-            tx_log: 6,
-            owner_w_log: 13,
-            main_w_log: 14,
-            wallet_a_w_log: 17,
-            wallet_b_w_log: 16,
-            exact_state_region_log: 12,
-            spine_cap_log: 1,
-            meta_a_w_log: 14,
-            meta_b_w_log: 17,
+        25 => SelectedZkBlockGeometry {
+            tier: 25,
+            auth_tiles: 32,
+            tx_log: 5,
+            owner_w_log: 12,
+            main_w_log: 13,
+            wallet_a_w_log: 16,
+            wallet_b_w_log: 15,
+            exact_state_region_log: 10,
+            spine_cap_log: 0,
+            meta_a_w_log: 12,
+            meta_b_w_log: 16,
             meta_b_block_log: 11,
-            touched_capacity: 641,
-            segment_capacity: 256,
-            paired_caps_per_block: [11, 4],
-            paired_bases: [0, 704],
-            tx_root_base: 960,
-            tx_root_paths_per_block: 4,
-            wallet_overflow_bases: [1_024, 1_034],
+            touched_capacity: 251,
+            segment_capacity: 251,
+            paired_caps_per_block: [8, 8],
+            paired_bases: [0, 512],
+            tx_root_base: 1_024,
+            tx_root_paths_per_block: 8,
+            wallet_overflow_bases: [1_152, 1_162],
         },
         255 => SelectedZkBlockGeometry {
             tier: 255,

@@ -658,8 +658,8 @@ mod tests {
     #[test]
     fn c1_history_basefold_wire_shapes_are_exact() {
         let expected = [
-            // B64: k_code=20, FRI arities [4,4,4,4,2].
-            (0usize, 20usize, 3_848usize, 521_744usize),
+            // B25: k_code=19. Exact encoded lengths are pinned below.
+            (0usize, 19usize, 3_720usize, 500_560usize),
             // B255: k_code=21, FRI arities [4,4,4,4,3].
             (1usize, 21usize, 3_976usize, 547_024usize),
         ];

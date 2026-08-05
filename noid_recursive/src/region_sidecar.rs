@@ -69,7 +69,7 @@ pub use walk_a::*;
 
 pub const DUPLEX_REGION_SIDECAR_VERSION: u8 = 1;
 pub const DUPLEX_REGION_COMMITTED_COLUMNS: usize = 6;
-pub const MERKLE_REGION_SIDECAR_VERSION: u8 = 1;
+pub const MERKLE_REGION_SIDECAR_VERSION: u8 = 2;
 pub const MERKLE_REGION_COMMITTED_COLUMNS: usize = 9;
 /// Number of Link claim groups in the production joint C1 History walk.
 pub const JOINT_C1_LINK_GROUPS: usize = 3;

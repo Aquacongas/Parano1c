@@ -446,14 +446,14 @@ pub fn block_tx_hash_body(body: &TxBody) -> TxBodyHash {
 
 /// Native user counts used by the release freezer's honest backbone.
 ///
-/// B64 blocks grow a spendable pool geometrically; the final 65-page block
+/// B25 blocks grow a spendable pool geometrically; the final 26-page block
 /// establishes the B255 parent boundary. Every block starts at canonical
 /// genesis ancestry and is mined, checked and materialized through the
 /// production state transition.
-pub const HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS: [usize; 8] = [0, 1, 3, 7, 15, 31, 63, 65];
+pub const HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS: [usize; 7] = [0, 1, 3, 7, 15, 25, 26];
 
 /// One honest current-block member for each fixed HistoryStep tier.
-pub const HISTORY_STEP_FREEZER_FORK_USER_COUNTS: [usize; 2] = [64, 65];
+pub const HISTORY_STEP_FREEZER_FORK_USER_COUNTS: [usize; 2] = [25, 26];
 
 #[derive(Clone)]
 struct TrackedSpendable {
@@ -490,6 +490,8 @@ pub struct PreparedHistoryStepTierFixture<const TIER: usize> {
     nonce: u128,
     start_accumulator: noid_recursive::ChainAccumulator,
     end_accumulator: noid_recursive::ChainAccumulator,
+    input_preparation: Duration,
+    user_pages: usize,
 }
 
 impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
@@ -503,6 +505,17 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
 
     pub fn end_accumulator(&self) -> &noid_recursive::ChainAccumulator {
         &self.end_accumulator
+    }
+
+    /// Node-side preparation after the block template and wallet proofs exist:
+    /// bounded payload accounting, authorization decoding, page-class checks
+    /// and construction of the exact native HistoryStep witness components.
+    pub fn input_preparation(&self) -> Duration {
+        self.input_preparation
+    }
+
+    pub fn user_pages(&self) -> usize {
+        self.user_pages
     }
 
     pub fn into_parts(
@@ -534,7 +547,7 @@ impl<const TIER: usize> PreparedHistoryStepTierFixture<TIER> {
 
 /// Heterogeneous streaming item used while the freezer proves the backbone.
 pub enum PreparedHistoryStepBackboneInput {
-    B64(PreparedHistoryStepTierFixture<64>),
+    B25(PreparedHistoryStepTierFixture<25>),
     B255(PreparedHistoryStepTierFixture<255>),
 }
 
@@ -609,13 +622,13 @@ impl HonestHistoryStepFixtureProvider {
         let step = self.backbone_index;
         let user_count = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS[step];
         let capture_parent_slot = match step {
-            6 => Some(0),
-            7 => Some(1),
+            5 => Some(0),
+            6 => Some(1),
             _ => None,
         };
         let input = match noid_chain::consensus::params::block_page_class_tier(user_count) {
-            Some(64) => self
-                .build_child::<64>(user_count, step as u128)?
+            Some(25) => self
+                .build_child::<25>(user_count, step as u128)?
                 .map_into(&mut self.live)?,
             Some(255) => self
                 .build_child::<255>(user_count, step as u128)?
@@ -633,16 +646,27 @@ impl HonestHistoryStepFixtureProvider {
         }))
     }
 
-    pub fn b64(
+    pub fn b25(
         &self,
         class_id: noid_recursive::CanonicalHistoryStepClassId,
         expected_start: &noid_recursive::ChainAccumulator,
-    ) -> Result<PreparedHistoryStepTierFixture<64>, String> {
-        self.fork::<64>(
+    ) -> Result<PreparedHistoryStepTierFixture<25>, String> {
+        self.fork::<25>(
             class_id,
             expected_start,
             HISTORY_STEP_FREEZER_FORK_USER_COUNTS[0],
         )
+    }
+
+    /// Coinbase-only B25 child used to calibrate the benchmark against the
+    /// default mining path. The recursive proof shape remains the complete
+    /// B25 class shape.
+    pub fn b25_coinbase_only(
+        &self,
+        class_id: noid_recursive::CanonicalHistoryStepClassId,
+        expected_start: &noid_recursive::ChainAccumulator,
+    ) -> Result<PreparedHistoryStepTierFixture<25>, String> {
+        self.fork::<25>(class_id, expected_start, 0)
     }
 
     pub fn b255(
@@ -783,6 +807,14 @@ impl HonestHistoryStepFixtureProvider {
                 Ok(proof)
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let authorization_bytes = authorization_proofs
+            .into_iter()
+            .map(|proof| {
+                WalletAuthorizationBundle { proof }
+                    .to_bytes()
+                    .map_err(|error| format!("encode honest wallet authorization: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let block = template.into_block(0);
         let nonce_key = noid_chain::hash_block_header(&block.header);
@@ -810,6 +842,34 @@ impl HonestHistoryStepFixtureProvider {
             asert_anchor: &checkpoint.asert_anchor,
             local_time: timestamp,
         };
+        let input_preparation_started = Instant::now();
+        let authorization_weight = authorization_bytes
+            .iter()
+            .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
+            .ok_or_else(|| "honest authorization byte weight overflow".to_owned())?;
+        let payload_weight = block
+            .to_bytes()
+            .len()
+            .checked_add(authorization_weight)
+            .ok_or_else(|| "honest block byte weight overflow".to_owned())?;
+        std::hint::black_box(payload_weight);
+        let stream = noid_chain::validate_block_page_stream(&block.transactions)
+            .map_err(|error| format!("honest block body is non-canonical: {error}"))?;
+        if usize::from(stream.page_count) != user_count {
+            return Err(format!(
+                "honest block has {} user pages, expected {user_count}",
+                stream.page_count
+            ));
+        }
+        let authorization_proofs = authorization_bytes
+            .into_iter()
+            .enumerate()
+            .map(|(index, encoded)| {
+                WalletAuthorizationBundle::from_bytes(&encoded)
+                    .map(|bundle| bundle.proof)
+                    .map_err(|error| format!("decode honest wallet authorization {index}: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let witness = noid_block::prepare_history_step_input_witness::<TIER>(
             block,
             context,
@@ -817,6 +877,7 @@ impl HonestHistoryStepFixtureProvider {
             &self.ghost,
         )
         .map_err(|error| format!("prepare honest B{TIER} HistoryStep: {error}"))?;
+        let input_preparation = input_preparation_started.elapsed();
 
         let mut next_spendables = Vec::with_capacity(
             checkpoint.spendables.len() - user_count + 1 + next_user_spendables.len(),
@@ -841,6 +902,8 @@ impl HonestHistoryStepFixtureProvider {
                 nonce,
                 start_accumulator: checkpoint.start_accumulator.clone(),
                 end_accumulator,
+                input_preparation,
+                user_pages: user_count,
             },
             sealed_block,
             next_spendables,
@@ -863,9 +926,9 @@ impl noid_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixture
     ) -> Result<Option<noid_recursive::HistoryStepFreezeInput>, Self::Error> {
         HonestHistoryStepFixtureProvider::next_backbone(self, expected_start)?
             .map(|step| match step.input {
-                PreparedHistoryStepBackboneInput::B64(input) => input
+                PreparedHistoryStepBackboneInput::B25(input) => input
                     .into_history_step_input()
-                    .map(noid_recursive::HistoryStepFreezeInput::B64),
+                    .map(noid_recursive::HistoryStepFreezeInput::B25),
                 PreparedHistoryStepBackboneInput::B255(input) => input
                     .into_history_step_input()
                     .map(noid_recursive::HistoryStepFreezeInput::B255),
@@ -873,12 +936,12 @@ impl noid_recursive::HistoryStepFreezeInputProvider for HonestHistoryStepFixture
             .transpose()
     }
 
-    fn b64(
+    fn b25(
         &mut self,
         class: noid_recursive::CanonicalHistoryStepClassId,
         expected_start: &noid_recursive::ChainAccumulator,
-    ) -> Result<noid_recursive::HistoryStepBlockInput<64>, Self::Error> {
-        HonestHistoryStepFixtureProvider::b64(self, class, expected_start)?
+    ) -> Result<noid_recursive::HistoryStepBlockInput<25>, Self::Error> {
+        HonestHistoryStepFixtureProvider::b25(self, class, expected_start)?
             .into_history_step_input()
     }
 
@@ -939,7 +1002,7 @@ macro_rules! impl_advance_honest_backbone {
     };
 }
 
-impl_advance_honest_backbone!(64, B64);
+impl_advance_honest_backbone!(25, B25);
 impl_advance_honest_backbone!(255, B255);
 
 fn genesis_fixture_checkpoint() -> HistoryStepFixtureCheckpoint {
@@ -1112,24 +1175,24 @@ mod two_class_history_step_fixture_tests {
     use super::*;
 
     #[test]
-    fn freezer_page_counts_select_only_b64_and_b255() {
+    fn freezer_page_counts_select_only_b25_and_b255() {
         let backbone = HISTORY_STEP_FREEZER_BACKBONE_USER_COUNTS
             .map(|count| noid_chain::consensus::params::block_page_class_tier(count).unwrap());
-        assert_eq!(backbone, [64, 64, 64, 64, 64, 64, 64, 255]);
+        assert_eq!(backbone, [25, 25, 25, 25, 25, 25, 255]);
         let forks = HISTORY_STEP_FREEZER_FORK_USER_COUNTS
             .map(|count| noid_chain::consensus::params::block_page_class_tier(count).unwrap());
-        assert_eq!(forks, [64, 255]);
+        assert_eq!(forks, [25, 255]);
     }
 
     #[test]
     #[ignore = "runs real wallet proving and production PoW"]
-    fn first_backbone_step_is_a_coinbase_only_b64_block() {
+    fn first_backbone_step_is_a_coinbase_only_b25_block() {
         let mut provider = HonestHistoryStepFixtureProvider::new(0x4849_5354_4550).unwrap();
         let genesis = noid_recursive::genesis_accumulator();
         let step = provider.next_backbone(&genesis).unwrap().unwrap();
         assert!(step.capture_parent_slot.is_none());
-        let PreparedHistoryStepBackboneInput::B64(prepared) = step.input else {
-            panic!("height one must select B64");
+        let PreparedHistoryStepBackboneInput::B25(prepared) = step.input else {
+            panic!("height one must select B25");
         };
         let (witness, nonce, start, end) = prepared.into_parts();
         let (block, _) = witness.finish(nonce, &start, &end).unwrap();

@@ -64,7 +64,7 @@ cd "$RELEASE_ROOT_DIR"
 release_build_pack_tools 1
 
 CURRENT_STAGE='canonical HistoryStep matrix generation'
-printf '\n==> Generating B64/m23 and B255/m24 matrices at zstd level 19\n'
+printf '\n==> Generating B25/m22 and B255/m24 matrices at zstd level 19\n'
 NOID_ARTIFACT_ZSTD_LEVEL=19 "$RELEASE_MATRIX_GENERATOR" "$STAGING_DIR"
 
 CURRENT_STAGE='pack authentication'

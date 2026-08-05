@@ -59,7 +59,7 @@ pub const WALK_A_REGION_SIDECAR_VERSION: u8 = 1;
 pub const WALK_A_WALLET_COMMITTED_COLUMNS: usize = 6;
 pub const WALK_A_META_COMMITTED_COLUMNS: usize = 8;
 pub const MAX_WALK_A_PATTERN_LOG: usize = 20;
-/// Four production tiers cover at most the padded B255 class (`2^8` slots).
+/// The production classes cover at most the padded B255 class (`2^8` slots).
 pub const MAX_WALK_A_TX_LOG: usize = 8;
 /// Published selected capsule geometry.  VK validity must not depend on
 /// debug-only reductions of the native prover's exercised query count.
@@ -959,7 +959,7 @@ fn canonical_meta_protocol(
     let both = es_slots.is_some() && spine_slots.is_some();
     let wallet_overflow = matches!(
         (tx_log, exact_state_region_log, spine_cap_log),
-        (6, Some(12), Some(1)) | (8, Some(13), Some(0))
+        (5, Some(10), Some(0)) | (8, Some(13), Some(0))
     );
     let overflow_family_slots = if wallet_overflow {
         tx_count

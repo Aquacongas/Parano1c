@@ -106,8 +106,8 @@ fn validate_launch_compatibility(
     let step = provider
         .next_backbone(&genesis)?
         .ok_or_else(|| "honest HistoryStep launch fixture is missing".to_owned())?;
-    let PreparedHistoryStepBackboneInput::B64(prepared) = step.input else {
-        return Err("honest HistoryStep launch fixture is not B64".to_owned());
+    let PreparedHistoryStepBackboneInput::B25(prepared) = step.input else {
+        return Err("honest HistoryStep launch fixture is not B25".to_owned());
     };
     let (witness, nonce, start, end) = prepared.into_parts();
     let (_, input) = witness

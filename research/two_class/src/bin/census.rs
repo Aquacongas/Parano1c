@@ -4,12 +4,12 @@
 use paranoid_two_class_research::{geometry, parent_union};
 
 fn main() {
-    println!("B64/B255 isolated PagedSpend research census");
+    println!("B25/B255 isolated PagedSpend research census");
     println!(
-        "B64 pages/auths   {}/{} (m{})",
-        geometry::B64_PAGE_CAPACITY,
-        geometry::B64_AUTHORIZATION_CAPACITY,
-        geometry::B64_OUTER_M,
+        "B25 pages/auths   {}/{} (m{})",
+        geometry::B25_PAGE_CAPACITY,
+        geometry::B25_AUTHORIZATION_CAPACITY,
+        geometry::B25_OUTER_M,
     );
     println!(
         "B255 pages/auths  {}/{}+pad (m{})",
@@ -18,9 +18,9 @@ fn main() {
         geometry::B255_OUTER_M,
     );
     println!(
-        "B64 inputs/outputs {}/{}",
-        geometry::B64_INPUT_CAPACITY,
-        geometry::B64_OUTPUT_CAPACITY,
+        "B25 inputs/outputs {}/{}",
+        geometry::B25_INPUT_CAPACITY,
+        geometry::B25_OUTPUT_CAPACITY,
     );
     println!(
         "B255 inputs/outputs {}/{}",
@@ -33,18 +33,18 @@ fn main() {
         geometry::LOGICAL_INPUT_CAPACITY,
         geometry::LOGICAL_OUTPUT_CAPACITY,
     );
-    println!("B64 saturated TPS {:.3}", geometry::b64_saturated_tps());
+    println!("B25 saturated TPS {:.3}", geometry::b25_saturated_tps());
     println!(
         "protocol TPS      {:.3}",
         geometry::protocol_saturated_tps()
     );
     let parent = parent_union::ParentUnionLayout::canonical();
     println!(
-        "parent m23/m24 q  {}/{}",
-        parent.b64.fri_queries, parent.b255.fri_queries
+        "parent m22/m24 q  {}/{}",
+        parent.b25.fri_queries, parent.b255.fri_queries
     );
     println!(
         "parent union tail  {} fields",
-        parent.inactive_m23_suffix_fields
+        parent.inactive_m22_suffix_fields
     );
 }

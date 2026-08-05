@@ -2548,11 +2548,11 @@ mod tests {
     /// this benchmark intentionally avoids constructing all nine output tables.
     #[test]
     #[ignore = "production-width C1 recursive profile"]
-    fn c1_joint_b64_recursive_row_profile() {
+    fn c1_joint_b25_recursive_row_profile() {
         use noid_ivc_core::deep_chain::c1::{prove_ragged_deep_chain_walk, C1LaneClaimGroup};
 
-        let w_logs = [14usize, 15, 17, 17, 14, 16, 17, 13, 14];
-        let mut rng = Rng(0xC1_B64_C1AC);
+        let w_logs = [14usize, 15, 17, 16, 12, 15, 16, 12, 13];
+        let mut rng = Rng(0xC1_B25_C1AC);
         let instances = w_logs
             .iter()
             .map(|&w_log| {
@@ -2568,12 +2568,12 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let references = instances.iter().collect::<Vec<_>>();
-        let mut native_channel = FsLaneChallenger::new_c1(b"c1-joint-b64-recursive-profile");
+        let mut native_channel = FsLaneChallenger::new_c1(b"c1-joint-b25-recursive-profile");
         let (proof, _) = prove_ragged_deep_chain_walk(&references, &groups, &mut native_channel);
 
         let mut builder = FieldR1csBuilder::new();
         let mut channel = noid_ivc_core::field_circuit::FsChannelUnionRecorder::new_c1(
-            b"c1-joint-b64-recursive-profile",
+            b"c1-joint-b25-recursive-profile",
         );
         let group_traces = groups
             .iter()
@@ -2605,7 +2605,7 @@ mod tests {
         assert_eq!(trace_post.eval(builder.values()), native_post);
         let recording = channel.finish();
         eprintln!(
-            "[deep-chain] genuine C1 joint B64 rows={rows}, transcript_perms={}, \
+            "[deep-chain] genuine C1 joint B25 rows={rows}, transcript_perms={}, \
              transcript_data={}, transcript_challenges={}, terminals={}",
             recording.perms,
             recording.data_wires.len(),

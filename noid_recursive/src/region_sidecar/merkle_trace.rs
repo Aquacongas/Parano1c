@@ -215,20 +215,77 @@ fn merkle_zero_terms_trace(
         }
     }
 
+    let mut paired_weights = Vec::new();
+    if families
+        .iter()
+        .any(|family| matches!(family, MerkleProtocolFamily::PairedUpdate { .. }))
+    {
+        paired_weights.push(LinExpr::constant(F128::ONE));
+        for _ in 1..6 {
+            let next = mul(b, paired_weights.last().expect("paired weight"), lambda);
+            paired_weights.push(next);
+        }
+    }
     for family in families {
         if let MerkleProtocolFamily::PairedUpdate { refs, .. } = family {
-            for factors in [
-                vec![
-                    ColRef::Fixed(refs.old_even),
-                    ColRef::Committed(refs.d),
-                    ColRef::Committed(refs.d),
-                ],
-                vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
-            ] {
-                terms.push(RelationTermTrace {
-                    coeff: LinExpr::constant(F128::ONE),
-                    factors,
-                });
+            let equations = [
+                (
+                    vec![
+                        ColRef::Fixed(refs.old_even),
+                        ColRef::Committed(refs.d),
+                        ColRef::Committed(refs.d),
+                    ],
+                    vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
+                ),
+                (
+                    vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[0])],
+                    vec![
+                        ColRef::Fixed(refs.bridge),
+                        ColRef::CommittedShift2(refs.c[0]),
+                    ],
+                ),
+                (
+                    vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[1])],
+                    vec![
+                        ColRef::Fixed(refs.bridge),
+                        ColRef::CommittedShift2(refs.c[1]),
+                    ],
+                ),
+                (
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::Committed(refs.sib[0]),
+                    ],
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::CommittedShift(refs.sib[0]),
+                    ],
+                ),
+                (
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::Committed(refs.sib[1]),
+                    ],
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::CommittedShift(refs.sib[1]),
+                    ],
+                ),
+                (
+                    vec![ColRef::Fixed(refs.copy_step), ColRef::Committed(refs.d)],
+                    vec![
+                        ColRef::Fixed(refs.copy_step),
+                        ColRef::CommittedShift(refs.d),
+                    ],
+                ),
+            ];
+            for (weight, (left, right)) in paired_weights.iter().zip(equations) {
+                for factors in [left, right] {
+                    terms.push(RelationTermTrace {
+                        coeff: weight.clone(),
+                        factors,
+                    });
+                }
             }
         }
     }
