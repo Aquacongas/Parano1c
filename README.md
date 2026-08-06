@@ -68,7 +68,7 @@ validation removes redundant execution.
 [Block and Tiwari](https://eprint.iacr.org/2024/1161) define concrete FS-FRI
 security as the minimum expected classical random-oracle query work over every
 positive integer query budget. Applying their definitions, 256-bit
-random-oracle setting and whole-bit presentation to the production B64 and
+random-oracle setting and whole-bit presentation to the production B25 and
 B255 profiles gives 127 provable bits and 127 conjectured bits against a
 128-bit target. Both expected-work values lie in the exact interval
 `[127, 128)`. The complete substitutions, integer optimization and comparison
@@ -207,7 +207,7 @@ protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
 Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
 relation without a trusted setup. One joint `GF(2^256)` transcript binds the
 three Link and six Block recursive regions into the outer PCS batch. The two
-authenticated launch matrices, B64 at `m=23` and B255 at `m=24`, are embedded
+authenticated launch matrices, B25 at `m=22` and B255 at `m=24`, are embedded
 in the official binary and can be regenerated from source. The Parano1d Lab
 [FROST-GKR research article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
@@ -228,18 +228,19 @@ PoW has one job: choose the order of valid transitions. Hash power cannot make
 an invalid `HistoryStep` acceptable.
 
 The miner proves the nonce-independent block first, then searches a fixed
-Poseidon2b header with a 128-bit nonce. ASERT targets a 15-second mean interval,
-and cumulative work selects the chain. An external miner receives an immutable,
-single-use template and returns only a nonce; it cannot alter the transactions
-or state root.
+Poseidon2b header with a 128-bit nonce. ASERT targets the complete interval
+between accepted blocks, including proof preparation, nonce search and
+propagation, at a 15-second mean. Cumulative work selects the chain. An external
+miner receives an immutable, single-use template and returns only a nonce; it
+cannot alter the transactions or state root.
 
 ## Launch Profile
 
 | Parameter | Value |
 |---|---:|
 | Mean block target | 15 seconds |
-| Default miner class | B64, `m=23`, up to 64 user pages |
-| Large miner class | B255, `m=24`, up to 255 user pages |
+| Default miner class | B25, `m=22`, up to 25 effective page positions |
+| Large miner class | B255, `m=24`, up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
 | Maximum one-page throughput | 17 TPS |
 | Maximum inputs in one transaction | 1,020 |
@@ -247,7 +248,7 @@ or state root.
 | Recent block / reorg suffix | 18 blocks |
 | State domain | `2^24` to `2^32` slots |
 
-B64 is the laptop-class mining floor, not the protocol ceiling. The production
+B25 is the laptop-class mining floor, not the protocol ceiling. The production
 capacity selector measures complete preparation on each host and uses B255 only
 when that host sustains the larger class within the block cadence. Every node
 verifies both classes.

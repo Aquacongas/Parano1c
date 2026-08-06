@@ -1,9 +1,8 @@
 # Reproducible research results
 
-Files in this directory contain fresh measurements for the active B64/B255
-PagedSpend design only. Superseded A128 and mixed-tree samples are not retained.
+The reports in this directory pin the source revision, command, build profile,
+machine and measured path. Wallet-local results and `HistoryStep` proof results
+are recorded separately because they measure different work.
 
-Each result records the exact git commit, command, build profile, machine and
-raw p50/p95 values. Release-pack reports additionally record byte identity,
-authentication pins and the complete freezer exit. Wallet-local results are
-not HistoryStep proof timings.
+- [`2026-08-06-wallet-20-sample.md`](2026-08-06-wallet-20-sample.md) measures one complete local authorization path for three ordinary transaction sizes.
+- [`2026-08-06-history-step-b25-b255.md`](2026-08-06-history-step-b25-b255.md) compares both production proof classes on a low-cost AVX2 laptop and an AVX-512 PC.

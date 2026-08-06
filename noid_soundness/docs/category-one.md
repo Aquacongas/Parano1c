@@ -68,7 +68,7 @@ time.
 | Wallet query geometry and Johnson ledger | [`ZK_AUTH_CAPSULE_GEOMETRY`](../../noid_fri_binius/src/zk_capsule.rs) and [`conditional_selected_zk_auth_base_iop_ledger`](../../noid_gkr/src/zk_auth_qrom.rs) |
 | C1 challenge support | [`C1_CHALLENGE_MIN_ENTROPY_BITS`](../../noid_ivc_core/src/field/gf2_256.rs) |
 | History query count | [`HISTORY_STEP_FRI_QUERIES`](../../noid_recursive/src/acceptance/history_step_bank.rs) |
-| Canonical B64 and B255 PCS profiles | [`canonical_history_step_pcs_params`](../../noid_recursive/src/acceptance/history_step_bank.rs) |
+| Canonical B25 and B255 PCS profiles | [`canonical_history_step_pcs_params`](../../noid_recursive/src/acceptance/history_step_bank.rs) |
 | BaseFold query count | [`BASEFOLD_RATE_QUARTER_C1_QUERIES`](../../noid_ivc_core/src/pcs/basefold.rs) |
 | Sidecar transcript groups | [`JOINT_C1_GROUPS`](../../noid_recursive/src/region_sidecar.rs) |
 | Poseidon2b profile | [`STATE_SIZE`, `SBOX_EXPONENT`, `F_ROUNDS`, `P_ROUNDS`](../../noid_poseidon2b/src/native/permutation.rs) and [`RATE`](../../noid_poseidon2b/src/native/compression.rs) |
@@ -82,7 +82,7 @@ History queries                = 133
 History queries = BaseFold queries
 challenge support              = 2^255
 digest width                   = 256 bits
-B64 codeword                   = 2^20 at rate 1/4
+B25 codeword                   = 2^19 at rate 1/4
 B255 codeword                  = 2^21 at rate 1/4
 Poseidon2b                     = t4, rate2, x^7, RF8, RP58
 joint sidecar groups           = 3 + 6 = 9
@@ -195,7 +195,7 @@ N\frac{2h^5+3h\gamma s_N^2}{3s_N^3}+\frac{h}{s_N}
 \[
 L_N(m)=\left\lceil\frac{h}{s_N}\right\rceil-1,
 \qquad
-L_{\max}(m)=\max\{L_{2^{20}}(m),L_{2^{21}}(m)\},
+L_{\max}(m)=\max\{L_{2^{19}}(m),L_{2^{21}}(m)\},
 \tag{7}
 \]
 
@@ -239,7 +239,7 @@ into the embedded `GF(2^128)` subfield.
 
 The maximum algebraic identity has 127 roots per candidate. The joint sidecar
 has nine groups across four Poseidon lanes, hence 36 roots per candidate. For
-all B64 and B255 layers,
+all B25 and B255 layers,
 
 \[
 \begin{aligned}
@@ -585,7 +585,7 @@ The certificate evaluates these production event families:
 wallet.query
 wallet.field
 history.query
-history.b64.proximity
+history.b25.proximity
 history.b255.proximity
 history.candidate-switching
 history.joint-sidecar

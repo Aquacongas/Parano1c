@@ -65,7 +65,7 @@ Their published comparison and the production Parano1d row are:
 | Lambda Class | lambdaworks | 80 / 100 / 128 | 81 / 99 / 127 | 81 / 101 / 129 |
 | RISC Zero | RISC Zero | 100 | 37 | 99 |
 | Matter Labs | era-boojum | 100 | 50 | 99 |
-| **Parano1d** | History B64 / B255 | **128** | **127** | **127** |
+| **Parano1d** | History B25 / B255 | **128** | **127** | **127** |
 
 Both Parano1d values lie in the exact interval `[127, 128)`. Their whole-bit
 values are equal because the 256-bit random-oracle collision term controls the
