@@ -737,6 +737,43 @@ impl BlockRegionProverInput {
         DuplexRegionProverPlan::new(vk.main_c(), self.main_c.s0(), self.main_c.s_out())?;
         Ok(())
     }
+
+    fn validate_children_certified_c1(
+        &self,
+        vk: &BlockRegionSidecarVk,
+    ) -> Result<(), RegionSidecarError> {
+        WalkARegionProverPlan::new_certified_c1(
+            vk.wallet_a(),
+            self.wallet_a.s0(),
+            self.wallet_a.s_out(),
+        )?;
+        WalkARegionProverPlan::new_certified_c1(
+            vk.meta_a(),
+            self.meta_a.s0(),
+            self.meta_a.s_out(),
+        )?;
+        MerkleRegionProverPlan::new_certified_c1(
+            vk.wallet_b(),
+            self.wallet_b.s0(),
+            self.wallet_b.s_out(),
+        )?;
+        MerkleRegionProverPlan::new_certified_c1(
+            vk.meta_b(),
+            self.meta_b.s0(),
+            self.meta_b.s_out(),
+        )?;
+        DuplexRegionProverPlan::new_certified_c1(
+            vk.owner_c(),
+            self.owner_c.s0(),
+            self.owner_c.s_out(),
+        )?;
+        DuplexRegionProverPlan::new_certified_c1(
+            vk.main_c(),
+            self.main_c.s0(),
+            self.main_c.s_out(),
+        )?;
+        Ok(())
+    }
 }
 
 /// Borrowed proving plan.  It has no challenger constructor; callers must run
@@ -913,6 +950,12 @@ impl BlockRegionPreparation {
         BlockRegionProverPlan::new_selected_zk(&self.vk, &self.input)
     }
 
+    pub(crate) fn certified_c1_prover_plan(
+        &self,
+    ) -> Result<BlockRegionProverPlan<'_>, RegionSidecarError> {
+        BlockRegionProverPlan::new_certified_c1(&self.vk, &self.input)
+    }
+
     pub fn into_parts(self) -> (BlockRegionSidecarVk, BlockRegionProverInput) {
         (self.vk, self.input)
     }
@@ -927,38 +970,46 @@ impl<'a> BlockRegionProverPlan<'a> {
         Ok(Self { vk, input })
     }
 
+    fn new_certified_c1(
+        vk: &'a BlockRegionSidecarVk,
+        input: &'a BlockRegionProverInput,
+    ) -> Result<Self, RegionSidecarError> {
+        input.validate_children_certified_c1(vk)?;
+        Ok(Self { vk, input })
+    }
+
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
         challenger: &mut Ch,
     ) -> Result<C1BlockRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
         bind_block_vk(challenger, self.vk);
-        let wallet_a_plan = WalkARegionProverPlan::new(
+        let wallet_a_plan = WalkARegionProverPlan::new_certified_c1(
             self.vk.wallet_a(),
             self.input.wallet_a.s0(),
             self.input.wallet_a.s_out(),
         )?;
-        let meta_a_plan = WalkARegionProverPlan::new(
+        let meta_a_plan = WalkARegionProverPlan::new_certified_c1(
             self.vk.meta_a(),
             self.input.meta_a.s0(),
             self.input.meta_a.s_out(),
         )?;
-        let wallet_b_plan = MerkleRegionProverPlan::new(
+        let wallet_b_plan = MerkleRegionProverPlan::new_certified_c1(
             self.vk.wallet_b(),
             self.input.wallet_b.s0(),
             self.input.wallet_b.s_out(),
         )?;
-        let meta_b_plan = MerkleRegionProverPlan::new(
+        let meta_b_plan = MerkleRegionProverPlan::new_certified_c1(
             self.vk.meta_b(),
             self.input.meta_b.s0(),
             self.input.meta_b.s_out(),
         )?;
-        let owner_c_plan = DuplexRegionProverPlan::new(
+        let owner_c_plan = DuplexRegionProverPlan::new_certified_c1(
             self.vk.owner_c(),
             self.input.owner_c.s0(),
             self.input.owner_c.s_out(),
         )?;
-        let main_c_plan = DuplexRegionProverPlan::new(
+        let main_c_plan = DuplexRegionProverPlan::new_certified_c1(
             self.vk.main_c(),
             self.input.main_c.s0(),
             self.input.main_c.s_out(),
@@ -1200,7 +1251,6 @@ pub(super) fn block_c1_proof_shapes(
     vk: &BlockRegionSidecarVk,
     total_vars: usize,
 ) -> Result<BlockC1ProofShapes, RegionSidecarError> {
-    vk.validate_selected_zk_roles()?;
     Ok(BlockC1ProofShapes {
         wallet_a: walk_a_bounded_shape(vk.wallet_a(), total_vars)?.walk_deferred(),
         meta_a: walk_a_bounded_shape(vk.meta_a(), total_vars)?.walk_deferred(),

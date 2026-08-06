@@ -58,8 +58,8 @@ use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 use crate::region_sidecar::{
     CombinedDuplexRegionDescriptor, CombinedDuplexRegionVk, CombinedDuplexSubChannelDescriptor,
-    LinkRegionProverInput, LinkRegionSidecarVk, MerkleRegionFamily, MerkleRegionVk,
-    RecordingDuplexRegionVk, RegionSidecarError, RegionWalkEndpoints,
+    LinkRegionProverInput, LinkRegionProverPlan, LinkRegionSidecarVk, MerkleRegionFamily,
+    MerkleRegionVk, RecordingDuplexRegionVk, RegionSidecarError, RegionWalkEndpoints,
     MAX_COMBINED_DUPLEX_DATA_LANES,
 };
 
@@ -1174,8 +1174,10 @@ impl HistoryStepParentRegionPreparation {
         &self.vk
     }
 
-    pub(crate) fn prover_input(&self) -> &LinkRegionProverInput {
-        &self.input
+    pub(crate) fn certified_c1_prover_plan(
+        &self,
+    ) -> Result<LinkRegionProverPlan<'_>, RegionSidecarError> {
+        LinkRegionProverPlan::new_certified_c1(&self.vk, &self.input)
     }
 }
 

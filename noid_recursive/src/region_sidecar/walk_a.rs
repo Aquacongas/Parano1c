@@ -49,7 +49,7 @@ use crate::acceptance::trace::region_source_binding_c1::{
 use super::bounded_decode::{
     preflight_fixed_proof, record_serde_attempt, FixedProofShape, ProofTailShape, RelationShape,
 };
-use super::{push_f128, push_usize, witness_log, RegionSidecarError};
+use super::{push_f128, push_usize, validate_c1_endpoint_lengths, witness_log, RegionSidecarError};
 
 #[path = "walk_a_trace.rs"]
 mod walk_a_trace;
@@ -333,7 +333,7 @@ pub struct WalkARegionProverPlan<'a> {
 pub(crate) struct C1WalkARegionProverWalkContinuation<'a, 'z> {
     vk: &'a WalkARegionVk,
     total_vars: usize,
-    protocol: CanonicalWalkAProtocol,
+    protocol: Arc<CanonicalWalkAProtocol>,
     committed: Vec<&'z [F128]>,
     exposure_owned: Option<[Vec<F128>; 4]>,
     s0: &'a [Vec<F128>; 4],
@@ -439,13 +439,22 @@ impl<'a> WalkARegionProverPlan<'a> {
         Ok(Self { vk, s0, s_out })
     }
 
+    pub(super) fn new_certified_c1(
+        vk: &'a WalkARegionVk,
+        s0: &'a [Vec<F128>; 4],
+        s_out: &'a [Vec<F128>; 4],
+    ) -> Result<Self, RegionSidecarError> {
+        validate_c1_endpoint_lengths(vk.w_log, s0, s_out)?;
+        Ok(Self { vk, s0, s_out })
+    }
+
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
         challenger: &mut Ch,
     ) -> Result<C1WalkARegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
         let total_vars = witness_log(z)?;
-        let protocol = self.vk.validate_in_witness(total_vars)?;
+        let protocol = self.vk.certified_c1_protocol_in_witness(total_vars)?;
         let committed = self
             .vk
             .slices()
@@ -618,7 +627,7 @@ pub(super) fn walk_a_bounded_shape(
     vk: &WalkARegionVk,
     total_vars: usize,
 ) -> Result<FixedProofShape, RegionSidecarError> {
-    let protocol = vk.validate_in_witness(total_vars)?;
+    let protocol = vk.certified_c1_protocol_in_witness(total_vars)?;
     Ok(walk_a_proof_shape(&protocol))
 }
 

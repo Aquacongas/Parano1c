@@ -229,6 +229,25 @@ impl LinkRegionProverInput {
         validate_recording_endpoints(vk.rec_c(), &self.rec_c)?;
         Ok(())
     }
+
+    fn validate_certified_c1(&self, vk: &LinkRegionSidecarVk) -> Result<(), RegionSidecarError> {
+        CombinedDuplexRegionProverPlan::new_certified_c1(
+            vk.leaf_a(),
+            self.leaf_a.s0(),
+            self.leaf_a.s_out(),
+        )?;
+        MerkleRegionProverPlan::new_certified_c1(
+            vk.path_b(),
+            self.path_b.s0(),
+            self.path_b.s_out(),
+        )?;
+        RecordingDuplexRegionProverPlan::new_certified_c1(
+            vk.rec_c(),
+            self.rec_c.s0(),
+            self.rec_c.s_out(),
+        )?;
+        Ok(())
+    }
 }
 
 pub struct LinkRegionProverPlan<'a> {
@@ -313,23 +332,32 @@ impl<'a> LinkRegionProverPlan<'a> {
         Ok(Self { vk, input })
     }
 
+    pub(crate) fn new_certified_c1(
+        vk: &'a LinkRegionSidecarVk,
+        input: &'a LinkRegionProverInput,
+    ) -> Result<Self, RegionSidecarError> {
+        vk.validate_roles()?;
+        input.validate_certified_c1(vk)?;
+        Ok(Self { vk, input })
+    }
+
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
         challenger: &mut Ch,
     ) -> Result<C1LinkRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
         bind_link_vk(challenger, self.vk);
-        let leaf_plan = CombinedDuplexRegionProverPlan::new(
+        let leaf_plan = CombinedDuplexRegionProverPlan::new_certified_c1(
             self.vk.leaf_a(),
             self.input.leaf_a.s0(),
             self.input.leaf_a.s_out(),
         )?;
-        let path_plan = MerkleRegionProverPlan::new(
+        let path_plan = MerkleRegionProverPlan::new_certified_c1(
             self.vk.path_b(),
             self.input.path_b.s0(),
             self.input.path_b.s_out(),
         )?;
-        let rec_plan = RecordingDuplexRegionProverPlan::new(
+        let rec_plan = RecordingDuplexRegionProverPlan::new_certified_c1(
             self.vk.rec_c(),
             self.input.rec_c.s0(),
             self.input.rec_c.s_out(),

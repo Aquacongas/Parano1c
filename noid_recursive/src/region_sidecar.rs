@@ -279,6 +279,19 @@ impl DuplexRegionVk {
         }
         Ok(())
     }
+
+    /// Per-proof C1 witness gate for a key authenticated by `new` or
+    /// `from_union`. The immutable layout and fixed bank are constructor
+    /// invariants; only the enclosing witness width varies between proofs.
+    fn validate_certified_c1_in_witness(
+        &self,
+        total_vars: usize,
+    ) -> Result<(), RegionSidecarError> {
+        if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        Ok(())
+    }
 }
 
 /// Prover-only inputs not carried by the sidecar proof: layer-0 and layer-66
@@ -303,6 +316,15 @@ impl<'a> DuplexRegionProverPlan<'a> {
         {
             return Err(RegionSidecarError::BadWalkColumns);
         }
+        Ok(Self { vk, s0, s_out })
+    }
+
+    fn new_certified_c1(
+        vk: &'a DuplexRegionVk,
+        s0: &'a [Vec<F128>; 4],
+        s_out: &'a [Vec<F128>; 4],
+    ) -> Result<Self, RegionSidecarError> {
+        validate_c1_endpoint_lengths(vk.w_log, s0, s_out)?;
         Ok(Self { vk, s0, s_out })
     }
 
@@ -418,7 +440,7 @@ impl<'a> DuplexRegionProverPlan<'a> {
         challenger: &mut Ch,
     ) -> Result<C1DuplexRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
         let total_vars = witness_log(z)?;
-        self.vk.validate_in_witness(total_vars)?;
+        self.vk.validate_certified_c1_in_witness(total_vars)?;
         let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
             let slice = self.vk.slices[column];
             &z[slice.start()..slice.start() + slice.len()]
@@ -1066,13 +1088,22 @@ impl C1MerkleRegionVerifierWalkContinuation<'_> {
 }
 
 impl<'a> MerkleRegionProverPlan<'a> {
+    fn new_certified_c1(
+        vk: &'a MerkleRegionVk,
+        s0: &'a [Vec<F128>; 4],
+        s_out: &'a [Vec<F128>; 4],
+    ) -> Result<Self, RegionSidecarError> {
+        validate_c1_endpoint_lengths(vk.w_log, s0, s_out)?;
+        Ok(Self { vk, s0, s_out })
+    }
+
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
         challenger: &mut Ch,
     ) -> Result<C1MerkleRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
         let total_vars = witness_log(z)?;
-        self.vk.validate_in_witness(total_vars)?;
+        self.vk.validate_certified_c1_in_witness(total_vars)?;
         let committed: [&[F128]; MERKLE_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
             let slice = self.vk.slices[column];
             &z[slice.start()..slice.start() + slice.len()]
@@ -1553,6 +1584,23 @@ fn witness_log(z: &[F128]) -> Result<usize, RegionSidecarError> {
     Ok(z.len().trailing_zeros() as usize)
 }
 
+fn validate_c1_endpoint_lengths(
+    w_log: usize,
+    s0: &[Vec<F128>; 4],
+    s_out: &[Vec<F128>; 4],
+) -> Result<(), RegionSidecarError> {
+    if w_log >= usize::BITS as usize {
+        return Err(RegionSidecarError::BadWalkColumns);
+    }
+    let expected = 1usize << w_log;
+    if s0.iter().any(|column| column.len() != expected)
+        || s_out.iter().any(|column| column.len() != expected)
+    {
+        return Err(RegionSidecarError::BadWalkColumns);
+    }
+    Ok(())
+}
+
 fn push_usize(out: &mut Vec<u8>, value: usize) {
     let encoded = u64::try_from(value).expect("region-sidecar index exceeds u64");
     out.extend_from_slice(&encoded.to_le_bytes());
@@ -1603,6 +1651,31 @@ mod tests {
     use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit;
 
     const OUTER_DOMAIN: &[u8] = b"duplex-region-sidecar-field-e2e-v1";
+
+    #[test]
+    fn certified_c1_endpoint_gate_checks_both_boundaries() {
+        let s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 8]);
+        let s_out = s0.clone();
+        assert_eq!(validate_c1_endpoint_lengths(3, &s0, &s_out), Ok(()));
+
+        let mut short_s0 = s0.clone();
+        short_s0[1].pop();
+        assert_eq!(
+            validate_c1_endpoint_lengths(3, &short_s0, &s_out),
+            Err(RegionSidecarError::BadWalkColumns)
+        );
+
+        let mut long_s_out = s_out.clone();
+        long_s_out[2].push(F128::ZERO);
+        assert_eq!(
+            validate_c1_endpoint_lengths(3, &s0, &long_s_out),
+            Err(RegionSidecarError::BadWalkColumns)
+        );
+        assert_eq!(
+            validate_c1_endpoint_lengths(usize::BITS as usize, &s0, &s_out),
+            Err(RegionSidecarError::BadWalkColumns)
+        );
+    }
 
     fn params(m: usize) -> PcsParams {
         PcsParams {

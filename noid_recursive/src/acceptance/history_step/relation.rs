@@ -1411,11 +1411,8 @@ pub fn prove_built_history_step(
     let entry = bank.entry(built.class_id);
     macro_rules! prove_with_matrix {
         ($prove:path, $matrix:expr) => {{
-            let parent_plan = LinkRegionProverPlan::new(
-                built.preparations.recursion.vk(),
-                built.preparations.recursion.prover_input(),
-            )?;
-            let direct_block_plan = built.preparations.direct_block.prover_plan()?;
+            let parent_plan = built.preparations.recursion.certified_c1_prover_plan()?;
+            let direct_block_plan = built.preparations.direct_block.certified_c1_prover_plan()?;
             let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
             $prove(
                 $matrix,

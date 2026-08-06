@@ -49,8 +49,8 @@ use crate::acceptance::trace::self_verify::{
 use crate::acceptance::trace::{ExtExpr, FieldR1csBuilder, LinExpr};
 
 use super::{
-    duplex_layout_digest, push_usize, RegionSidecarError, RegionWalkEndpoints,
-    DUPLEX_REGION_COMMITTED_COLUMNS, DUPLEX_REGION_SIDECAR_VERSION,
+    duplex_layout_digest, push_usize, validate_c1_endpoint_lengths, RegionSidecarError,
+    RegionWalkEndpoints, DUPLEX_REGION_COMMITTED_COLUMNS, DUPLEX_REGION_SIDECAR_VERSION,
 };
 
 const RECORDING_DUPLEX_LAYOUT_DIGEST_DOMAIN: &[u8] =
@@ -207,20 +207,6 @@ impl RecordingDuplexRegionVk {
             {
                 return Err(RegionSidecarError::BadSlice);
             }
-        }
-        Ok(())
-    }
-
-    fn validate_in_witness(&self, total_vars: usize) -> Result<(), RegionSidecarError> {
-        self.validate_structure()?;
-        if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
-            return Err(RegionSidecarError::BadSlice);
-        }
-        if self
-            .selector_slice()
-            .is_some_and(|slice| slice.log2_len != 0 || !slice.fits(total_vars))
-        {
-            return Err(RegionSidecarError::BadSlice);
         }
         Ok(())
     }
@@ -646,6 +632,15 @@ impl<'a> RecordingDuplexRegionProverPlan<'a> {
         Ok(Self { vk, s0, s_out })
     }
 
+    pub(super) fn new_certified_c1(
+        vk: &'a RecordingDuplexRegionVk,
+        s0: &'a [Vec<F128>; STATE_SIZE],
+        s_out: &'a [Vec<F128>; STATE_SIZE],
+    ) -> Result<Self, RegionSidecarError> {
+        validate_c1_endpoint_lengths(vk.w_log, s0, s_out)?;
+        Ok(Self { vk, s0, s_out })
+    }
+
     pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
         &self,
         z: &'z [F128],
@@ -655,7 +650,7 @@ impl<'a> RecordingDuplexRegionProverPlan<'a> {
             return Err(RegionSidecarError::WitnessShape);
         }
         let total_vars = z.len().trailing_zeros() as usize;
-        self.vk.validate_in_witness(total_vars)?;
+        self.vk.validate_certified_c1_in_witness(total_vars)?;
         let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
             let slice = self.vk.slices[column];
             &z[slice.start()..slice.start() + slice.len()]
@@ -925,7 +920,7 @@ pub(super) fn recording_duplex_bounded_shape(
     vk: &RecordingDuplexRegionVk,
     total_vars: usize,
 ) -> Result<super::bounded_decode::FixedProofShape, RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
+    vk.validate_certified_c1_in_witness(total_vars)?;
     let selection_values = claimed_refs(&carry_selection_terms(&vk.refs.c, F128::ONE)).len();
     let substitution_refs = claimed_refs(&vk.substitution_terms(F128::ONE, F128::ONE));
     let shifts = substitution_refs

@@ -56,7 +56,7 @@ use crate::region_sidecar::{
     shape_only_joint_c1_region_sidecar_proof, verify_joint_c1_region_sidecar_post_commit,
     verify_joint_c1_region_sidecar_post_commit_layout_captured,
     verify_joint_c1_region_sidecar_trace_post_commit, BlockRegionPreparation, BlockRegionSidecarVk,
-    JointC1RegionSidecarProof, LinkRegionProverPlan, LinkRegionSidecarVk, RegionSidecarError,
+    JointC1RegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
 };
 
 mod freezer;

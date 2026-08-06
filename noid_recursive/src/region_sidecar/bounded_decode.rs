@@ -297,7 +297,7 @@ pub(super) fn duplex_shape_for_vk(
     vk: &DuplexRegionVk,
     total_vars: usize,
 ) -> Result<FixedProofShape, RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
+    vk.validate_certified_c1_in_witness(total_vars)?;
     Ok(duplex_proof_shape(vk))
 }
 
@@ -332,7 +332,7 @@ pub(super) fn merkle_shape_for_vk(
     vk: &MerkleRegionVk,
     total_vars: usize,
 ) -> Result<MerkleProofShape, RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
+    vk.validate_certified_c1_in_witness(total_vars)?;
     let families = vk.protocol_families();
     Ok(merkle_proof_shape(vk, &families))
 }
