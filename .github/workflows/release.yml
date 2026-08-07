@@ -50,7 +50,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      contents: read
+      contents: write
 
     steps:
       - name: Check out the tagged source
@@ -77,18 +77,19 @@ jobs:
             echo "stable releases cannot use a semantic prerelease version" >&2
             exit 1
           fi
-          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$GITHUB_REF" = refs/heads/main
           source scripts/release_common.sh
           release_workspace_version
           test "v$RELEASE_VERSION" = "$RELEASE_TAG"
           test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          tagged_sha="$(git rev-parse HEAD)"
           platform_ci="$(gh run view "$PLATFORM_CI_RUN_ID" \
             --json conclusion,event,headSha,status,workflowName)"
           test "$(jq -r .status <<<"$platform_ci")" = completed
           test "$(jq -r .conclusion <<<"$platform_ci")" = success
           test "$(jq -r .event <<<"$platform_ci")" = workflow_dispatch
           test "$(jq -r .workflowName <<<"$platform_ci")" = "Platform CI"
-          test "$(jq -r .headSha <<<"$platform_ci")" = "$GITHUB_SHA"
+          test "$(jq -r .headSha <<<"$platform_ci")" = "$tagged_sha"
 
   build:
     name: ${{ matrix.name }}
