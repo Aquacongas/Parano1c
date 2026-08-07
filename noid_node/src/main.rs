@@ -1614,6 +1614,119 @@ enum SnapshotHeaderNextAction {
 }
 
 const SNAPSHOT_HEADER_REQUEST_WINDOW: usize = 2;
+/// An exact header window must make observable progress independently of the
+/// request-response transport timeout. A peer can leave a stream open without
+/// delivering the remaining range, in which case libp2p may not produce a
+/// failure event that advances the node FSM.
+const SNAPSHOT_HEADER_BASE_HEDGE_DELAY: Duration = Duration::from_secs(4);
+const SNAPSHOT_HEADER_BASE_FAILOVER_TIMEOUT: Duration = Duration::from_secs(8);
+const SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT: Duration = Duration::from_secs(15);
+/// Before the first successful exact response, budget a full 4,096-header
+/// batch at 64 KiB/s. This keeps a slow residential or VPN path viable while
+/// the hard failover cap still prevents an open stream from holding sync.
+const SNAPSHOT_HEADER_UNKNOWN_PATH_BYTES_PER_SECOND: u128 = 64 * 1_024;
+const SNAPSHOT_HEADER_TIMING_SAFETY_FACTOR: u128 = 2;
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotHeaderTimingSample {
+    count: u16,
+    elapsed: Duration,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SnapshotHeaderPathTiming {
+    slowest: Option<SnapshotHeaderTimingSample>,
+}
+
+impl SnapshotHeaderPathTiming {
+    fn observe(&mut self, count: u16, elapsed: Duration) {
+        if count == 0 {
+            return;
+        }
+        let sample = SnapshotHeaderTimingSample { count, elapsed };
+        let replace = self.slowest.is_none_or(|current| {
+            elapsed.as_nanos().saturating_mul(u128::from(current.count))
+                > current.elapsed.as_nanos().saturating_mul(u128::from(count))
+        });
+        if replace {
+            self.slowest = Some(sample);
+        }
+    }
+
+    fn expected_response_time(self, count: u16) -> Duration {
+        let nanos = if let Some(sample) = self.slowest {
+            sample
+                .elapsed
+                .as_nanos()
+                .saturating_mul(u128::from(count))
+                .saturating_mul(SNAPSHOT_HEADER_TIMING_SAFETY_FACTOR)
+                .div_ceil(u128::from(sample.count))
+        } else {
+            let response_bytes =
+                (noid_p2p::header_sync_codec::HEADER_RESPONSE_PREFIX_BYTES as u128).saturating_add(
+                    u128::from(count).saturating_mul(noid_chain::BLOCK_HEADER_WIRE_SIZE as u128),
+                );
+            response_bytes
+                .saturating_mul(1_000_000_000)
+                .div_ceil(SNAPSHOT_HEADER_UNKNOWN_PATH_BYTES_PER_SECOND)
+        };
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
+    }
+}
+
+fn snapshot_header_deadlines(count: u16, timing: SnapshotHeaderPathTiming) -> (Duration, Duration) {
+    let failover = timing
+        .expected_response_time(count)
+        .max(SNAPSHOT_HEADER_BASE_FAILOVER_TIMEOUT)
+        .min(SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT);
+    let half_failover =
+        Duration::from_nanos(u64::try_from(failover.as_nanos() / 2).unwrap_or(u64::MAX));
+    (
+        half_failover.max(SNAPSHOT_HEADER_BASE_HEDGE_DELAY),
+        failover,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SnapshotHeaderRequestPlan {
+    token: u64,
+    start_height: u64,
+    count: u16,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SnapshotHeaderAttempt {
+    token: u64,
+    failed: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OutstandingSnapshotHeaderRequest {
+    count: u16,
+    started_at: Instant,
+    primary: SnapshotHeaderAttempt,
+    hedge: Option<SnapshotHeaderAttempt>,
+}
+
+impl OutstandingSnapshotHeaderRequest {
+    fn accepts(&self, token: u64) -> bool {
+        (!self.primary.failed && self.primary.token == token)
+            || self
+                .hedge
+                .is_some_and(|attempt| !attempt.failed && attempt.token == token)
+    }
+
+    fn has_active_attempt(&self) -> bool {
+        !self.primary.failed || self.hedge.is_some_and(|attempt| !attempt.failed)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotHeaderStallAction {
+    Retry(Vec<SnapshotHeaderRequestPlan>),
+    Wait,
+    Failover(SnapshotHeaderRequestPlan),
+}
 
 #[derive(Debug)]
 struct SnapshotHeaderPipeline {
@@ -1621,8 +1734,10 @@ struct SnapshotHeaderPipeline {
     from: libp2p::PeerId,
     target_height: u64,
     next_request_height: u64,
-    outstanding: std::collections::BTreeMap<u64, u16>,
+    next_request_token: u64,
+    outstanding: std::collections::BTreeMap<u64, OutstandingSnapshotHeaderRequest>,
     ready: std::collections::BTreeMap<u64, Vec<noid_chain::BlockHeader>>,
+    path_timing: SnapshotHeaderPathTiming,
 }
 
 impl SnapshotHeaderPipeline {
@@ -1632,12 +1747,23 @@ impl SnapshotHeaderPipeline {
             from,
             target_height,
             next_request_height: next_height,
+            next_request_token: 0,
             outstanding: std::collections::BTreeMap::new(),
             ready: std::collections::BTreeMap::new(),
+            path_timing: SnapshotHeaderPathTiming::default(),
         }
     }
 
-    fn refill_plan(&mut self) -> Vec<(u64, u16)> {
+    fn allocate_token(&mut self) -> u64 {
+        self.next_request_token = self.next_request_token.wrapping_add(1);
+        self.next_request_token
+    }
+
+    fn refill_plan(&mut self) -> Vec<SnapshotHeaderRequestPlan> {
+        self.refill_plan_at(Instant::now())
+    }
+
+    fn refill_plan_at(&mut self, now: Instant) -> Vec<SnapshotHeaderRequestPlan> {
         let mut plan = Vec::with_capacity(SNAPSHOT_HEADER_REQUEST_WINDOW);
         while self.outstanding.len() + self.ready.len() < SNAPSHOT_HEADER_REQUEST_WINDOW
             && self.next_request_height <= self.target_height
@@ -1646,8 +1772,24 @@ impl SnapshotHeaderPipeline {
             let count =
                 (self.target_height - start_height + 1).min(MAX_STAGED_HEADER_BATCH as u64) as u16;
             self.next_request_height += u64::from(count);
-            self.outstanding.insert(start_height, count);
-            plan.push((start_height, count));
+            let token = self.allocate_token();
+            self.outstanding.insert(
+                start_height,
+                OutstandingSnapshotHeaderRequest {
+                    count,
+                    started_at: now,
+                    primary: SnapshotHeaderAttempt {
+                        token,
+                        failed: false,
+                    },
+                    hedge: None,
+                },
+            );
+            plan.push(SnapshotHeaderRequestPlan {
+                token,
+                start_height,
+                count,
+            });
         }
         plan
     }
@@ -1659,18 +1801,24 @@ impl SnapshotHeaderPipeline {
     fn accept(
         &mut self,
         generation: u64,
+        token: u64,
         from: libp2p::PeerId,
         start_height: u64,
         requested_count: u16,
         headers: Vec<noid_chain::BlockHeader>,
+        received_at: Instant,
     ) -> Result<(), String> {
         if generation != self.generation || from != self.from {
             return Err("snapshot header response belongs to another session".into());
         }
-        let Some(expected_count) = self.outstanding.remove(&start_height) else {
+        let Some(expected) = self.outstanding.remove(&start_height) else {
             return Err("snapshot header response has no matching outstanding range".into());
         };
-        if expected_count != requested_count || headers.len() != usize::from(expected_count) {
+        if !expected.accepts(token) {
+            self.outstanding.insert(start_height, expected);
+            return Err("snapshot header response has a stale correlation token".into());
+        }
+        if expected.count != requested_count || headers.len() != usize::from(expected.count) {
             return Err("snapshot header response length does not match its exact request".into());
         }
         if headers
@@ -1679,25 +1827,120 @@ impl SnapshotHeaderPipeline {
         {
             return Err("snapshot header response starts at the wrong height".into());
         }
-        let expected_end = start_height + u64::from(expected_count) - 1;
+        let expected_end = start_height + u64::from(expected.count) - 1;
         if headers
             .last()
             .is_none_or(|header| header.height != expected_end)
         {
             return Err("snapshot header response ends at the wrong height".into());
         }
+        self.path_timing.observe(
+            expected.count,
+            received_at.saturating_duration_since(expected.started_at),
+        );
         if self.ready.insert(start_height, headers).is_some() {
             return Err("duplicate snapshot header response".into());
         }
         Ok(())
     }
 
-    fn take_ready(&mut self, next_height: u64) -> Option<Vec<noid_chain::BlockHeader>> {
-        self.ready.remove(&next_height)
+    fn matches_outstanding(&self, start_height: u64, count: u16, token: u64) -> bool {
+        self.outstanding
+            .get(&start_height)
+            .is_some_and(|request| request.count == count && request.accepts(token))
     }
 
-    fn contains_outstanding(&self, start_height: u64, count: u16) -> bool {
-        self.outstanding.get(&start_height).copied() == Some(count)
+    fn install_hedge(&mut self, start_height: u64) -> SnapshotHeaderRequestPlan {
+        let token = self.allocate_token();
+        let request = self
+            .outstanding
+            .get_mut(&start_height)
+            .expect("hedge target is an outstanding exact range");
+        debug_assert!(request.hedge.is_none());
+        request.hedge = Some(SnapshotHeaderAttempt {
+            token,
+            failed: false,
+        });
+        SnapshotHeaderRequestPlan {
+            token,
+            start_height,
+            count: request.count,
+        }
+    }
+
+    fn timeout_action(&mut self, now: Instant) -> Option<SnapshotHeaderStallAction> {
+        if let Some((&start_height, request)) = self.outstanding.iter().find(|(_, request)| {
+            let (_, failover) = snapshot_header_deadlines(request.count, self.path_timing);
+            now.saturating_duration_since(request.started_at) >= failover
+        }) {
+            return Some(SnapshotHeaderStallAction::Failover(
+                SnapshotHeaderRequestPlan {
+                    token: request.primary.token,
+                    start_height,
+                    count: request.count,
+                },
+            ));
+        }
+        let due = self
+            .outstanding
+            .iter()
+            .filter_map(|(&start_height, request)| {
+                let (hedge, _) = snapshot_header_deadlines(request.count, self.path_timing);
+                (request.hedge.is_none()
+                    && now.saturating_duration_since(request.started_at) >= hedge)
+                    .then_some(start_height)
+            })
+            .collect::<Vec<_>>();
+        if due.is_empty() {
+            return None;
+        }
+        Some(SnapshotHeaderStallAction::Retry(
+            due.into_iter()
+                .map(|start_height| self.install_hedge(start_height))
+                .collect(),
+        ))
+    }
+
+    fn failure_action(
+        &mut self,
+        start_height: u64,
+        count: u16,
+        token: u64,
+    ) -> Option<SnapshotHeaderStallAction> {
+        let request = self.outstanding.get_mut(&start_height)?;
+        if request.count != count {
+            return None;
+        }
+        if !request.primary.failed && request.primary.token == token {
+            request.primary.failed = true;
+        } else if let Some(hedge) = request.hedge.as_mut() {
+            if hedge.failed || hedge.token != token {
+                return None;
+            }
+            hedge.failed = true;
+        } else {
+            return None;
+        }
+
+        if !request.has_active_attempt() && request.hedge.is_some() {
+            return Some(SnapshotHeaderStallAction::Failover(
+                SnapshotHeaderRequestPlan {
+                    token,
+                    start_height,
+                    count,
+                },
+            ));
+        }
+        if request.hedge.is_none() {
+            return Some(SnapshotHeaderStallAction::Retry(vec![
+                self.install_hedge(start_height)
+            ]));
+        }
+        Some(SnapshotHeaderStallAction::Wait)
+    }
+
+    fn take_ready(&mut self, next_height: u64) -> Option<Vec<noid_chain::BlockHeader>> {
+        self.ready.remove(&next_height)
     }
 
     fn is_drained(&self) -> bool {
@@ -2354,14 +2597,17 @@ mod tests {
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         next_block_has_competing_parent, p2p_listen_to_multiaddr,
         prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
-        snapshot_bridge_requires_tail, snapshot_header_next_action,
+        snapshot_bridge_requires_tail, snapshot_header_deadlines, snapshot_header_next_action,
         snapshot_segment_request_capacity, state_segment_response_matches_snapshot_boundary,
         terminal_alternate_peer, unavailable_block_requires_snapshot,
         validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
         validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
-        SnapshotHeaderBoundary, SnapshotHeaderNextAction, SnapshotHeaderPipeline,
+        SnapshotHeaderBoundary, SnapshotHeaderNextAction, SnapshotHeaderPathTiming,
+        SnapshotHeaderPipeline, SnapshotHeaderRequestPlan, SnapshotHeaderStallAction,
         SnapshotSegmentResponseAdmission, TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS,
-        HISTORY_STEP_TERMINAL_HEDGE_DELAY, MINING_PEER_QUORUM, STATE_MANIFEST_RESPONSE_TIMEOUT,
+        HISTORY_STEP_TERMINAL_HEDGE_DELAY, MINING_PEER_QUORUM,
+        SNAPSHOT_HEADER_BASE_FAILOVER_TIMEOUT, SNAPSHOT_HEADER_BASE_HEDGE_DELAY,
+        SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT, STATE_MANIFEST_RESPONSE_TIMEOUT,
     };
 
     #[test]
@@ -2642,10 +2888,59 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_header_deadlines_adapt_without_changing_the_fast_path() {
+        let mut fast = SnapshotHeaderPathTiming::default();
+        fast.observe(4_096, std::time::Duration::from_secs(1));
+        assert_eq!(
+            snapshot_header_deadlines(4_096, fast),
+            (
+                SNAPSHOT_HEADER_BASE_HEDGE_DELAY,
+                SNAPSHOT_HEADER_BASE_FAILOVER_TIMEOUT,
+            )
+        );
+
+        let unknown = snapshot_header_deadlines(4_096, SnapshotHeaderPathTiming::default());
+        assert!(unknown.0 > SNAPSHOT_HEADER_BASE_HEDGE_DELAY);
+        assert!(unknown.1 > SNAPSHOT_HEADER_BASE_FAILOVER_TIMEOUT);
+        assert!(unknown.1 < SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT);
+
+        let mut slow_vpn = SnapshotHeaderPathTiming::default();
+        slow_vpn.observe(4_096, std::time::Duration::from_secs(6));
+        assert_eq!(
+            snapshot_header_deadlines(4_096, slow_vpn),
+            (
+                std::time::Duration::from_secs(6),
+                std::time::Duration::from_secs(12),
+            )
+        );
+
+        slow_vpn.observe(4_096, std::time::Duration::from_secs(20));
+        assert_eq!(
+            snapshot_header_deadlines(4_096, slow_vpn).1,
+            SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT
+        );
+    }
+
+    #[test]
     fn snapshot_header_pipeline_is_two_wide_and_reorders_exact_ranges() {
         let peer = libp2p::PeerId::random();
+        let started = std::time::Instant::now();
         let mut pipeline = SnapshotHeaderPipeline::new(7, peer, 1, 5_822);
-        assert_eq!(pipeline.refill_plan(), vec![(1, 4_096), (4_097, 1_726)]);
+        assert_eq!(
+            pipeline.refill_plan_at(started),
+            vec![
+                SnapshotHeaderRequestPlan {
+                    token: 1,
+                    start_height: 1,
+                    count: 4_096,
+                },
+                SnapshotHeaderRequestPlan {
+                    token: 2,
+                    start_height: 4_097,
+                    count: 1_726,
+                },
+            ]
+        );
         assert!(pipeline.refill_plan().is_empty());
 
         let headers = |start: u64, count: u16| {
@@ -2658,15 +2953,119 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         pipeline
-            .accept(7, peer, 4_097, 1_726, headers(4_097, 1_726))
+            .accept(
+                7,
+                2,
+                peer,
+                4_097,
+                1_726,
+                headers(4_097, 1_726),
+                started + std::time::Duration::from_secs(1),
+            )
             .unwrap();
         assert!(pipeline.take_ready(1).is_none());
         pipeline
-            .accept(7, peer, 1, 4_096, headers(1, 4_096))
+            .accept(
+                7,
+                1,
+                peer,
+                1,
+                4_096,
+                headers(1, 4_096),
+                started + std::time::Duration::from_secs(2),
+            )
             .unwrap();
         assert_eq!(pipeline.take_ready(1).unwrap().len(), 4_096);
         assert_eq!(pipeline.take_ready(4_097).unwrap().len(), 1_726);
         assert!(pipeline.is_drained());
+    }
+
+    #[test]
+    fn snapshot_header_pipeline_hedges_fast_and_accepts_either_attempt() {
+        let peer = libp2p::PeerId::random();
+        let started = std::time::Instant::now();
+        let mut pipeline = SnapshotHeaderPipeline::new(7, peer, 1, 8_192);
+        pipeline
+            .path_timing
+            .observe(4_096, std::time::Duration::from_secs(1));
+        let initial = pipeline.refill_plan_at(started);
+        assert_eq!(initial.len(), 2);
+        assert_eq!(
+            pipeline.timeout_action(
+                started + SNAPSHOT_HEADER_BASE_HEDGE_DELAY - std::time::Duration::from_millis(1)
+            ),
+            None
+        );
+
+        let hedge_at = started + SNAPSHOT_HEADER_BASE_HEDGE_DELAY;
+        let SnapshotHeaderStallAction::Retry(hedges) = pipeline.timeout_action(hedge_at).unwrap()
+        else {
+            panic!("the liveness budget must create one exact hedge");
+        };
+        assert_eq!(hedges.len(), 2);
+        assert_eq!(hedges[0].start_height, 1);
+        assert_eq!(hedges[0].token, 3);
+        assert_eq!(hedges[1].start_height, 4_097);
+        assert_eq!(hedges[1].token, 4);
+        assert!(pipeline.matches_outstanding(1, 4_096, initial[0].token));
+        assert!(pipeline.matches_outstanding(1, 4_096, hedges[0].token));
+        assert_eq!(
+            pipeline.failure_action(1, 4_096, initial[0].token),
+            Some(SnapshotHeaderStallAction::Wait),
+            "one failed attempt cannot discard its active hedge"
+        );
+        assert!(pipeline.matches_outstanding(1, 4_096, hedges[0].token));
+
+        let Some(SnapshotHeaderStallAction::Failover(expired)) =
+            pipeline.timeout_action(started + SNAPSHOT_HEADER_BASE_FAILOVER_TIMEOUT)
+        else {
+            panic!("the bounded hedge must fail over within the sync budget");
+        };
+        assert_eq!((expired.start_height, expired.count), (1, 4_096));
+    }
+
+    #[test]
+    fn partial_snapshot_header_progress_cannot_stall_the_remaining_range() {
+        let peer = libp2p::PeerId::random();
+        let started = std::time::Instant::now();
+        let mut pipeline = SnapshotHeaderPipeline::new(9, peer, 1, 8_192);
+        let initial = pipeline.refill_plan_at(started);
+        assert_eq!(initial.len(), 2);
+
+        let first_headers = (1..=4_096)
+            .map(|height| {
+                let mut header = noid_chain::consensus::genesis::genesis_header();
+                header.height = height;
+                header
+            })
+            .collect::<Vec<_>>();
+        pipeline
+            .accept(
+                9,
+                initial[0].token,
+                peer,
+                1,
+                4_096,
+                first_headers,
+                started + std::time::Duration::from_secs(6),
+            )
+            .unwrap();
+        assert_eq!(pipeline.take_ready(1).unwrap().len(), 4_096);
+
+        let Some(SnapshotHeaderStallAction::Retry(hedges)) =
+            pipeline.timeout_action(started + std::time::Duration::from_secs(6))
+        else {
+            panic!("the missing second range must receive a bounded hedge");
+        };
+        assert_eq!(hedges.len(), 1);
+        assert_eq!((hedges[0].start_height, hedges[0].count), (4_097, 4_096));
+
+        let Some(SnapshotHeaderStallAction::Failover(expired)) =
+            pipeline.timeout_action(started + std::time::Duration::from_secs(12))
+        else {
+            panic!("partial progress must not suppress peer failover");
+        };
+        assert_eq!((expired.start_height, expired.count), (4_097, 4_096));
     }
 
     #[test]
@@ -2682,12 +3081,15 @@ mod tests {
         let current_peer = libp2p::PeerId::random();
         let old_peer = libp2p::PeerId::random();
         let mut pipeline = SnapshotHeaderPipeline::new(8, current_peer, 1, 5_000);
-        assert_eq!(pipeline.refill_plan(), vec![(1, 4_096), (4_097, 904)]);
+        let plan = pipeline.refill_plan();
+        assert_eq!(plan.len(), 2);
+        assert_eq!((plan[0].start_height, plan[0].count), (1, 4_096));
+        assert_eq!((plan[1].start_height, plan[1].count), (4_097, 904));
         assert!(!pipeline.matches_session(7, old_peer));
         assert!(!pipeline.matches_session(7, current_peer));
         assert!(pipeline.matches_session(8, current_peer));
         assert!(
-            pipeline.contains_outstanding(1, 4_096),
+            pipeline.matches_outstanding(1, 4_096, plan[0].token),
             "stale response filtering cannot consume the active window"
         );
     }
@@ -5795,6 +6197,7 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::SnapshotHeadersBatch {
                 generation,
+                token,
                 from,
                 start_height,
                 requested_count,
@@ -5819,12 +6222,25 @@ async fn handle_p2p_events(
                     );
                     continue;
                 }
+                if !pipeline.matches_outstanding(start_height, requested_count, token) {
+                    tracing::debug!(
+                        peer = %from,
+                        generation,
+                        token,
+                        start_height,
+                        requested_count,
+                        "dropping delayed snapshot headers from a retired exact request"
+                    );
+                    continue;
+                }
                 if let Err(error) = pipeline.accept(
                     generation,
+                    token,
                     from,
                     start_height,
                     requested_count,
                     headers,
+                    Instant::now(),
                 ) {
                     tracing::warn!(
                         peer = %from,
@@ -5879,13 +6295,14 @@ async fn handle_p2p_events(
                     continue;
                 }
                 let refill = pipeline.refill_plan();
-                for (next_start, count) in refill {
+                for request in refill {
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
                             generation: snapshot_sync_generation,
+                            token: request.token,
                             peer: from,
-                            start_height: next_start,
-                            count,
+                            start_height: request.start_height,
+                            count: request.count,
                         })
                         .await;
                 }
@@ -5894,44 +6311,72 @@ async fn handle_p2p_events(
             }
             Ok(NetworkEvent::SnapshotHeadersRequestFailed {
                 generation,
+                token,
                 from,
                 start_height,
                 count,
             }) => {
-                let correlated = snapshot_header_pipeline.as_ref().is_some_and(|pipeline| {
-                    pipeline.generation == generation
-                        && pipeline.from == from
-                        && pipeline.contains_outstanding(start_height, count)
+                let action = snapshot_header_pipeline.as_mut().and_then(|pipeline| {
+                    pipeline
+                        .matches_session(generation, from)
+                        .then(|| pipeline.failure_action(start_height, count, token))
+                        .flatten()
                 });
-                if !correlated {
+                let Some(action) = action else {
                     tracing::debug!(
                         peer = %from,
                         generation,
+                        token,
                         start_height,
                         count,
                         "ignoring stale snapshot header request failure"
                     );
                     continue;
+                };
+                match action {
+                    SnapshotHeaderStallAction::Retry(requests) => {
+                        for request in requests {
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
+                                    generation: snapshot_sync_generation,
+                                    token: request.token,
+                                    peer: from,
+                                    start_height: request.start_height,
+                                    count: request.count,
+                                })
+                                .await;
+                        }
+                        tracing::warn!(
+                            peer = %from,
+                            start_height,
+                            count,
+                            "snapshot header request failed; retrying the exact range once"
+                        );
+                    }
+                    SnapshotHeaderStallAction::Wait => {
+                        tracing::debug!(
+                            peer = %from,
+                            start_height,
+                            count,
+                            "one snapshot header attempt failed; waiting for its active hedge"
+                        );
+                    }
+                    SnapshotHeaderStallAction::Failover(request) => {
+                        let staged_headers = pending_snapshot_header_sync
+                            .as_ref()
+                            .map_or(0, |sync| sync.staging.staged_len());
+                        drop(pending_snapshot_header_sync.take());
+                        tracing::warn!(
+                            peer = %from,
+                            start_height = request.start_height,
+                            count = request.count,
+                            staged_headers,
+                            "snapshot header exact retry failed; retaining stage for peer failover"
+                        );
+                        reset_sync_state!();
+                        request_bounded_manifest_failover!(from, true);
+                    }
                 }
-                if let Some(sync) = pending_snapshot_header_sync.take() {
-                    tracing::warn!(
-                        peer = %from,
-                        start_height,
-                        count,
-                        staged_headers = sync.staging.staged_len(),
-                        "snapshot header request failed — retaining exact stage for failover"
-                    );
-                    drop(sync);
-                } else {
-                    tracing::warn!(
-                        peer = %from,
-                        start_height,
-                        count,
-                        "snapshot header request failed during bounded disk append"
-                    );
-                }
-                reset_sync_state!();
-                request_bounded_manifest_failover!(from, true);
                 continue;
             }
             Ok(NetworkEvent::HeadersBatch { from, headers }) => {
@@ -7273,13 +7718,14 @@ async fn handle_p2p_events(
                             continue;
                         }
                         let refill = pipeline.refill_plan();
-                        for (next_start, count) in refill {
+                        for request in refill {
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
                                     generation,
+                                    token: request.token,
                                     peer: from,
-                                    start_height: next_start,
-                                    count,
+                                    start_height: request.start_height,
+                                    count: request.count,
                                 })
                                 .await;
                         }
@@ -7289,13 +7735,14 @@ async fn handle_p2p_events(
 
                     let refill = pipeline.refill_plan();
                     pending_snapshot_header_sync = Some(sync);
-                    for (next_start, count) in refill {
+                    for request in refill {
                         let _ = p2p_cmd
                             .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
                                 generation,
+                                token: request.token,
                                 peer: from,
-                                start_height: next_start,
-                                count,
+                                start_height: request.start_height,
+                                count: request.count,
                             })
                             .await;
                     }
@@ -8084,6 +8531,78 @@ async fn handle_p2p_events(
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
+
+            let stalled_snapshot_headers = if snapshot_header_staging_inflight.is_none() {
+                snapshot_header_pipeline.as_mut().and_then(|pipeline| {
+                    pipeline.timeout_action(now).map(|action| {
+                        (
+                            pipeline.from,
+                            pipeline.target_height,
+                            pipeline.outstanding.len(),
+                            pipeline.ready.len(),
+                            action,
+                        )
+                    })
+                })
+            } else {
+                None
+            };
+            if let Some((peer, target_height, outstanding, buffered, action)) =
+                stalled_snapshot_headers
+            {
+                match action {
+                    SnapshotHeaderStallAction::Retry(requests) => {
+                        let retry_count = requests.len();
+                        for request in requests {
+                            let _ = p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
+                                    generation: snapshot_sync_generation,
+                                    token: request.token,
+                                    peer,
+                                    start_height: request.start_height,
+                                    count: request.count,
+                                })
+                                .await;
+                        }
+                        tracing::warn!(
+                            peer = %peer,
+                            target_height,
+                            outstanding,
+                            buffered,
+                            retry_count,
+                            base_hedge_secs = SNAPSHOT_HEADER_BASE_HEDGE_DELAY.as_secs(),
+                            failover_cap_secs = SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT.as_secs(),
+                            "snapshot header request crossed its adaptive deadline; hedging each exact range once"
+                        );
+                    }
+                    SnapshotHeaderStallAction::Wait => {
+                        unreachable!("the heartbeat only creates hedge or failover actions");
+                    }
+                    SnapshotHeaderStallAction::Failover(request) => {
+                        let staged_headers = pending_snapshot_header_sync
+                            .as_ref()
+                            .map_or(0, |sync| sync.staging.staged_len());
+                        // Dropping the live owner without calling the cleanup
+                        // helper preserves the authenticated candidate file.
+                        // The same boundary resumes at its first missing height.
+                        drop(pending_snapshot_header_sync.take());
+                        tracing::warn!(
+                            peer = %peer,
+                            target_height,
+                            start_height = request.start_height,
+                            count = request.count,
+                            staged_headers,
+                            outstanding,
+                            buffered,
+                            failover_cap_secs = SNAPSHOT_HEADER_MAX_FAILOVER_TIMEOUT.as_secs(),
+                            "snapshot header hedge crossed its adaptive deadline; retaining stage for peer failover"
+                        );
+                        reset_sync_state!();
+                        request_bounded_manifest_failover!(peer, true);
+                        continue;
+                    }
+                }
+            }
 
             let recent_terminal_hedge = pending_recent_suffix.as_ref().and_then(|pending| {
                 pending

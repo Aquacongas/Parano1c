@@ -702,7 +702,7 @@ struct PendingHeaderRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderRequestKind {
     General,
-    Snapshot { generation: u64 },
+    Snapshot { generation: u64, token: u64 },
 }
 
 fn header_request_survives_snapshot_generation(
@@ -711,7 +711,7 @@ fn header_request_survives_snapshot_generation(
 ) -> bool {
     !matches!(
         kind,
-        HeaderRequestKind::Snapshot { generation } if generation != active_generation
+        HeaderRequestKind::Snapshot { generation, .. } if generation != active_generation
     )
 }
 
@@ -1120,11 +1120,13 @@ pub enum NetworkCommand {
     /// Fetch one exactly correlated header range for snapshot disk staging.
     ///
     /// Unlike `FetchHeaders`, two ranges from the same peer may be in flight.
-    /// `generation`, `start_height`, and `count` are returned unchanged so the
-    /// node can reject stale or out-of-order responses without confusing them
-    /// with reorg/tip probes.
+    /// `generation`, the node-local `token`, `start_height`, and `count` are
+    /// returned unchanged so the node can reject stale or out-of-order
+    /// responses without confusing them with reorg/tip probes.
     FetchSnapshotHeaders {
         generation: u64,
+        /// Node-local correlation token. It is never sent on the wire.
+        token: u64,
         peer: PeerId,
         start_height: u64,
         count: u16,
@@ -1227,6 +1229,7 @@ pub enum NetworkEvent {
     /// Exactly correlated response for snapshot header staging.
     SnapshotHeadersBatch {
         generation: u64,
+        token: u64,
         from: PeerId,
         start_height: u64,
         requested_count: u16,
@@ -1235,6 +1238,7 @@ pub enum NetworkEvent {
     /// Transport or decoding failed for one exact snapshot header range.
     SnapshotHeadersRequestFailed {
         generation: u64,
+        token: u64,
         from: PeerId,
         start_height: u64,
         count: u16,
@@ -2784,6 +2788,7 @@ async fn handle_network_command(
         }
         NetworkCommand::FetchSnapshotHeaders {
             generation,
+            token,
             peer,
             start_height,
             count,
@@ -2796,7 +2801,10 @@ async fn handle_network_command(
             // The node owns a single snapshot-header FSM. Once it advances to
             // a new generation, delayed requests from every older generation
             // are inert and must not consume the bounded correlation table.
-            // Keep both current-window requests and unrelated general probes.
+            // Keep both current-window requests, their one bounded hedge, and
+            // unrelated general probes. The node accepts the first valid
+            // response from either attempt and correlation tokens make the
+            // later duplicate inert.
             pending_header_requests.retain(|_, pending| {
                 header_request_survives_snapshot_generation(pending.kind, generation)
             });
@@ -2804,6 +2812,7 @@ async fn handle_network_command(
                 let _ = required_event_tx
                     .send(NetworkEvent::SnapshotHeadersRequestFailed {
                         generation,
+                        token,
                         from: peer,
                         start_height,
                         count,
@@ -2824,7 +2833,7 @@ async fn handle_network_command(
                     peer,
                     start_height,
                     count,
-                    kind: HeaderRequestKind::Snapshot { generation },
+                    kind: HeaderRequestKind::Snapshot { generation, token },
                 },
             );
             debug_assert!(inserted, "fresh snapshot header request ID must be unique");
@@ -3317,10 +3326,11 @@ async fn handle_swarm_event(
                             })
                             .await;
                     }
-                    HeaderRequestKind::Snapshot { generation } => {
+                    HeaderRequestKind::Snapshot { generation, token } => {
                         let _ = required_event_tx
                             .send(NetworkEvent::SnapshotHeadersRequestFailed {
                                 generation,
+                                token,
                                 from: pending.peer,
                                 start_height: pending.start_height,
                                 count: pending.count,
@@ -3344,10 +3354,11 @@ async fn handle_swarm_event(
                                 })
                                 .await;
                         }
-                        HeaderRequestKind::Snapshot { generation } => {
+                        HeaderRequestKind::Snapshot { generation, token } => {
                             let _ = required_event_tx
                                 .send(NetworkEvent::SnapshotHeadersRequestFailed {
                                     generation,
+                                    token,
                                     from: pending.peer,
                                     start_height: pending.start_height,
                                     count: pending.count,
@@ -3367,10 +3378,11 @@ async fn handle_swarm_event(
                         })
                         .await;
                 }
-                HeaderRequestKind::Snapshot { generation } => {
+                HeaderRequestKind::Snapshot { generation, token } => {
                     let _ = required_event_tx
                         .send(NetworkEvent::SnapshotHeadersBatch {
                             generation,
+                            token,
                             from: peer,
                             start_height: pending.start_height,
                             requested_count: pending.count,
@@ -3412,10 +3424,11 @@ async fn handle_swarm_event(
                         })
                         .await;
                 }
-                HeaderRequestKind::Snapshot { generation } => {
+                HeaderRequestKind::Snapshot { generation, token } => {
                     let _ = required_event_tx
                         .send(NetworkEvent::SnapshotHeadersRequestFailed {
                             generation,
+                            token,
                             from: pending.peer,
                             start_height: pending.start_height,
                             count: pending.count,
@@ -4578,10 +4591,11 @@ async fn handle_swarm_event(
                                 })
                                 .await;
                         }
-                        HeaderRequestKind::Snapshot { generation } => {
+                        HeaderRequestKind::Snapshot { generation, token } => {
                             let _ = required_event_tx
                                 .send(NetworkEvent::SnapshotHeadersRequestFailed {
                                     generation,
+                                    token,
                                     from: pending.peer,
                                     start_height: pending.start_height,
                                     count: pending.count,
@@ -5337,7 +5351,10 @@ mod tests {
                 peer,
                 start_height: 1,
                 count: 512,
-                kind: HeaderRequestKind::Snapshot { generation: 7 },
+                kind: HeaderRequestKind::Snapshot {
+                    generation: 7,
+                    token: 11,
+                },
             }
         ));
         assert!(registry.try_insert(
@@ -5346,7 +5363,10 @@ mod tests {
                 peer,
                 start_height: 513,
                 count: 512,
-                kind: HeaderRequestKind::Snapshot { generation: 8 },
+                kind: HeaderRequestKind::Snapshot {
+                    generation: 8,
+                    token: 12,
+                },
             }
         ));
         assert!(registry.try_insert(

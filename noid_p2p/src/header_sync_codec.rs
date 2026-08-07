@@ -22,6 +22,8 @@ const REQUEST_MAGIC: [u8; 4] = *b"NHQ2";
 const RESPONSE_MAGIC: [u8; 4] = *b"NHB2";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
 const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 2;
+/// Fixed bytes preceding the canonical header payload in one response.
+pub const HEADER_RESPONSE_PREFIX_BYTES: usize = RESPONSE_HEADER_BYTES;
 /// Maximum fixed-framing header batch.
 ///
 /// At the canonical 212-byte header size this keeps one response below
