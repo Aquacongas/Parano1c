@@ -571,15 +571,9 @@ impl BlockMiner {
                             // Matches block_work() in difficulty.rs — higher = harder.
                             // Genesis = 27lz. ASERT raises this when blocks arrive faster
                             // than BLOCK_TIME (15s) and lowers it when they're slower.
-                            let diff_lz: u32 = {
-                                let t = &sealed_header.difficulty_target;
-                                let mut lz = 0u32;
-                                for i in (0..32).rev() {
-                                    if t[i] == 0 { lz += 8; }
-                                    else { lz += t[i].leading_zeros(); break; }
-                                }
-                                lz
-                            };
+                            let diff_lz = noid_chain::consensus::target_leading_zero_bits(
+                                &sealed_header.difficulty_target,
+                            );
 
                             tracing::debug!(
                                 height,

@@ -1298,9 +1298,24 @@ impl WalletOps for WalletHandle {
                 }
                 Ok(hex::encode(bytes))
             }
-            None => Err(format!(
-                "no receipt for {txhash_hex} — block already pruned or tx not found"
-            )),
+            None => {
+                let is_same_owner_consolidation = w.history.iter().any(|entry| {
+                    entry.tx_hash == tx_hash
+                        && entry.direction == state::TxDirection::Sent
+                        && entry.peer_address.is_some_and(|peer| {
+                            entry.own_address.as_deref().is_some_and(|own| {
+                                noid_poseidon2b::primitives::Address(peer).to_bech32() == own
+                            })
+                        })
+                });
+                if is_same_owner_consolidation {
+                    Err("same-owner consolidations do not create payment receipts".to_string())
+                } else {
+                    Err(format!(
+                        "no receipt for {txhash_hex} — block already pruned or tx not found"
+                    ))
+                }
+            }
         }
     }
 }
@@ -1646,6 +1661,33 @@ mod tests {
         assert_eq!(balance.pending_outbound_micronoid, 2_000);
         assert_eq!(balance.spendable_micronoid, 2_000);
         assert_eq!(handle.status().utxo_count, 2);
+    }
+
+    #[test]
+    fn export_receipt_identifies_same_owner_consolidation_without_cached_receipt() {
+        let (_dir, handle) = handle_with_utxos(&[2_000, 2_000]);
+        let tx_hash = [0xA5; 32];
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_mut().unwrap();
+            let active = wallet.active_address();
+            wallet.history.push(state::TxHistoryEntry {
+                tx_hash,
+                height: 7,
+                direction: state::TxDirection::Sent,
+                is_coinbase: false,
+                amount_micronoid: 100,
+                peer_address: Some(active.0),
+                timestamp: 8,
+                own_address: Some(active.to_bech32()),
+                own_key_index: Some(wallet.active_index),
+            });
+        }
+
+        assert_eq!(
+            handle.export_receipt(&hex::encode(tx_hash)).unwrap_err(),
+            "same-owner consolidations do not create payment receipts"
+        );
     }
 
     #[test]

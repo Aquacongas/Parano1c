@@ -3240,10 +3240,7 @@ async fn handle_swarm_event(
             _ => {}
         },
 
-        // --- AutoNAT: log reachability status ---
-        //
-        // Operators need to know if their node is publicly reachable.
-        // If private: advise configuring port forwarding or using a relay.
+        // --- AutoNAT: log the latest reachability sample ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::Autonat(autonat::Event::StatusChanged {
             old,
             new,
@@ -3252,10 +3249,14 @@ async fn handle_swarm_event(
                 tracing::info!(addr = %addr, "autonat: node is publicly reachable");
             }
             autonat::NatStatus::Private => {
-                tracing::warn!(
+                // AutoNAT v1 reports the result of a dial-back sample. A
+                // single failed sample is not a stable NAT classification:
+                // another connected probe server can immediately confirm the
+                // same public address. Keep the sample visible without
+                // presenting it as an operator fault.
+                tracing::info!(
                     prev = ?old,
-                    "autonat: node is behind NAT — inbound connections will \
-                     use relay; consider port forwarding tcp/9400 for better connectivity"
+                    "autonat: latest dial-back probe did not confirm public reachability"
                 );
             }
             autonat::NatStatus::Unknown => {

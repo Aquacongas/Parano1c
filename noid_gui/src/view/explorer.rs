@@ -3,8 +3,8 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use iced::widget::{button, column, container, row, scrollable, stack, Space};
-use iced::{Alignment, Color, Element, Length, Padding};
+use iced::widget::{button, column, container, row, scrollable, Space};
+use iced::{Alignment, Element, Length, Padding};
 
 use crate::app::{App, Message};
 use crate::i18n::{text, text_input};
@@ -52,33 +52,16 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
 }
 
 fn search_bar(app: &App, compact: bool) -> Element<'_, Message> {
-    let query_input = text_input("", &app.explorer_query)
-        .on_input(Message::ExplorerQueryChanged)
-        .on_submit(Message::SubmitExplorerSearch)
-        .size(14)
-        .padding([11, 13])
-        .width(Length::Fill)
-        .style(theme::scope_search_input);
-    let query: Element<'_, Message> = if app.explorer_query.is_empty() {
-        stack![
-            query_input,
-            container(
-                text("ADDRESS · BLOCK HEIGHT/HASH · TXID · SLOT:<NUMBER>")
-                    .size(12)
-                    .color(Color {
-                        a: 0.52,
-                        ..theme::MUTED
-                    }),
-            )
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(Padding::ZERO.left(14))
-            .align_y(Alignment::Center),
-        ]
-        .into()
-    } else {
-        query_input.into()
-    };
+    let query = text_input(
+        "ADDRESS · BLOCK HEIGHT/HASH · TXID · SLOT:<NUMBER>",
+        &app.explorer_query,
+    )
+    .on_input(Message::ExplorerQueryChanged)
+    .on_submit(Message::SubmitExplorerSearch)
+    .size(14)
+    .padding([11, 13])
+    .width(Length::Fill)
+    .style(theme::scope_search_input);
 
     let label = if app.explorer_searching {
         "SEARCHING…"

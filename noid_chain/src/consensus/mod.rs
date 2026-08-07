@@ -70,7 +70,9 @@ pub use development_allocation::{
     DEVELOPMENT_SHARE_DENOMINATOR, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
     TARGET_BLOCKS_PER_DAY,
 };
-pub use difficulty::{add_work, block_work, le256_lt, next_target, work_gt};
+pub use difficulty::{
+    add_work, block_work, le256_lt, next_target, target_leading_zero_bits, work_gt,
+};
 pub use emission::{
     block_reward, format_noid, max_coinbase_value, max_coinbase_value_from_claimable_fee_sum,
     total_fees,

@@ -236,6 +236,19 @@ pub fn le256_lt(a: &[u8; 32], b: &[u8; 32]) -> bool {
     false
 }
 
+/// Count the zero bits above the most-significant set bit of a little-endian
+/// 256-bit target.
+pub fn target_leading_zero_bits(target: &[u8; 32]) -> u32 {
+    let mut zeros = 0u32;
+    for &byte in target.iter().rev() {
+        zeros += byte.leading_zeros();
+        if byte != 0 {
+            break;
+        }
+    }
+    zeros
+}
+
 /// Compute the PoW work done for one block with the given strict-`<` target.
 ///
 /// Consensus accepts exactly `target` digest values: `0..target-1`. The
@@ -654,5 +667,18 @@ mod tests {
         assert!(le256_lt(&one, &big));
         assert!(!le256_lt(&big, &zero));
         assert!(!le256_lt(&one, &one)); // equal
+    }
+
+    #[test]
+    fn target_leading_zero_bits_uses_little_endian_significance() {
+        assert_eq!(target_leading_zero_bits(&[0u8; 32]), 256);
+        assert_eq!(target_leading_zero_bits(&[0xFFu8; 32]), 0);
+
+        let mut target = [0u8; 32];
+        target[28] = 0xE1;
+        assert_eq!(target_leading_zero_bits(&target), 24);
+
+        target[28] = 0x01;
+        assert_eq!(target_leading_zero_bits(&target), 31);
     }
 }

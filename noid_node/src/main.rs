@@ -765,6 +765,10 @@ async fn main() -> anyhow::Result<()> {
         .add_directive("libp2p_tcp=warn".parse().unwrap_or_default())
         .add_directive("libp2p_noise=warn".parse().unwrap_or_default())
         .add_directive("libp2p_yamux=warn".parse().unwrap_or_default())
+        // yamux logs a warning when a peer closes the socket before our
+        // best-effort closing frame is flushed. The connection is already
+        // closed at that point, so this is not an operator-actionable fault.
+        .add_directive("yamux=error".parse().unwrap_or_default())
         .add_directive("libp2p_gossipsub=error".parse().unwrap_or_default())
         .add_directive("libp2p_request_response=warn".parse().unwrap_or_default())
         .add_directive("libp2p_identify=warn".parse().unwrap_or_default())

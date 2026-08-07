@@ -2053,16 +2053,7 @@ impl ParanoidApiServer for RpcHandler {
         let tip = chain.tip_header();
         let height = chain.tip_height();
         let diff = tip.difficulty_target;
-        // Count leading zero bits (each leading hex '0' = 4 bits).
-        let diff_bits = diff.iter().rev().fold(0u32, |zeros, &b| {
-            if zeros % 8 == 0 && b == 0 {
-                zeros + 8
-            } else if zeros % 8 == 0 {
-                zeros + b.leading_zeros()
-            } else {
-                zeros
-            }
-        });
+        let diff_bits = noid_chain::consensus::target_leading_zero_bits(&diff);
         let reward = block_reward(tip.log_slots);
         Ok(MiningInfo {
             height,
