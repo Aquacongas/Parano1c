@@ -17,7 +17,7 @@ use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
 use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use serde_json::Value;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 
 // ---------------------------------------------------------------------------
 // ANSI terminal colours (no external crate needed)
@@ -34,9 +34,8 @@ const WHT: &str = "\x1b[97m"; // bright white value
 
 /// Check whether stdout is a real terminal (disable colours when piped).
 fn is_tty() -> bool {
-    // Simple heuristic: if TERM is set and it's not "dumb", we're likely in a TTY.
-    // This avoids adding libc/isatty dep.
-    std::env::var("TERM").is_ok_and(|t| t != "dumb")
+    io::stdout().is_terminal()
+        && std::env::var("TERM").is_ok_and(|t| t != "dumb")
         && std::env::var("NO_COLOR").is_err()
         && std::env::var("CI").is_err()
 }
@@ -571,15 +570,17 @@ async fn cmd_status(ctx: &Ctx<'_>) -> anyhow::Result<()> {
     let capacity = 1u64 << log_slots.min(63);
     let fill_pct = slots.saturating_mul(100).checked_div(capacity).unwrap_or(0);
 
-    // Count leading zeroes in difficulty target for human difficulty reading.
-    let diff_bits = diff.chars().take_while(|&c| c == '0').count() * 4; // each hex '0' = 4 zero bits
+    let diff_bits = hex::decode(diff)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(|target| noid_chain::consensus::target_leading_zero_bits(&target));
 
     section("Paranoid node status");
     kv("Height", &height.to_string());
     kv("Best hash", ctx.h(best_hash));
     kv2(
         "Difficulty",
-        &format!("{diff_bits} leading zeros"),
+        &diff_bits.map_or_else(|| "unknown".into(), |bits| format!("{bits} leading zeros")),
         &format!("(0x{})", &diff[..diff.len().min(16)]),
     );
     kv2(
@@ -1283,14 +1284,18 @@ async fn cmd_address(
         println!("  {} locally generated address(es)", addrs.len());
         println!();
         println!(
-            "  {}▶ = active address (sends spend from it). Switch: 'address --use <index>'.{}",
-            c!(DIM, ""),
-            RST
+            "  {}",
+            c!(
+                DIM,
+                "▶ = active address (sends spend from it). Switch: 'address --use <index>'."
+            )
         );
         println!(
-            "  {}To move funds between your addresses, activate the source and send normally.{}",
-            c!(DIM, ""),
-            RST
+            "  {}",
+            c!(
+                DIM,
+                "To move funds between your addresses, activate the source and send normally."
+            )
         );
     } else if new {
         let result = rpc(ctx, "walletNextAddress", &[])
