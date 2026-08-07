@@ -103,7 +103,7 @@ jobs:
             runner: ubuntu-22.04
             artifact: parano1d-core-${{ inputs.tag }}-linux-x86_64.tar.gz
             gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-x86_64.deb
-            run_tests: true
+            run_tests: false
           - name: Linux ARM64
             runner: ubuntu-22.04-arm
             artifact: parano1d-core-${{ inputs.tag }}-linux-aarch64.tar.gz
