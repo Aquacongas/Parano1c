@@ -2,10 +2,16 @@
 
 **Proof-native Layer 1 ordered by proof of work.**
 
-Blockchains have a fundamental architectural flaw: to validate the present,
-you must replay the past. Bitcoin, Ethereum, and nearly every major network
-inherit this property. A new full node downloads the chain from genesis and
-re-executes every transaction because the current state does not prove itself.
+Blockchains have a fundamental architectural flaw: the present does not prove
+itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
+that validity by validating the chain from genesis. Other networks may shorten
+bootstrap with snapshots or checkpoints, but those only move the dependency
+forward: the current state still does not carry a proof of its own valid path
+from genesis.
+
+A new verifier must therefore reconstruct that path or rely on state produced
+by prior historical validation.
+
 This is not a temporary limitation. It is baked into the model.
 
 Parano1d is designed to remove this requirement.
