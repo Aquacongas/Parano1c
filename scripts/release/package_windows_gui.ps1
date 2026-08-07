@@ -91,7 +91,7 @@ try {
     }
 
     $Wallet = Join-Path $InstallDir "Parano1d.exe"
-    $Node = Join-Path $InstallDir "parano1d.exe"
+    $Node = Join-Path $InstallDir "parano1d-node.exe"
     $InstalledLicense = Join-Path $InstallDir "LICENSE.txt"
     $InstalledNotice = Join-Path $InstallDir "NOTICE.txt"
     if (-not (Test-Path -Path $Wallet -PathType Leaf) -or
@@ -112,6 +112,14 @@ try {
         -PassThru
     if ($Check.ExitCode -ne 0) {
         throw "Installed GUI wallet self-check exited with code $($Check.ExitCode)"
+    }
+    $NodeCheck = Start-Process `
+        -FilePath $Node `
+        -ArgumentList "--check-hardware" `
+        -Wait `
+        -PassThru
+    if ($NodeCheck.ExitCode -ne 0) {
+        throw "Installed node self-check exited with code $($NodeCheck.ExitCode)"
     }
 
     $Uninstaller = Join-Path $InstallDir "unins000.exe"

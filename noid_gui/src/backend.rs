@@ -1788,21 +1788,50 @@ fn home_dir() -> Option<PathBuf> {
         })
 }
 
-fn find_node_binary() -> PathBuf {
-    let executable_name = if cfg!(target_os = "windows") {
-        "parano1d.exe"
-    } else {
-        "parano1d"
-    };
-    if let Ok(current) = std::env::current_exe() {
-        if let Some(parent) = current.parent() {
-            let sibling = parent.join(executable_name);
-            if sibling.is_file() {
-                return sibling;
-            }
+#[cfg(target_os = "windows")]
+const SIBLING_NODE_NAMES: &[&str] = &["parano1d-node.exe", "parano1d.exe"];
+#[cfg(target_os = "macos")]
+const SIBLING_NODE_NAMES: &[&str] = &["parano1d-node", "parano1d"];
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+const SIBLING_NODE_NAMES: &[&str] = &["parano1d"];
+
+fn sibling_node_binary(current: &Path) -> Option<PathBuf> {
+    let parent = current.parent()?;
+    let current_canonical = std::fs::canonicalize(current).ok();
+    SIBLING_NODE_NAMES.iter().find_map(|name| {
+        let candidate = parent.join(name);
+        if !candidate.is_file() {
+            return None;
         }
-    }
-    PathBuf::from(executable_name)
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        if candidate
+            .file_name()
+            .and_then(|name| name.to_str())
+            .zip(current.file_name().and_then(|name| name.to_str()))
+            .is_some_and(|(candidate, current)| candidate.eq_ignore_ascii_case(current))
+        {
+            return None;
+        }
+        let candidate_canonical = std::fs::canonicalize(&candidate).ok();
+        if current_canonical.is_some() && candidate_canonical == current_canonical {
+            return None;
+        }
+        Some(candidate)
+    })
+}
+
+pub(crate) fn bundled_node_binary() -> Option<PathBuf> {
+    sibling_node_binary(&std::env::current_exe().ok()?)
+}
+
+fn find_node_binary() -> PathBuf {
+    bundled_node_binary().unwrap_or_else(|| {
+        PathBuf::from(if cfg!(target_os = "windows") {
+            "parano1d.exe"
+        } else {
+            "parano1d"
+        })
+    })
 }
 
 fn rpc_listen_from_url(url: &str) -> Option<&str> {
@@ -2961,6 +2990,17 @@ fn mock_receipt_verification(txid: &str) -> ReceiptVerificationSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sibling_node_discovery_rejects_the_gui_itself() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("wallet-bin");
+        std::fs::write(&current, b"wallet").unwrap();
+        let sibling = directory.path().join(SIBLING_NODE_NAMES[0]);
+        std::fs::write(&sibling, b"node").unwrap();
+        assert_eq!(sibling_node_binary(&current), Some(sibling.clone()));
+        assert_eq!(sibling_node_binary(&sibling), None);
+    }
 
     #[test]
     fn target_difficulty_is_relative_to_the_genesis_floor() {

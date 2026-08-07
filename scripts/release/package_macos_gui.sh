@@ -77,7 +77,7 @@ DMG_ROOT="$TEMPORARY/dmg"
 mkdir -p -- "$MACOS" "$RESOURCES" "$ICONSET" "$DMG_ROOT"
 
 install -m 0755 "$BIN_DIR/parano1d-gui" "$MACOS/Parano1d"
-install -m 0755 "$BIN_DIR/parano1d" "$MACOS/parano1d"
+install -m 0755 "$BIN_DIR/parano1d" "$MACOS/parano1d-node"
 install -m 0644 "$RELEASE_ROOT_DIR/LICENSE" "$RESOURCES/LICENSE.txt"
 install -m 0644 "$RELEASE_ROOT_DIR/NOTICE" "$RESOURCES/NOTICE.txt"
 
@@ -115,16 +115,17 @@ iconutil -c icns "$ICONSET" -o "$RESOURCES/Parano1d.icns"
 xattr -cr "$APP"
 SIGN_IDENTITY=${NOID_MACOS_SIGN_IDENTITY:--}
 if [[ $SIGN_IDENTITY == - ]]; then
-  codesign --force --sign - --timestamp=none "$MACOS/parano1d"
+  codesign --force --sign - --timestamp=none "$MACOS/parano1d-node"
   codesign --force --sign - --timestamp=none "$MACOS/Parano1d"
   codesign --force --deep --sign - --timestamp=none "$APP"
 else
-  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/parano1d"
+  codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/parano1d-node"
   codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$MACOS/Parano1d"
   codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
 fi
 codesign --verify --deep --strict "$APP"
 "$MACOS/Parano1d" --release-self-check >/dev/null
+"$MACOS/parano1d-node" --check-hardware >/dev/null
 
 cp -R "$APP" "$DMG_ROOT/Parano1d.app"
 ln -s /Applications "$DMG_ROOT/Applications"
@@ -141,8 +142,11 @@ hdiutil attach -readonly -nobrowse -mountpoint "$TEMPORARY/mount" "$ARTIFACT" >/
 MOUNTED=1
 "$TEMPORARY/mount/Parano1d.app/Contents/MacOS/Parano1d" \
   --release-self-check >/dev/null
+"$TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-node" \
+  --check-hardware >/dev/null
 [[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/LICENSE.txt ]]
 [[ -s $TEMPORARY/mount/Parano1d.app/Contents/Resources/NOTICE.txt ]]
+[[ -s $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-node ]]
 [[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-cli ]]
 [[ ! -e $TEMPORARY/mount/Parano1d.app/Contents/MacOS/parano1d-miner ]]
 hdiutil detach "$TEMPORARY/mount" -quiet

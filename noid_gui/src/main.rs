@@ -23,7 +23,7 @@ fn app_theme(_: &app::App) -> iced::Theme {
 }
 
 fn window_settings() -> window::Settings {
-    let mut settings = window::Settings {
+    let settings = window::Settings {
         size: Size::new(1200.0, 760.0),
         min_size: Some(Size::new(920.0, 640.0)),
         position: window::Position::Centered,
@@ -32,9 +32,14 @@ fn window_settings() -> window::Settings {
     };
     #[cfg(target_os = "linux")]
     {
+        let mut settings = settings;
         settings.platform_specific.application_id = LINUX_APPLICATION_ID.into();
+        settings
     }
-    settings
+    #[cfg(not(target_os = "linux"))]
+    {
+        settings
+    }
 }
 
 fn handle_process_command() -> bool {
@@ -55,14 +60,7 @@ fn handle_process_command() -> bool {
         return false;
     }
 
-    let node_name = if cfg!(target_os = "windows") {
-        "parano1d.exe"
-    } else {
-        "parano1d"
-    };
-    let node = std::env::current_exe()
-        .ok()
-        .and_then(|executable| executable.parent().map(|parent| parent.join(node_name)));
+    let node = backend::bundled_node_binary();
     match node {
         Some(node) if node.is_file() => {
             println!(

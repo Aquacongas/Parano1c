@@ -67,7 +67,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceDir}\parano1d-gui.exe"; DestDir: "{app}"; DestName: "Parano1d.exe"; Flags: ignoreversion
-Source: "{#SourceDir}\parano1d.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\parano1d.exe"; DestDir: "{app}"; DestName: "parano1d-node.exe"; Flags: ignoreversion
 Source: "{#LicenseFile}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "{#NoticeFile}"; DestDir: "{app}"; DestName: "NOTICE.txt"; Flags: ignoreversion
 
