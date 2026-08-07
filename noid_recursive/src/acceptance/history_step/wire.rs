@@ -8,13 +8,13 @@
 //! authenticated class/runtime. No vector lengths or serde representation
 //! occur on this wire.
 
-use noid_ivc_core::field::F128;
-use noid_ivc_core::pcs::basefold::QueryOpening;
+use noid_ivc_core::field::{F128, F256};
+use noid_ivc_core::pcs::basefold::{C1QueryOpening, C1RoundMessage};
 use noid_ivc_core::pcs::{
-    compute_fri_arities, default_fri_queries, fri_commit_layout, BaseFoldProof, Commitment,
-    PcsParams, RoundCommitment, RoundMessage, LOG_PACKING,
+    compute_fri_arities, default_fri_queries, fri_commit_layout, C1BaseFoldProof, Commitment,
+    PcsParams, RoundCommitment, LOG_PACKING,
 };
-use noid_ivc_core::proof::{FieldR1csProof, FieldShape};
+use noid_ivc_core::proof::{C1FieldR1csProof, FieldShape};
 
 use super::relation::{validate_terminal_metadata, verify_history_step_terminal, HistoryStepProof};
 use super::*;
@@ -22,14 +22,14 @@ use crate::acceptance::history_step_bank::{
     history_step_bank_block_accumulator, CanonicalHistoryStepClassId, HISTORY_STEP_CLASS_COUNT,
 };
 use crate::region_sidecar::{
-    canonical_block_region_sidecar_len, canonical_link_region_sidecar_len,
-    decode_block_region_sidecar_canonical, decode_link_region_sidecar_canonical,
-    encode_block_region_sidecar_canonical, encode_link_region_sidecar_canonical,
+    canonical_joint_c1_region_sidecar_len, decode_joint_c1_region_sidecar_canonical,
+    encode_joint_c1_region_sidecar_canonical,
 };
 
 const PREFIX_BYTES: usize = 42;
 const HASH_BYTES: usize = 32;
 const F128_BYTES: usize = 16;
+const F256_BYTES: usize = 32;
 
 fn add(left: usize, right: usize) -> Result<usize, HistoryStepError> {
     left.checked_add(right)
@@ -104,24 +104,28 @@ impl BaseFoldWireShape {
         })
     }
 
-    fn encoded_len(&self) -> Result<usize, HistoryStepError> {
-        let mut len = mul(self.round_messages, 2 * F128_BYTES)?;
-        len = add(len, HASH_BYTES)?;
-        len = add(len, mul(self.round_commitments, HASH_BYTES)?)?;
-        len = add(len, 2 * F128_BYTES)?;
-        len = add(len, mul(self.final_codeword, F128_BYTES)?)?;
-        len = add(len, mul(self.plaintext_tail, F128_BYTES)?)?;
-        len = add(len, 8)?;
+    fn query_encoded_len(&self) -> Result<usize, HistoryStepError> {
         let mut query_len = 8usize;
         query_len = add(query_len, mul(self.initial_leaf, F128_BYTES)?)?;
         query_len = add(query_len, mul(self.initial_path, HASH_BYTES)?)?;
-        query_len = add(query_len, mul(self.post_row_batch_leaf, F128_BYTES)?)?;
+        query_len = add(query_len, mul(self.post_row_batch_leaf, F256_BYTES)?)?;
         query_len = add(query_len, mul(self.post_row_batch_path, HASH_BYTES)?)?;
         for (leaf, path) in &self.epoch_shapes {
-            query_len = add(query_len, mul(*leaf, F128_BYTES)?)?;
+            query_len = add(query_len, mul(*leaf, F256_BYTES)?)?;
             query_len = add(query_len, mul(*path, HASH_BYTES)?)?;
         }
-        add(len, mul(self.queries, query_len)?)
+        Ok(query_len)
+    }
+
+    fn encoded_len(&self) -> Result<usize, HistoryStepError> {
+        let mut len = mul(self.round_messages, 2 * F256_BYTES)?;
+        len = add(len, HASH_BYTES)?;
+        len = add(len, mul(self.round_commitments, HASH_BYTES)?)?;
+        len = add(len, 2 * F256_BYTES)?;
+        len = add(len, mul(self.final_codeword, F256_BYTES)?)?;
+        len = add(len, mul(self.plaintext_tail, F256_BYTES)?)?;
+        len = add(len, 8)?;
+        add(len, mul(self.queries, self.query_encoded_len()?)?)
     }
 }
 
@@ -135,7 +139,7 @@ fn field_proof_len(shape: FieldShape, params: &PcsParams) -> Result<usize, Histo
     let lincheck_lanes = add(mul(shape.k_log - shape.k_skip, 2)?, skip)?;
     let basefold = BaseFoldWireShape::derive(params)?.encoded_len()?;
     add(
-        mul(add(zerocheck_lanes, lincheck_lanes)?, F128_BYTES)?,
+        mul(add(zerocheck_lanes, lincheck_lanes)?, F256_BYTES)?,
         basefold,
     )
 }
@@ -151,11 +155,8 @@ fn terminal_len_for_class(
     len = add(len, field_proof_len(entry.shape(), entry.pcs_params())?)?;
     len = add(
         len,
-        canonical_link_region_sidecar_len(runtime.parent_recursion_vk(), entry.shape().m)?,
-    )?;
-    len = add(
-        len,
-        canonical_block_region_sidecar_len(
+        canonical_joint_c1_region_sidecar_len(
+            runtime.parent_recursion_vk(),
             runtime
                 .direct_block_vk(class.current_slot())
                 .ok_or(HistoryStepError::RuntimeBlockVk(class.current_slot()))?,
@@ -178,6 +179,10 @@ pub fn history_step_terminal_max_wire_bytes(
 fn put_f128(out: &mut Vec<u8>, value: F128) {
     out.extend_from_slice(&value.lo.to_le_bytes());
     out.extend_from_slice(&value.hi.to_le_bytes());
+}
+
+fn put_f256(out: &mut Vec<u8>, value: F256) {
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 fn put_hash(out: &mut Vec<u8>, value: &[u8; HASH_BYTES]) {
@@ -235,6 +240,14 @@ impl<'a> Reader<'a> {
         })
     }
 
+    fn f256(&mut self) -> Result<F256, HistoryStepError> {
+        let bytes: [u8; F256_BYTES] = self
+            .take(F256_BYTES)?
+            .try_into()
+            .map_err(|_| HistoryStepError::WireEncoding)?;
+        Ok(F256::from_le_bytes(bytes))
+    }
+
     fn hash(&mut self) -> Result<[u8; HASH_BYTES], HistoryStepError> {
         self.take(HASH_BYTES)?
             .try_into()
@@ -248,32 +261,6 @@ impl<'a> Reader<'a> {
             Err(HistoryStepError::WireEncoding)
         }
     }
-}
-
-fn encode_f128_pair_vec(
-    out: &mut Vec<u8>,
-    values: &[(F128, F128)],
-    expected: usize,
-) -> Result<(), HistoryStepError> {
-    if values.len() != expected {
-        return Err(HistoryStepError::WireEncoding);
-    }
-    for (left, right) in values {
-        put_f128(out, *left);
-        put_f128(out, *right);
-    }
-    Ok(())
-}
-
-fn decode_f128_pair_vec(
-    reader: &mut Reader<'_>,
-    count: usize,
-) -> Result<Vec<(F128, F128)>, HistoryStepError> {
-    let mut values = Vec::with_capacity(count);
-    for _ in 0..count {
-        values.push((reader.f128()?, reader.f128()?));
-    }
-    Ok(values)
 }
 
 fn encode_f128_vec(
@@ -294,6 +281,54 @@ fn decode_f128_vec(reader: &mut Reader<'_>, count: usize) -> Result<Vec<F128>, H
     let mut values = Vec::with_capacity(count);
     for _ in 0..count {
         values.push(reader.f128()?);
+    }
+    Ok(values)
+}
+
+fn encode_f256_pair_vec(
+    out: &mut Vec<u8>,
+    values: &[(F256, F256)],
+    expected: usize,
+) -> Result<(), HistoryStepError> {
+    if values.len() != expected {
+        return Err(HistoryStepError::WireEncoding);
+    }
+    for &(left, right) in values {
+        put_f256(out, left);
+        put_f256(out, right);
+    }
+    Ok(())
+}
+
+fn decode_f256_pair_vec(
+    reader: &mut Reader<'_>,
+    count: usize,
+) -> Result<Vec<(F256, F256)>, HistoryStepError> {
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push((reader.f256()?, reader.f256()?));
+    }
+    Ok(values)
+}
+
+fn encode_f256_vec(
+    out: &mut Vec<u8>,
+    values: &[F256],
+    expected: usize,
+) -> Result<(), HistoryStepError> {
+    if values.len() != expected {
+        return Err(HistoryStepError::WireEncoding);
+    }
+    for &value in values {
+        put_f256(out, value);
+    }
+    Ok(())
+}
+
+fn decode_f256_vec(reader: &mut Reader<'_>, count: usize) -> Result<Vec<F256>, HistoryStepError> {
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        values.push(reader.f256()?);
     }
     Ok(values)
 }
@@ -325,23 +360,23 @@ fn decode_hash_vec(
 
 fn encode_field_proof(
     out: &mut Vec<u8>,
-    proof: &FieldR1csProof,
+    proof: &C1FieldR1csProof,
     shape: FieldShape,
     params: &PcsParams,
 ) -> Result<(), HistoryStepError> {
     let skip = 1usize << shape.k_skip;
-    encode_f128_vec(out, &proof.zerocheck.round1_ab, skip)?;
-    encode_f128_vec(out, &proof.zerocheck.round1_c, skip)?;
-    encode_f128_pair_vec(
+    encode_f256_vec(out, &proof.zerocheck.round1_ab, skip)?;
+    encode_f256_vec(out, &proof.zerocheck.round1_c, skip)?;
+    encode_f256_pair_vec(
         out,
         &proof.zerocheck.multilinear_rounds,
         shape.m - shape.k_skip,
     )?;
-    put_f128(out, proof.zerocheck.final_a_eval);
-    put_f128(out, proof.zerocheck.final_b_eval);
-    put_f128(out, proof.zerocheck.final_c_eval);
-    encode_f128_pair_vec(out, &proof.lincheck.rounds, shape.k_log - shape.k_skip)?;
-    encode_f128_vec(out, &proof.lincheck.z_partial, skip)?;
+    put_f256(out, proof.zerocheck.final_a_eval);
+    put_f256(out, proof.zerocheck.final_b_eval);
+    put_f256(out, proof.zerocheck.final_c_eval);
+    encode_f256_pair_vec(out, &proof.lincheck.rounds, shape.k_log - shape.k_skip)?;
+    encode_f256_vec(out, &proof.lincheck.z_partial, skip)?;
     encode_basefold(out, &proof.pcs_open, &BaseFoldWireShape::derive(params)?)
 }
 
@@ -349,22 +384,22 @@ fn decode_field_proof(
     reader: &mut Reader<'_>,
     shape: FieldShape,
     params: &PcsParams,
-) -> Result<FieldR1csProof, HistoryStepError> {
+) -> Result<C1FieldR1csProof, HistoryStepError> {
     let skip = 1usize << shape.k_skip;
-    let zerocheck = noid_ivc_core::zerocheck::ZerocheckProof {
-        round1_ab: decode_f128_vec(reader, skip)?,
-        round1_c: decode_f128_vec(reader, skip)?,
-        multilinear_rounds: decode_f128_pair_vec(reader, shape.m - shape.k_skip)?,
-        final_a_eval: reader.f128()?,
-        final_b_eval: reader.f128()?,
-        final_c_eval: reader.f128()?,
+    let zerocheck = noid_ivc_core::zerocheck::field_c1::C1ZerocheckProof {
+        round1_ab: decode_f256_vec(reader, skip)?,
+        round1_c: decode_f256_vec(reader, skip)?,
+        multilinear_rounds: decode_f256_pair_vec(reader, shape.m - shape.k_skip)?,
+        final_a_eval: reader.f256()?,
+        final_b_eval: reader.f256()?,
+        final_c_eval: reader.f256()?,
     };
-    let lincheck = noid_ivc_core::lincheck::LincheckProof {
-        rounds: decode_f128_pair_vec(reader, shape.k_log - shape.k_skip)?,
-        z_partial: decode_f128_vec(reader, skip)?,
+    let lincheck = noid_ivc_core::lincheck::c1::C1LincheckProof {
+        rounds: decode_f256_pair_vec(reader, shape.k_log - shape.k_skip)?,
+        z_partial: decode_f256_vec(reader, skip)?,
     };
     let pcs_open = decode_basefold(reader, &BaseFoldWireShape::derive(params)?)?;
-    Ok(FieldR1csProof {
+    Ok(C1FieldR1csProof {
         zerocheck,
         lincheck,
         pcs_open,
@@ -373,14 +408,14 @@ fn decode_field_proof(
 
 fn encode_query(
     out: &mut Vec<u8>,
-    query: &QueryOpening,
+    query: &C1QueryOpening,
     shape: &BaseFoldWireShape,
 ) -> Result<(), HistoryStepError> {
     let position = u64::try_from(query.position).map_err(|_| HistoryStepError::WireEncoding)?;
     out.extend_from_slice(&position.to_le_bytes());
     encode_f128_vec(out, &query.initial_leaf, shape.initial_leaf)?;
     encode_hash_vec(out, &query.initial_path, shape.initial_path)?;
-    encode_f128_vec(out, &query.post_row_batch_leaf, shape.post_row_batch_leaf)?;
+    encode_f256_vec(out, &query.post_row_batch_leaf, shape.post_row_batch_leaf)?;
     encode_hash_vec(out, &query.post_row_batch_path, shape.post_row_batch_path)?;
     if query.epoch_leaves.len() != shape.epoch_shapes.len()
         || query.epoch_paths.len() != shape.epoch_shapes.len()
@@ -388,7 +423,7 @@ fn encode_query(
         return Err(HistoryStepError::WireEncoding);
     }
     for (index, (leaf, path)) in shape.epoch_shapes.iter().enumerate() {
-        encode_f128_vec(out, &query.epoch_leaves[index], *leaf)?;
+        encode_f256_vec(out, &query.epoch_leaves[index], *leaf)?;
         encode_hash_vec(out, &query.epoch_paths[index], *path)?;
     }
     Ok(())
@@ -397,19 +432,19 @@ fn encode_query(
 fn decode_query(
     reader: &mut Reader<'_>,
     shape: &BaseFoldWireShape,
-) -> Result<QueryOpening, HistoryStepError> {
+) -> Result<C1QueryOpening, HistoryStepError> {
     let position = usize::try_from(reader.u64()?).map_err(|_| HistoryStepError::WireEncoding)?;
     let initial_leaf = decode_f128_vec(reader, shape.initial_leaf)?;
     let initial_path = decode_hash_vec(reader, shape.initial_path)?;
-    let post_row_batch_leaf = decode_f128_vec(reader, shape.post_row_batch_leaf)?;
+    let post_row_batch_leaf = decode_f256_vec(reader, shape.post_row_batch_leaf)?;
     let post_row_batch_path = decode_hash_vec(reader, shape.post_row_batch_path)?;
     let mut epoch_leaves = Vec::with_capacity(shape.epoch_shapes.len());
     let mut epoch_paths = Vec::with_capacity(shape.epoch_shapes.len());
     for (leaf, path) in &shape.epoch_shapes {
-        epoch_leaves.push(decode_f128_vec(reader, *leaf)?);
+        epoch_leaves.push(decode_f256_vec(reader, *leaf)?);
         epoch_paths.push(decode_hash_vec(reader, *path)?);
     }
-    Ok(QueryOpening {
+    Ok(C1QueryOpening {
         position,
         initial_leaf,
         initial_path,
@@ -422,7 +457,7 @@ fn decode_query(
 
 fn encode_basefold(
     out: &mut Vec<u8>,
-    proof: &BaseFoldProof,
+    proof: &C1BaseFoldProof,
     shape: &BaseFoldWireShape,
 ) -> Result<(), HistoryStepError> {
     if proof.round_messages.len() != shape.round_messages
@@ -432,17 +467,17 @@ fn encode_basefold(
         return Err(HistoryStepError::WireEncoding);
     }
     for message in &proof.round_messages {
-        put_f128(out, message.u_0);
-        put_f128(out, message.u_2);
+        put_f256(out, message.u_0);
+        put_f256(out, message.u_2);
     }
     put_hash(out, &proof.post_row_batch_commit.root);
     for commitment in &proof.round_commitments {
         put_hash(out, &commitment.root);
     }
-    put_f128(out, proof.final_a);
-    put_f128(out, proof.final_b);
-    encode_f128_vec(out, &proof.final_codeword, shape.final_codeword)?;
-    encode_f128_vec(out, &proof.plaintext_tail, shape.plaintext_tail)?;
+    put_f256(out, proof.final_a);
+    put_f256(out, proof.final_b);
+    encode_f256_vec(out, &proof.final_codeword, shape.final_codeword)?;
+    encode_f256_vec(out, &proof.plaintext_tail, shape.plaintext_tail)?;
     out.extend_from_slice(&proof.pow_nonce.to_le_bytes());
     for query in &proof.queries {
         encode_query(out, query, shape)?;
@@ -453,12 +488,12 @@ fn encode_basefold(
 fn decode_basefold(
     reader: &mut Reader<'_>,
     shape: &BaseFoldWireShape,
-) -> Result<BaseFoldProof, HistoryStepError> {
+) -> Result<C1BaseFoldProof, HistoryStepError> {
     let mut round_messages = Vec::with_capacity(shape.round_messages);
     for _ in 0..shape.round_messages {
-        round_messages.push(RoundMessage {
-            u_0: reader.f128()?,
-            u_2: reader.f128()?,
+        round_messages.push(C1RoundMessage {
+            u_0: reader.f256()?,
+            u_2: reader.f256()?,
         });
     }
     let post_row_batch_commit = RoundCommitment {
@@ -470,16 +505,16 @@ fn decode_basefold(
             root: reader.hash()?,
         });
     }
-    let final_a = reader.f128()?;
-    let final_b = reader.f128()?;
-    let final_codeword = decode_f128_vec(reader, shape.final_codeword)?;
-    let plaintext_tail = decode_f128_vec(reader, shape.plaintext_tail)?;
+    let final_a = reader.f256()?;
+    let final_b = reader.f256()?;
+    let final_codeword = decode_f256_vec(reader, shape.final_codeword)?;
+    let plaintext_tail = decode_f256_vec(reader, shape.plaintext_tail)?;
     let pow_nonce = reader.u64()?;
     let mut queries = Vec::with_capacity(shape.queries);
     for _ in 0..shape.queries {
         queries.push(decode_query(reader, shape)?);
     }
-    Ok(BaseFoldProof {
+    Ok(C1BaseFoldProof {
         round_messages,
         post_row_batch_commit,
         round_commitments,
@@ -499,19 +534,16 @@ pub fn encode_history_step_terminal(
     validate_terminal_metadata(runtime, terminal, None)?;
     let entry = runtime.bank().entry(terminal.class_id);
     let expected = terminal_len_for_class(runtime, terminal.class_id)?;
-    let parent_sidecar = encode_link_region_sidecar_canonical(
+    let block_vk = runtime
+        .direct_block_vk(terminal.class_id.current_slot())
+        .ok_or(HistoryStepError::RuntimeBlockVk(
+            terminal.class_id.current_slot(),
+        ))?;
+    let sidecar = encode_joint_c1_region_sidecar_canonical(
         runtime.parent_recursion_vk(),
+        block_vk,
         entry.shape().m,
-        &terminal.proof.sidecar.parent_recursion,
-    )?;
-    let block_sidecar = encode_block_region_sidecar_canonical(
-        runtime
-            .direct_block_vk(terminal.class_id.current_slot())
-            .ok_or(HistoryStepError::RuntimeBlockVk(
-                terminal.class_id.current_slot(),
-            ))?,
-        entry.shape().m,
-        &terminal.proof.sidecar.direct_block,
+        &terminal.proof.sidecar,
     )?;
     let mut out = Vec::with_capacity(expected);
     out.push(HISTORY_STEP_WIRE_VERSION);
@@ -526,8 +558,7 @@ pub fn encode_history_step_terminal(
         entry.shape(),
         entry.pcs_params(),
     )?;
-    out.extend_from_slice(&parent_sidecar);
-    out.extend_from_slice(&block_sidecar);
+    out.extend_from_slice(&sidecar);
     if out.len() != expected {
         return Err(HistoryStepError::WireLength {
             expected,
@@ -571,19 +602,20 @@ pub fn decode_history_step_terminal(
     let commitment_root = reader.hash()?;
     let io = decode_f128_vec(&mut reader, runtime.bank().spec().io_len)?;
     let field_proof = decode_field_proof(&mut reader, entry.shape(), entry.pcs_params())?;
-    let parent_len =
-        canonical_link_region_sidecar_len(runtime.parent_recursion_vk(), entry.shape().m)?;
-    let parent_recursion = decode_link_region_sidecar_canonical(
-        runtime.parent_recursion_vk(),
-        entry.shape().m,
-        reader.take(parent_len)?,
-    )?;
     let block_vk = runtime
         .direct_block_vk(class_id.current_slot())
         .ok_or(HistoryStepError::RuntimeBlockVk(class_id.current_slot()))?;
-    let block_len = canonical_block_region_sidecar_len(block_vk, entry.shape().m)?;
-    let direct_block =
-        decode_block_region_sidecar_canonical(block_vk, entry.shape().m, reader.take(block_len)?)?;
+    let sidecar_len = canonical_joint_c1_region_sidecar_len(
+        runtime.parent_recursion_vk(),
+        block_vk,
+        entry.shape().m,
+    )?;
+    let sidecar = decode_joint_c1_region_sidecar_canonical(
+        runtime.parent_recursion_vk(),
+        block_vk,
+        entry.shape().m,
+        reader.take(sidecar_len)?,
+    )?;
     reader.finish()?;
     let proof = HistoryStepProof {
         field_proof,
@@ -592,10 +624,7 @@ pub fn decode_history_step_terminal(
             params: entry.pcs_params().clone(),
         },
         io,
-        sidecar: HistoryStepCompositeSidecarProof {
-            parent_recursion,
-            direct_block,
-        },
+        sidecar,
     };
     let accumulator = history_step_bank_block_accumulator(runtime.bank(), &proof.io)?;
     let terminal = HistoryStepTerminal {
@@ -617,4 +646,41 @@ pub fn decode_verify_history_step_terminal(
 ) -> Result<AcceptedHistoryStepTerminal, HistoryStepError> {
     let terminal = decode_history_step_terminal(runtime, bytes)?;
     verify_history_step_terminal(runtime, &terminal, expected_header, epoch_anchor_header)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::acceptance::history_step_bank::{
+        canonical_history_step_pcs_params, HISTORY_STEP_FRI_QUERIES,
+    };
+
+    #[test]
+    fn c1_history_basefold_wire_shapes_are_exact() {
+        let expected = [
+            // B25: k_code=19. Exact encoded lengths are pinned below.
+            (0usize, 19usize, 3_720usize, 500_560usize),
+            // B255: k_code=21, FRI arities [4,4,4,4,3].
+            (1usize, 21usize, 3_976usize, 547_024usize),
+        ];
+
+        for (class_index, expected_k_code, expected_query_bytes, expected_total) in expected {
+            let class = CanonicalHistoryStepClassId::from_index(class_index)
+                .expect("canonical History class");
+            let params = canonical_history_step_pcs_params(class);
+            let shape = BaseFoldWireShape::derive(&params).expect("canonical BaseFold wire shape");
+            assert_eq!(params.k_code(), expected_k_code);
+            assert_eq!(shape.queries, HISTORY_STEP_FRI_QUERIES);
+            assert_eq!(
+                shape
+                    .query_encoded_len()
+                    .expect("canonical query wire length"),
+                expected_query_bytes
+            );
+            assert_eq!(
+                shape.encoded_len().expect("canonical BaseFold wire length"),
+                expected_total
+            );
+        }
+    }
 }

@@ -25,26 +25,29 @@ use noid_gkr::zk_auth_capsule::{
 };
 use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 
-use super::{eq_ind_partial_eval_trace, flat_of, mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
+use super::{
+    constrain_nonzero_ext, eq_ind_partial_eval_ext_trace, flat_of, mul_ext, ExtExpr,
+    FieldR1csBuilder, LinExpr, F256,
+};
 
 pub const ZK_POST_CLAIM_VARS: usize = ZK_AUTH_CAPSULE_BANK_VARS;
 pub const ZK_POST_CLAIM_OPERAND_CLAIMS: usize = ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS;
 pub const ZK_POST_CLAIM_TOTAL_CLAIMS: usize = ZK_AUTH_CAPSULE_POST_CLAIMS;
 
 /// One inverse witness, one product, and one equality pin for `eta != 0`.
-pub const ZK_POST_CLAIM_ETA_ROWS: usize = 3;
+pub const ZK_POST_CLAIM_ETA_ROWS: usize = 7;
 /// Ten Horner products for the eleven ordered scalar claims.
-pub const ZK_POST_CLAIM_SCALAR_RLC_ROWS: usize = 10;
+pub const ZK_POST_CLAIM_SCALAR_RLC_ROWS: usize = 30;
 /// Five factored, ZK-padded terminal operand functionals at `s`, including
 /// the rank-five dummy extension and its in-circuit nonzero coefficient check.
-pub const ZK_POST_CLAIM_STATE_RELATION_ROWS: usize = 95;
+pub const ZK_POST_CLAIM_STATE_RELATION_ROWS: usize = 283;
 /// Four sparse boundary functionals at `s`.
-pub const ZK_POST_CLAIM_BOUNDARY_RELATION_ROWS: usize = 18;
+pub const ZK_POST_CLAIM_BOUNDARY_RELATION_ROWS: usize = 54;
 /// Both Libra-mask functionals, before their shared high-address selector.
-pub const ZK_POST_CLAIM_MASK_RELATION_ROWS: usize = 162;
+pub const ZK_POST_CLAIM_MASK_RELATION_ROWS: usize = 486;
 /// Exact eta fold of the eleven relation functionals; the last two share the
 /// mask-address selector and therefore cost eleven rather than twelve rows.
-pub const ZK_POST_CLAIM_RELATION_RLC_ROWS: usize = 11;
+pub const ZK_POST_CLAIM_RELATION_RLC_ROWS: usize = 33;
 /// Incremental rows after all caller-owned dynamic inputs are allocated.
 /// Deliberately excludes transcript replay and Phase A itself.
 pub const ZK_POST_CLAIM_RELATION_TRACE_ROWS: usize = ZK_POST_CLAIM_ETA_ROWS
@@ -65,7 +68,7 @@ const _: () = assert!(ZK_POST_CLAIM_VARS == 11);
 const _: () = assert!(ZK_POST_CLAIM_OPERAND_CLAIMS == 5);
 const _: () = assert!(ZK_POST_CLAIM_TOTAL_CLAIMS == 11);
 const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_BOOLEAN_INDEX == 2047);
-const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET == 1280);
+const _: () = assert!(ZK_AUTH_CAPSULE_TERMINAL_BLINDING_OFFSET == 768);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkPostClaimDynamicInput {
@@ -94,17 +97,17 @@ pub enum ZkPostClaimRelationTraceError {
 #[derive(Clone, Debug)]
 pub struct ZkPostClaimRelationTraceInput {
     /// AuthGKR input point `rho`, canonical LOW-to-HIGH.
-    pub input_point: [LinExpr; ZK_POST_CLAIM_VARS],
+    pub input_point: [ExtExpr; ZK_POST_CLAIM_VARS],
     /// AuthGKR terminal point `r`, canonical LOW-to-HIGH.
-    pub auth_terminal_point: [LinExpr; ZK_POST_CLAIM_VARS],
+    pub auth_terminal_point: [ExtExpr; ZK_POST_CLAIM_VARS],
     /// Phase-A terminal point `s`, canonical LOW-to-HIGH.
-    pub phase_a_terminal_point: [LinExpr; ZK_POST_CLAIM_VARS],
+    pub phase_a_terminal_point: [ExtExpr; ZK_POST_CLAIM_VARS],
     /// Post-claim RLC challenge, sampled after all eleven scalar claims.
-    pub eta: LinExpr,
+    pub eta: ExtExpr,
     /// `[state_inc, state_lane_0, ..., state_lane_3]`.
-    pub terminal_operand_claims: [LinExpr; ZK_POST_CLAIM_OPERAND_CLAIMS],
-    pub mask_mle_at_input: LinExpr,
-    pub mask_final_at_terminal: LinExpr,
+    pub terminal_operand_claims: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS],
+    pub mask_mle_at_input: ExtExpr,
+    pub mask_final_at_terminal: ExtExpr,
     /// Public output-address lanes.  Capacity-IV lanes are protocol constants.
     pub expected_address: [LinExpr; 2],
 }
@@ -112,14 +115,26 @@ pub struct ZkPostClaimRelationTraceInput {
 #[derive(Clone, Debug)]
 pub struct ZkPostClaimRelationTraceOutput {
     /// The derived Phase-A bank claim `<B,t>`.
-    pub bank_claim: LinExpr,
+    pub bank_claim: ExtExpr,
     /// Alias of `bank_claim`, named after the native relation field.
-    pub expected_inner_product: LinExpr,
+    pub expected_inner_product: ExtExpr,
     /// Transparent `t(s)` at the canonical Phase-A terminal point.
-    pub terminal_relation_value: LinExpr,
+    pub terminal_relation_value: ExtExpr,
 }
 
-fn check_dynamic(
+fn check_dynamic_ext(
+    expression: &ExtExpr,
+    input: ZkPostClaimDynamicInput,
+    index: usize,
+) -> Result<(), ZkPostClaimRelationTraceError> {
+    if expression.is_const() {
+        Err(ZkPostClaimRelationTraceError::DynamicInputIsConstant { input, index })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_dynamic_base(
     expression: &LinExpr,
     input: ZkPostClaimDynamicInput,
     index: usize,
@@ -135,72 +150,66 @@ fn preflight_dynamic_inputs(
     input: &ZkPostClaimRelationTraceInput,
 ) -> Result<(), ZkPostClaimRelationTraceError> {
     for (index, expression) in input.input_point.iter().enumerate() {
-        check_dynamic(expression, ZkPostClaimDynamicInput::InputPoint, index)?;
+        check_dynamic_ext(expression, ZkPostClaimDynamicInput::InputPoint, index)?;
     }
     for (index, expression) in input.auth_terminal_point.iter().enumerate() {
-        check_dynamic(
+        check_dynamic_ext(
             expression,
             ZkPostClaimDynamicInput::AuthTerminalPoint,
             index,
         )?;
     }
     for (index, expression) in input.phase_a_terminal_point.iter().enumerate() {
-        check_dynamic(
+        check_dynamic_ext(
             expression,
             ZkPostClaimDynamicInput::PhaseATerminalPoint,
             index,
         )?;
     }
-    check_dynamic(&input.eta, ZkPostClaimDynamicInput::Eta, 0)?;
+    check_dynamic_ext(&input.eta, ZkPostClaimDynamicInput::Eta, 0)?;
     for (index, expression) in input.terminal_operand_claims.iter().enumerate() {
-        check_dynamic(
+        check_dynamic_ext(
             expression,
             ZkPostClaimDynamicInput::TerminalOperandClaim,
             index,
         )?;
     }
-    check_dynamic(
+    check_dynamic_ext(
         &input.mask_mle_at_input,
         ZkPostClaimDynamicInput::MaskInputClaim,
         0,
     )?;
-    check_dynamic(
+    check_dynamic_ext(
         &input.mask_final_at_terminal,
         ZkPostClaimDynamicInput::MaskFinalClaim,
         0,
     )?;
     for (index, expression) in input.expected_address.iter().enumerate() {
-        check_dynamic(expression, ZkPostClaimDynamicInput::ExpectedAddress, index)?;
+        check_dynamic_base(expression, ZkPostClaimDynamicInput::ExpectedAddress, index)?;
     }
     Ok(())
 }
 
-fn product(b: &mut FieldR1csBuilder, factors: &[LinExpr]) -> LinExpr {
+fn product(b: &mut FieldR1csBuilder, factors: &[ExtExpr]) -> ExtExpr {
     assert!(!factors.is_empty());
     let mut result = factors[0].clone();
     for factor in &factors[1..] {
-        result = mul(b, &result, factor);
+        result = mul_ext(b, &result, factor);
     }
     result
 }
 
-fn rlc_horner(b: &mut FieldR1csBuilder, eta: &LinExpr, values: &[LinExpr]) -> LinExpr {
+fn rlc_horner(b: &mut FieldR1csBuilder, eta: &ExtExpr, values: &[ExtExpr]) -> ExtExpr {
     assert!(!values.is_empty());
     let mut result = values[values.len() - 1].clone();
     for value in values[..values.len() - 1].iter().rev() {
-        result = value.add(&mul(b, eta, &result));
+        result = value.add(&mul_ext(b, eta, &result));
     }
     result
 }
 
-fn constrain_eta_nonzero(b: &mut FieldR1csBuilder, eta: &LinExpr) {
-    constrain_nonzero(b, eta);
-}
-
-fn constrain_nonzero(b: &mut FieldR1csBuilder, value: &LinExpr) {
-    let inverse = LinExpr::from_wire(b.alloc_f128(value.eval(b.values()).inv()));
-    let product = LinExpr::from_wire(b.mul(value, &inverse));
-    pin_eq(b, &product, &LinExpr::constant(F128::ONE));
+fn constrain_eta_nonzero(b: &mut FieldR1csBuilder, eta: &ExtExpr) {
+    constrain_nonzero_ext(b, eta);
 }
 
 /// Extend an existing Boolean equality tensor by higher coordinates.  The
@@ -208,14 +217,14 @@ fn constrain_nonzero(b: &mut FieldR1csBuilder, value: &LinExpr) {
 /// variables.
 fn extend_boolean_tensor(
     b: &mut FieldR1csBuilder,
-    mut tensor: Vec<LinExpr>,
-    higher_coordinates: &[LinExpr],
-) -> Vec<LinExpr> {
+    mut tensor: Vec<ExtExpr>,
+    higher_coordinates: &[ExtExpr],
+) -> Vec<ExtExpr> {
     for coordinate in higher_coordinates {
         let old_len = tensor.len();
         let mut high = Vec::with_capacity(old_len);
         for low in &mut tensor {
-            let at_one = mul(b, low, coordinate);
+            let at_one = mul_ext(b, low, coordinate);
             *low = low.add(&at_one);
             high.push(at_one);
         }
@@ -225,8 +234,8 @@ fn extend_boolean_tensor(
 }
 
 struct RoundCorrelations {
-    same_active: LinExpr,
-    shifted_active: LinExpr,
+    same_active: ExtExpr,
+    shifted_active: ExtExpr,
 }
 
 /// Correlations over the seven round bits:
@@ -238,70 +247,70 @@ struct RoundCorrelations {
 /// `64,65`.  No 128- or 2048-cell witness table is materialized.
 fn active_round_correlations(
     b: &mut FieldR1csBuilder,
-    r: &[LinExpr],
-    s: &[LinExpr],
+    r: &[ExtExpr],
+    s: &[ExtExpr],
 ) -> RoundCorrelations {
     assert_eq!(r.len(), ROUND_BITS);
     assert_eq!(s.len(), ROUND_BITS);
 
     // a_i: 0 -> 1 at bit i; b_i: 1 -> 0 at bit i.
-    let a: [LinExpr; ROUND_BITS] =
-        std::array::from_fn(|i| mul(b, &r[i].add_const(F128::ONE), &s[i]));
-    let carry: [LinExpr; ROUND_BITS] =
-        std::array::from_fn(|i| mul(b, &r[i], &s[i].add_const(F128::ONE)));
+    let a: [ExtExpr; ROUND_BITS] =
+        std::array::from_fn(|i| mul_ext(b, &r[i].add_const(F256::ONE), &s[i]));
+    let carry: [ExtExpr; ROUND_BITS] =
+        std::array::from_fn(|i| mul_ext(b, &r[i], &s[i].add_const(F256::ONE)));
 
     // Equality suffix over bits 1..5, shared by the same-round selector and
     // the increment recurrence.
-    let eq: [LinExpr; 6] = std::array::from_fn(|i| r[i].add(&s[i]).add_const(F128::ONE));
-    let mut eq_suffix: [LinExpr; 6] = std::array::from_fn(|_| LinExpr::zero());
+    let eq: [ExtExpr; 6] = std::array::from_fn(|i| r[i].add(&s[i]).add_const(F256::ONE));
+    let mut eq_suffix: [ExtExpr; 6] = std::array::from_fn(|_| ExtExpr::zero());
     eq_suffix[5] = eq[5].clone();
     for i in (1..5).rev() {
-        eq_suffix[i] = mul(b, &eq[i], &eq_suffix[i + 1]);
+        eq_suffix[i] = mul_ext(b, &eq[i], &eq_suffix[i + 1]);
     }
 
     // Both points are zero at a fixed bit.  These suffixes describe the two
     // sparse high-round cases 64 and 65.
-    let zero_pair: [LinExpr; 6] = std::array::from_fn(|i| {
+    let zero_pair: [ExtExpr; 6] = std::array::from_fn(|i| {
         if i == 0 {
-            LinExpr::zero()
+            ExtExpr::zero()
         } else {
-            mul(b, &r[i].add_const(F128::ONE), &s[i].add_const(F128::ONE))
+            mul_ext(b, &r[i].add_const(F256::ONE), &s[i].add_const(F256::ONE))
         }
     });
-    let mut zero_suffix: [LinExpr; 6] = std::array::from_fn(|_| LinExpr::zero());
+    let mut zero_suffix: [ExtExpr; 6] = std::array::from_fn(|_| ExtExpr::zero());
     zero_suffix[5] = zero_pair[5].clone();
     for i in (1..5).rev() {
-        zero_suffix[i] = mul(b, &zero_pair[i], &zero_suffix[i + 1]);
+        zero_suffix[i] = mul_ext(b, &zero_pair[i], &zero_suffix[i + 1]);
     }
 
     // F_n = a_0*Eq(high) + b_0*F_{n-1}(high), excluding the all-one input.
     let mut increment_low_six = a[5].clone();
     for i in (0..5).rev() {
         increment_low_six =
-            mul(b, &a[i], &eq_suffix[i + 1]).add(&mul(b, &carry[i], &increment_low_six));
+            mul_ext(b, &a[i], &eq_suffix[i + 1]).add(&mul_ext(b, &carry[i], &increment_low_six));
     }
 
-    let high_zero = mul(b, &r[6].add_const(F128::ONE), &s[6].add_const(F128::ONE));
-    let low_range = mul(b, &high_zero, &increment_low_six);
+    let high_zero = mul_ext(b, &r[6].add_const(F256::ONE), &s[6].add_const(F256::ONE));
+    let low_range = mul_ext(b, &high_zero, &increment_low_six);
 
     // q=63 carries out of the low six bits into round bit six.
     let low_all_ones_carry = product(b, &carry[..6]);
-    let q63 = mul(b, &low_all_ones_carry, &a[6]);
+    let q63 = mul_ext(b, &low_all_ones_carry, &a[6]);
 
     // q=64 and q=65, with round bit six staying one.
-    let q64_low = mul(b, &a[0], &zero_suffix[1]);
-    let q65_low = mul(b, &carry[0], &a[1]);
-    let q65_low = mul(b, &q65_low, &zero_suffix[2]);
-    let high_one = mul(b, &r[6], &s[6]);
-    let high_sparse = mul(b, &high_one, &q64_low.add(&q65_low));
+    let q64_low = mul_ext(b, &a[0], &zero_suffix[1]);
+    let q65_low = mul_ext(b, &carry[0], &a[1]);
+    let q65_low = mul_ext(b, &q65_low, &zero_suffix[2]);
+    let high_one = mul_ext(b, &r[6], &s[6]);
+    let high_sparse = mul_ext(b, &high_one, &q64_low.add(&q65_low));
     let shifted_active = low_range.add(&q63).add(&high_sparse);
 
     // Rounds 0..63: high bit zero and all lower bits equal.  Rounds 64,65:
     // high bit one, low bit arbitrary/equal, bits 1..5 fixed zero.
-    let lower_equal = mul(b, &eq[0], &eq_suffix[1]);
-    let low_block = mul(b, &high_zero, &lower_equal);
-    let sparse_high = mul(b, &high_one, &zero_suffix[1]);
-    let sparse_high = mul(b, &sparse_high, &eq[0]);
+    let lower_equal = mul_ext(b, &eq[0], &eq_suffix[1]);
+    let low_block = mul_ext(b, &high_zero, &lower_equal);
+    let sparse_high = mul_ext(b, &high_one, &zero_suffix[1]);
+    let sparse_high = mul_ext(b, &sparse_high, &eq[0]);
     let same_active = low_block.add(&sparse_high);
 
     RoundCorrelations {
@@ -311,76 +320,76 @@ fn active_round_correlations(
 }
 
 struct OperandRelationValues {
-    terminal: [LinExpr; ZK_POST_CLAIM_OPERAND_CLAIMS],
-    lane_at_s: [LinExpr; 4],
-    s_high_zero: LinExpr,
+    terminal: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS],
+    lane_at_s: [ExtExpr; 4],
+    s_high_zero: ExtExpr,
 }
 
 fn terminal_operand_relation_values(
     b: &mut FieldR1csBuilder,
-    r: &[LinExpr; ZK_POST_CLAIM_VARS],
-    s: &[LinExpr; ZK_POST_CLAIM_VARS],
+    r: &[ExtExpr; ZK_POST_CLAIM_VARS],
+    s: &[ExtExpr; ZK_POST_CLAIM_VARS],
 ) -> OperandRelationValues {
-    let lane_tensor = eq_ind_partial_eval_trace(b, &s[..LANE_BITS]);
-    let lane_at_s: [LinExpr; 4] = lane_tensor.try_into().expect("two lane bits");
+    let lane_tensor = eq_ind_partial_eval_ext_trace(b, &s[..LANE_BITS]);
+    let lane_at_s: [ExtExpr; 4] = lane_tensor.try_into().expect("two lane bits");
 
-    let r_high_zero = mul(
+    let r_high_zero = mul_ext(
         b,
-        &r[HIGH_START].add_const(F128::ONE),
-        &r[HIGH_START + 1].add_const(F128::ONE),
+        &r[HIGH_START].add_const(F256::ONE),
+        &r[HIGH_START + 1].add_const(F256::ONE),
     );
-    let s_high_zero = mul(
+    let s_high_zero = mul_ext(
         b,
-        &s[HIGH_START].add_const(F128::ONE),
-        &s[HIGH_START + 1].add_const(F128::ONE),
+        &s[HIGH_START].add_const(F256::ONE),
+        &s[HIGH_START + 1].add_const(F256::ONE),
     );
-    let joint_high_zero = mul(b, &r_high_zero, &s_high_zero);
+    let joint_high_zero = mul_ext(b, &r_high_zero, &s_high_zero);
 
     let round =
         active_round_correlations(b, &r[ROUND_START..HIGH_START], &s[ROUND_START..HIGH_START]);
 
-    let same_common = mul(b, &joint_high_zero, &round.same_active);
-    let lane_values: [LinExpr; 4] =
-        std::array::from_fn(|lane| mul(b, &same_common, &lane_at_s[lane]));
+    let same_common = mul_ext(b, &joint_high_zero, &round.same_active);
+    let lane_values: [ExtExpr; 4] =
+        std::array::from_fn(|lane| mul_ext(b, &same_common, &lane_at_s[lane]));
 
-    let lane_equal = mul(
+    let lane_equal = mul_ext(
         b,
-        &r[0].add(&s[0]).add_const(F128::ONE),
-        &r[1].add(&s[1]).add_const(F128::ONE),
+        &r[0].add(&s[0]).add_const(F256::ONE),
+        &r[1].add(&s[1]).add_const(F256::ONE),
     );
-    let increment = mul(b, &joint_high_zero, &lane_equal);
-    let increment = mul(b, &increment, &round.shifted_active);
+    let increment = mul_ext(b, &joint_high_zero, &lane_equal);
+    let increment = mul_ext(b, &increment, &round.shifted_active);
 
     // ZK dummy extension. Native operand table row 2047 is inactive and
-    // reads five distinct bank cells 1280..1284. Its coefficient at AuthGKR's
+    // reads five distinct bank cells 768..772. Its coefficient at AuthGKR's
     // terminal point is eq(r, 2047) = product_j r_j. The five bank-cell basis
     // weights at Phase A's point are eq(s, 1280+i), i=0..4.
     let r_blinding_weight = product(b, r);
-    constrain_nonzero(b, &r_blinding_weight);
+    constrain_nonzero_ext(b, &r_blinding_weight);
 
-    // Cells 1280..1284 share address bits
-    // [3..=10] = [0,0,0,0,0,1,0,1]. The first four use bit2=0 and the four
+    // Cells 768..772 share address bits
+    // [3..=10] = [0,0,0,0,0,1,1,0]. The first four use bit2=0 and the four
     // two-bit lane basis values; the fifth is low bits 100.
     let s_blinding_high_factors = [
-        s[3].add_const(F128::ONE),
-        s[4].add_const(F128::ONE),
-        s[5].add_const(F128::ONE),
-        s[6].add_const(F128::ONE),
-        s[7].add_const(F128::ONE),
+        s[3].add_const(F256::ONE),
+        s[4].add_const(F256::ONE),
+        s[5].add_const(F256::ONE),
+        s[6].add_const(F256::ONE),
+        s[7].add_const(F256::ONE),
         s[8].clone(),
-        s[9].add_const(F128::ONE),
-        s[10].clone(),
+        s[9].clone(),
+        s[10].add_const(F256::ONE),
     ];
     let s_blinding_high = product(b, &s_blinding_high_factors);
-    let joint_blinding_high = mul(b, &r_blinding_weight, &s_blinding_high);
-    let joint_bit2_zero = mul(b, &joint_blinding_high, &s[2].add_const(F128::ONE));
-    let mut blinding_values: [LinExpr; ZK_POST_CLAIM_OPERAND_CLAIMS] =
-        std::array::from_fn(|_| LinExpr::zero());
+    let joint_blinding_high = mul_ext(b, &r_blinding_weight, &s_blinding_high);
+    let joint_bit2_zero = mul_ext(b, &joint_blinding_high, &s[2].add_const(F256::ONE));
+    let mut blinding_values: [ExtExpr; ZK_POST_CLAIM_OPERAND_CLAIMS] =
+        std::array::from_fn(|_| ExtExpr::zero());
     for lane in 0..4 {
-        blinding_values[lane] = mul(b, &joint_bit2_zero, &lane_at_s[lane]);
+        blinding_values[lane] = mul_ext(b, &joint_bit2_zero, &lane_at_s[lane]);
     }
-    let joint_bit2_one = mul(b, &joint_blinding_high, &s[2]);
-    blinding_values[4] = mul(b, &joint_bit2_one, &lane_at_s[0]);
+    let joint_bit2_one = mul_ext(b, &joint_blinding_high, &s[2]);
+    blinding_values[4] = mul_ext(b, &joint_bit2_one, &lane_at_s[0]);
 
     OperandRelationValues {
         terminal: [
@@ -397,98 +406,98 @@ fn terminal_operand_relation_values(
 
 fn boundary_relation_values(
     b: &mut FieldR1csBuilder,
-    s: &[LinExpr; ZK_POST_CLAIM_VARS],
-    lane_at_s: &[LinExpr; 4],
-    s_high_zero: &LinExpr,
-) -> [LinExpr; 4] {
+    s: &[ExtExpr; ZK_POST_CLAIM_VARS],
+    lane_at_s: &[ExtExpr; 4],
+    s_high_zero: &ExtExpr,
+) -> [ExtExpr; 4] {
     let coefficient_source = sparse_boundary_claims(AuthCapsuleBoundaryPublic::canonical([
         Block128::ZERO,
         Block128::ZERO,
     ]));
 
-    let round_zero_factors: Vec<LinExpr> = (ROUND_START..HIGH_START)
-        .map(|coordinate| s[coordinate].add_const(F128::ONE))
+    let round_zero_factors: Vec<ExtExpr> = (ROUND_START..HIGH_START)
+        .map(|coordinate| s[coordinate].add_const(F256::ONE))
         .collect();
     let round_zero = product(b, &round_zero_factors);
-    let row_zero = mul(b, &round_zero, s_high_zero);
+    let row_zero = mul_ext(b, &round_zero, s_high_zero);
 
     let initial_lane_eval = |claim_index: usize| {
         coefficient_source[claim_index]
             .terms
             .iter()
-            .fold(LinExpr::zero(), |acc, term| {
+            .fold(ExtExpr::zero(), |acc, term| {
                 let lane = term.bank_index & 3;
-                acc.add(&lane_at_s[lane].scale(flat_of(term.coefficient)))
+                acc.add(&lane_at_s[lane].scale_base(flat_of(term.coefficient)))
             })
     };
-    let initial_2 = mul(b, &row_zero, &initial_lane_eval(0));
-    let initial_3 = mul(b, &row_zero, &initial_lane_eval(1));
+    let initial_2 = mul_ext(b, &row_zero, &initial_lane_eval(0));
+    let initial_3 = mul_ext(b, &row_zero, &initial_lane_eval(1));
 
     // Round 66 = binary 1000010 in LOW-to-HIGH round-bit order.
-    let round_66_factors: Vec<LinExpr> = (0..ROUND_BITS)
+    let round_66_factors: Vec<ExtExpr> = (0..ROUND_BITS)
         .map(|bit| {
             if bit == 1 || bit == 6 {
                 s[ROUND_START + bit].clone()
             } else {
-                s[ROUND_START + bit].add_const(F128::ONE)
+                s[ROUND_START + bit].add_const(F256::ONE)
             }
         })
         .collect();
     let round_66 = product(b, &round_66_factors);
-    let row_66 = mul(b, &round_66, s_high_zero);
-    let output_0 = mul(b, &row_66, &lane_at_s[0]);
-    let output_1 = mul(b, &row_66, &lane_at_s[1]);
+    let row_66 = mul_ext(b, &round_66, s_high_zero);
+    let output_0 = mul_ext(b, &row_66, &lane_at_s[0]);
+    let output_1 = mul_ext(b, &row_66, &lane_at_s[1]);
 
     [initial_2, initial_3, output_0, output_1]
 }
 
 struct MaskRelationValues {
-    input_without_high: LinExpr,
-    final_without_high: LinExpr,
-    high_selector: LinExpr,
+    input_without_high: ExtExpr,
+    final_without_high: ExtExpr,
+    high_selector: ExtExpr,
 }
 
 fn mask_relation_values(
     b: &mut FieldR1csBuilder,
-    rho: &[LinExpr; ZK_POST_CLAIM_VARS],
-    r: &[LinExpr; ZK_POST_CLAIM_VARS],
-    s: &[LinExpr; ZK_POST_CLAIM_VARS],
-    lane_at_s: &[LinExpr; 4],
+    rho: &[ExtExpr; ZK_POST_CLAIM_VARS],
+    r: &[ExtExpr; ZK_POST_CLAIM_VARS],
+    s: &[ExtExpr; ZK_POST_CLAIM_VARS],
+    lane_at_s: &[ExtExpr; 4],
 ) -> MaskRelationValues {
     // Mask power occupies address bits 0..3.  Reuse the already-built tensor
     // for bits 0..1 and extend it through bits 2..3.
     let power_tensor = extend_boolean_tensor(b, lane_at_s.to_vec(), &s[2..4]);
-    let variable_tensor = eq_ind_partial_eval_trace(b, &s[4..8]);
+    let variable_tensor = eq_ind_partial_eval_ext_trace(b, &s[4..8]);
 
-    // All active mask cells have address bits 8,9,10 = 0,0,1.
-    let mask_high = mul(b, &s[10], &s[9].add_const(F128::ONE));
-    let high_selector = mul(b, &mask_high, &s[8].add_const(F128::ONE));
+    // All active mask cells have address bits 8,9,10 = 0,1,0.
+    let mask_high = mul_ext(b, &s[10].add_const(F256::ONE), &s[9]);
+    let high_selector = mul_ext(b, &mask_high, &s[8].add_const(F256::ONE));
 
     let active_variable_weight = variable_tensor[..MASK_ACTIVE_VARIABLES]
         .iter()
-        .fold(LinExpr::zero(), |acc, value| acc.add(value));
+        .fold(ExtExpr::zero(), |acc, value| acc.add(value));
     let rho_weighted_variables = (0..MASK_ACTIVE_VARIABLES)
-        .fold(LinExpr::zero(), |acc, variable| {
-            acc.add(&mul(b, &variable_tensor[variable], &rho[variable]))
+        .fold(ExtExpr::zero(), |acc, variable| {
+            acc.add(&mul_ext(b, &variable_tensor[variable], &rho[variable]))
         });
     let positive_power_weight = power_tensor[1..MASK_ACTIVE_POWERS]
         .iter()
-        .fold(LinExpr::zero(), |acc, value| acc.add(value));
-    let input_without_high = mul(b, &power_tensor[0], &active_variable_weight).add(&mul(
+        .fold(ExtExpr::zero(), |acc, value| acc.add(value));
+    let input_without_high = mul_ext(b, &power_tensor[0], &active_variable_weight).add(&mul_ext(
         b,
         &positive_power_weight,
         &rho_weighted_variables,
     ));
 
-    let mut final_without_high = LinExpr::zero();
+    let mut final_without_high = ExtExpr::zero();
     for variable in 0..MASK_ACTIVE_VARIABLES {
         // sum_{power=0}^{10} eq(power,s[0..4]) * r_variable^power.
         let mut polynomial = power_tensor[MASK_ACTIVE_POWERS - 1].clone();
         for power in (0..MASK_ACTIVE_POWERS - 1).rev() {
-            polynomial = power_tensor[power].add(&mul(b, &r[variable], &polynomial));
+            polynomial = power_tensor[power].add(&mul_ext(b, &r[variable], &polynomial));
         }
         final_without_high =
-            final_without_high.add(&mul(b, &variable_tensor[variable], &polynomial));
+            final_without_high.add(&mul_ext(b, &variable_tensor[variable], &polynomial));
     }
 
     MaskRelationValues {
@@ -509,16 +518,16 @@ pub fn build_zk_post_claim_relation_trace(
     input: &ZkPostClaimRelationTraceInput,
 ) -> Result<ZkPostClaimRelationTraceOutput, ZkPostClaimRelationTraceError> {
     preflight_dynamic_inputs(input)?;
-    if input.eta.eval(b.values()) == F128::ZERO {
+    if input.eta.eval(b.values()) == F256::ZERO {
         return Err(ZkPostClaimRelationTraceError::ZeroEta);
     }
     if input
         .auth_terminal_point
         .iter()
-        .fold(F128::ONE, |acc, coordinate| {
+        .fold(F256::ONE, |acc, coordinate| {
             acc * coordinate.eval(b.values())
         })
-        == F128::ZERO
+        == F256::ZERO
     {
         return Err(ZkPostClaimRelationTraceError::ZeroTerminalBlindingWeight);
     }
@@ -535,10 +544,10 @@ pub fn build_zk_post_claim_relation_trace(
         input.terminal_operand_claims[2].clone(),
         input.terminal_operand_claims[3].clone(),
         input.terminal_operand_claims[4].clone(),
-        LinExpr::constant(flat_of(iv[0])),
-        LinExpr::constant(flat_of(iv[1])),
-        input.expected_address[0].clone(),
-        input.expected_address[1].clone(),
+        ExtExpr::constant(F256::from_base(flat_of(iv[0]))),
+        ExtExpr::constant(F256::from_base(flat_of(iv[1]))),
+        ExtExpr::from_base(input.expected_address[0].clone()),
+        ExtExpr::from_base(input.expected_address[1].clone()),
         input.mask_mle_at_input.clone(),
         input.mask_final_at_terminal.clone(),
     ];
@@ -578,8 +587,8 @@ pub fn build_zk_post_claim_relation_trace(
     // then continue the exact eta-Horner order through boundary and state.
     let mut terminal_relation_value =
         mask.input_without_high
-            .add(&mul(b, &input.eta, &mask.final_without_high));
-    terminal_relation_value = mul(b, &mask.high_selector, &terminal_relation_value);
+            .add(&mul_ext(b, &input.eta, &mask.final_without_high));
+    terminal_relation_value = mul_ext(b, &mask.high_selector, &terminal_relation_value);
     let leading_relation_values = [
         operands.terminal[0].clone(),
         operands.terminal[1].clone(),
@@ -592,7 +601,7 @@ pub fn build_zk_post_claim_relation_trace(
         boundary[3].clone(),
     ];
     for value in leading_relation_values.iter().rev() {
-        terminal_relation_value = value.add(&mul(b, &input.eta, &terminal_relation_value));
+        terminal_relation_value = value.add(&mul_ext(b, &input.eta, &terminal_relation_value));
     }
     debug_assert_eq!(b.num_wires() - mask_end, ZK_POST_CLAIM_RELATION_RLC_ROWS);
 
@@ -611,8 +620,12 @@ pub fn build_zk_post_claim_relation_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::{alloc_block, pin_eq, test_support::tower_value};
+    use crate::acceptance::trace::{
+        alloc_block, alloc_block256, const_block256, pin_eq_ext, test_support::tower_value_ext,
+        F128,
+    };
     use noid_core::mle::evaluate::evaluate_slice;
+    use noid_core::Block256;
     use noid_core::TowerField;
     use noid_gkr::zk_auth_capsule::{
         build_post_claim_relation, AuthCapsulePostClaims, AuthCapsuleTerminalOperandClaims,
@@ -620,21 +633,21 @@ mod tests {
     use noid_ivc_core::field_r1cs::FieldR1cs;
 
     const DYNAMIC_INPUT_ROWS: usize =
-        3 * ZK_POST_CLAIM_VARS + 1 + ZK_POST_CLAIM_OPERAND_CLAIMS + 2 + 2;
+        2 * (3 * ZK_POST_CLAIM_VARS + 1 + ZK_POST_CLAIM_OPERAND_CLAIMS + 2) + 2;
     const FIXTURE_USEFUL_ROWS: usize = 1 + DYNAMIC_INPUT_ROWS + ZK_POST_CLAIM_RELATION_TRACE_ROWS;
 
     #[derive(Clone)]
     struct NativeFixture {
-        rho: [Block128; ZK_POST_CLAIM_VARS],
-        r: [Block128; ZK_POST_CLAIM_VARS],
-        s: [Block128; ZK_POST_CLAIM_VARS],
-        eta: Block128,
-        terminal: [Block128; ZK_POST_CLAIM_OPERAND_CLAIMS],
-        mask_input: Block128,
-        mask_final: Block128,
+        rho: [Block256; ZK_POST_CLAIM_VARS],
+        r: [Block256; ZK_POST_CLAIM_VARS],
+        s: [Block256; ZK_POST_CLAIM_VARS],
+        eta: Block256,
+        terminal: [Block256; ZK_POST_CLAIM_OPERAND_CLAIMS],
+        mask_input: Block256,
+        mask_final: Block256,
         address: [Block128; 2],
-        bank_claim: Block128,
-        terminal_relation_value: Block128,
+        bank_claim: Block256,
+        terminal_relation_value: Block256,
     }
 
     fn elem(index: usize, domain: u128, salt: u128) -> Block128 {
@@ -647,17 +660,24 @@ mod tests {
         )
     }
 
+    fn ext_elem(index: usize, domain: u128, salt: u128) -> Block256 {
+        Block256::new(
+            elem(index, domain, salt),
+            elem(index + 97, domain ^ 0xC1_256, salt.rotate_left(29)),
+        )
+    }
+
     fn fixture(salt: u128) -> NativeFixture {
-        let rho = std::array::from_fn(|i| elem(i, 0xA110, salt ^ 0x11));
-        let r = std::array::from_fn(|i| elem(i, 0xB220, salt ^ 0x22));
-        let s = std::array::from_fn(|i| elem(i, 0xC330, salt ^ 0x33));
-        let mut eta = elem(19, 0xE7A0, salt ^ 0x44);
-        if eta == Block128::ZERO {
-            eta = Block128::ONE;
+        let rho = std::array::from_fn(|i| ext_elem(i, 0xA110, salt ^ 0x11));
+        let r = std::array::from_fn(|i| ext_elem(i, 0xB220, salt ^ 0x22));
+        let s = std::array::from_fn(|i| ext_elem(i, 0xC330, salt ^ 0x33));
+        let mut eta = ext_elem(19, 0xE7A0, salt ^ 0x44);
+        if eta == Block256::ZERO {
+            eta = Block256::ONE;
         }
-        let terminal = std::array::from_fn(|i| elem(i, 0x57A7E, salt ^ 0x55));
-        let mask_input = elem(31, 0x6A5C, salt ^ 0x66);
-        let mask_final = elem(32, 0x6A5C, salt ^ 0x77);
+        let terminal = std::array::from_fn(|i| ext_elem(i, 0x57A7E, salt ^ 0x55));
+        let mask_input = ext_elem(31, 0x6A5C, salt ^ 0x66);
+        let mask_final = ext_elem(32, 0x6A5C, salt ^ 0x77);
         let address = [elem(41, 0xADD0, salt ^ 0x88), elem(42, 0xADD0, salt ^ 0x99)];
         let claims = AuthCapsulePostClaims {
             terminal_operands: AuthCapsuleTerminalOperandClaims {
@@ -696,13 +716,13 @@ mod tests {
         native: &NativeFixture,
     ) -> ZkPostClaimRelationTraceInput {
         ZkPostClaimRelationTraceInput {
-            input_point: std::array::from_fn(|i| alloc_block(b, native.rho[i])),
-            auth_terminal_point: std::array::from_fn(|i| alloc_block(b, native.r[i])),
-            phase_a_terminal_point: std::array::from_fn(|i| alloc_block(b, native.s[i])),
-            eta: alloc_block(b, native.eta),
-            terminal_operand_claims: std::array::from_fn(|i| alloc_block(b, native.terminal[i])),
-            mask_mle_at_input: alloc_block(b, native.mask_input),
-            mask_final_at_terminal: alloc_block(b, native.mask_final),
+            input_point: std::array::from_fn(|i| alloc_block256(b, native.rho[i])),
+            auth_terminal_point: std::array::from_fn(|i| alloc_block256(b, native.r[i])),
+            phase_a_terminal_point: std::array::from_fn(|i| alloc_block256(b, native.s[i])),
+            eta: alloc_block256(b, native.eta),
+            terminal_operand_claims: std::array::from_fn(|i| alloc_block256(b, native.terminal[i])),
+            mask_mle_at_input: alloc_block256(b, native.mask_input),
+            mask_final_at_terminal: alloc_block256(b, native.mask_final),
             expected_address: std::array::from_fn(|i| alloc_block(b, native.address[i])),
         }
     }
@@ -711,8 +731,8 @@ mod tests {
         r1cs: FieldR1cs,
         witness: Vec<F128>,
         trace_rows: usize,
-        bank_claim: Block128,
-        terminal_relation_value: Block128,
+        bank_claim: Block256,
+        terminal_relation_value: Block256,
         eta_wire: usize,
         auth_terminal_wire: usize,
     }
@@ -724,27 +744,23 @@ mod tests {
         expression.terms[0].0 as usize
     }
 
-    fn build(native: &NativeFixture, pin_to: Option<(Block128, Block128)>) -> BuiltFixture {
+    fn build(native: &NativeFixture, pin_to: Option<(Block256, Block256)>) -> BuiltFixture {
         let mut b = FieldR1csBuilder::new();
         let input = alloc_input(&mut b, native);
-        let eta_wire = bare_wire(&input.eta);
-        let auth_terminal_wire = bare_wire(&input.auth_terminal_point[0]);
+        let eta_wire = bare_wire(&input.eta.lo);
+        let auth_terminal_wire = bare_wire(&input.auth_terminal_point[0].lo);
         assert_eq!(b.num_wires(), 1 + DYNAMIC_INPUT_ROWS);
         let before = b.num_wires();
         let output = build_zk_post_claim_relation_trace(&mut b, &input).expect("valid fixture");
         let trace_rows = b.num_wires() - before;
-        let bank_claim = tower_value(&b, &output.bank_claim);
-        let terminal_relation_value = tower_value(&b, &output.terminal_relation_value);
+        let bank_claim = tower_value_ext(&b, &output.bank_claim);
+        let terminal_relation_value = tower_value_ext(&b, &output.terminal_relation_value);
         if let Some((expected_bank, expected_terminal)) = pin_to {
-            pin_eq(
-                &mut b,
-                &output.bank_claim,
-                &LinExpr::constant(flat_of(expected_bank)),
-            );
-            pin_eq(
+            pin_eq_ext(&mut b, &output.bank_claim, &const_block256(expected_bank));
+            pin_eq_ext(
                 &mut b,
                 &output.terminal_relation_value,
-                &LinExpr::constant(flat_of(expected_terminal)),
+                &const_block256(expected_terminal),
             );
         }
         let (r1cs, witness) = b.build();
@@ -783,7 +799,7 @@ mod tests {
         assert!(!built.r1cs.satisfies(&tampered));
 
         let mut zero = native;
-        zero.eta = Block128::ZERO;
+        zero.eta = Block256::ZERO;
         let mut b = FieldR1csBuilder::new();
         let input = alloc_input(&mut b, &zero);
         let before = b.num_wires();
@@ -805,7 +821,7 @@ mod tests {
         assert!(!built.r1cs.satisfies(&tampered));
 
         let mut zero = native;
-        zero.r[0] = Block128::ZERO;
+        zero.r[0] = Block256::ZERO;
         let mut b = FieldR1csBuilder::new();
         let input = alloc_input(&mut b, &zero);
         let before = b.num_wires();
@@ -827,15 +843,15 @@ mod tests {
         mutations.push(("terminal claim order", order));
 
         let mut rho = original.clone();
-        rho.rho[7] += Block128::ONE;
+        rho.rho[7] += Block256::ONE;
         mutations.push(("rho", rho));
 
         let mut r = original.clone();
-        r.r[3] += Block128::ONE;
+        r.r[3] += Block256::ONE;
         mutations.push(("AuthGKR terminal", r));
 
         let mut s = original.clone();
-        s.s[9] += Block128::ONE;
+        s.s[9] += Block256::ONE;
         mutations.push(("Phase-A terminal", s));
 
         let mut address = original.clone();
@@ -843,9 +859,9 @@ mod tests {
         mutations.push(("address", address));
 
         let mut eta = original.clone();
-        eta.eta += Block128::ONE;
-        if eta.eta == Block128::ZERO {
-            eta.eta += Block128::from(2u128);
+        eta.eta += Block256::ONE;
+        if eta.eta == Block256::ZERO {
+            eta.eta += Block256::from(2u128);
         }
         mutations.push(("eta", eta));
 
@@ -877,7 +893,7 @@ mod tests {
         let native = fixture(0xA11C_E040);
         let mut b = FieldR1csBuilder::new();
         let mut input = alloc_input(&mut b, &native);
-        input.phase_a_terminal_point[6] = LinExpr::constant(flat_of(native.s[6]));
+        input.phase_a_terminal_point[6] = const_block256(native.s[6]);
         let before = b.num_wires();
         assert!(matches!(
             build_zk_post_claim_relation_trace(&mut b, &input),

@@ -138,7 +138,7 @@ pub struct App {
     pub master_secret_copied: bool,
     pub settings_notice: Option<String>,
     pub settings_error: Option<String>,
-    pub matrix_b64: MatrixCacheState,
+    pub matrix_b25: MatrixCacheState,
     pub matrix_b255: MatrixCacheState,
     matrix_preparation_id: u64,
     pub consolidation_hint_open: bool,
@@ -296,7 +296,7 @@ pub enum Message {
     CloseSecretDialog,
     ImportSecretFinished(Result<String, String>),
     PrepareMatrices,
-    B64MatrixPrepared(u64, Result<(), String>),
+    B25MatrixPrepared(u64, Result<(), String>),
     B255MatrixPrepared(u64, Result<(), String>),
     Keyboard(iced::keyboard::Event),
     Noop,
@@ -423,7 +423,7 @@ impl App {
             master_secret_copied: false,
             settings_notice: None,
             settings_error: None,
-            matrix_b64: if mock {
+            matrix_b25: if mock {
                 MatrixCacheState::Ready
             } else {
                 MatrixCacheState::Pending
@@ -1028,7 +1028,7 @@ impl App {
                 {
                     return Task::none();
                 }
-                if enabled && self.matrix_b64 != MatrixCacheState::Ready {
+                if enabled && self.matrix_b25 != MatrixCacheState::Ready {
                     return Task::none();
                 }
                 if self.backend.is_mock() {
@@ -1634,7 +1634,7 @@ impl App {
                             self.node_log_error = None;
                             self.node_log_paused = false;
                             self.node_log_last_refresh = None;
-                            self.matrix_b64 = MatrixCacheState::Pending;
+                            self.matrix_b25 = MatrixCacheState::Pending;
                             self.matrix_b255 = MatrixCacheState::Pending;
                             return Task::batch([
                                 self.refresh_snapshot(),
@@ -2019,11 +2019,11 @@ impl App {
                 }
             }
             Message::PrepareMatrices => return self.begin_matrix_preparation(),
-            Message::B64MatrixPrepared(preparation_id, result) => {
+            Message::B25MatrixPrepared(preparation_id, result) => {
                 if preparation_id != self.matrix_preparation_id {
                     return Task::none();
                 }
-                self.matrix_b64 = match result {
+                self.matrix_b25 = match result {
                     Ok(()) => MatrixCacheState::Ready,
                     Err(error) => MatrixCacheState::Failed(error),
                 };
@@ -2248,20 +2248,20 @@ impl App {
 
     fn begin_matrix_preparation(&mut self) -> Task<Message> {
         if self.backend.is_mock()
-            || matches!(self.matrix_b64, MatrixCacheState::Preparing)
-            || (self.matrix_b64 == MatrixCacheState::Ready
+            || matches!(self.matrix_b25, MatrixCacheState::Preparing)
+            || (self.matrix_b25 == MatrixCacheState::Ready
                 && self.matrix_b255 == MatrixCacheState::Ready)
         {
             return Task::none();
         }
-        self.matrix_b64 = MatrixCacheState::Preparing;
+        self.matrix_b25 = MatrixCacheState::Preparing;
         self.matrix_b255 = MatrixCacheState::Pending;
         self.matrix_preparation_id = self.matrix_preparation_id.wrapping_add(1);
         let preparation_id = self.matrix_preparation_id;
         let backend = self.backend.clone();
         Task::perform(
-            async move { backend.prepare_matrix_cache(MatrixClass::B64).await },
-            move |result| Message::B64MatrixPrepared(preparation_id, result),
+            async move { backend.prepare_matrix_cache(MatrixClass::B25).await },
+            move |result| Message::B25MatrixPrepared(preparation_id, result),
         )
     }
 

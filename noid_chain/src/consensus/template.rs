@@ -513,7 +513,7 @@ fn build_block_template_with_post_state(
     difficulty_target: Digest,
 ) -> Result<(BlockTemplate, ChainState), TemplateBuildError> {
     use crate::consensus::development_allocation::{
-        development_allocation, PARANO1D_LAB_ADDRESS, O1_NETWORK_FUND_ADDRESS,
+        development_allocation, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
     };
     use crate::consensus::expected_child_log_slots;
     use crate::consensus::fees::fee_breakdown;
@@ -867,7 +867,7 @@ mod tests {
     #[test]
     fn due_template_builds_the_mandatory_two_recipient_payout() {
         use crate::consensus::development_allocation::{
-            development_share_each, miner_subsidy, PARANO1D_LAB_ADDRESS, O1_NETWORK_FUND_ADDRESS,
+            development_share_each, miner_subsidy, O1_NETWORK_FUND_ADDRESS, PARANO1D_LAB_ADDRESS,
             TARGET_BLOCKS_PER_DAY,
         };
         use crate::consensus::emission::block_reward;

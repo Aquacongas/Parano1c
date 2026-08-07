@@ -28,7 +28,7 @@ use crate::deep_chain::leaf_hash::SourceLeafColumns;
 use crate::deep_chain::relations::{ColRef, FixedPattern, RelationTerm};
 use crate::deep_chain::source_tree::{mds_weights_pub, permute_flat_state, run_perm};
 use crate::field::F128;
-use noid_poseidon2b::native::domain::{TAG_CAPSLEAF, capacity_iv_flat};
+use noid_poseidon2b::native::domain::{TAG_CAPS256, TAG_CAPSLEAF, TAG_CAPSMIX, capacity_iv_flat};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 /// Symbols per capsule leaf — mirrors
@@ -202,6 +202,171 @@ pub fn build_capsule_leaf_columns(
     )
 }
 
+/// Fixed C1 leaf types used by the wide authorization PCS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum C1CapsuleLeafKind {
+    /// Eight base-field bank cells interleaved with eight wide companion
+    /// cells: 24 base-field lanes, 12 permutations.
+    MixedSource,
+    /// Sixteen wide mid-codeword cells: 32 base-field lanes, 16 permutations.
+    WideMid,
+}
+
+pub const C1_CAPSULE_SOURCE_LANES: usize = 24;
+pub const C1_CAPSULE_SOURCE_SLOTS: usize = C1_CAPSULE_SOURCE_LANES / 2;
+pub const C1_CAPSULE_SOURCE_DIGEST_SLOT: usize = C1_CAPSULE_SOURCE_SLOTS - 1;
+pub const C1_CAPSULE_MID_LANES: usize = 32;
+pub const C1_CAPSULE_MID_SLOTS: usize = C1_CAPSULE_MID_LANES / 2;
+pub const C1_CAPSULE_MID_DIGEST_SLOT: usize = C1_CAPSULE_MID_SLOTS - 1;
+pub const C1_CAPSULE_LEAF_STRIDE: usize = 16;
+
+impl C1CapsuleLeafKind {
+    pub const fn lane_count(self) -> usize {
+        match self {
+            Self::MixedSource => C1_CAPSULE_SOURCE_LANES,
+            Self::WideMid => C1_CAPSULE_MID_LANES,
+        }
+    }
+
+    pub const fn active_slots(self) -> usize {
+        self.lane_count() / 2
+    }
+}
+
+fn c1_capsule_leaf_iv_flat(kind: C1CapsuleLeafKind) -> [F128; 2] {
+    let tag = match kind {
+        C1CapsuleLeafKind::MixedSource => TAG_CAPSMIX,
+        C1CapsuleLeafKind::WideMid => TAG_CAPS256,
+    };
+    let iv = capacity_iv_flat(tag);
+    [raw_flat_lane(iv[0]), raw_flat_lane(iv[1])]
+}
+
+/// One metadata-free C1 leaf. The dedicated tag fixes `lanes.len()` and the
+/// ordered Merkle path binds its position.
+#[derive(Clone, Debug)]
+pub struct C1CapsuleLeafData {
+    pub lanes: Vec<F128>,
+}
+
+/// Scalar replay of the native C1 fixed-shape leaf sponge.
+pub fn flat_c1_capsule_leaf_hash(kind: C1CapsuleLeafKind, lanes: &[F128]) -> [F128; 2] {
+    assert_eq!(lanes.len(), kind.lane_count(), "C1 capsule leaf lane count");
+    let iv = c1_capsule_leaf_iv_flat(kind);
+    let mut state = [F128::ZERO; STATE_SIZE];
+    for (slot, pair) in lanes.chunks_exact(2).enumerate() {
+        let raw = if slot == 0 {
+            [pair[0], pair[1], iv[0], iv[1]]
+        } else {
+            [state[0] + pair[0], state[1] + pair[1], state[2], state[3]]
+        };
+        state = permute_flat_state(raw);
+    }
+    [state[0], state[1]]
+}
+
+/// Build metadata-free C1 leaf columns at a common 16-slot stride. Source
+/// tiles leave slots 12..15 available to another explicitly disjoint family;
+/// mid tiles consume all sixteen slots.
+pub fn build_c1_capsule_leaf_columns(
+    leaves: &[C1CapsuleLeafData],
+    kind: C1CapsuleLeafKind,
+    w_log: usize,
+) -> (SourceLeafColumns, Vec<[F128; 2]>) {
+    let w = 1usize << w_log;
+    assert_eq!(w % C1_CAPSULE_LEAF_STRIDE, 0, "C1 leaf domain stride");
+    let num_tiles = w / C1_CAPSULE_LEAF_STRIDE;
+    assert!(leaves.len() <= num_tiles, "more C1 leaves than tiles");
+    assert!(
+        leaves
+            .iter()
+            .all(|leaf| leaf.lanes.len() == kind.lane_count()),
+        "C1 leaf shape mismatch"
+    );
+    let iv = c1_capsule_leaf_iv_flat(kind);
+    let zero_lanes = vec![F128::ZERO; kind.lane_count()];
+
+    let mut c: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s0: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut s_out: [Vec<F128>; STATE_SIZE] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+    let mut in_: [Vec<F128>; 2] = std::array::from_fn(|_| vec![F128::ZERO; w]);
+
+    let (ghost_s0, ghost_out) = run_perm([F128::ZERO; STATE_SIZE]);
+    for slot in 0..w {
+        for lane in 0..STATE_SIZE {
+            s0[lane][slot] = ghost_s0[lane];
+            s_out[lane][slot] = ghost_out[lane];
+            c[lane][slot] = ghost_out[lane];
+        }
+    }
+
+    let mut digests = Vec::with_capacity(leaves.len());
+    for tile in 0..num_tiles {
+        let lanes = leaves
+            .get(tile)
+            .map_or(zero_lanes.as_slice(), |leaf| leaf.lanes.as_slice());
+        let base = tile * C1_CAPSULE_LEAF_STRIDE;
+        let mut previous = [F128::ZERO; STATE_SIZE];
+        for (local_slot, pair) in lanes.chunks_exact(2).enumerate() {
+            let slot = base + local_slot;
+            let raw = if local_slot == 0 {
+                [pair[0], pair[1], iv[0], iv[1]]
+            } else {
+                [
+                    previous[0] + pair[0],
+                    previous[1] + pair[1],
+                    previous[2],
+                    previous[3],
+                ]
+            };
+            let (state_in, state_out) = run_perm(raw);
+            for lane in 0..STATE_SIZE {
+                s0[lane][slot] = state_in[lane];
+                s_out[lane][slot] = state_out[lane];
+                c[lane][slot] = state_out[lane];
+            }
+            in_[0][slot] = pair[0];
+            in_[1][slot] = pair[1];
+            previous = state_out;
+        }
+        if tile < leaves.len() {
+            let digest_slot = base + kind.active_slots() - 1;
+            digests.push([c[0][digest_slot], c[1][digest_slot]]);
+        }
+    }
+
+    let digest = digests.first().copied().unwrap_or([F128::ZERO; 2]);
+    (
+        SourceLeafColumns {
+            c,
+            s0,
+            s_out,
+            in_,
+            digest,
+        },
+        digests,
+    )
+}
+
+/// Periodic carry and IV patterns for one C1 leaf kind.
+pub fn c1_capsule_leaf_fixed_patterns(kind: C1CapsuleLeafKind) -> Vec<FixedPattern> {
+    let low_log = C1_CAPSULE_LEAF_STRIDE.trailing_zeros() as usize;
+    let mut carry = vec![F128::ZERO; C1_CAPSULE_LEAF_STRIDE];
+    let mut iv0 = vec![F128::ZERO; C1_CAPSULE_LEAF_STRIDE];
+    let mut iv1 = vec![F128::ZERO; C1_CAPSULE_LEAF_STRIDE];
+    let iv = c1_capsule_leaf_iv_flat(kind);
+    iv0[0] = iv[0];
+    iv1[0] = iv[1];
+    for slot in 1..kind.active_slots() {
+        carry[slot] = F128::ONE;
+    }
+    vec![
+        FixedPattern::new(low_log, carry),
+        FixedPattern::new(low_log, iv0),
+        FixedPattern::new(low_log, iv1),
+    ]
+}
+
 /// Column/pattern indices of one capsule-leaf sponge family. Committed column
 /// order `IN0, IN1, C0..C3`; pattern order `CARRY, IV0, IV1`.
 #[derive(Clone, Copy, Debug)]
@@ -321,6 +486,23 @@ mod tests {
         ]
     }
 
+    fn native_c1_digest(kind: C1CapsuleLeafKind, lanes: &[F128]) -> [F128; 2] {
+        let tag = match kind {
+            C1CapsuleLeafKind::MixedSource => TAG_CAPSMIX,
+            C1CapsuleLeafKind::WideMid => TAG_CAPS256,
+        };
+        let mut sponge = Poseidon2bFlatSponge::with_tag(tag);
+        for lane in lanes {
+            let value = ((lane.hi as u128) << 64) | lane.lo as u128;
+            sponge.update(&value.to_le_bytes());
+        }
+        let digest = sponge.finalize_no_pad();
+        [
+            raw_flat_lane(u128::from_le_bytes(digest[..16].try_into().unwrap())),
+            raw_flat_lane(u128::from_le_bytes(digest[16..].try_into().unwrap())),
+        ]
+    }
+
     /// Column replay == the native flat sponge (both the scalar replay and
     /// the tiled columns), including a ghost tile past the real leaves.
     #[test]
@@ -355,5 +537,39 @@ mod tests {
             ghost_native,
             "ghost tile digest"
         );
+    }
+
+    #[test]
+    fn c1_fixed_shape_columns_match_native_sponges() {
+        let mut seed = 0xC1A5_5EEDu64;
+        for kind in [C1CapsuleLeafKind::MixedSource, C1CapsuleLeafKind::WideMid] {
+            let leaves = (0..3)
+                .map(|_| C1CapsuleLeafData {
+                    lanes: (0..kind.lane_count())
+                        .map(|_| next_f128(&mut seed))
+                        .collect(),
+                })
+                .collect::<Vec<_>>();
+            let (columns, digests) = build_c1_capsule_leaf_columns(&leaves, kind, 6);
+            for (tile, leaf) in leaves.iter().enumerate() {
+                let native = native_c1_digest(kind, &leaf.lanes);
+                assert_eq!(flat_c1_capsule_leaf_hash(kind, &leaf.lanes), native);
+                assert_eq!(digests[tile], native);
+                let digest_slot = tile * C1_CAPSULE_LEAF_STRIDE + kind.active_slots() - 1;
+                assert_eq!(
+                    [columns.c[0][digest_slot], columns.c[1][digest_slot]],
+                    native
+                );
+            }
+            if kind == C1CapsuleLeafKind::MixedSource {
+                for tile in 0..4 {
+                    for slot in C1_CAPSULE_SOURCE_SLOTS..C1_CAPSULE_LEAF_STRIDE {
+                        let physical = tile * C1_CAPSULE_LEAF_STRIDE + slot;
+                        assert_eq!(columns.in_[0][physical], F128::ZERO);
+                        assert_eq!(columns.in_[1][physical], F128::ZERO);
+                    }
+                }
+            }
+        }
     }
 }

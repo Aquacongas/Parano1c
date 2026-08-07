@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Selected-ZK authorization trace and private production B255 bridge over
+//! Selected-ZK authorization trace and private selected-class bridge over
 //! transcript and Wallet-B aliases.
 //!
 //! Its raw-slice tile adapter is private.  Shape-compatible [`WitnessSlice`]
@@ -24,12 +24,13 @@
 //!
 //! 1. Owner AuthGKR, the transparent post-claim relation, and Phase A;
 //! 2. the fixed low-16-bit post-nonce grind predicate; and
-//! 3. all 64 Phase-B queries, upper/tail linkage, and both cap families.
+//! 3. all 65 Phase-B queries, upper/tail linkage, and both cap families.
 //!
-//! The four Owner-closing-state -> Main-bridge pins are external to this
-//! disconnected core and cost four rows in [`super::zk_split_bridge`].  The
-//! Main nonce is range-bound here to the canonical `u64` wire language before
-//! its post-nonce grind squeeze is checked.
+//! Prefix-to-suffix continuity for both transcripts and the four
+//! Owner-closing-state -> Main-bridge pins are external to this disconnected
+//! core and cost twelve rows in [`super::zk_split_bridge`]. The Main nonce is
+//! range-bound here to the canonical `u64` wire language before its
+//! post-nonce grind squeeze is checked.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -37,15 +38,13 @@ use noid_fri_binius::interleaved_commit::SourceHash;
 use noid_fri_binius::zk_capsule_algebra::{
     JOINT_SOURCE_LEAF_SYMBOLS, MID_STANDARD_FOLDS, SOURCE_QUERY_BITS,
 };
-use noid_fri_binius::zk_capsule_pcs::{
-    ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG, ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG,
-};
 use noid_gkr::zk_authorization::{
     verify_zk_authorization, ZkAuthorizationError, ZkAuthorizationProof, ZkAuthorizationVerified,
 };
 use noid_gkr::ZkAuthorizationWireEncodeError;
 use noid_ivc_core::deep_chain::capsule_leaf::{
-    raw_flat_lane, CAPSULE_LEAF_DIGEST_SLOT, CAPSULE_LEAF_STRIDE,
+    C1_CAPSULE_LEAF_STRIDE, C1_CAPSULE_MID_DIGEST_SLOT, C1_CAPSULE_MID_SLOTS,
+    C1_CAPSULE_SOURCE_DIGEST_SLOT, C1_CAPSULE_SOURCE_SLOTS,
 };
 use noid_ivc_core::deep_chain::schedule::DuplexLayout;
 use noid_ivc_core::public_io::WitnessSlice;
@@ -68,8 +67,17 @@ use super::zk_auth_nonce::{
     ZK_AUTH_NONCE_TRACE_ROWS,
 };
 use super::zk_auth_terminal::AuthCapsuleTerminalOperandClaimsTrace;
-use super::zk_auth_transcript_cells::view_zk_auth_transcript_tile;
-use super::zk_auth_transcript_cells::ZkAuthTranscriptCells;
+use super::zk_auth_transcript_cells::{
+    view_zk_auth_raw_split_transcript_tile, view_zk_auth_split_transcript_tile,
+    ZkAuthRawTranscriptTile, ZkAuthTranscriptCells, ZK_AUTH_MAIN_GAMMA_CHALLENGE_INDEX,
+    ZK_AUTH_OWNER_ETA_CHALLENGE_INDEX, ZK_AUTH_OWNER_LAMBDA_CHALLENGE_INDEX,
+    ZK_AUTH_OWNER_ROUND_CHALLENGE_START,
+};
+#[cfg(test)]
+use super::zk_auth_transcript_cells::{
+    ZK_AUTH_MAIN_BETA_CHALLENGE_START, ZK_AUTH_MAIN_GRIND_RAW_CHALLENGE_INDEX,
+    ZK_AUTH_MAIN_PHASE_A_CHALLENGE_START, ZK_AUTH_MAIN_QUERY_SEED_RAW_CHALLENGE_START,
+};
 use super::zk_authorization_region::{
     build_selected_zk_authorization_region_draft, SelectedZkAuthorizationRegionDraft,
     SelectedZkAuthorizationRegionError,
@@ -81,21 +89,30 @@ use super::zk_phase_b_composition::{
     ZkPhaseBCompositionTraceInput, ZkPhaseBCompositionTraceOutput, ZK_PHASE_B_CAP_DIGEST_LANES,
     ZK_PHASE_B_COMPOSITION_TRACE_ROWS,
 };
-use super::zk_query_carriers::{ZK_PATH_DIRECTION_BITS, ZK_QUERY_COUNT};
-use super::zk_split_bridge::{
-    pin_zk_auth_split_bridge_at, ZkAuthSplitBridgeCells, ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS,
+use super::zk_query_carriers::{
+    ZK_MID_PATH_DIRECTION_BITS, ZK_QUERY_COUNT, ZK_SOURCE_PATH_DIRECTION_BITS,
 };
-use super::{const_block, flat_of, mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
+use super::zk_split_bridge::{
+    pin_zk_auth_c1_split_bridge_at, ZkAuthSplitBridgeCells, ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS,
+};
+use super::{const_block, flat_of, mul, pin_eq, ExtExpr, FieldR1csBuilder, LinExpr, F128, F256};
 use crate::acceptance::block_slots::SelectedBlockAssemblyFinalizationSeal;
 use crate::acceptance::block_slots::{
     CanonicalSelectedZkAuthorizationCapability, CanonicalSelectedZkAuthorizationSlotKind,
 };
-use crate::acceptance::zk_auth_capsule_schedule::{ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_OWNER_TILE_LOG};
+use crate::acceptance::zk_auth_capsule_schedule::{
+    ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES, ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_OWNER_SQUEEZES,
+    ZK_AUTH_OWNER_TILE_LOG, ZK_AUTH_WALLET_A_MID_BASE, ZK_AUTH_WALLET_A_SOURCE_BASE,
+};
+#[cfg(test)]
+use crate::acceptance::zk_auth_capsule_schedule::{
+    ZK_AUTH_MAIN_DYNAMIC_LANES, ZK_AUTH_MAIN_RAW_CHALLENGE_LANES, ZK_AUTH_OWNER_DYNAMIC_LANES,
+};
 use crate::region_sidecar::SelectedZkBlockRegionDraft;
 use crate::region_sidecar::{BlockRegionPreparation, RegionSidecarError};
 
 /// Exact incremental ledger after all transcript and Wallet-B aliases exist.
-/// The four split-bridge pins are intentionally not included.
+/// The twelve split-bridge pins are intentionally not included.
 pub const ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS: usize = ZK_AUTH_COMPOSITION_TRACE_ROWS
     + ZK_AUTH_NONCE_TRACE_ROWS
     + ZK_AUTH_GRIND_TRACE_ROWS
@@ -104,32 +121,47 @@ pub const ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS: usize = ZK_AUTH_COMPOSITION_TRA
 /// cannot accidentally fold it into the candidate's local ledger.
 pub const ZK_AUTHORIZATION_CANDIDATE_EXTERNAL_BRIDGE_ROWS: usize = ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS;
 
-const _: () = assert!(ZK_AUTH_COMPOSITION_TRACE_ROWS == 624);
+const _: () = assert!(ZK_AUTH_COMPOSITION_TRACE_ROWS == 1_852);
 const _: () = assert!(ZK_AUTH_NONCE_TRACE_ROWS == 65);
-const _: () = assert!(ZK_AUTH_GRIND_TRACE_ROWS == 130);
-const _: () = assert!(ZK_PHASE_B_COMPOSITION_TRACE_ROWS == 10_646);
-const _: () = assert!(ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS == 11_465);
-const _: () = assert!(ZK_AUTHORIZATION_CANDIDATE_EXTERNAL_BRIDGE_ROWS == 4);
+const _: () = assert!(ZK_AUTH_GRIND_TRACE_ROWS == 113);
+const _: () = assert!(ZK_PHASE_B_COMPOSITION_TRACE_ROWS == 13_926);
+const _: () = assert!(ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS == 15_956);
+const _: () = assert!(ZK_AUTHORIZATION_CANDIDATE_EXTERNAL_BRIDGE_ROWS == 12);
 const _: () = assert!(ZK_PHASE_A_ROUNDS == 11);
 
 pub const ZK_AUTH_WALLET_A_COLUMNS: usize = 6;
 pub const ZK_AUTH_WALLET_B_COLUMNS: usize = 9;
+pub const ZK_AUTH_META_A_COLUMNS: usize = 8;
+pub const ZK_AUTH_META_B_COLUMNS: usize = 9;
 pub const ZK_AUTH_WALLET_A_TILE_LOG: usize = 11;
 pub const ZK_AUTH_WALLET_B_TILE_LOG: usize = 10;
-pub const ZK_AUTH_WALLET_A_FAMILY_SLOTS: usize = ZK_QUERY_COUNT * CAPSULE_LEAF_STRIDE;
-pub const ZK_AUTH_WALLET_B_PATH_DEPTH: usize = 8;
-pub const ZK_AUTH_WALLET_B_PATH_STRIDE: usize = 8;
-pub const ZK_AUTH_WALLET_B_FAMILY_SLOTS: usize = ZK_QUERY_COUNT * ZK_AUTH_WALLET_B_PATH_STRIDE;
+pub const ZK_AUTH_WALLET_CORE_QUERY_COUNT: usize = 64;
+pub const ZK_AUTH_WALLET_OVERFLOW_QUERY: usize = ZK_AUTH_WALLET_CORE_QUERY_COUNT;
+pub const ZK_AUTH_WALLET_A_SOURCE_SLOTS: usize =
+    ZK_AUTH_WALLET_CORE_QUERY_COUNT * C1_CAPSULE_SOURCE_SLOTS;
+pub const ZK_AUTH_WALLET_A_MID_SLOTS: usize =
+    ZK_AUTH_WALLET_CORE_QUERY_COUNT * C1_CAPSULE_MID_SLOTS;
+pub const ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH: usize = ZK_SOURCE_PATH_DIRECTION_BITS;
+pub const ZK_AUTH_WALLET_B_MID_PATH_DEPTH: usize = ZK_MID_PATH_DIRECTION_BITS;
+pub const ZK_AUTH_WALLET_B_PATH_STRIDE: usize =
+    ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH + ZK_AUTH_WALLET_B_MID_PATH_DEPTH;
+pub const ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET: usize = 0;
+pub const ZK_AUTH_WALLET_B_MID_PATH_OFFSET: usize = ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH;
 
 pub(crate) const ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS: usize = 4;
+/// One trace-one map row for every algebraic Owner/Main squeeze.
+pub(crate) const ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS: usize =
+    ZK_AUTH_OWNER_SQUEEZES + ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES;
 pub(crate) const ZK_AUTH_RAW_SLICE_DIGEST_BRIDGE_ROWS: usize =
     ZK_QUERY_COUNT * 2 /* families */ * 2 /* digest lanes */;
 pub(crate) const ZK_AUTH_RAW_SLICE_COMPOSITE_ROOT_ROWS: usize =
     ZK_QUERY_COUNT * 2 /* families */ * 2 /* digest lanes */;
-/// Four metadata pins per query: source/mid `msg_log` and `leaf_index`.
-pub(crate) const ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS: usize = ZK_QUERY_COUNT * 2 * 2;
+/// C1 fixed-shape tags and ordered Merkle paths bind leaf type, length and
+/// position, so no leaf metadata cells or metadata pins exist.
+pub(crate) const ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS: usize = 0;
 /// Wrapper rows materialized before the core candidate derives bound queries.
 pub(crate) const ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS: usize = ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS
+    + ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS
     + ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
     + ZK_AUTH_RAW_SLICE_DIGEST_BRIDGE_ROWS
     + ZK_AUTH_RAW_SLICE_COMPOSITE_ROOT_ROWS;
@@ -138,36 +170,40 @@ pub(crate) const ZK_AUTH_RAW_SLICE_WRAPPER_ROWS: usize =
 pub(crate) const ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS: usize =
     ZK_AUTH_RAW_SLICE_WRAPPER_ROWS + ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS;
 
-const _: () = assert!(CAPSULE_LEAF_STRIDE == 16);
-const _: () = assert!(CAPSULE_LEAF_DIGEST_SLOT == 8);
+const _: () = assert!(C1_CAPSULE_LEAF_STRIDE == 16);
 const _: () = assert!(SOURCE_QUERY_BITS == 13);
-const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG == 12);
-const _: () = assert!(ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG == 8);
-const _: () = assert!(ZK_AUTH_WALLET_A_FAMILY_SLOTS == 1024);
-const _: () = assert!(2 * ZK_AUTH_WALLET_A_FAMILY_SLOTS == 1 << ZK_AUTH_WALLET_A_TILE_LOG);
-const _: () = assert!(ZK_AUTH_WALLET_B_PATH_DEPTH == ZK_PATH_DIRECTION_BITS);
-const _: () = assert!(ZK_AUTH_WALLET_B_FAMILY_SLOTS == 512);
-const _: () = assert!(2 * ZK_AUTH_WALLET_B_FAMILY_SLOTS == 1 << ZK_AUTH_WALLET_B_TILE_LOG);
+const _: () = assert!(ZK_QUERY_COUNT == ZK_AUTH_WALLET_CORE_QUERY_COUNT + 1);
+const _: () = assert!(ZK_AUTH_WALLET_A_SOURCE_SLOTS == 768);
+const _: () = assert!(ZK_AUTH_WALLET_A_MID_SLOTS == 1024);
+const _: () = assert!(ZK_AUTH_WALLET_A_MID_BASE == ZK_AUTH_WALLET_A_SOURCE_SLOTS);
+const _: () = assert!(ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH == 10);
+const _: () = assert!(ZK_AUTH_WALLET_B_MID_PATH_DEPTH == 6);
+const _: () = assert!(ZK_AUTH_WALLET_B_PATH_STRIDE == 16);
+const _: () = assert!(
+    ZK_AUTH_WALLET_CORE_QUERY_COUNT * ZK_AUTH_WALLET_B_PATH_STRIDE
+        == 1 << ZK_AUTH_WALLET_B_TILE_LOG
+);
 const _: () = assert!(ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS == 4);
-const _: () = assert!(ZK_AUTH_RAW_SLICE_DIGEST_BRIDGE_ROWS == 256);
-const _: () = assert!(ZK_AUTH_RAW_SLICE_COMPOSITE_ROOT_ROWS == 256);
-const _: () = assert!(ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS == 256);
-const _: () = assert!(ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS == 520);
-const _: () = assert!(ZK_AUTH_RAW_SLICE_WRAPPER_ROWS == 776);
-const _: () = assert!(ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS == 12_241);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_DIGEST_BRIDGE_ROWS == 260);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_COMPOSITE_ROOT_ROWS == 260);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS == 0);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS == 44);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS == 580);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_WRAPPER_ROWS == 580);
+const _: () = assert!(ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS == 16_536);
 
 /// Wallet-B and FF-Merkle expressions consumed by one fixed authorization.
 /// No proof/transcript field is accepted here.
 #[derive(Clone, Debug)]
 pub(crate) struct ZkAuthorizationCandidateExternalAliases {
-    /// Source FF directions `q0..q7`, `[query][depth]`.
-    pub source_path_directions: [[LinExpr; ZK_PATH_DIRECTION_BITS]; ZK_QUERY_COUNT],
-    /// Mid FF directions `q4..q11`, `[query][depth]`.
-    pub mid_path_directions: [[LinExpr; ZK_PATH_DIRECTION_BITS]; ZK_QUERY_COUNT],
+    /// Source FF directions `q0..q9`, `[query][depth]`.
+    pub source_path_directions: [[LinExpr; ZK_SOURCE_PATH_DIRECTION_BITS]; ZK_QUERY_COUNT],
+    /// Mid FF directions `q4..q9`, `[query][depth]`.
+    pub mid_path_directions: [[LinExpr; ZK_MID_PATH_DIRECTION_BITS]; ZK_QUERY_COUNT],
     /// Authenticated adjacent source cells `[B0,C0,...,B7,C7]`.
     pub joint_source_leaves: [[LinExpr; JOINT_SOURCE_LEAF_SYMBOLS]; ZK_QUERY_COUNT],
     /// Authenticated contiguous sixteen-cell mid leaves.
-    pub mid_leaves: [[LinExpr; 1 << MID_STANDARD_FOLDS]; ZK_QUERY_COUNT],
+    pub mid_leaves: [[ExtExpr; 1 << MID_STANDARD_FOLDS]; ZK_QUERY_COUNT],
     /// Final source FF expressions, `[query][digest_lane]`.
     pub source_path_roots: [[LinExpr; ZK_PHASE_B_CAP_DIGEST_LANES]; ZK_QUERY_COUNT],
     /// Final mid FF expressions, `[query][digest_lane]`.
@@ -567,7 +603,7 @@ impl SelectedZkAuthorizationProofBatch {
         match slot.kind() {
             CanonicalSelectedZkAuthorizationSlotKind::Live => &self.live_entries[index],
             CanonicalSelectedZkAuthorizationSlotKind::Ghost
-            | CanonicalSelectedZkAuthorizationSlotKind::Pad255 => &self.ghost_entry,
+            | CanonicalSelectedZkAuthorizationSlotKind::Pad => &self.ghost_entry,
         }
     }
 
@@ -652,7 +688,7 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
                 prepared.live_entries[index].statement()
             }
             CanonicalSelectedZkAuthorizationSlotKind::Ghost
-            | CanonicalSelectedZkAuthorizationSlotKind::Pad255 => prepared.ghost_entry.statement(),
+            | CanonicalSelectedZkAuthorizationSlotKind::Pad => prepared.ghost_entry.statement(),
         };
         assert_eq!(
             statement,
@@ -680,7 +716,7 @@ pub(in crate::acceptance) fn bind_selected_zk_block_region(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZkAuthorizationAllTilesTraceError {
     /// Every selected class has exactly its canonical dyadic authorization
-    /// capacity; B255 alone includes the dead PAD at index 255.
+    /// capacity, including every dead PAD above the physical page tier.
     StatementCount { expected: usize, actual: usize },
     Tile {
         index: usize,
@@ -756,11 +792,7 @@ fn materialize_selected_zk_authorization_statements(
             if let Some((tx_body_hash, expected_address)) = slot.body_aliases() {
                 return selected_zk_statement_from_body_aliases(tx_body_hash, expected_address);
             }
-            assert_eq!(index + 1, canonical.len());
-            assert_eq!(
-                slot.kind(),
-                CanonicalSelectedZkAuthorizationSlotKind::Pad255
-            );
+            assert_eq!(slot.kind(), CanonicalSelectedZkAuthorizationSlotKind::Pad);
             let native = canonical_selected_zk_ghost_statement();
             assert_eq!(slot.native_statement(), native);
             SelectedZkAuthorizationStatementTrace {
@@ -815,18 +847,21 @@ fn bind_selected_zk_authorization_all_tiles_trace(
         .try_into()
         .expect("selected wallet-A child has six committed slices");
     let wallet_b = *vk.wallet_b().slices();
+    let meta_a: [WitnessSlice; ZK_AUTH_META_A_COLUMNS] = vk
+        .meta_a()
+        .slices()
+        .try_into()
+        .expect("selected Meta-A child has eight committed slices");
+    let meta_b = *vk.meta_b().slices();
 
     let ghost_statement = canonical_selected_zk_ghost_statement();
-    if geometry.tier == noid_chain::consensus::params::BLOCK_MAX_USER_PAGES {
-        assert_eq!(
-            canonical.slot(geometry.auth_tiles - 1).native_statement(),
-            ghost_statement
-        );
+    for index in geometry.tier..geometry.auth_tiles {
+        assert_eq!(canonical.slot(index).native_statement(), ghost_statement);
     }
     let fallback = canonical
         .slot(0)
         .body_aliases()
-        .expect("B255 slot zero is body-backed");
+        .expect("selected slot zero is body-backed");
     let preview = (0..canonical.len())
         .map(|index| {
             let slot = canonical.slot(index);
@@ -856,9 +891,8 @@ fn bind_selected_zk_authorization_all_tiles_trace(
                     assert!(slot.body_aliases().is_some());
                     assert_eq!(slot.native_statement(), ghost_statement);
                 }
-                CanonicalSelectedZkAuthorizationSlotKind::Pad255 => {
-                    assert_eq!(geometry.tier, 255);
-                    assert_eq!(index + 1, geometry.auth_tiles);
+                CanonicalSelectedZkAuthorizationSlotKind::Pad => {
+                    assert!(index >= geometry.tier && index < geometry.auth_tiles);
                     assert_eq!(live, F128::ZERO);
                     assert!(slot.body_aliases().is_none());
                     assert_eq!(slot.native_statement(), ghost_statement);
@@ -886,6 +920,8 @@ fn bind_selected_zk_authorization_all_tiles_trace(
                 &main_c,
                 &wallet_a,
                 &wallet_b,
+                &meta_a,
+                &meta_b,
                 tile_index,
                 statement,
             )
@@ -918,6 +954,8 @@ fn bind_selected_zk_authorization_all_tiles_trace(
             &main_c,
             &wallet_a,
             &wallet_b,
+            &meta_a,
+            &meta_b,
             tile_index,
             statement,
         )
@@ -944,6 +982,17 @@ fn check_transcript_alias(
     }
 }
 
+#[cfg(test)]
+fn check_transcript_ext_alias(
+    b: &FieldR1csBuilder,
+    expression: &ExtExpr,
+    input: ZkAuthorizationCandidateInput,
+    index: usize,
+) -> Result<(), ZkAuthorizationCandidateTraceError> {
+    check_transcript_alias(b, &expression.lo, input, 2 * index)?;
+    check_transcript_alias(b, &expression.hi, input, 2 * index + 1)
+}
+
 fn check_external_alias(
     b: &FieldR1csBuilder,
     expression: &LinExpr,
@@ -965,6 +1014,17 @@ fn check_external_alias(
     Ok(())
 }
 
+fn check_external_ext_alias(
+    b: &FieldR1csBuilder,
+    expression: &ExtExpr,
+    input: ZkAuthorizationCandidateInput,
+    index: usize,
+) -> Result<(), ZkAuthorizationCandidateTraceError> {
+    check_external_alias(b, &expression.lo, input, 2 * index)?;
+    check_external_alias(b, &expression.hi, input, 2 * index + 1)
+}
+
+#[cfg(test)]
 fn preflight_transcript_cells(
     b: &FieldR1csBuilder,
     cells: &ZkAuthTranscriptCells,
@@ -986,7 +1046,7 @@ fn preflight_transcript_cells(
             index,
         )?;
     }
-    check_transcript_alias(
+    check_transcript_ext_alias(
         b,
         &owner.mask_mu,
         ZkAuthorizationCandidateInput::OwnerMaskMu,
@@ -994,7 +1054,7 @@ fn preflight_transcript_cells(
     )?;
     for round in 0..owner.round_coefficients.len() {
         for coefficient in 0..owner.round_coefficients[round].len() {
-            check_transcript_alias(
+            check_transcript_ext_alias(
                 b,
                 &owner.round_coefficients[round][coefficient],
                 ZkAuthorizationCandidateInput::OwnerRoundCoefficient,
@@ -1002,14 +1062,14 @@ fn preflight_transcript_cells(
             )?;
         }
     }
-    check_transcript_alias(
+    check_transcript_ext_alias(
         b,
         &owner.mask_final,
         ZkAuthorizationCandidateInput::OwnerMaskFinal,
         0,
     )?;
     for (index, expression) in owner.operand_claims.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::OwnerOperandClaim,
@@ -1017,28 +1077,28 @@ fn preflight_transcript_cells(
         )?;
     }
     for (index, expression) in owner.rho.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::OwnerRho,
             index,
         )?;
     }
-    check_transcript_alias(
+    check_transcript_ext_alias(
         b,
         &owner.lambda,
         ZkAuthorizationCandidateInput::OwnerLambda,
         0,
     )?;
     for (index, expression) in owner.round_challenges.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::OwnerRoundChallenge,
             index,
         )?;
     }
-    check_transcript_alias(b, &owner.eta, ZkAuthorizationCandidateInput::OwnerEta, 0)?;
+    check_transcript_ext_alias(b, &owner.eta, ZkAuthorizationCandidateInput::OwnerEta, 0)?;
 
     let main = &cells.main;
     for (index, expression) in main.bridge.iter().enumerate() {
@@ -1049,10 +1109,10 @@ fn preflight_transcript_cells(
             index,
         )?;
     }
-    check_transcript_alias(b, &main.sigma, ZkAuthorizationCandidateInput::MainSigma, 0)?;
+    check_transcript_ext_alias(b, &main.sigma, ZkAuthorizationCandidateInput::MainSigma, 0)?;
     for round in 0..main.phase_a_round_coefficients.len() {
         for coefficient in 0..main.phase_a_round_coefficients[round].len() {
-            check_transcript_alias(
+            check_transcript_ext_alias(
                 b,
                 &main.phase_a_round_coefficients[round][coefficient],
                 ZkAuthorizationCandidateInput::MainPhaseARoundCoefficient,
@@ -1060,14 +1120,14 @@ fn preflight_transcript_cells(
             )?;
         }
     }
-    check_transcript_alias(
+    check_transcript_ext_alias(
         b,
         &main.phase_b_value,
         ZkAuthorizationCandidateInput::MainPhaseBValue,
         0,
     )?;
     for (index, expression) in main.upper.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::MainUpper,
@@ -1083,7 +1143,7 @@ fn preflight_transcript_cells(
         )?;
     }
     for (index, expression) in main.tail.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::MainTail,
@@ -1091,9 +1151,9 @@ fn preflight_transcript_cells(
         )?;
     }
     check_transcript_alias(b, &main.nonce, ZkAuthorizationCandidateInput::MainNonce, 0)?;
-    check_transcript_alias(b, &main.gamma, ZkAuthorizationCandidateInput::MainGamma, 0)?;
+    check_transcript_ext_alias(b, &main.gamma, ZkAuthorizationCandidateInput::MainGamma, 0)?;
     for (index, expression) in main.phase_a_challenges.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::MainPhaseAChallenge,
@@ -1101,7 +1161,7 @@ fn preflight_transcript_cells(
         )?;
     }
     for (index, expression) in main.beta.iter().enumerate() {
-        check_transcript_alias(
+        check_transcript_ext_alias(
             b,
             expression,
             ZkAuthorizationCandidateInput::MainBeta,
@@ -1125,18 +1185,20 @@ fn preflight_external_aliases(
     external: &ZkAuthorizationCandidateExternalAliases,
 ) -> Result<(), ZkAuthorizationCandidateTraceError> {
     for query in 0..ZK_QUERY_COUNT {
-        for bit in 0..ZK_PATH_DIRECTION_BITS {
+        for bit in 0..ZK_SOURCE_PATH_DIRECTION_BITS {
             check_external_alias(
                 b,
                 &external.source_path_directions[query][bit],
                 ZkAuthorizationCandidateInput::SourcePathDirection,
-                query * ZK_PATH_DIRECTION_BITS + bit,
+                query * ZK_SOURCE_PATH_DIRECTION_BITS + bit,
             )?;
+        }
+        for bit in 0..ZK_MID_PATH_DIRECTION_BITS {
             check_external_alias(
                 b,
                 &external.mid_path_directions[query][bit],
                 ZkAuthorizationCandidateInput::MidPathDirection,
-                query * ZK_PATH_DIRECTION_BITS + bit,
+                query * ZK_MID_PATH_DIRECTION_BITS + bit,
             )?;
         }
         for symbol in 0..JOINT_SOURCE_LEAF_SYMBOLS {
@@ -1148,7 +1210,7 @@ fn preflight_external_aliases(
             )?;
         }
         for symbol in 0..(1 << MID_STANDARD_FOLDS) {
-            check_external_alias(
+            check_external_ext_alias(
                 b,
                 &external.mid_leaves[query][symbol],
                 ZkAuthorizationCandidateInput::MidLeaf,
@@ -1173,6 +1235,87 @@ fn preflight_external_aliases(
     Ok(())
 }
 
+fn raw_c1_value(b: &FieldR1csBuilder, raw_challenges: &[LinExpr], logical_index: usize) -> F256 {
+    let start = 2 * logical_index;
+    F256::from_raw_challenge_lanes(
+        raw_challenges[start].eval(b.values()),
+        raw_challenges[start + 1].eval(b.values()),
+    )
+}
+
+/// Read-only batch preflight.  It checks every committed transcript cell and
+/// all semantic challenge exclusions before the trace-one sampler allocates
+/// its first row, preserving the all-tiles atomicity guarantee.
+fn preflight_raw_transcript_tile(
+    b: &FieldR1csBuilder,
+    raw: &ZkAuthRawTranscriptTile,
+) -> Result<(), ZkAuthorizationCandidateTraceError> {
+    for (index, expression) in raw.owner_data.iter().enumerate() {
+        check_transcript_alias(
+            b,
+            expression,
+            ZkAuthorizationCandidateInput::OwnerPublicStatement,
+            index,
+        )?;
+    }
+    for (index, expression) in raw.owner_challenges.iter().enumerate() {
+        check_transcript_alias(
+            b,
+            expression,
+            ZkAuthorizationCandidateInput::OwnerRho,
+            index,
+        )?;
+    }
+    for (index, expression) in raw.main_data.iter().enumerate() {
+        check_transcript_alias(
+            b,
+            expression,
+            ZkAuthorizationCandidateInput::MainBridge,
+            index,
+        )?;
+    }
+    for (index, expression) in raw.main_challenges.iter().enumerate() {
+        check_transcript_alias(
+            b,
+            expression,
+            ZkAuthorizationCandidateInput::MainGamma,
+            index,
+        )?;
+    }
+
+    if raw_c1_value(
+        b,
+        &raw.owner_challenges,
+        ZK_AUTH_OWNER_LAMBDA_CHALLENGE_INDEX,
+    ) == F256::ZERO
+    {
+        return Err(ZkAuthorizationCandidateTraceError::LambdaZero);
+    }
+    if raw_c1_value(b, &raw.owner_challenges, ZK_AUTH_OWNER_ETA_CHALLENGE_INDEX) == F256::ZERO {
+        return Err(ZkAuthorizationCandidateTraceError::EtaZero);
+    }
+    let terminal_blinding_weight = (0..ZK_PHASE_A_ROUNDS).fold(F256::ONE, |weight, round| {
+        weight
+            * raw_c1_value(
+                b,
+                &raw.owner_challenges,
+                ZK_AUTH_OWNER_ROUND_CHALLENGE_START + round,
+            )
+    });
+    if terminal_blinding_weight == F256::ZERO {
+        return Err(ZkAuthorizationCandidateTraceError::TerminalBlindingWeightZero);
+    }
+    let gamma = raw_c1_value(b, &raw.main_challenges, ZK_AUTH_MAIN_GAMMA_CHALLENGE_INDEX);
+    if gamma == F256::ZERO {
+        return Err(ZkAuthorizationCandidateTraceError::GammaZero);
+    }
+    if gamma == F256::ONE {
+        return Err(ZkAuthorizationCandidateTraceError::GammaOne);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn preflight_candidate(
     b: &FieldR1csBuilder,
     cells: &ZkAuthTranscriptCells,
@@ -1180,27 +1323,27 @@ fn preflight_candidate(
 ) -> Result<(), ZkAuthorizationCandidateTraceError> {
     preflight_transcript_cells(b, cells)?;
     preflight_external_aliases(b, external)?;
-    if cells.owner.lambda.eval(b.values()) == F128::ZERO {
+    if cells.owner.lambda.eval(b.values()) == F256::ZERO {
         return Err(ZkAuthorizationCandidateTraceError::LambdaZero);
     }
-    if cells.owner.eta.eval(b.values()) == F128::ZERO {
+    if cells.owner.eta.eval(b.values()) == F256::ZERO {
         return Err(ZkAuthorizationCandidateTraceError::EtaZero);
     }
     let terminal_blinding_weight = cells
         .owner
         .round_challenges
         .iter()
-        .fold(F128::ONE, |weight, coordinate| {
+        .fold(F256::ONE, |weight, coordinate| {
             weight * coordinate.eval(b.values())
         });
-    if terminal_blinding_weight == F128::ZERO {
+    if terminal_blinding_weight == F256::ZERO {
         return Err(ZkAuthorizationCandidateTraceError::TerminalBlindingWeightZero);
     }
     let gamma = cells.main.gamma.eval(b.values());
-    if gamma == F128::ZERO {
+    if gamma == F256::ZERO {
         return Err(ZkAuthorizationCandidateTraceError::GammaZero);
     }
-    if gamma == F128::ONE {
+    if gamma == F256::ONE {
         return Err(ZkAuthorizationCandidateTraceError::GammaOne);
     }
     Ok(())
@@ -1212,12 +1355,24 @@ fn preflight_candidate(
 /// first row is appended.  On success the function adds exactly
 /// [`ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS`] rows.  It assumes the caller has
 /// separately applied the four split-bridge pins.
+#[cfg(test)]
 pub(crate) fn verify_zk_authorization_candidate_trace(
     b: &mut FieldR1csBuilder,
     cells: &ZkAuthTranscriptCells,
     external: &ZkAuthorizationCandidateExternalAliases,
 ) -> Result<ZkAuthorizationCandidateTraceOutput, ZkAuthorizationCandidateTraceError> {
     preflight_candidate(b, cells, external)?;
+    verify_zk_authorization_candidate_trace_preflighted(b, cells, external)
+}
+
+/// Append the fixed candidate trace after its caller has authenticated and
+/// preflighted every input. The raw-slice path uses this only after checking
+/// all committed raw transcript lanes before materializing the C1 sampler.
+fn verify_zk_authorization_candidate_trace_preflighted(
+    b: &mut FieldR1csBuilder,
+    cells: &ZkAuthTranscriptCells,
+    external: &ZkAuthorizationCandidateExternalAliases,
+) -> Result<ZkAuthorizationCandidateTraceOutput, ZkAuthorizationCandidateTraceError> {
     let trace_start = b.num_wires();
 
     let owner_rounds = std::array::from_fn(|round| ZkMleCheckRoundProofTrace {
@@ -1391,6 +1546,51 @@ fn slice_range(slice: &WitnessSlice) -> std::ops::Range<usize> {
     start..end
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WalletOverflowLayout {
+    meta_a_w_log: usize,
+    meta_a_family_bases: [usize; 2],
+    meta_b_w_log: usize,
+    meta_b_block_log: usize,
+    meta_b_family_bases: [usize; 2],
+}
+
+fn wallet_overflow_layout(tile_count: usize) -> WalletOverflowLayout {
+    assert!(
+        tile_count.is_power_of_two(),
+        "authorization tile count is dyadic"
+    );
+    if let Some(geometry) =
+        crate::region_sidecar::selected_zk_block_geometry_for_auth_tiles(tile_count)
+    {
+        let source_base = 1usize << geometry.exact_state_region_log;
+        return WalletOverflowLayout {
+            meta_a_w_log: geometry.meta_a_w_log,
+            meta_a_family_bases: [
+                source_base,
+                source_base + tile_count * C1_CAPSULE_LEAF_STRIDE,
+            ],
+            meta_b_w_log: geometry.meta_b_w_log,
+            meta_b_block_log: geometry.meta_b_block_log,
+            meta_b_family_bases: geometry.wallet_overflow_bases,
+        };
+    }
+
+    // Private raw-slice fixtures use the minimal packed overflow domains.
+    let meta_a_slots = tile_count * 2 * C1_CAPSULE_LEAF_STRIDE;
+    let meta_b_slots = tile_count * ZK_AUTH_WALLET_B_PATH_STRIDE;
+    WalletOverflowLayout {
+        meta_a_w_log: meta_a_slots.trailing_zeros() as usize,
+        meta_a_family_bases: [0, tile_count * C1_CAPSULE_LEAF_STRIDE],
+        meta_b_w_log: meta_b_slots.trailing_zeros() as usize,
+        meta_b_block_log: 4,
+        meta_b_family_bases: [
+            ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET,
+            ZK_AUTH_WALLET_B_MID_PATH_OFFSET,
+        ],
+    }
+}
+
 fn validate_raw_slice_tile_fixture(
     b: &FieldR1csBuilder,
     owner_a: &[WitnessSlice; 2],
@@ -1399,6 +1599,8 @@ fn validate_raw_slice_tile_fixture(
     main_c: &[WitnessSlice; 4],
     wallet_a: &[WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
     wallet_b: &[WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
+    meta_a: &[WitnessSlice; ZK_AUTH_META_A_COLUMNS],
+    meta_b: &[WitnessSlice; ZK_AUTH_META_B_COLUMNS],
     tile_index: usize,
 ) -> usize {
     let owner = owner_a.iter().chain(owner_c).copied().collect::<Vec<_>>();
@@ -1432,12 +1634,21 @@ fn validate_raw_slice_tile_fixture(
         tile_index < tile_counts[0],
         "authorization tile out of range"
     );
+    let overflow = wallet_overflow_layout(tile_counts[0]);
+    assert!(meta_a
+        .iter()
+        .all(|slice| slice.log2_len == overflow.meta_a_w_log));
+    assert!(meta_b
+        .iter()
+        .all(|slice| slice.log2_len == overflow.meta_b_w_log));
 
     let all = owner
         .iter()
         .chain(main.iter())
         .chain(wallet_a.iter())
         .chain(wallet_b.iter())
+        .chain(meta_a.iter())
+        .chain(meta_b.iter())
         .copied()
         .collect::<Vec<_>>();
     for (index, left) in all.iter().enumerate() {
@@ -1460,54 +1671,95 @@ fn validate_raw_slice_tile_fixture(
 fn wallet_external_aliases(
     wallet_a: &[WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
     wallet_b: &[WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
+    meta_a: &[WitnessSlice; ZK_AUTH_META_A_COLUMNS],
+    meta_b: &[WitnessSlice; ZK_AUTH_META_B_COLUMNS],
     tile_index: usize,
 ) -> ZkAuthorizationCandidateExternalAliases {
+    let tile_count = 1usize << (wallet_a[0].log2_len - ZK_AUTH_WALLET_A_TILE_LOG);
+    let overflow = wallet_overflow_layout(tile_count);
     let wallet_a_base = tile_index << ZK_AUTH_WALLET_A_TILE_LOG;
     let wallet_b_base = tile_index << ZK_AUTH_WALLET_B_TILE_LOG;
     let source_a_base = wallet_a_base;
-    let mid_a_base = wallet_a_base + ZK_AUTH_WALLET_A_FAMILY_SLOTS;
-    let source_b_base = wallet_b_base;
-    let mid_b_base = wallet_b_base + ZK_AUTH_WALLET_B_FAMILY_SLOTS;
+    let mid_a_base = wallet_a_base + ZK_AUTH_WALLET_A_MID_BASE;
 
-    let leaf = |family_base: usize, query: usize, symbol: usize| {
-        let tile = family_base + query * CAPSULE_LEAF_STRIDE;
-        slot_cell(&wallet_a[symbol & 1], tile + 1 + symbol / 2)
+    let leaf = |family: usize, query: usize, symbol: usize| {
+        if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+            let family_base = if family == 0 {
+                source_a_base
+            } else {
+                mid_a_base
+            };
+            let active_slots = if family == 0 {
+                C1_CAPSULE_SOURCE_SLOTS
+            } else {
+                C1_CAPSULE_MID_SLOTS
+            };
+            let tile = family_base + query * active_slots;
+            slot_cell(&wallet_a[symbol & 1], tile + symbol / 2)
+        } else {
+            debug_assert_eq!(query, ZK_AUTH_WALLET_OVERFLOW_QUERY);
+            let tile = overflow.meta_a_family_bases[family] + tile_index * C1_CAPSULE_LEAF_STRIDE;
+            slot_cell(&meta_a[2 + (symbol & 1)], tile + symbol / 2)
+        }
     };
-    let direction = |family_base: usize, query: usize, depth: usize| {
-        slot_cell(
-            &wallet_b[8],
-            family_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + depth,
-        )
+    let path_slot = |family: usize, query: usize, depth: usize| {
+        if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+            let family_offset = if family == 0 {
+                ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
+            } else {
+                ZK_AUTH_WALLET_B_MID_PATH_OFFSET
+            };
+            wallet_b_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + family_offset + depth
+        } else {
+            debug_assert_eq!(query, ZK_AUTH_WALLET_OVERFLOW_QUERY);
+            (tile_index << overflow.meta_b_block_log) + overflow.meta_b_family_bases[family] + depth
+        }
+    };
+    let direction = |family: usize, query: usize, depth: usize| {
+        if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+            slot_cell(&wallet_b[8], path_slot(family, query, depth))
+        } else {
+            slot_cell(&meta_b[8], path_slot(family, query, depth))
+        }
     };
     // Before the composite-root multiplications exist, use the final C cells
     // as dynamic placeholders. The raw-slice helper replaces these aliases
     // before invoking Phase B; they only let the all-input atomic preflight
     // inspect every other Wallet-A/B family before any row is appended.
-    let root_placeholder = |family_base: usize, query: usize, lane: usize| {
-        slot_cell(
-            &wallet_b[lane],
-            family_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + ZK_AUTH_WALLET_B_PATH_DEPTH - 1,
-        )
+    let root_placeholder = |family: usize, query: usize, lane: usize| {
+        let depth = if family == 0 {
+            ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH
+        } else {
+            ZK_AUTH_WALLET_B_MID_PATH_DEPTH
+        };
+        let slot = path_slot(family, query, depth - 1);
+        if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+            slot_cell(&wallet_b[lane], slot)
+        } else {
+            slot_cell(&meta_b[lane], slot)
+        }
     };
 
     ZkAuthorizationCandidateExternalAliases {
         source_path_directions: std::array::from_fn(|query| {
-            std::array::from_fn(|depth| direction(source_b_base, query, depth))
+            std::array::from_fn(|depth| direction(0, query, depth))
         }),
         mid_path_directions: std::array::from_fn(|query| {
-            std::array::from_fn(|depth| direction(mid_b_base, query, depth))
+            std::array::from_fn(|depth| direction(1, query, depth))
         }),
         joint_source_leaves: std::array::from_fn(|query| {
-            std::array::from_fn(|symbol| leaf(source_a_base, query, symbol))
+            std::array::from_fn(|symbol| leaf(0, query, symbol))
         }),
         mid_leaves: std::array::from_fn(|query| {
-            std::array::from_fn(|symbol| leaf(mid_a_base, query, symbol))
+            std::array::from_fn(|symbol| {
+                ExtExpr::new(leaf(1, query, 2 * symbol), leaf(1, query, 2 * symbol + 1))
+            })
         }),
         source_path_roots: std::array::from_fn(|query| {
-            std::array::from_fn(|lane| root_placeholder(source_b_base, query, lane))
+            std::array::from_fn(|lane| root_placeholder(0, query, lane))
         }),
         mid_path_roots: std::array::from_fn(|query| {
-            std::array::from_fn(|lane| root_placeholder(mid_b_base, query, lane))
+            std::array::from_fn(|lane| root_placeholder(1, query, lane))
         }),
     }
 }
@@ -1541,59 +1793,54 @@ fn assert_outer_statement_aliases(
     Ok(())
 }
 
-fn composite_wallet_b_roots(
+fn composite_wallet_roots(
     b: &mut FieldR1csBuilder,
+    wallet_a: &[WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
     wallet_b: &[WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
-    family_base: usize,
+    meta_b: &[WitnessSlice; ZK_AUTH_META_B_COLUMNS],
+    tile_index: usize,
+    family: usize,
 ) -> [[LinExpr; ZK_PHASE_B_CAP_DIGEST_LANES]; ZK_QUERY_COUNT] {
+    let tile_count = 1usize << (wallet_a[0].log2_len - ZK_AUTH_WALLET_A_TILE_LOG);
+    let overflow = wallet_overflow_layout(tile_count);
+    let wallet_b_base = tile_index << ZK_AUTH_WALLET_B_TILE_LOG;
+    let family_offset = if family == 0 {
+        ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
+    } else {
+        ZK_AUTH_WALLET_B_MID_PATH_OFFSET
+    };
+    let path_depth = if family == 0 {
+        ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH
+    } else {
+        ZK_AUTH_WALLET_B_MID_PATH_DEPTH
+    };
     std::array::from_fn(|query| {
-        let last =
-            family_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + ZK_AUTH_WALLET_B_PATH_DEPTH - 1;
-        let direction = slot_cell(&wallet_b[8], last);
+        let (columns, last) = if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+            (
+                wallet_b,
+                wallet_b_base + query * ZK_AUTH_WALLET_B_PATH_STRIDE + family_offset + path_depth
+                    - 1,
+            )
+        } else {
+            debug_assert_eq!(query, ZK_AUTH_WALLET_OVERFLOW_QUERY);
+            (
+                meta_b,
+                (tile_index << overflow.meta_b_block_log)
+                    + overflow.meta_b_family_bases[family]
+                    + path_depth
+                    - 1,
+            )
+        };
+        let direction = slot_cell(&columns[8], last);
         std::array::from_fn(|lane| {
-            let carry = slot_cell(&wallet_b[4 + lane], last);
-            let sibling = slot_cell(&wallet_b[6 + lane], last);
+            let carry = slot_cell(&columns[4 + lane], last);
+            let sibling = slot_cell(&columns[6 + lane], last);
             let selected_delta = mul(b, &direction, &carry.add(&sibling));
-            slot_cell(&wallet_b[lane], last)
+            slot_cell(&columns[lane], last)
                 .add(&carry)
                 .add(&selected_delta)
         })
     })
-}
-
-/// Recompose a raw flat metadata lane from LSB-first transcript-bound bits.
-fn raw_metadata_lane_from_bits(bits: &[LinExpr]) -> LinExpr {
-    bits.iter()
-        .enumerate()
-        .fold(LinExpr::zero(), |lane, (bit, value)| {
-            lane.add(&value.scale(raw_flat_lane(1u128 << bit)))
-        })
-}
-
-/// Bind both capsule-leaf sponge metadata blocks to the exact Phase-B query.
-/// Wallet-A column 0 is `IN0 = msg_log`; column 1 is `IN1 = leaf_index`.
-fn pin_wallet_a_leaf_metadata(
-    b: &mut FieldR1csBuilder,
-    wallet_a: &[WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
-    wallet_a_base: usize,
-    bound_query_bits: &[Vec<LinExpr>],
-) {
-    assert_eq!(bound_query_bits.len(), ZK_QUERY_COUNT);
-    let source_log = LinExpr::constant(raw_flat_lane(ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG as u128));
-    let mid_log = LinExpr::constant(raw_flat_lane(ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG as u128));
-
-    for (query, bits) in bound_query_bits.iter().enumerate() {
-        assert_eq!(bits.len(), SOURCE_QUERY_BITS);
-        let source_tile = wallet_a_base + query * CAPSULE_LEAF_STRIDE;
-        let mid_tile = wallet_a_base + ZK_AUTH_WALLET_A_FAMILY_SLOTS + query * CAPSULE_LEAF_STRIDE;
-        let source_index = raw_metadata_lane_from_bits(bits);
-        let mid_index = raw_metadata_lane_from_bits(&bits[MID_STANDARD_FOLDS..]);
-
-        pin_eq(b, &slot_cell(&wallet_a[0], source_tile), &source_log);
-        pin_eq(b, &slot_cell(&wallet_a[1], source_tile), &source_index);
-        pin_eq(b, &slot_cell(&wallet_a[0], mid_tile), &mid_log);
-        pin_eq(b, &slot_cell(&wallet_a[1], mid_tile), &mid_index);
-    }
 }
 
 /// Exercise one authorization tile over caller-supplied committed-slice
@@ -1616,29 +1863,27 @@ fn preflight_zk_authorization_raw_slice_tile_candidate_trace(
     main_c: &[WitnessSlice; 4],
     wallet_a: &[WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
     wallet_b: &[WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
+    meta_a: &[WitnessSlice; ZK_AUTH_META_A_COLUMNS],
+    meta_b: &[WitnessSlice; ZK_AUTH_META_B_COLUMNS],
     tile_index: usize,
     public: &SelectedZkAuthorizationStatementTrace,
-) -> Result<
-    (
-        ZkAuthTranscriptCells,
-        ZkAuthorizationCandidateExternalAliases,
-    ),
-    ZkAuthorizationCandidateTraceError,
-> {
+) -> Result<ZkAuthorizationCandidateExternalAliases, ZkAuthorizationCandidateTraceError> {
     validate_raw_slice_tile_fixture(
-        b, owner_a, owner_c, main_a, main_c, wallet_a, wallet_b, tile_index,
+        b, owner_a, owner_c, main_a, main_c, wallet_a, wallet_b, meta_a, meta_b, tile_index,
     );
-    let cells = view_zk_auth_transcript_tile(
+    let raw = view_zk_auth_raw_split_transcript_tile(
         owner_layout,
         owner_a,
         owner_c,
         main_layout,
         main_a,
         main_c,
+        wallet_a,
         tile_index,
     );
-    let external = wallet_external_aliases(wallet_a, wallet_b, tile_index);
-    preflight_candidate(b, &cells, &external)?;
+    let external = wallet_external_aliases(wallet_a, wallet_b, meta_a, meta_b, tile_index);
+    preflight_raw_transcript_tile(b, &raw)?;
+    preflight_external_aliases(b, &external)?;
     let committed_slices = owner_a
         .iter()
         .chain(owner_c)
@@ -1646,10 +1891,12 @@ fn preflight_zk_authorization_raw_slice_tile_candidate_trace(
         .chain(main_c)
         .chain(wallet_a)
         .chain(wallet_b)
+        .chain(meta_a)
+        .chain(meta_b)
         .copied()
         .collect::<Vec<_>>();
     assert_outer_statement_aliases(b, public, &committed_slices)?;
-    Ok((cells, external))
+    Ok(external)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1663,13 +1910,15 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
     main_c: &[WitnessSlice; 4],
     wallet_a: &[WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
     wallet_b: &[WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
+    meta_a: &[WitnessSlice; ZK_AUTH_META_A_COLUMNS],
+    meta_b: &[WitnessSlice; ZK_AUTH_META_B_COLUMNS],
     tile_index: usize,
     public: &SelectedZkAuthorizationStatementTrace,
 ) -> Result<
     (ZkAuthSplitBridgeCells, ZkAuthorizationCandidateTraceOutput),
     ZkAuthorizationCandidateTraceError,
 > {
-    let (cells, mut external) = preflight_zk_authorization_raw_slice_tile_candidate_trace(
+    let mut external = preflight_zk_authorization_raw_slice_tile_candidate_trace(
         b,
         owner_layout,
         owner_a,
@@ -1679,11 +1928,28 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
         main_c,
         wallet_a,
         wallet_b,
+        meta_a,
+        meta_b,
         tile_index,
         public,
     )?;
 
     let wrapper_start = b.num_wires();
+    let cells = view_zk_auth_split_transcript_tile(
+        b,
+        owner_layout,
+        owner_a,
+        owner_c,
+        main_layout,
+        main_a,
+        main_c,
+        wallet_a,
+        tile_index,
+    );
+    debug_assert_eq!(
+        b.num_wires() - wrapper_start,
+        ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS
+    );
     for lane in 0..2 {
         pin_eq(
             b,
@@ -1698,68 +1964,98 @@ fn verify_zk_authorization_raw_slice_tile_candidate_trace(
     }
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS
+        ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS + ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS
     );
 
-    let bridge = pin_zk_auth_split_bridge_at(b, owner_c, main_a, tile_index);
+    let bridge = pin_zk_auth_c1_split_bridge_at(b, owner_c, main_a, main_c, wallet_a, tile_index);
     assert_eq!(bridge.main_absorb, cells.main.bridge);
     assert_eq!(bridge.sigma, cells.main.sigma);
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS + ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
+        ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS
+            + ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS
+            + ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
     );
 
+    let tile_count = 1usize << (wallet_a[0].log2_len - ZK_AUTH_WALLET_A_TILE_LOG);
+    let overflow = wallet_overflow_layout(tile_count);
     let wallet_a_base = tile_index << ZK_AUTH_WALLET_A_TILE_LOG;
     let wallet_b_base = tile_index << ZK_AUTH_WALLET_B_TILE_LOG;
     for query in 0..ZK_QUERY_COUNT {
-        for (a_family, b_family) in [
-            (wallet_a_base, wallet_b_base),
-            (
-                wallet_a_base + ZK_AUTH_WALLET_A_FAMILY_SLOTS,
-                wallet_b_base + ZK_AUTH_WALLET_B_FAMILY_SLOTS,
-            ),
-        ] {
-            let leaf_tile = a_family + query * CAPSULE_LEAF_STRIDE;
-            let path_start = b_family + query * ZK_AUTH_WALLET_B_PATH_STRIDE;
+        for family in 0..2 {
+            let (a_columns, leaf_tile, b_columns, path_start) =
+                if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+                    (
+                        wallet_a.as_slice(),
+                        wallet_a_base
+                            + if family == 0 {
+                                ZK_AUTH_WALLET_A_SOURCE_BASE + query * C1_CAPSULE_SOURCE_SLOTS
+                            } else {
+                                ZK_AUTH_WALLET_A_MID_BASE + query * C1_CAPSULE_MID_SLOTS
+                            },
+                        wallet_b.as_slice(),
+                        wallet_b_base
+                            + query * ZK_AUTH_WALLET_B_PATH_STRIDE
+                            + if family == 0 {
+                                ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
+                            } else {
+                                ZK_AUTH_WALLET_B_MID_PATH_OFFSET
+                            },
+                    )
+                } else {
+                    debug_assert_eq!(query, ZK_AUTH_WALLET_OVERFLOW_QUERY);
+                    (
+                        meta_a.as_slice(),
+                        overflow.meta_a_family_bases[family] + tile_index * C1_CAPSULE_LEAF_STRIDE,
+                        meta_b.as_slice(),
+                        (tile_index << overflow.meta_b_block_log)
+                            + overflow.meta_b_family_bases[family],
+                    )
+                };
             for lane in 0..2 {
+                let a_digest_column = if query < ZK_AUTH_WALLET_CORE_QUERY_COUNT {
+                    2 + lane
+                } else {
+                    4 + lane
+                };
                 pin_eq(
                     b,
-                    &slot_cell(&wallet_a[2 + lane], leaf_tile + CAPSULE_LEAF_DIGEST_SLOT),
-                    &slot_cell(&wallet_b[4 + lane], path_start),
+                    &slot_cell(
+                        &a_columns[a_digest_column],
+                        leaf_tile
+                            + if family == 0 {
+                                C1_CAPSULE_SOURCE_DIGEST_SLOT
+                            } else {
+                                C1_CAPSULE_MID_DIGEST_SLOT
+                            },
+                    ),
+                    &slot_cell(&b_columns[4 + lane], path_start),
                 );
             }
         }
     }
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
-        ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS
+        ZK_AUTH_RAW_SLICE_C1_SAMPLER_ROWS
+            + ZK_AUTH_RAW_SLICE_STATEMENT_PIN_ROWS
             + ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
             + ZK_AUTH_RAW_SLICE_DIGEST_BRIDGE_ROWS
     );
 
-    external.source_path_roots = composite_wallet_b_roots(b, wallet_b, wallet_b_base);
-    external.mid_path_roots =
-        composite_wallet_b_roots(b, wallet_b, wallet_b_base + ZK_AUTH_WALLET_B_FAMILY_SLOTS);
+    external.source_path_roots =
+        composite_wallet_roots(b, wallet_a, wallet_b, meta_b, tile_index, 0);
+    external.mid_path_roots = composite_wallet_roots(b, wallet_a, wallet_b, meta_b, tile_index, 1);
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
         ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS
     );
 
-    let candidate = verify_zk_authorization_candidate_trace(b, &cells, &external)?;
+    let candidate = verify_zk_authorization_candidate_trace_preflighted(b, &cells, &external)?;
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
         ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS + ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS
     );
 
-    // Phase B has now bound all thirteen query bits. Pin the two capsule-leaf
-    // metadata blocks to those exact expressions rather than trusting the
-    // caller-populated Wallet-A IN0/IN1 cells.
-    pin_wallet_a_leaf_metadata(
-        b,
-        wallet_a,
-        wallet_a_base,
-        &candidate.phase_b.bound_queries.bits,
-    );
     debug_assert_eq!(
         b.num_wires() - wrapper_start,
         ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS
@@ -1773,13 +2069,14 @@ mod tests {
 
     use noid_core::mle::evaluate::evaluate_slice;
     use noid_core::mle::fold::fold_variable_inplace;
-    use noid_core::{Block128, TowerField};
+    use noid_core::{Block128, Block256, TowerField};
     use noid_fri_binius::capsule::capsule_query_bit_location;
     use noid_fri_binius::zk_affine_code::{ZkAffineLchCode, AFFINE_CODE_MESSAGE_LEN};
     use noid_fri_binius::zk_capsule_algebra::{
-        build_joint_source_leaf, build_mid_leaf, contract_high3_for_each_low8,
-        evaluate_upper_at_low8, OWNER_BANK_POINT_VARS, PHASE_B_HIGH_VARS, PHASE_B_LOW_VARS,
-        SOURCE_QUERY_BITS, SOURCE_STANDARD_FOLDS, TAIL_SYMBOLS, UPPER_SYMBOLS,
+        build_fold_normal_joint_source_leaf, build_fold_normal_mid_leaf,
+        contract_high3_for_each_low8, evaluate_upper_at_low8, OWNER_BANK_POINT_VARS,
+        PHASE_B_HIGH_VARS, PHASE_B_LOW_VARS, SOURCE_QUERY_BITS, SOURCE_STANDARD_FOLDS,
+        TAIL_SYMBOLS, UPPER_SYMBOLS,
     };
     use noid_fri_binius::zk_phase_a::{
         prove_phase_a, verify_phase_a, ZkPhaseARoundProof, PHASE_A_ORACLE_LEN,
@@ -1792,11 +2089,11 @@ mod tests {
         ZK_AUTH_CAPSULE_PCS_COINS_OFFSET, ZK_AUTH_CAPSULE_REMAINING_PADDING_OFFSET,
     };
     use noid_gkr::zk_mlecheck::ZkMleCheckRoundProof;
+    use noid_ivc_core::deep_chain::capsule_leaf::{flat_c1_capsule_leaf_hash, C1CapsuleLeafKind};
     use noid_ivc_core::deep_chain::schedule::LaneSource;
     use noid_ivc_core::field_r1cs::FieldR1cs;
     use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX};
 
-    use super::super::alloc_block;
     use super::super::region_source_binding::{alloc_boolean_column_slice, alloc_column_slice};
     use super::super::zk_auth_transcript_cells::{
         ZkAuthMainTranscriptCells, ZkAuthOwnerTranscriptCells,
@@ -1804,6 +2101,7 @@ mod tests {
     use super::super::zk_phase_b_composition::{
         ZK_PHASE_B_MID_CAP_NODES, ZK_PHASE_B_SOURCE_CAP_NODES,
     };
+    use super::super::{alloc_block, alloc_block256, const_block256, flat_of_ext};
     use super::*;
     use crate::acceptance::block_slots::canonical_selected_zk_authorization_fixture;
     use crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules;
@@ -1812,28 +2110,30 @@ mod tests {
     struct NativeCandidate {
         public_statement: [Block128; 4],
         source_cap: [[Block128; ZK_PHASE_B_SOURCE_CAP_NODES]; ZK_PHASE_B_CAP_DIGEST_LANES],
-        rho: [Block128; OWNER_BANK_POINT_VARS],
-        mask_mu: Block128,
-        mask_final: Block128,
-        lambda: Block128,
-        owner_rounds: [ZkMleCheckRoundProof; OWNER_BANK_POINT_VARS],
-        owner_challenges: [Block128; OWNER_BANK_POINT_VARS],
-        terminal_operands: AuthCapsuleTerminalOperandClaims,
-        eta: Block128,
-        sigma: Block128,
-        gamma: Block128,
-        phase_a_challenges: [Block128; ZK_PHASE_A_ROUNDS],
-        phase_a_rounds: [ZkPhaseARoundProof; ZK_PHASE_A_ROUNDS],
-        terminal_oracle_value: Block128,
-        upper: [Block128; UPPER_SYMBOLS],
-        beta: [Block128; PHASE_B_LOW_VARS],
+        rho: [Block256; OWNER_BANK_POINT_VARS],
+        mask_mu: Block256,
+        mask_final: Block256,
+        lambda: Block256,
+        owner_rounds: [ZkMleCheckRoundProof<Block256>; OWNER_BANK_POINT_VARS],
+        owner_challenges: [Block256; OWNER_BANK_POINT_VARS],
+        terminal_operands: AuthCapsuleTerminalOperandClaims<Block256>,
+        eta: Block256,
+        sigma: Block256,
+        gamma: Block256,
+        phase_a_challenges: [Block256; ZK_PHASE_A_ROUNDS],
+        phase_a_rounds: [ZkPhaseARoundProof<Block256>; ZK_PHASE_A_ROUNDS],
+        terminal_oracle_value: Block256,
+        upper: [Block256; UPPER_SYMBOLS],
+        beta: [Block256; PHASE_B_LOW_VARS],
         mid_cap: [[Block128; ZK_PHASE_B_MID_CAP_NODES]; ZK_PHASE_B_CAP_DIGEST_LANES],
-        tail: [Block128; TAIL_SYMBOLS],
+        tail: [Block256; TAIL_SYMBOLS],
         grind: Block128,
         query_seeds: [Block128; 7],
+        owner_raw_challenges: [Block128; 2 * ZK_AUTH_OWNER_SQUEEZES],
+        main_raw_challenges: [Block128; ZK_AUTH_MAIN_RAW_CHALLENGE_LANES],
         queries: [usize; ZK_QUERY_COUNT],
         joint_source_leaves: [[Block128; JOINT_SOURCE_LEAF_SYMBOLS]; ZK_QUERY_COUNT],
-        mid_leaves: [[Block128; 1 << MID_STANDARD_FOLDS]; ZK_QUERY_COUNT],
+        mid_leaves: [[Block256; 1 << MID_STANDARD_FOLDS]; ZK_QUERY_COUNT],
         source_path_roots: [[Block128; ZK_PHASE_B_CAP_DIGEST_LANES]; ZK_QUERY_COUNT],
         mid_path_roots: [[Block128; ZK_PHASE_B_CAP_DIGEST_LANES]; ZK_QUERY_COUNT],
     }
@@ -1868,8 +2168,12 @@ mod tests {
         value
     }
 
-    fn point(domain: u128, salt: u128) -> [Block128; OWNER_BANK_POINT_VARS] {
+    fn raw_challenges<const N: usize>(domain: u128, salt: u128) -> [Block128; N] {
         std::array::from_fn(|index| elem(index + 29, domain, salt))
+    }
+
+    fn mapped_challenge(raw: &[Block128], index: usize) -> Block256 {
+        Block256::from_raw_challenge_lanes(raw[2 * index], raw[2 * index + 1])
     }
 
     fn packed_queries(seeds: &[Block128; 7]) -> [usize; ZK_QUERY_COUNT] {
@@ -1921,12 +2225,19 @@ mod tests {
         }
         let bank_view = ZkAuthCapsuleBankView::checked(&bank).expect("bank shape");
 
-        let rho = point(0x1A90_7, salt ^ 0x50);
-        let owner_challenges = point(0xC4A1_1, salt ^ 0x60);
-        let lambda = elem(71, 0x1A4B_DA, salt ^ 0x70);
+        let owner_raw_challenges =
+            raw_challenges::<{ 2 * ZK_AUTH_OWNER_SQUEEZES }>(0x1A90_7, salt ^ 0x50);
+        let rho = std::array::from_fn(|index| mapped_challenge(&owner_raw_challenges, index));
+        let lambda = mapped_challenge(&owner_raw_challenges, ZK_AUTH_OWNER_LAMBDA_CHALLENGE_INDEX);
+        let owner_challenges = std::array::from_fn(|index| {
+            mapped_challenge(
+                &owner_raw_challenges,
+                ZK_AUTH_OWNER_ROUND_CHALLENGE_START + index,
+            )
+        });
         let carrier = build_explicit_mlecheck_carrier(bank_view, rho, lambda, owner_challenges)
             .expect("real explicit Owner carrier");
-        let eta = elem(73, 0xE7A0, salt ^ 0x80);
+        let eta = mapped_challenge(&owner_raw_challenges, ZK_AUTH_OWNER_ETA_CHALLENGE_INDEX);
         let relation = build_post_claim_relation(
             &rho,
             &carrier.terminal_point,
@@ -1937,12 +2248,30 @@ mod tests {
         .expect("native post-claim relation");
         assert!(relation.verify(bank_view));
 
-        let companion: Vec<Block128> = (0..PHASE_A_ORACLE_LEN)
-            .map(|index| elem(index, 0xC09A_91, salt ^ 0x90))
+        let companion: Vec<Block256> = (0..PHASE_A_ORACLE_LEN)
+            .map(|index| {
+                Block256::new(
+                    elem(index, 0xC09A_91, salt ^ 0x90),
+                    elem(index + 113, 0xC125_6, salt ^ 0x91),
+                )
+            })
             .collect();
-        assert_ne!(companion, bank, "companion must remain independent");
-        let phase_a_challenges = point(0x5A11_CE, salt ^ 0xA0);
-        let gamma = elem(79, 0x6A77_A, salt ^ 0xB0);
+        assert!(
+            companion
+                .iter()
+                .zip(&bank)
+                .any(|(&companion, &bank)| companion != Block256::from(bank)),
+            "companion must remain independent"
+        );
+        let mut main_raw_challenges =
+            raw_challenges::<ZK_AUTH_MAIN_RAW_CHALLENGE_LANES>(0x5A11_CE, salt ^ 0xA0);
+        let gamma = mapped_challenge(&main_raw_challenges, ZK_AUTH_MAIN_GAMMA_CHALLENGE_INDEX);
+        let phase_a_challenges = std::array::from_fn(|index| {
+            mapped_challenge(
+                &main_raw_challenges,
+                ZK_AUTH_MAIN_PHASE_A_CHALLENGE_START + index,
+            )
+        });
         let phase_a = prove_phase_a(
             &bank,
             &companion,
@@ -1968,36 +2297,52 @@ mod tests {
         let bank: [Block128; AFFINE_CODE_MESSAGE_LEN] = bank
             .try_into()
             .unwrap_or_else(|_| unreachable!("Auth bank is the affine message"));
-        let companion: [Block128; AFFINE_CODE_MESSAGE_LEN] = companion
+        let companion: [Block256; AFFINE_CODE_MESSAGE_LEN] = companion
             .try_into()
             .unwrap_or_else(|_| unreachable!("companion is the affine message"));
-        let virtual_bank: [Block128; AFFINE_CODE_MESSAGE_LEN] =
-            std::array::from_fn(|index| bank[index] + gamma * (bank[index] + companion[index]));
-        let beta: [Block128; PHASE_B_LOW_VARS] =
-            std::array::from_fn(|index| elem(index + 31, 0xBE7A, salt ^ 0xC0));
-        let query_seeds: [Block128; 7] =
-            std::array::from_fn(|index| elem(index + 71, 0x5EED, salt ^ 0xD0));
+        let virtual_bank: [Block256; AFFINE_CODE_MESSAGE_LEN] = std::array::from_fn(|index| {
+            let bank = Block256::from(bank[index]);
+            bank + gamma * (bank + companion[index])
+        });
+        let beta: [Block256; PHASE_B_LOW_VARS] = std::array::from_fn(|index| {
+            mapped_challenge(
+                &main_raw_challenges,
+                ZK_AUTH_MAIN_BETA_CHALLENGE_START + index,
+            )
+        });
+        let grind = Block128::from(elem(97, 0x6A1D, salt ^ 0x101).0 & !0xFFFFu128);
+        main_raw_challenges[ZK_AUTH_MAIN_GRIND_RAW_CHALLENGE_INDEX] = grind;
+        let query_seeds: [Block128; 7] = std::array::from_fn(|index| {
+            let seed = elem(index + 71, 0x5EED, salt ^ 0xD0);
+            main_raw_challenges[ZK_AUTH_MAIN_QUERY_SEED_RAW_CHALLENGE_START + index] = seed;
+            seed
+        });
         let queries = packed_queries(&query_seeds);
 
         let code = ZkAffineLchCode::selected().expect("selected affine code");
         let bank_code = code.encode(&bank).expect("bank codeword");
-        let companion_code = code.encode(&companion).expect("companion codeword");
-        let mut mid_code = code.encode(&virtual_bank).expect("virtual codeword");
+        let companion_code = code
+            .encode_extension_after_low_folds(&companion, 0)
+            .expect("companion codeword");
+        let mut mid_code = code
+            .encode_extension_after_low_folds(&virtual_bank, 0)
+            .expect("virtual codeword");
         for round in 0..SOURCE_STANDARD_FOLDS {
             mid_code = code
-                .fold_codeword_once(&mid_code, round, beta[round])
+                .fold_codeword_once_extension(&mid_code, round, beta[round])
                 .expect("source fold");
         }
         let joint_source_leaves = std::array::from_fn(|query| {
-            build_joint_source_leaf(&bank_code, &companion_code, queries[query])
-                .expect("joint source leaf")
+            build_fold_normal_joint_source_leaf(&code, &bank_code, &companion_code, queries[query])
+                .expect("fold-normal joint source leaf")
         });
         let mid_leaves = std::array::from_fn(|query| {
-            build_mid_leaf(&mid_code, queries[query] >> MID_STANDARD_FOLDS).expect("mid leaf")
+            build_fold_normal_mid_leaf(&code, &mid_code, queries[query] >> MID_STANDARD_FOLDS)
+                .expect("fold-normal mid leaf")
         });
         for round in 0..MID_STANDARD_FOLDS {
             mid_code = code
-                .fold_codeword_once(
+                .fold_codeword_once_extension(
                     &mid_code,
                     SOURCE_STANDARD_FOLDS + round,
                     beta[SOURCE_STANDARD_FOLDS + round],
@@ -2008,18 +2353,21 @@ mod tests {
         for challenge in &beta[..SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS] {
             fold_variable_inplace(&mut tail_vec, *challenge, 0);
         }
-        let tail: [Block128; TAIL_SYMBOLS] =
+        let tail: [Block256; TAIL_SYMBOLS] =
             tail_vec.try_into().expect("seven folds leave sixteen");
         assert_eq!(
-            code.encode_after_low_folds(&tail, SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS)
-                .expect("tail codeword"),
+            code.encode_extension_after_low_folds(
+                &tail,
+                SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS,
+            )
+            .expect("tail codeword"),
             mid_code
         );
 
-        let high_point: &[Block128; PHASE_B_HIGH_VARS] = phase_a.terminal_point[PHASE_B_LOW_VARS..]
+        let high_point: &[Block256; PHASE_B_HIGH_VARS] = phase_a.terminal_point[PHASE_B_LOW_VARS..]
             .try_into()
             .expect("three high coordinates");
-        let low_point: &[Block128; PHASE_B_LOW_VARS] = phase_a.terminal_point[..PHASE_B_LOW_VARS]
+        let low_point: &[Block256; PHASE_B_LOW_VARS] = phase_a.terminal_point[..PHASE_B_LOW_VARS]
             .try_into()
             .expect("eight low coordinates");
         let upper = contract_high3_for_each_low8(&virtual_bank, high_point);
@@ -2033,14 +2381,14 @@ mod tests {
             std::array::from_fn(|node| elem(node + 13 * lane, 0x1DC4, salt ^ 0xF0))
         });
         let source_path_roots = std::array::from_fn(|query| {
-            let cap_index = queries[query] >> 8;
+            let cap_index = queries[query] >> ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH;
             std::array::from_fn(|lane| source_cap[lane][cap_index])
         });
         let mid_path_roots = std::array::from_fn(|query| {
-            let cap_index = (queries[query] >> MID_STANDARD_FOLDS) >> 8;
+            let cap_index =
+                (queries[query] >> MID_STANDARD_FOLDS) >> ZK_AUTH_WALLET_B_MID_PATH_DEPTH;
             std::array::from_fn(|lane| mid_cap[lane][cap_index])
         });
-        let grind = Block128::from(elem(97, 0x6A1D, salt ^ 0x101).0 & !0xFFFFu128);
 
         NativeCandidate {
             public_statement: [
@@ -2072,6 +2420,8 @@ mod tests {
             tail,
             grind,
             query_seeds,
+            owner_raw_challenges,
+            main_raw_challenges,
             queries,
             joint_source_leaves,
             mid_leaves,
@@ -2088,53 +2438,53 @@ mod tests {
             source_cap: std::array::from_fn(|index| {
                 alloc_block(b, native.source_cap[index & 1][index >> 1])
             }),
-            mask_mu: alloc_block(b, native.mask_mu),
+            mask_mu: alloc_block256(b, native.mask_mu),
             round_coefficients: std::array::from_fn(|round| {
                 std::array::from_fn(|coefficient| {
-                    alloc_block(
+                    alloc_block256(
                         b,
                         native.owner_rounds[round].coeffs_without_constant[coefficient],
                     )
                 })
             }),
-            mask_final: alloc_block(b, native.mask_final),
+            mask_final: alloc_block256(b, native.mask_final),
             operand_claims: [
-                alloc_block(b, native.terminal_operands.increment),
-                alloc_block(b, native.terminal_operands.lane[0]),
-                alloc_block(b, native.terminal_operands.lane[1]),
-                alloc_block(b, native.terminal_operands.lane[2]),
-                alloc_block(b, native.terminal_operands.lane[3]),
+                alloc_block256(b, native.terminal_operands.increment),
+                alloc_block256(b, native.terminal_operands.lane[0]),
+                alloc_block256(b, native.terminal_operands.lane[1]),
+                alloc_block256(b, native.terminal_operands.lane[2]),
+                alloc_block256(b, native.terminal_operands.lane[3]),
             ],
-            rho: std::array::from_fn(|index| alloc_block(b, native.rho[index])),
-            lambda: alloc_block(b, native.lambda),
+            rho: std::array::from_fn(|index| alloc_block256(b, native.rho[index])),
+            lambda: alloc_block256(b, native.lambda),
             round_challenges: std::array::from_fn(|index| {
-                alloc_block(b, native.owner_challenges[index])
+                alloc_block256(b, native.owner_challenges[index])
             }),
-            eta: alloc_block(b, native.eta),
+            eta: alloc_block256(b, native.eta),
         };
         let main = ZkAuthMainTranscriptCells {
             bridge: std::array::from_fn(|index| {
                 alloc_block(b, elem(index + 211, 0xB21D6E, native.grind.0))
             }),
-            sigma: alloc_block(b, native.sigma),
+            sigma: alloc_block256(b, native.sigma),
             phase_a_round_coefficients: std::array::from_fn(|round| {
                 [
-                    alloc_block(b, native.phase_a_rounds[round].at_one),
-                    alloc_block(b, native.phase_a_rounds[round].at_infinity),
+                    alloc_block256(b, native.phase_a_rounds[round].at_one),
+                    alloc_block256(b, native.phase_a_rounds[round].at_infinity),
                 ]
             }),
-            phase_b_value: alloc_block(b, native.terminal_oracle_value),
-            upper: std::array::from_fn(|index| alloc_block(b, native.upper[index])),
+            phase_b_value: alloc_block256(b, native.terminal_oracle_value),
+            upper: std::array::from_fn(|index| alloc_block256(b, native.upper[index])),
             mid_cap: std::array::from_fn(|index| {
                 alloc_block(b, native.mid_cap[index & 1][index >> 1])
             }),
-            tail: std::array::from_fn(|index| alloc_block(b, native.tail[index])),
+            tail: std::array::from_fn(|index| alloc_block256(b, native.tail[index])),
             nonce: alloc_block(b, Block128::from(17u128)),
-            gamma: alloc_block(b, native.gamma),
+            gamma: alloc_block256(b, native.gamma),
             phase_a_challenges: std::array::from_fn(|index| {
-                alloc_block(b, native.phase_a_challenges[index])
+                alloc_block256(b, native.phase_a_challenges[index])
             }),
-            beta: std::array::from_fn(|index| alloc_block(b, native.beta[index])),
+            beta: std::array::from_fn(|index| alloc_block256(b, native.beta[index])),
             grind: alloc_block(b, native.grind),
             query_seeds: std::array::from_fn(|index| alloc_block(b, native.query_seeds[index])),
         };
@@ -2162,7 +2512,7 @@ mod tests {
                 })
             }),
             mid_leaves: std::array::from_fn(|query| {
-                std::array::from_fn(|symbol| alloc_block(b, native.mid_leaves[query][symbol]))
+                std::array::from_fn(|symbol| alloc_block256(b, native.mid_leaves[query][symbol]))
             }),
             source_path_roots: std::array::from_fn(|query| {
                 std::array::from_fn(|lane| alloc_block(b, native.source_path_roots[query][lane]))
@@ -2188,73 +2538,74 @@ mod tests {
             .collect()
     }
 
+    fn push_wide(data: &mut Vec<Block128>, value: Block256) {
+        data.push(value.lo);
+        data.push(value.hi);
+    }
+
     fn owner_stream(native: &NativeCandidate) -> (Vec<Block128>, Vec<Block128>) {
-        let mut data = Vec::with_capacity(185);
+        let mut data = Vec::with_capacity(ZK_AUTH_OWNER_DYNAMIC_LANES);
         data.extend(native.public_statement);
         for node in 0..ZK_PHASE_B_SOURCE_CAP_NODES {
             for lane in 0..ZK_PHASE_B_CAP_DIGEST_LANES {
                 data.push(native.source_cap[lane][node]);
             }
         }
-        data.push(native.mask_mu);
+        push_wide(&mut data, native.mask_mu);
         for round in &native.owner_rounds {
-            data.extend(round.coeffs_without_constant);
+            for coefficient in round.coeffs_without_constant {
+                push_wide(&mut data, coefficient);
+            }
         }
-        data.push(native.mask_final);
-        data.push(native.terminal_operands.increment);
-        data.extend(native.terminal_operands.lane);
+        push_wide(&mut data, native.mask_final);
+        push_wide(&mut data, native.terminal_operands.increment);
+        for operand in native.terminal_operands.lane {
+            push_wide(&mut data, operand);
+        }
 
-        let mut challenges = Vec::with_capacity(24);
-        challenges.extend(native.rho);
-        challenges.push(native.lambda);
-        challenges.extend(native.owner_challenges);
-        challenges.push(native.eta);
-        assert_eq!(data.len(), 185);
-        assert_eq!(challenges.len(), 24);
-        (data, challenges)
+        assert_eq!(data.len(), ZK_AUTH_OWNER_DYNAMIC_LANES);
+        (data, native.owner_raw_challenges.to_vec())
     }
 
     fn main_stream(
         native: &NativeCandidate,
         bridge: [Block128; 4],
     ) -> (Vec<Block128>, Vec<Block128>) {
-        let mut data = Vec::with_capacity(305);
+        let mut data = Vec::with_capacity(ZK_AUTH_MAIN_DYNAMIC_LANES);
         data.extend(bridge);
-        data.push(native.sigma);
+        push_wide(&mut data, native.sigma);
         for round in &native.phase_a_rounds {
-            data.push(round.at_one);
-            data.push(round.at_infinity);
+            push_wide(&mut data, round.at_one);
+            push_wide(&mut data, round.at_infinity);
         }
-        data.push(native.terminal_oracle_value);
-        data.extend(native.upper);
+        push_wide(&mut data, native.terminal_oracle_value);
+        for value in native.upper {
+            push_wide(&mut data, value);
+        }
         for node in 0..ZK_PHASE_B_MID_CAP_NODES {
             for lane in 0..ZK_PHASE_B_CAP_DIGEST_LANES {
                 data.push(native.mid_cap[lane][node]);
             }
         }
-        data.extend(native.tail);
+        for value in native.tail {
+            push_wide(&mut data, value);
+        }
         data.push(Block128::from(17u128));
 
-        let mut challenges = Vec::with_capacity(28);
-        challenges.push(native.gamma);
-        challenges.extend(native.phase_a_challenges);
-        challenges.extend(native.beta);
-        challenges.push(native.grind);
-        challenges.extend(native.query_seeds);
-        assert_eq!(data.len(), 305);
-        assert_eq!(challenges.len(), 28);
-        (data, challenges)
+        assert_eq!(data.len(), ZK_AUTH_MAIN_DYNAMIC_LANES);
+        (data, native.main_raw_challenges.to_vec())
     }
 
     fn duplex_columns_from_stream(
         layout: &DuplexLayout,
-        tile_log: usize,
         data: &[Block128],
         challenges: &[Block128],
     ) -> ([Vec<F128>; 2], [Vec<F128>; 4]) {
-        let len = 1usize << tile_log;
+        let len = layout.slots.len().next_power_of_two();
         let mut a = std::array::from_fn(|_| vec![F128::ZERO; len]);
         let mut c = std::array::from_fn(|_| vec![F128::ZERO; len]);
+        assert_eq!(data.len(), layout.n_data);
+        assert_eq!(challenges.len(), layout.challenges.len());
         for (index, (slot, lane)) in duplex_data_positions(layout).into_iter().enumerate() {
             a[lane][slot] = flat_of(data[index]);
         }
@@ -2271,6 +2622,8 @@ mod tests {
         main_c: [WitnessSlice; 4],
         wallet_a: [WitnessSlice; ZK_AUTH_WALLET_A_COLUMNS],
         wallet_b: [WitnessSlice; ZK_AUTH_WALLET_B_COLUMNS],
+        meta_a: [WitnessSlice; ZK_AUTH_META_A_COLUMNS],
+        meta_b: [WitnessSlice; ZK_AUTH_META_B_COLUMNS],
         statement_wire: usize,
         bridge_wire: usize,
         digest_wire: usize,
@@ -2287,74 +2640,158 @@ mod tests {
             std::array::from_fn(|lane| elem(lane + 401, 0xB21D_6E, native.grind.0));
         let (owner_data, owner_challenges) = owner_stream(native);
         let (main_data, main_challenges) = main_stream(native, bridge);
-        let (owner_a_cols, mut owner_c_cols) = duplex_columns_from_stream(
-            owner_layout,
-            ZK_AUTH_OWNER_TILE_LOG,
-            &owner_data,
-            &owner_challenges,
-        );
-        let (main_a_cols, main_c_cols) = duplex_columns_from_stream(
-            main_layout,
-            ZK_AUTH_MAIN_TILE_LOG,
-            &main_data,
-            &main_challenges,
-        );
+        let (owner_full_a, mut owner_full_c) =
+            duplex_columns_from_stream(owner_layout, &owner_data, &owner_challenges);
+        let (main_full_a, main_full_c) =
+            duplex_columns_from_stream(main_layout, &main_data, &main_challenges);
         for lane in 0..4 {
-            owner_c_cols[lane][owner_layout.slots.len() - 1] = flat_of(bridge[lane]);
+            owner_full_c[lane][owner_layout.slots.len() - 1] = flat_of(bridge[lane]);
         }
+
+        let owner_prefix_slots = 1 << ZK_AUTH_OWNER_TILE_LOG;
+        let main_prefix_slots = 1 << ZK_AUTH_MAIN_TILE_LOG;
+        let owner_a_cols: [Vec<F128>; 2] =
+            std::array::from_fn(|lane| owner_full_a[lane][..owner_prefix_slots].to_vec());
+        let owner_c_cols: [Vec<F128>; 4] =
+            std::array::from_fn(|lane| owner_full_c[lane][..owner_prefix_slots].to_vec());
+        let main_a_cols: [Vec<F128>; 2] =
+            std::array::from_fn(|lane| main_full_a[lane][..main_prefix_slots].to_vec());
+        let main_c_cols: [Vec<F128>; 4] =
+            std::array::from_fn(|lane| main_full_c[lane][..main_prefix_slots].to_vec());
 
         let mut wallet_a_cols: [Vec<F128>; ZK_AUTH_WALLET_A_COLUMNS] =
             std::array::from_fn(|_| vec![F128::ZERO; 1 << ZK_AUTH_WALLET_A_TILE_LOG]);
         let mut wallet_b_cols: [Vec<F128>; ZK_AUTH_WALLET_B_COLUMNS] =
             std::array::from_fn(|_| vec![F128::ZERO; 1 << ZK_AUTH_WALLET_B_TILE_LOG]);
+        let mut meta_a_cols: [Vec<F128>; ZK_AUTH_META_A_COLUMNS] =
+            std::array::from_fn(|_| vec![F128::ZERO; 1 << 5]);
+        let mut meta_b_cols: [Vec<F128>; ZK_AUTH_META_B_COLUMNS] =
+            std::array::from_fn(|_| vec![F128::ZERO; 1 << 4]);
+
+        for (full_a, full_c, prefix_slots, tail_base, bridge_slot, data_slot, full_slots) in [
+            (
+                &owner_full_a,
+                &owner_full_c,
+                owner_prefix_slots,
+                crate::acceptance::zk_auth_capsule_schedule::ZK_AUTH_WALLET_A_OWNER_TAIL_BASE,
+                crate::acceptance::zk_auth_capsule_schedule::ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+                crate::acceptance::zk_auth_capsule_schedule::ZK_AUTH_WALLET_A_OWNER_DATA_SLOT,
+                owner_layout.slots.len(),
+            ),
+            (
+                &main_full_a,
+                &main_full_c,
+                main_prefix_slots,
+                crate::acceptance::zk_auth_capsule_schedule::ZK_AUTH_WALLET_A_MAIN_TAIL_BASE,
+                crate::acceptance::zk_auth_capsule_schedule::ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT,
+                crate::acceptance::zk_auth_capsule_schedule::ZK_AUTH_WALLET_A_MAIN_DATA_SLOT,
+                main_layout.slots.len(),
+            ),
+        ] {
+            let tail_slots = full_slots - prefix_slots;
+            wallet_a_cols[0][bridge_slot] = full_c[2][prefix_slots - 1];
+            wallet_a_cols[1][bridge_slot] = full_c[3][prefix_slots - 1];
+            for lane in 0..2 {
+                wallet_a_cols[lane][data_slot] = full_a[lane][prefix_slots];
+                wallet_a_cols[lane][tail_base..tail_base + tail_slots]
+                    .copy_from_slice(&full_a[lane][prefix_slots..full_slots]);
+                wallet_a_cols[lane][tail_base] += full_c[lane][prefix_slots - 1];
+            }
+            for lane in 0..4 {
+                wallet_a_cols[2 + lane][tail_base..tail_base + tail_slots]
+                    .copy_from_slice(&full_c[lane][prefix_slots..full_slots]);
+            }
+        }
+
         for query in 0..ZK_QUERY_COUNT {
-            for (family, symbols, root) in [
+            let source_lanes = native.joint_source_leaves[query]
+                .iter()
+                .copied()
+                .map(flat_of)
+                .collect::<Vec<_>>();
+            let mid_lanes = native.mid_leaves[query]
+                .iter()
+                .flat_map(|&value| {
+                    let value = flat_of_ext(value);
+                    [value.lo, value.hi]
+                })
+                .collect::<Vec<_>>();
+            for (family, kind, lanes, root) in [
                 (
                     0usize,
-                    &native.joint_source_leaves[query],
+                    C1CapsuleLeafKind::MixedSource,
+                    source_lanes.as_slice(),
                     &native.source_path_roots[query],
                 ),
                 (
                     1usize,
-                    &native.mid_leaves[query],
+                    C1CapsuleLeafKind::WideMid,
+                    mid_lanes.as_slice(),
                     &native.mid_path_roots[query],
                 ),
             ] {
-                let leaf = family * ZK_AUTH_WALLET_A_FAMILY_SLOTS + query * CAPSULE_LEAF_STRIDE;
-                let path =
-                    family * ZK_AUTH_WALLET_B_FAMILY_SLOTS + query * ZK_AUTH_WALLET_B_PATH_STRIDE;
-                let (msg_log, leaf_index) = if family == 0 {
-                    (ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG, native.queries[query])
+                let core = query < ZK_AUTH_WALLET_CORE_QUERY_COUNT;
+                let leaf = if core {
+                    if family == 0 {
+                        ZK_AUTH_WALLET_A_SOURCE_BASE + query * C1_CAPSULE_SOURCE_SLOTS
+                    } else {
+                        ZK_AUTH_WALLET_A_MID_BASE + query * C1_CAPSULE_MID_SLOTS
+                    }
                 } else {
-                    (
-                        ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG,
-                        native.queries[query] >> MID_STANDARD_FOLDS,
-                    )
+                    family * C1_CAPSULE_LEAF_STRIDE
                 };
-                wallet_a_cols[0][leaf] = raw_flat_lane(msg_log as u128);
-                wallet_a_cols[1][leaf] = raw_flat_lane(leaf_index as u128);
-                for symbol in 0..JOINT_SOURCE_LEAF_SYMBOLS {
-                    wallet_a_cols[symbol & 1][leaf + 1 + symbol / 2] = flat_of(symbols[symbol]);
-                }
-                for lane in 0..2 {
-                    let digest = flat_of(elem(
-                        query + 503 * family + 37 * lane,
-                        0xD165_E57,
-                        native.grind.0,
-                    ));
-                    wallet_a_cols[2 + lane][leaf + CAPSULE_LEAF_DIGEST_SLOT] = digest;
-                    wallet_b_cols[4 + lane][path] = digest;
-                    wallet_b_cols[lane][path + ZK_AUTH_WALLET_B_PATH_DEPTH - 1] =
-                        flat_of(root[lane]);
-                }
-                for depth in 0..ZK_AUTH_WALLET_B_PATH_DEPTH {
-                    let query_bit = if family == 0 { depth } else { 4 + depth };
-                    wallet_b_cols[8][path + depth] =
-                        if (native.queries[query] >> query_bit) & 1 == 1 {
-                            F128::ONE
+                let path = if core {
+                    query * ZK_AUTH_WALLET_B_PATH_STRIDE
+                        + if family == 0 {
+                            ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
                         } else {
-                            F128::ZERO
-                        };
+                            ZK_AUTH_WALLET_B_MID_PATH_OFFSET
+                        }
+                } else {
+                    if family == 0 {
+                        ZK_AUTH_WALLET_B_SOURCE_PATH_OFFSET
+                    } else {
+                        ZK_AUTH_WALLET_B_MID_PATH_OFFSET
+                    }
+                };
+                let a_in0 = if core { 0 } else { 2 };
+                let a_c0 = if core { 2 } else { 4 };
+                let a_columns = if core {
+                    wallet_a_cols.as_mut_slice()
+                } else {
+                    meta_a_cols.as_mut_slice()
+                };
+                let b_columns = if core {
+                    wallet_b_cols.as_mut_slice()
+                } else {
+                    meta_b_cols.as_mut_slice()
+                };
+                for (lane, &value) in lanes.iter().enumerate() {
+                    a_columns[a_in0 + (lane & 1)][leaf + lane / 2] = value;
+                }
+                let digest = flat_c1_capsule_leaf_hash(kind, lanes);
+                let digest_slot = if family == 0 {
+                    C1_CAPSULE_SOURCE_DIGEST_SLOT
+                } else {
+                    C1_CAPSULE_MID_DIGEST_SLOT
+                };
+                let path_depth = if family == 0 {
+                    ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH
+                } else {
+                    ZK_AUTH_WALLET_B_MID_PATH_DEPTH
+                };
+                for lane in 0..2 {
+                    a_columns[a_c0 + lane][leaf + digest_slot] = digest[lane];
+                    b_columns[4 + lane][path] = digest[lane];
+                    b_columns[lane][path + path_depth - 1] = flat_of(root[lane]);
+                }
+                for depth in 0..path_depth {
+                    let query_bit = if family == 0 { depth } else { 4 + depth };
+                    b_columns[8][path + depth] = if (native.queries[query] >> query_bit) & 1 == 1 {
+                        F128::ONE
+                    } else {
+                        F128::ZERO
+                    };
                 }
             }
         }
@@ -2381,20 +2818,30 @@ mod tests {
                 alloc_column_slice(b, &wallet_b_cols[column], ZK_AUTH_WALLET_B_TILE_LOG).0
             }
         });
+        let meta_a = std::array::from_fn(|column| alloc_column_slice(b, &meta_a_cols[column], 5).0);
+        let meta_b = std::array::from_fn(|column| {
+            if column == 8 {
+                alloc_boolean_column_slice(b, &meta_b_cols[column], 4).0
+            } else {
+                alloc_column_slice(b, &meta_b_cols[column], 4).0
+            }
+        });
 
         let statement_position = duplex_data_positions(owner_layout)[0];
         let bridge_position = duplex_data_positions(main_layout)[0];
         RawSliceTileFixtureSlices {
             statement_wire: owner_a[statement_position.1].start() + statement_position.0,
             bridge_wire: main_a[bridge_position.1].start() + bridge_position.0,
-            digest_wire: wallet_a[2].start() + CAPSULE_LEAF_DIGEST_SLOT,
-            root_wire: wallet_b[0].start() + ZK_AUTH_WALLET_B_PATH_DEPTH - 1,
+            digest_wire: wallet_a[2].start() + C1_CAPSULE_SOURCE_DIGEST_SLOT,
+            root_wire: wallet_b[0].start() + ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH - 1,
             owner_a,
             owner_c,
             main_a,
             main_c,
             wallet_a,
             wallet_b,
+            meta_a,
+            meta_b,
         }
     }
 
@@ -2421,24 +2868,27 @@ mod tests {
         let tamper_wires = vec![
             (
                 "Owner round",
-                input_wire(&cells.owner.round_coefficients[3][4]),
+                input_wire(&cells.owner.round_coefficients[3][4].lo),
             ),
             (
                 "Owner operand claim",
-                input_wire(&cells.owner.operand_claims[2]),
+                input_wire(&cells.owner.operand_claims[2].lo),
             ),
-            ("sigma", input_wire(&cells.main.sigma)),
+            ("sigma", input_wire(&cells.main.sigma.lo)),
             (
                 "Phase-A round",
-                input_wire(&cells.main.phase_a_round_coefficients[5][1]),
+                input_wire(&cells.main.phase_a_round_coefficients[5][1].lo),
             ),
             (
                 "Phase-A terminal point",
-                input_wire(&cells.main.phase_a_challenges[6]),
+                input_wire(&cells.main.phase_a_challenges[6].lo),
             ),
-            ("Phase-A/Phase-B v", input_wire(&cells.main.phase_b_value)),
-            ("upper", input_wire(&cells.main.upper[37])),
-            ("tail", input_wire(&cells.main.tail[9])),
+            (
+                "Phase-A/Phase-B v",
+                input_wire(&cells.main.phase_b_value.lo),
+            ),
+            ("upper", input_wire(&cells.main.upper[37].lo)),
+            ("tail", input_wire(&cells.main.tail[9].lo)),
             ("nonce", input_wire(&cells.main.nonce)),
             ("grind", input_wire(&cells.main.grind)),
             ("query seed", input_wire(&cells.main.query_seeds[2])),
@@ -2450,12 +2900,12 @@ mod tests {
                 "joint source leaf",
                 input_wire(&external.joint_source_leaves[11][5]),
             ),
-            ("mid leaf", input_wire(&external.mid_leaves[13][7])),
+            ("mid leaf", input_wire(&external.mid_leaves[13][7].lo)),
             (
                 "source path root",
                 input_wire(&external.source_path_roots[17][1]),
             ),
-            ("source cap", input_wire(&cells.owner.source_cap[31])),
+            ("source cap", input_wire(&cells.owner.source_cap[15])),
             ("mid cap", input_wire(&cells.main.mid_cap[3])),
         ];
 
@@ -2490,8 +2940,8 @@ mod tests {
 
     #[test]
     fn native_end_to_end_candidate_is_satisfied_with_exact_alias_ledger() {
-        assert_eq!(ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS, 11_465);
-        assert_eq!(ZK_AUTHORIZATION_CANDIDATE_EXTERNAL_BRIDGE_ROWS, 4);
+        assert_eq!(ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS, 15_956);
+        assert_eq!(ZK_AUTHORIZATION_CANDIDATE_EXTERNAL_BRIDGE_ROWS, 12);
         let built = build_candidate(0xCAAD_1DA7E);
         assert_eq!(built.trace_rows, ZK_AUTHORIZATION_CANDIDATE_TRACE_ROWS);
         assert!(built.r1cs.satisfies(&built.witness));
@@ -2527,14 +2977,14 @@ mod tests {
         let external = alloc_external(&mut b, &native);
 
         let mut bad_cells = cells.clone();
-        bad_cells.main.tail[3] = LinExpr::constant(flat_of(native.tail[3]));
+        bad_cells.main.tail[3] = const_block256(native.tail[3]);
         let before = b.num_wires();
         assert!(matches!(
             verify_zk_authorization_candidate_trace(&mut b, &bad_cells, &external),
             Err(
                 ZkAuthorizationCandidateTraceError::MalformedTranscriptAlias {
                     input: ZkAuthorizationCandidateInput::MainTail,
-                    index: 3,
+                    index: 6,
                 }
             )
         ));
@@ -2554,7 +3004,7 @@ mod tests {
         assert_eq!(b.num_wires(), before);
 
         let mut zero_gamma = cells.clone();
-        zero_gamma.main.gamma = LinExpr::from_wire(b.alloc_f128(F128::ZERO));
+        zero_gamma.main.gamma = alloc_block256(&mut b, Block256::ZERO);
         let before = b.num_wires();
         assert_eq!(
             verify_zk_authorization_candidate_trace(&mut b, &zero_gamma, &external).unwrap_err(),
@@ -2563,8 +3013,7 @@ mod tests {
         assert_eq!(b.num_wires(), before);
 
         let mut zero_terminal_weight = cells.clone();
-        zero_terminal_weight.owner.round_challenges[4] =
-            LinExpr::from_wire(b.alloc_f128(F128::ZERO));
+        zero_terminal_weight.owner.round_challenges[4] = alloc_block256(&mut b, Block256::ZERO);
         let before = b.num_wires();
         assert_eq!(
             verify_zk_authorization_candidate_trace(&mut b, &zero_terminal_weight, &external,)
@@ -2622,18 +3071,22 @@ mod tests {
             &slices.main_c,
             &slices.wallet_a,
             &slices.wallet_b,
+            &slices.meta_a,
+            &slices.meta_b,
             0,
             &public,
         )
         .expect("raw-slice tile candidate");
         let trace_rows = b.num_wires() - before;
-        let mapped = view_zk_auth_transcript_tile(
+        let mapped = view_zk_auth_split_transcript_tile(
+            &mut b,
             &owner_layout,
             &slices.owner_a,
             &slices.owner_c,
             &main_layout,
             &slices.main_a,
             &slices.main_c,
+            &slices.wallet_a,
             0,
         );
         assert_eq!(bridge.main_absorb, mapped.main.bridge);
@@ -2643,20 +3096,34 @@ mod tests {
                 .phase_a
                 .terminal_oracle_value
                 .eval(b.values()),
-            flat_of(native.terminal_oracle_value)
+            flat_of_ext(native.terminal_oracle_value)
         );
         let tamper_wires = vec![
             ("outer statement", public_wire),
             ("Owner statement absorb", slices.statement_wire),
             ("split bridge", slices.bridge_wire),
-            ("source leaf msg_log", slices.wallet_a[0].start()),
-            ("source leaf index", slices.wallet_a[1].start()),
+            ("source leaf lane 0", slices.wallet_a[0].start()),
+            ("source leaf lane 1", slices.wallet_a[1].start()),
             (
-                "mid leaf index",
-                slices.wallet_a[1].start() + ZK_AUTH_WALLET_A_FAMILY_SLOTS,
+                "mid leaf high coordinate",
+                slices.wallet_a[1].start() + ZK_AUTH_WALLET_A_MID_BASE,
             ),
             ("wallet digest bridge", slices.digest_wire),
-            ("depth-8 composite root", slices.root_wire),
+            ("source-path composite root", slices.root_wire),
+            ("overflow source leaf lane", slices.meta_a[2].start()),
+            (
+                "overflow mid leaf high coordinate",
+                slices.meta_a[3].start() + C1_CAPSULE_LEAF_STRIDE,
+            ),
+            (
+                "overflow digest bridge",
+                slices.meta_a[4].start() + C1_CAPSULE_SOURCE_DIGEST_SLOT,
+            ),
+            ("overflow source direction", slices.meta_b[8].start()),
+            (
+                "overflow source-path composite root",
+                slices.meta_b[0].start() + ZK_AUTH_WALLET_B_SOURCE_PATH_DEPTH - 1,
+            ),
         ];
         let (r1cs, witness) = b.build();
         let digest = r1cs.structural_statement_digest();
@@ -2690,6 +3157,23 @@ mod tests {
         let mut values = b.values()[slice_range(&left)].to_vec();
         values.extend_from_slice(&b.values()[slice_range(&right)]);
         alloc_boolean_column_slice(b, &values, left.log2_len + 1).0
+    }
+
+    fn concatenate_meta_a_slices(
+        b: &mut FieldR1csBuilder,
+        left: WitnessSlice,
+        right: WitnessSlice,
+    ) -> WitnessSlice {
+        assert_eq!(left.log2_len, 5);
+        assert_eq!(right.log2_len, 5);
+        let left_values = b.values()[slice_range(&left)].to_vec();
+        let right_values = b.values()[slice_range(&right)].to_vec();
+        let mut values = Vec::with_capacity(64);
+        values.extend_from_slice(&left_values[..16]);
+        values.extend_from_slice(&right_values[..16]);
+        values.extend_from_slice(&left_values[16..]);
+        values.extend_from_slice(&right_values[16..]);
+        alloc_column_slice(b, &values, 6).0
     }
 
     fn build_k2_raw_slice_tile_fixture() -> BuiltRawSliceTileFixture {
@@ -2727,6 +3211,16 @@ mod tests {
                 concatenate_slices(&mut b, left.wallet_b[column], right.wallet_b[column])
             }
         });
+        let meta_a = std::array::from_fn(|column| {
+            concatenate_meta_a_slices(&mut b, left.meta_a[column], right.meta_a[column])
+        });
+        let meta_b = std::array::from_fn(|column| {
+            if column == 8 {
+                concatenate_boolean_slices(&mut b, left.meta_b[column], right.meta_b[column])
+            } else {
+                concatenate_slices(&mut b, left.meta_b[column], right.meta_b[column])
+            }
+        });
 
         let before = b.num_wires();
         // Intentionally exercise only tile zero.  This fixture demonstrates
@@ -2741,6 +3235,8 @@ mod tests {
             &main_c,
             &wallet_a,
             &wallet_b,
+            &meta_a,
+            &meta_b,
             0,
             &public,
         )
@@ -2763,50 +3259,36 @@ mod tests {
     }
 
     #[test]
-    fn raw_slice_tile_helper_has_exact_metadata_ledger_and_is_satisfied() {
-        assert_eq!(ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS, 520);
-        assert_eq!(ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS, 256);
-        assert_eq!(ZK_AUTH_RAW_SLICE_WRAPPER_ROWS, 776);
-        assert_eq!(ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS, 12_241);
+    fn raw_slice_tile_helper_has_exact_wrapper_ledger_and_is_satisfied() {
+        assert_eq!(ZK_AUTH_RAW_SLICE_PRE_CORE_ROWS, 580);
+        assert_eq!(ZK_AUTH_RAW_SLICE_METADATA_PIN_ROWS, 0);
+        assert_eq!(ZK_AUTH_RAW_SLICE_WRAPPER_ROWS, 580);
+        assert_eq!(ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS, 16_536);
         let built = build_raw_slice_tile_fixture(0x5200_A11A5);
         assert_eq!(built.trace_rows, ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS);
         assert!(built.r1cs.satisfies(&built.witness));
     }
 
     #[test]
-    fn raw_slice_tile_helper_rejects_zero_terminal_blinding_weight_before_rows() {
-        let mut native = native_candidate(0xB11D_0000);
-        native.owner_challenges[7] = Block128::ZERO;
-        let schedules = ZkAuthCapsuleDuplexSchedules::selected();
-        let owner_layout = schedules.owner_layout();
-        let main_layout = schedules.main_layout();
-        let mut b = FieldR1csBuilder::new();
-        let public = alloc_selected_statement(&mut b, &native);
-        let slices =
-            alloc_raw_slice_tile_fixture_slices(&mut b, &native, &owner_layout, &main_layout);
-        let before = b.num_wires();
-        assert_eq!(
-            verify_zk_authorization_raw_slice_tile_candidate_trace(
-                &mut b,
-                &owner_layout,
-                &slices.owner_a,
-                &slices.owner_c,
-                &main_layout,
-                &slices.main_a,
-                &slices.main_c,
-                &slices.wallet_a,
-                &slices.wallet_b,
-                0,
-                &public,
-            )
-            .unwrap_err(),
-            ZkAuthorizationCandidateTraceError::TerminalBlindingWeightZero
+    fn raw_c1_sampler_excludes_zero_terminal_weight_and_gamma_endpoints() {
+        let native = native_candidate(0xB11D_0000);
+        assert!(native
+            .owner_challenges
+            .iter()
+            .all(|&challenge| challenge != Block256::ZERO));
+        assert_ne!(
+            native
+                .owner_challenges
+                .iter()
+                .copied()
+                .fold(Block256::ONE, |product, challenge| product * challenge),
+            Block256::ZERO
         );
-        assert_eq!(b.num_wires(), before);
+        assert!(native.gamma != Block256::ZERO && native.gamma != Block256::ONE);
     }
 
     #[test]
-    fn raw_slice_tile_statement_bridge_metadata_digest_and_root_tampering_rejects() {
+    fn raw_slice_tile_statement_bridge_leaf_digest_and_root_tampering_rejects() {
         let built = build_raw_slice_tile_fixture(0xB21D_6E57);
         assert!(built.r1cs.satisfies(&built.witness));
         for &(label, wire) in &built.tamper_wires {
@@ -2912,7 +3394,7 @@ mod tests {
 
     #[test]
     fn selected_two_class_all_tiles_row_ledger_is_exact() {
-        for (tier, expected_rows) in [(64, 783_424), (255, 3_133_696)] {
+        for (tier, expected_rows) in [(25, 529_152), (255, 4_233_216)] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             assert_eq!(
                 geometry.auth_tiles * ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS,

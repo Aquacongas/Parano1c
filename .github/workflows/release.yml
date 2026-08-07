@@ -103,22 +103,27 @@ jobs:
             runner: ubuntu-22.04
             artifact: parano1d-core-${{ inputs.tag }}-linux-x86_64.tar.gz
             gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-x86_64.deb
+            run_tests: true
           - name: Linux ARM64
             runner: ubuntu-22.04-arm
             artifact: parano1d-core-${{ inputs.tag }}-linux-aarch64.tar.gz
             gui_artifact: parano1d-gui-${{ inputs.tag }}-linux-aarch64.deb
+            run_tests: false
           - name: Windows x86-64
             runner: windows-2025
             artifact: parano1d-core-${{ inputs.tag }}-windows-x86_64.zip
             gui_artifact: parano1d-gui-${{ inputs.tag }}-windows-x86_64-setup.exe
+            run_tests: false
           - name: macOS Apple Silicon
             runner: macos-15
             artifact: parano1d-core-${{ inputs.tag }}-macos-aarch64.tar.gz
             gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-aarch64.dmg
+            run_tests: false
           - name: macOS Intel
             runner: macos-15-intel
             artifact: parano1d-core-${{ inputs.tag }}-macos-x86_64.tar.gz
             gui_artifact: parano1d-gui-${{ inputs.tag }}-macos-x86_64.dmg
+            run_tests: false
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
@@ -196,10 +201,14 @@ jobs:
       - name: Build matrix-embedded native bundle
         shell: bash
         run: |
-          bash ./scripts/build_release.sh \
-            --pack .release-ci/pack/history-step-pack-v1 \
-            --output .release-ci/build \
-            --skip-tests
+          args=(
+            --pack .release-ci/pack/history-step-pack-v1
+            --output .release-ci/build
+          )
+          if [[ "${{ matrix.run_tests }}" != true ]]; then
+            args+=(--skip-tests)
+          fi
+          bash ./scripts/build_release.sh "${args[@]}"
           test -s ".release-ci/build/$ARTIFACT_NAME"
           test -s ".release-ci/build/$GUI_ARTIFACT_NAME"
 

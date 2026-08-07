@@ -17,7 +17,7 @@
 //! Internal mining has one Rayon pool containing every host-visible CPU. CPU
 //! heavy phases reuse that same pool in order; there is no permanent one-core
 //! PoW reservation and no independent prover pool. Every process starts with
-//! a 64-page template budget and may jump directly to 255 pages only when
+//! a 25-page template budget and may jump directly to 255 pages only when
 //! complete proof-class timings support the 15-second target.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
 //! template and HistoryStep preparation, validation, RPC, and P2P while miners run elsewhere.
@@ -451,12 +451,12 @@ impl BlockMiner {
             let proof_class = attempt.proof_class();
 
             // Complete class cost is independent of live-page occupancy. A
-            // coinbase-only B64 therefore calibrates the hardware just as a
-            // full B64 block does.
+            // coinbase-only B25 therefore calibrates the hardware just as a
+            // full B25 block does.
             let previous_page_limit = proof_capacity.page_limit();
             proof_capacity.observe_preparation(proof_class, prepare_elapsed);
             let next_page_limit = proof_capacity.page_limit();
-            let b64_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B64);
+            let b25_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B25);
             let b255_prepare_ms_ewma = proof_capacity.prepare_ms_ewma(BlockProofClass::B255);
             if previous_page_limit != next_page_limit {
                 tracing::info!(
@@ -464,7 +464,7 @@ impl BlockMiner {
                     previous_page_limit,
                     next_page_limit,
                     prepare_ms = prepare_elapsed.as_millis(),
-                    b64_prepare_ms_ewma,
+                    b25_prepare_ms_ewma,
                     b255_prepare_ms_ewma,
                     "miner proof capacity changed"
                 );
@@ -587,7 +587,7 @@ impl BlockMiner {
                                 n_txs,
                                 prepare_ms = prepare_elapsed.as_millis(),
                                 ?proof_class,
-                                b64_prepare_ms_ewma,
+                                b25_prepare_ms_ewma,
                                 b255_prepare_ms_ewma,
                                 pow_time = %format!("{elapsed_s:.2}s"),
                                 diff = %format!("lz{diff_lz}"),

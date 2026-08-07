@@ -5,20 +5,19 @@
 //! transcript grind.
 //!
 //! The input is the exact post-nonce transcript squeeze alias, already
-//! produced and bound by the Main duplex region.  This unit fully decomposes
-//! that tower-basis value into 128 Boolean bits, pins their exact
-//! recomposition to the alias, and pins the low 16 tower bits to zero.  The
+//! produced and bound by the Main duplex region.  The low 16 tower
+//! coefficients are fixed to zero, while the remaining 112 coefficients are
+//! allocated as Boolean bits and exactly recomposed to the alias.  The
 //! 16-bit mainnet window is a protocol constant here and never inherits the
 //! active capsule's debug/release `cfg` split.
 //!
 //! Exact incremental row ledger after the caller-owned `grind` expression:
 //!
 //! ```text
-//! 128 tower-bit Boolean rows       128
+//! 112 free high-bit Boolean rows   112
 //! exact 128-bit recomposition pin    1
-//! low-16 zero pin                    1
 //!                                  ---
-//! total                            130
+//! total                            113
 //! ```
 //!
 //! The absorbed nonce is deliberately not an input to this arithmetic unit.
@@ -30,22 +29,23 @@
 //! alter the `2^-16` success probability of an individual grind attempt, but
 //! it does define which nonce encodings the protocol accepts.
 
-use super::fri_pcs::compact_queries_from_squeezes_with_bits;
-use super::{flat_const, pin_zero, FieldR1csBuilder, LinExpr};
+use super::fri_pcs::expr_tower_value;
+use super::{flat_const, pin_eq, FieldR1csBuilder, LinExpr};
 
 /// Mainnet authorization grind window, in low tower-basis bits.
 pub const ZK_AUTH_GRIND_BITS: usize = 16;
 pub const ZK_AUTH_GRIND_TOWER_BITS: usize = 128;
-pub const ZK_AUTH_GRIND_BOOLEAN_ROWS: usize = ZK_AUTH_GRIND_TOWER_BITS;
+pub const ZK_AUTH_GRIND_HIGH_BITS: usize = ZK_AUTH_GRIND_TOWER_BITS - ZK_AUTH_GRIND_BITS;
+pub const ZK_AUTH_GRIND_BOOLEAN_ROWS: usize = ZK_AUTH_GRIND_HIGH_BITS;
 pub const ZK_AUTH_GRIND_RECOMPOSITION_ROWS: usize = 1;
-pub const ZK_AUTH_GRIND_LOW_ZERO_ROWS: usize = 1;
 /// Exact incremental rows after the transcript-owned `grind` alias exists.
 pub const ZK_AUTH_GRIND_TRACE_ROWS: usize =
-    ZK_AUTH_GRIND_BOOLEAN_ROWS + ZK_AUTH_GRIND_RECOMPOSITION_ROWS + ZK_AUTH_GRIND_LOW_ZERO_ROWS;
+    ZK_AUTH_GRIND_BOOLEAN_ROWS + ZK_AUTH_GRIND_RECOMPOSITION_ROWS;
 
 const _: () = assert!(ZK_AUTH_GRIND_BITS == 16);
 const _: () = assert!(ZK_AUTH_GRIND_TOWER_BITS == u128::BITS as usize);
-const _: () = assert!(ZK_AUTH_GRIND_TRACE_ROWS == 130);
+const _: () = assert!(ZK_AUTH_GRIND_HIGH_BITS == 112);
+const _: () = assert!(ZK_AUTH_GRIND_TRACE_ROWS == 113);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkAuthGrindTraceError {
@@ -56,9 +56,11 @@ pub enum ZkAuthGrindTraceError {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkAuthGrindTraceOutput {
-    /// Boolean tower-basis bits 0 through 15, LSB first.  They are aliases of
-    /// the full decomposition and are all pinned to zero as one linear sum.
+    /// The forced-zero low tower coefficients, exposed as constant aliases.
     pub low_bits_lsb: [LinExpr; ZK_AUTH_GRIND_BITS],
+    /// Boolean tower coefficients 16 through 127, LSB first within this
+    /// suffix. They are the only free coefficients needed by recomposition.
+    pub high_bits_lsb: [LinExpr; ZK_AUTH_GRIND_HIGH_BITS],
 }
 
 /// Enforce the fixed 16-low-tower-bit authorization grind predicate.
@@ -75,31 +77,26 @@ pub fn verify_zk_auth_grind_trace(
     }
 
     let trace_start = b.num_wires();
-    // This shared primitive decomposes all 128 tower bits and pins their
-    // exact phi-weighted recomposition.  Its `log_max_len` parameter only
-    // selects which low aliases it returns; it does not truncate the proof.
-    let (_, mut low_bit_sets) =
-        compact_queries_from_squeezes_with_bits(b, std::slice::from_ref(grind), ZK_AUTH_GRIND_BITS);
-    debug_assert_eq!(
-        b.num_wires() - trace_start,
-        ZK_AUTH_GRIND_BOOLEAN_ROWS + ZK_AUTH_GRIND_RECOMPOSITION_ROWS
-    );
-    let low_bits_lsb: [LinExpr; ZK_AUTH_GRIND_BITS] = low_bit_sets
-        .pop()
-        .expect("one grind squeeze produces one bit set")
-        .try_into()
-        .unwrap_or_else(|_| unreachable!("grind helper returns exactly sixteen low bits"));
-
-    let low_window = low_bits_lsb
-        .iter()
-        .enumerate()
-        .fold(LinExpr::zero(), |sum, (bit, expression)| {
-            sum.add(&expression.scale(flat_const(1u128 << bit)))
-        });
-    pin_zero(b, &low_window);
+    let tower = expr_tower_value(b, grind).0;
+    let low_bits_lsb = std::array::from_fn(|_| LinExpr::zero());
+    let high_bits_lsb: [LinExpr; ZK_AUTH_GRIND_HIGH_BITS] = std::array::from_fn(|index| {
+        let bit = ZK_AUTH_GRIND_BITS + index;
+        LinExpr::from_wire(b.alloc_bool(((tower >> bit) & 1) == 1))
+    });
+    let recomposed =
+        high_bits_lsb
+            .iter()
+            .enumerate()
+            .fold(LinExpr::zero(), |sum, (index, expression)| {
+                sum.add(&expression.scale(flat_const(1u128 << (ZK_AUTH_GRIND_BITS + index))))
+            });
+    pin_eq(b, &recomposed, grind);
 
     debug_assert_eq!(b.num_wires() - trace_start, ZK_AUTH_GRIND_TRACE_ROWS);
-    Ok(ZkAuthGrindTraceOutput { low_bits_lsb })
+    Ok(ZkAuthGrindTraceOutput {
+        low_bits_lsb,
+        high_bits_lsb,
+    })
 }
 
 #[cfg(test)]
@@ -125,7 +122,7 @@ mod tests {
         witness: Vec<F128>,
         trace_rows: usize,
         grind_wire: usize,
-        low_bit_wires: [usize; ZK_AUTH_GRIND_BITS],
+        high_bit_wires: [usize; ZK_AUTH_GRIND_HIGH_BITS],
     }
 
     fn build(value: Block128) -> BuiltGrind {
@@ -135,14 +132,15 @@ mod tests {
         let before = b.num_wires();
         let output = verify_zk_auth_grind_trace(&mut b, &grind).expect("dynamic grind alias");
         let trace_rows = b.num_wires() - before;
-        let low_bit_wires = std::array::from_fn(|bit| input_wire(&output.low_bits_lsb[bit]));
+        assert!(output.low_bits_lsb.iter().all(|bit| bit.is_const()));
+        let high_bit_wires = std::array::from_fn(|bit| input_wire(&output.high_bits_lsb[bit]));
         let (r1cs, witness) = b.build();
         BuiltGrind {
             r1cs,
             witness,
             trace_rows,
             grind_wire,
-            low_bit_wires,
+            high_bit_wires,
         }
     }
 
@@ -197,12 +195,14 @@ mod tests {
                 !built.r1cs.satisfies(&tampered_squeeze),
                 "transcript grind low bit {bit} escaped recomposition"
             );
+        }
 
+        for bit in 0..ZK_AUTH_GRIND_HIGH_BITS {
             let mut tampered_bit = built.witness.clone();
-            tampered_bit[built.low_bit_wires[bit]] += F128::ONE;
+            tampered_bit[built.high_bit_wires[bit]] += F128::ONE;
             assert!(
                 !built.r1cs.satisfies(&tampered_bit),
-                "decomposed grind low bit {bit} escaped zero pin"
+                "decomposed grind high bit {bit} escaped recomposition"
             );
         }
     }
@@ -216,10 +216,10 @@ mod tests {
         assert!(left.r1cs.satisfies(&left.witness));
         assert!(right.r1cs.satisfies(&right.witness));
 
-        assert_eq!(ZK_AUTH_GRIND_BOOLEAN_ROWS, 128);
+        assert_eq!(ZK_AUTH_GRIND_HIGH_BITS, 112);
+        assert_eq!(ZK_AUTH_GRIND_BOOLEAN_ROWS, 112);
         assert_eq!(ZK_AUTH_GRIND_RECOMPOSITION_ROWS, 1);
-        assert_eq!(ZK_AUTH_GRIND_LOW_ZERO_ROWS, 1);
-        assert_eq!(ZK_AUTH_GRIND_TRACE_ROWS, 130);
+        assert_eq!(ZK_AUTH_GRIND_TRACE_ROWS, 113);
         assert_eq!(left.trace_rows, ZK_AUTH_GRIND_TRACE_ROWS);
         assert_eq!(right.trace_rows, ZK_AUTH_GRIND_TRACE_ROWS);
         assert_eq!(left.r1cs.useful_rows, 1 + 1 + ZK_AUTH_GRIND_TRACE_ROWS);

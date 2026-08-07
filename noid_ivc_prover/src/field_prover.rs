@@ -4,13 +4,17 @@
 //! `noid_ivc_core::verifier::verify_field`.
 
 use noid_ivc_core::challenger::Challenger;
-use noid_ivc_core::field::F128;
+use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_r1cs::{CompactFieldR1cs, FieldProverRelation, FieldR1cs};
 use noid_ivc_core::lincheck::{self, LocallyAuthoredFreshLincheckCapture, QuirkyPoint};
-use noid_ivc_core::pcs::{self, Commitment, PcsParams, QuirkyDirectClaim};
-use noid_ivc_core::proof::{FieldR1csProof, R1csClaim, ZClaim, bind_statement_field_parts};
+use noid_ivc_core::pcs::{self, C1QuirkyDirectClaim, Commitment, PcsParams, QuirkyDirectClaim};
+use noid_ivc_core::proof::{
+    C1FieldR1csProof, C1R1csClaim, C1ZClaim, FieldR1csProof, R1csClaim, ZClaim,
+    bind_statement_field_parts, bind_statement_field_parts_c1,
+};
 use noid_ivc_core::public_io::{
     PublicIoSpec, assert_witness_matches_io, bind_post_commit_class, bind_public_io,
+    bind_public_io_c1,
 };
 use noid_ivc_core::zerocheck;
 
@@ -53,6 +57,7 @@ pub struct FieldPostCommitProverContext<'a, Ch> {
     total_vars: usize,
     challenger: &'a mut Ch,
     claims: Vec<QuirkyDirectClaim>,
+    c1_claims: Vec<C1QuirkyDirectClaim>,
 }
 
 impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
@@ -68,11 +73,20 @@ impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
             total_vars,
             challenger,
             claims: Vec::new(),
+            c1_claims: Vec::new(),
         }
     }
 
     fn finish(self) -> Vec<QuirkyDirectClaim> {
+        assert!(
+            self.c1_claims.is_empty(),
+            "extension-field claims require a C1 enclosing proof"
+        );
         self.claims
+    }
+
+    fn finish_c1(self) -> (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>) {
+        (self.claims, self.c1_claims)
     }
 
     pub fn witness(&self) -> &'a [F128] {
@@ -95,8 +109,20 @@ impl<'a, Ch> FieldPostCommitProverContext<'a, Ch> {
         self.claims.extend(claims);
     }
 
+    pub fn append_c1_claim(&mut self, claim: C1QuirkyDirectClaim) {
+        self.c1_claims.push(claim);
+    }
+
+    pub fn append_c1_claims(&mut self, claims: impl IntoIterator<Item = C1QuirkyDirectClaim>) {
+        self.c1_claims.extend(claims);
+    }
+
     pub fn claim_count(&self) -> usize {
         self.claims.len()
+    }
+
+    pub fn c1_claim_count(&self) -> usize {
+        self.c1_claims.len()
     }
 }
 
@@ -113,6 +139,14 @@ impl<Ch: Challenger> Challenger for FieldPostCommitProverContext<'_, Ch> {
         self.challenger.observe_f128_slice(values);
     }
 
+    fn observe_f256(&mut self, value: F256) {
+        self.challenger.observe_f256(value);
+    }
+
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        self.challenger.observe_f256_slice(values);
+    }
+
     fn observe_bytes(&mut self, bytes: &[u8]) {
         self.challenger.observe_bytes(bytes);
     }
@@ -123,6 +157,14 @@ impl<Ch: Challenger> Challenger for FieldPostCommitProverContext<'_, Ch> {
 
     fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
         self.challenger.sample_f128_vec(n)
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        self.challenger.sample_f256()
+    }
+
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        self.challenger.sample_f256_vec(n)
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -162,6 +204,28 @@ pub fn prove_field<Ch: Challenger>(
     (proof, commitment, claim)
 }
 
+/// Closed native C1 History proof path. This deliberately has no legacy
+/// profile selector: callers choose the C1 entry point and receive only the
+/// wide proof type.
+pub fn prove_field_c1<Ch: Challenger>(
+    r1cs: &FieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (C1FieldR1csProof, Commitment, C1R1csClaim) {
+    let (proof, (), commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        None,
+        false,
+        challenger,
+        |_, _, _| ((), (Vec::new(), Vec::new())),
+    );
+    debug_assert!(capture.is_none());
+    (proof, commitment, claim)
+}
+
 /// [`prove_field`] over an immutable canonical artifact authenticated by
 /// [`CompactFieldR1cs::open`].  The statement and proof transcript are
 /// byte-identical to the resident-CSR path; only A/B application and the
@@ -183,6 +247,317 @@ pub fn prove_field_compact<Ch: Challenger>(
     );
     debug_assert!(capture.is_none());
     (proof, commitment, claim)
+}
+
+pub fn prove_field_compact_c1<Ch: Challenger>(
+    r1cs: &CompactFieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (C1FieldR1csProof, Commitment, C1R1csClaim) {
+    let (proof, (), commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        None,
+        false,
+        challenger,
+        |_, _, _| ((), (Vec::new(), Vec::new())),
+    );
+    debug_assert!(capture.is_none());
+    (proof, commitment, claim)
+}
+
+pub fn prove_field_c1_capturing_fresh<Ch: Challenger>(
+    r1cs: &FieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (
+    C1FieldR1csProof,
+    Commitment,
+    C1R1csClaim,
+    lincheck::c1::C1LocallyAuthoredFreshLincheckCapture,
+) {
+    let (proof, (), commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        None,
+        true,
+        challenger,
+        |_, _, _| ((), (Vec::new(), Vec::new())),
+    );
+    (
+        proof,
+        commitment,
+        claim,
+        capture.expect("capturing C1 field prover returns its lincheck claim"),
+    )
+}
+
+pub fn prove_field_compact_c1_capturing_fresh<Ch: Challenger>(
+    r1cs: &CompactFieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    challenger: &mut Ch,
+) -> (
+    C1FieldR1csProof,
+    Commitment,
+    C1R1csClaim,
+    lincheck::c1::C1LocallyAuthoredFreshLincheckCapture,
+) {
+    let (proof, (), commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        None,
+        true,
+        challenger,
+        |_, _, _| ((), (Vec::new(), Vec::new())),
+    );
+    (
+        proof,
+        commitment,
+        claim,
+        capture.expect("capturing compact C1 field prover returns its lincheck claim"),
+    )
+}
+
+/// Production C1 proof with a public-IO envelope and a causally post-commit
+/// auxiliary protocol. Auxiliary F128 witness claims are embedded into the
+/// same extension-field PCS batch; the callback retains its existing typed
+/// sidecar API and exact transcript order.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_c1_with_public_io_and_post_commit_context<Ch, Aux, PostCommit>(
+    r1cs: &FieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> (C1FieldR1csProof, Aux, Commitment, C1R1csClaim)
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&mut FieldPostCommitProverContext<'_, Ch>) -> Aux,
+{
+    let (proof, auxiliary, commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        Some((spec, io)),
+        false,
+        challenger,
+        |witness, commitment, challenger| {
+            bind_post_commit_class(challenger, post_commit_class_digest);
+            let mut context =
+                FieldPostCommitProverContext::new(witness, commitment, r1cs.m, challenger);
+            let auxiliary = post_commit(&mut context);
+            (auxiliary, context.finish_c1())
+        },
+    );
+    debug_assert!(capture.is_none());
+    (proof, auxiliary, commitment, claim)
+}
+
+/// Compact authenticated-relation twin of
+/// [`prove_field_c1_with_public_io_and_post_commit_context`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_compact_c1_with_public_io_and_post_commit_context<Ch, Aux, PostCommit>(
+    r1cs: &CompactFieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> (C1FieldR1csProof, Aux, Commitment, C1R1csClaim)
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&mut FieldPostCommitProverContext<'_, Ch>) -> Aux,
+{
+    let total_vars = r1cs.shape().m;
+    let (proof, auxiliary, commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        Some((spec, io)),
+        false,
+        challenger,
+        |witness, commitment, challenger| {
+            bind_post_commit_class(challenger, post_commit_class_digest);
+            let mut context =
+                FieldPostCommitProverContext::new(witness, commitment, total_vars, challenger);
+            let auxiliary = post_commit(&mut context);
+            (auxiliary, context.finish_c1())
+        },
+    );
+    debug_assert!(capture.is_none());
+    (proof, auxiliary, commitment, claim)
+}
+
+fn prove_field_c1_inner<R, Ch, Aux, PostCommit>(
+    r1cs: &R,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    public_io: Option<(&PublicIoSpec, &[F128])>,
+    capture_fresh: bool,
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> (
+    C1FieldR1csProof,
+    Aux,
+    Commitment,
+    C1R1csClaim,
+    Option<lincheck::c1::C1LocallyAuthoredFreshLincheckCapture>,
+)
+where
+    R: FieldProverRelation,
+    Ch: Challenger,
+    PostCommit: FnOnce(
+        &[F128],
+        &Commitment,
+        &mut Ch,
+    ) -> (Aux, (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>)),
+{
+    let timing = std::env::var_os("NOIDH_FIELD_PROVE_TIMING").is_some();
+    let mut phase = std::time::Instant::now();
+    let lap = |label: &str, phase: &mut std::time::Instant| {
+        if timing {
+            eprintln!(
+                "[field-c1-prover] {label}: {:.1} ms",
+                phase.elapsed().as_secs_f64() * 1e3
+            );
+        }
+        *phase = std::time::Instant::now();
+    };
+    let shape = r1cs.field_shape();
+    let useful_rows = r1cs.useful_rows();
+    let width = 1usize << shape.k_log;
+    assert!(shape.m >= shape.k_log);
+    assert!(shape.k_skip <= shape.k_log);
+    assert!(useful_rows <= width);
+    assert_eq!(shape.k_skip, zerocheck::K_SKIP);
+    assert_eq!(witness.len(), 1usize << shape.m);
+    assert_eq!(pcs_params.m, shape.m + pcs::LOG_PACKING);
+
+    let (commitment, prover_data) = pcs::commit(witness, pcs_params);
+    lap("PCS commit", &mut phase);
+    bind_statement_field_parts_c1(challenger, &r1cs.field_statement_digest(), &commitment);
+
+    let io_claims = match public_io {
+        Some((spec, io)) => {
+            assert_witness_matches_io(witness, spec, io);
+            bind_public_io_c1(challenger, spec, io, shape.m)
+        }
+        None => Vec::new(),
+    };
+    lap("statement and public IO", &mut phase);
+    let (auxiliary, (auxiliary_claims, auxiliary_c1_claims)) =
+        post_commit(witness, &commitment, challenger);
+    lap("post-commit auxiliary", &mut phase);
+
+    let a = r1cs.apply_a_relation(witness);
+    let b = r1cs.apply_b_relation(witness);
+    lap("apply A/B", &mut phase);
+    let (zerocheck_proof, zerocheck_claim) =
+        zerocheck::field_c1::prove(&a, &b, witness, shape.m, challenger);
+    drop(a);
+    drop(b);
+    lap("zerocheck", &mut phase);
+
+    let inner_rest_len = shape.k_log - shape.k_skip;
+    let lincheck_point = lincheck::c1::C1QuirkyPoint {
+        z_skip: zerocheck_claim.z,
+        x_inner_rest: zerocheck_claim.mlv_challenges[..inner_rest_len].to_vec(),
+        x_outer: zerocheck_claim.mlv_challenges[inner_rest_len..].to_vec(),
+    };
+    let (lincheck_proof, lincheck_claim, fresh_capture) = if capture_fresh {
+        let (proof, claim, capture) = lincheck::c1::prove_field_capturing_fresh(
+            witness,
+            shape.m,
+            shape.k_log,
+            shape.k_skip,
+            useful_rows,
+            r1cs,
+            &lincheck_point,
+            zerocheck_claim.a_eval,
+            zerocheck_claim.b_eval,
+            challenger,
+        );
+        (proof, claim, Some(capture))
+    } else {
+        let (proof, claim) = lincheck::c1::prove_field(
+            witness,
+            shape.m,
+            shape.k_log,
+            shape.k_skip,
+            useful_rows,
+            r1cs,
+            &lincheck_point,
+            challenger,
+        );
+        (proof, claim, None)
+    };
+    lap("lincheck", &mut phase);
+
+    let ab = C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: lincheck_claim.r_inner_skip,
+            x_inner_rest: lincheck_claim.r_inner_rest.clone(),
+            x_outer: lincheck_point.x_outer.clone(),
+        },
+        value: lincheck_claim.w,
+    };
+    let c = C1ZClaim {
+        point: lincheck::c1::C1QuirkyPoint {
+            z_skip: zerocheck_claim.z,
+            x_inner_rest: zerocheck_claim.r_rest[..inner_rest_len].to_vec(),
+            x_outer: zerocheck_claim.r_rest[inner_rest_len..].to_vec(),
+        },
+        value: zerocheck_claim.c_eval,
+    };
+    let direct_claim = |claim: &C1ZClaim| {
+        let mut x_rest = claim.point.x_inner_rest.clone();
+        x_rest.extend_from_slice(&claim.point.x_outer);
+        C1QuirkyDirectClaim {
+            z_skip: claim.point.z_skip,
+            k_skip: shape.k_skip,
+            x_rest,
+            value: claim.value,
+        }
+    };
+    let mut claims = vec![direct_claim(&ab), direct_claim(&c)];
+    claims.extend(io_claims);
+    claims.extend(
+        auxiliary_claims
+            .into_iter()
+            .map(|claim| C1QuirkyDirectClaim {
+                z_skip: F256::from_base(claim.z_skip),
+                k_skip: claim.k_skip,
+                x_rest: claim.x_rest.into_iter().map(F256::from_base).collect(),
+                value: F256::from_base(claim.value),
+            }),
+    );
+    claims.extend(auxiliary_c1_claims);
+    let pcs_open =
+        pcs::open_batch_quirky_direct_c1(witness, &prover_data, &commitment, &claims, challenger);
+    lap("PCS open", &mut phase);
+
+    (
+        C1FieldR1csProof {
+            zerocheck: zerocheck_proof,
+            lincheck: lincheck_proof,
+            pcs_open,
+        },
+        auxiliary,
+        commitment,
+        C1R1csClaim { ab, c },
+        fresh_capture,
+    )
 }
 
 /// [`prove_field`] with a public-IO envelope: right after the statement

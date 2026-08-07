@@ -343,7 +343,7 @@ impl Mempool {
     }
 
     /// Anchor-filter before page packing so stale high-fee groups cannot
-    /// consume the local B64/B255 page budget and starve valid groups.
+    /// consume the local B25/B255 page budget and starve valid groups.
     pub fn select_for_block_at_anchor(
         &self,
         max_pages: usize,
@@ -648,27 +648,27 @@ mod tests {
     }
 
     #[test]
-    fn b64_skips_b255_only_group_without_slicing_or_waiting() {
+    fn b25_skips_b255_only_group_without_slicing_or_waiting() {
         let mut pool = Mempool::new(4);
-        let large = paged_tx(65, 1_000, 65_000, 7);
+        let large = paged_tx(26, 1_000, 26_000, 7);
         let large_id = id(&large);
         let small = tx(1, 2, 1, 8, [9u8; 32]);
         let small_id = id(&small);
         pool.admit(large, 0).unwrap();
         pool.admit(small, 0).unwrap();
 
-        let b64 = pool.select_for_block(64);
-        assert_eq!(b64.len(), 1);
-        assert_eq!(b64[0].spend.logical_txid, small_id);
-        assert_eq!(b64[0].pages.len(), 1);
+        let b25 = pool.select_for_block(25);
+        assert_eq!(b25.len(), 1);
+        assert_eq!(b25[0].spend.logical_txid, small_id);
+        assert_eq!(b25[0].pages.len(), 1);
 
         let b255 = pool.select_for_block(255);
         assert_eq!(b255.len(), 2);
         assert_eq!(b255[0].spend.logical_txid, large_id);
-        assert_eq!(b255[0].pages.len(), 65);
+        assert_eq!(b255[0].pages.len(), 26);
         assert_eq!(
             b255.iter().map(|entry| entry.pages.len()).sum::<usize>(),
-            66
+            27
         );
     }
 

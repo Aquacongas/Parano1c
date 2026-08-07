@@ -10,20 +10,22 @@
 use noid_chain::block_header::BlockHeader;
 use noid_ivc_core::challenger::FsLaneChallenger;
 use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout};
-use noid_ivc_core::field::F128;
+use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_circuit::{
     DeferredWitnessSlot, FieldR1csBuilder, FsChannelTrace, FsChannelUnionRecorder,
     LayoutRecordedChannel, LayoutRecordingChallenger, LinExpr, RecordedChannel,
 };
 use noid_ivc_core::field_r1cs::FieldR1cs;
-use noid_ivc_core::matrix_claim::{FreshLincheckClaim, MatrixFoldProof};
+use noid_ivc_core::matrix_claim::c1::{C1FreshLincheckClaim, C1MatrixFoldProof};
 use noid_ivc_core::pcs::{Commitment, PcsParams};
-use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldR1csProof, FieldShape};
+use noid_ivc_core::proof::{pcs_params_statement_bytes, C1FieldR1csProof, FieldShape};
 use noid_ivc_core::public_io::PublicIoSpec;
-use noid_ivc_core::verifier::{verify_field_deferred_matrix_with_post_commit_context, VerifyError};
+use noid_ivc_core::verifier::{
+    verify_field_c1_deferred_matrix_with_post_commit_context, VerifyError,
+};
 use noid_ivc_prover::field_prover::{
-    prove_field_compact_with_public_io_and_post_commit_context,
-    prove_field_with_public_io_and_post_commit_context,
+    prove_field_c1_with_public_io_and_post_commit_context,
+    prove_field_compact_c1_with_public_io_and_post_commit_context,
 };
 
 use super::block_slots::{
@@ -33,15 +35,15 @@ use super::block_slots::{
 use super::trace::accepted_claim_batch::digest_lanes;
 use super::trace::flat_of;
 use super::trace::matrix_fold::{
-    verify_matrix_claim_fold_trace, MatrixAccClaimTrace, MatrixFoldProofTrace,
+    verify_matrix_claim_fold_c1_trace, C1MatrixAccClaimTrace, C1MatrixFoldProofTrace,
 };
 use super::trace::r_pcs_region::{
     finalize_history_step_parent_region, prepare_history_step_parent_columns,
     HistoryStepParentGeometry, HistoryStepParentRegionPreparation, RPcsProof,
 };
 use super::trace::self_verify::{
-    alloc_flat_digest, flat_digest_lanes, shape_only_field_r1cs_proof,
-    verify_field_trace_deferred_region_with_post_commit_context_expr, FieldR1csProofTrace,
+    alloc_flat_digest, flat_digest_lanes, shape_only_field_r1cs_proof_c1,
+    verify_field_c1_trace_deferred_region_with_post_commit_context_expr, C1FieldR1csProofTrace,
     PcsWalkObligations,
 };
 use super::trace::zk_authorization_candidate::{
@@ -51,13 +53,10 @@ use super::trace::zk_authorization_candidate::{
 use super::trace::{mul, pin_eq, with_pin_gate};
 use crate::accumulator::{genesis_accumulator, ChainAccumulator};
 use crate::region_sidecar::{
-    shape_only_block_region_sidecar_proof, shape_only_link_region_sidecar_proof,
-    verify_block_region_sidecar_post_commit,
-    verify_block_region_sidecar_post_commit_layout_captured,
-    verify_block_region_sidecar_recorded_trace_post_commit, verify_link_region_sidecar_post_commit,
-    verify_link_region_sidecar_trace_post_commit, BlockRegionPreparation, BlockRegionSidecarProof,
-    BlockRegionSidecarVk, LinkRegionProverPlan, LinkRegionSidecarProof, LinkRegionSidecarVk,
-    RegionSidecarError,
+    shape_only_joint_c1_region_sidecar_proof, verify_joint_c1_region_sidecar_post_commit,
+    verify_joint_c1_region_sidecar_post_commit_layout_captured,
+    verify_joint_c1_region_sidecar_trace_post_commit, BlockRegionPreparation, BlockRegionSidecarVk,
+    JointC1RegionSidecarProof, LinkRegionSidecarVk, RegionSidecarError,
 };
 
 mod freezer;
@@ -388,12 +387,6 @@ impl std::error::Error for HistoryStepInputError {}
 pub(super) struct HistoryStepPreparations {
     recursion: HistoryStepParentRegionPreparation,
     direct_block: BlockRegionPreparation,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct HistoryStepCompositeSidecarProof {
-    parent_recursion: LinkRegionSidecarProof,
-    direct_block: BlockRegionSidecarProof,
 }
 
 fn alloc_pinned_flat_digest(builder: &mut FieldR1csBuilder, digest: &[u8; 32]) -> [LinExpr; 2] {

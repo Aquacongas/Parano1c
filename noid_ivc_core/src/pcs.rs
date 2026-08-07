@@ -28,9 +28,11 @@ pub mod ring_switch;
 pub mod tensor_algebra;
 
 pub use basefold::{
-    BASEFOLD_UDR_TARGET_BITS, BaseFoldProof, BaseFoldUdrConfigError, BaseFoldUdrConfiguration,
-    DEFAULT_FRI_QUERIES, PLAINTEXT_TAIL_MAX_F128, QUERY_GRIND_BITS, RoundCommitment, RoundMessage,
-    checked_fri_configuration, default_fri_queries, fri_commit_layout, sample_query_positions,
+    BASEFOLD_RATE_QUARTER_C1_QUERIES, BASEFOLD_UDR_TARGET_BITS, BaseFoldProof,
+    BaseFoldUdrConfigError, BaseFoldUdrConfiguration, C1BaseFoldProof, C1QueryOpening,
+    C1RoundMessage, DEFAULT_FRI_QUERIES, PLAINTEXT_TAIL_MAX_F128, QUERY_GRIND_BITS,
+    RoundCommitment, RoundMessage, checked_fri_configuration, default_fri_queries,
+    fri_commit_layout, sample_query_positions,
 };
 pub use commit::{
     Commitment, LOG_FRI_ARITY, PcsParams, ProverData, commit, commit_into, compute_fri_arities,
@@ -40,7 +42,7 @@ pub use pack::{LOG_PACKING, pack_witness, unpack_witness};
 pub use ring_switch::{RingSwitchProof, SparseEqTensor};
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::zerocheck::PaddingSpec;
 use serde::{Deserialize, Serialize};
 
@@ -156,6 +158,24 @@ pub struct QuirkyDirectClaimRef<'a> {
     pub k_skip: usize,
     pub x_rest: &'a [F128],
     pub value: F128,
+}
+
+/// C1 quirky opening claim. The committed vector remains F128-valued, while
+/// the point and claimed evaluation live in the extension challenge field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1QuirkyDirectClaim {
+    pub z_skip: F256,
+    pub k_skip: usize,
+    pub x_rest: Vec<F256>,
+    pub value: F256,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct C1QuirkyDirectClaimRef<'a> {
+    pub z_skip: F256,
+    pub k_skip: usize,
+    pub x_rest: &'a [F256],
+    pub value: F256,
 }
 
 /// Batched open over quirky-direct claims only (the FieldR1cs path): one
@@ -400,6 +420,199 @@ pub fn verify_opening_batch_quirky_direct<Ch: Challenger>(
     }
     if expected_final_b != proof.final_b {
         return Err(VerifyError::FinalBMismatch);
+    }
+    Ok(())
+}
+
+/// C1 batched quirky-direct opening. Claim descriptors and batching scalars
+/// are wide, but T1 remains the existing F128 codeword commitment. The fused
+/// tensor build also primes C1 BaseFold's first sumcheck message so the wide
+/// witness/tensor pair is streamed only once before folding.
+pub fn open_batch_quirky_direct_c1<Ch: Challenger>(
+    packed_witness: &[F128],
+    prover_data: &ProverData,
+    commitment: &Commitment,
+    claims: &[C1QuirkyDirectClaim],
+    challenger: &mut Ch,
+) -> C1BaseFoldProof {
+    use rayon::prelude::*;
+
+    assert!(!claims.is_empty(), "need at least one C1 claim");
+    let length = packed_witness.len();
+    debug_assert!(length.is_power_of_two());
+    let log_length = length.trailing_zeros() as usize;
+    for claim in claims {
+        assert_eq!(claim.x_rest.len() + claim.k_skip, log_length);
+    }
+
+    challenger.observe_label(b"history-pcs-open-field-c1");
+    for claim in claims {
+        challenger.observe_label(b"history-pcs-quirky-direct-c1");
+        challenger.observe_f256(claim.z_skip);
+        challenger.observe_f256(F256::from_base(F128::new(claim.k_skip as u64, 0)));
+        challenger.observe_f256_slice(&claim.x_rest);
+        challenger.observe_f256(claim.value);
+    }
+    let gammas = (0..claims.len())
+        .map(|_| challenger.sample_f256())
+        .collect::<Vec<_>>();
+    let target = claims
+        .iter()
+        .zip(&gammas)
+        .fold(F256::ZERO, |sum, (claim, &gamma)| sum + gamma * claim.value);
+
+    let split = B_COMBINED_SPLIT_LOG.min(log_length);
+    let low_length = 1usize << split;
+    let mut low_tables = Vec::with_capacity(claims.len());
+    let mut high_tables = Vec::with_capacity(claims.len());
+    for (claim, &gamma) in claims.iter().zip(&gammas) {
+        assert!(claim.k_skip <= split);
+        let mut skip = crate::zerocheck::field_c1::lagrange_weights(claim.k_skip, claim.z_skip, 0);
+        skip.iter_mut().for_each(|weight| *weight *= gamma);
+        let eq_low =
+            crate::zerocheck::field_c1::build_eq_table(&claim.x_rest[..split - claim.k_skip]);
+        let mut low = Vec::with_capacity(low_length);
+        for &eq in &eq_low {
+            for &weight in &skip {
+                low.push(eq * weight);
+            }
+        }
+        debug_assert_eq!(low.len(), low_length);
+        low_tables.push(low);
+        high_tables.push(crate::zerocheck::field_c1::build_eq_table(
+            &claim.x_rest[split - claim.k_skip..],
+        ));
+    }
+
+    // Every output block is explicitly zeroed before accumulation; the
+    // uninitialized allocation avoids a second serial full-vector write.
+    let mut combined: Vec<F256> = crate::alloc_uninit_vec(length);
+    let fuse_round_zero = low_length >= 2;
+    let round_zero_prime = combined
+        .par_chunks_mut(low_length)
+        .enumerate()
+        .map(|(high, output)| {
+            output.fill(F256::ZERO);
+            for (low, high_table) in low_tables.iter().zip(&high_tables) {
+                let scale = high_table[high];
+                if scale.is_zero() {
+                    continue;
+                }
+                for (slot, &low_value) in output.iter_mut().zip(low) {
+                    *slot += scale * low_value;
+                }
+            }
+            if !fuse_round_zero {
+                return (F256::ZERO, F256::ZERO);
+            }
+            let base = high * low_length;
+            let mut u_0 = F256::ZERO;
+            let mut u_2 = F256::ZERO;
+            for (pair, values) in output.chunks_exact(2).enumerate() {
+                let a_0 = packed_witness[base + 2 * pair];
+                let a_1 = packed_witness[base + 2 * pair + 1];
+                u_0 += values[0].scale_base(a_0);
+                u_2 += (values[0] + values[1]).scale_base(a_0 + a_1);
+            }
+            (u_0, u_2)
+        })
+        .reduce(
+            || (F256::ZERO, F256::ZERO),
+            |left, right| (left.0 + right.0, left.1 + right.1),
+        );
+
+    let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    basefold::prove_c1_with_precomputed_round0_prime(
+        packed_witness,
+        combined,
+        target,
+        &prover_data.codeword,
+        &prover_data.merkle_tree,
+        &ntt,
+        commitment.params.log_inv_rate,
+        commitment.params.log_batch_size,
+        default_fri_queries(commitment.params.log_dim(), commitment.params.log_inv_rate),
+        fuse_round_zero.then_some(round_zero_prime),
+        challenger,
+    )
+}
+
+/// Verify the C1 quirky-direct batch and its wide transparent tensor value.
+pub fn verify_opening_batch_quirky_direct_c1<Ch: Challenger>(
+    commitment: &Commitment,
+    claims: &[C1QuirkyDirectClaimRef<'_>],
+    proof: &C1BaseFoldProof,
+    challenger: &mut Ch,
+) -> Result<(), VerifyError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    assert!(!claims.is_empty(), "need at least one C1 claim");
+    let log_length = commitment.params.m - LOG_PACKING;
+    for claim in claims {
+        assert_eq!(claim.x_rest.len() + claim.k_skip, log_length);
+    }
+
+    challenger.observe_label(b"history-pcs-open-field-c1");
+    for claim in claims {
+        challenger.observe_label(b"history-pcs-quirky-direct-c1");
+        challenger.observe_f256(claim.z_skip);
+        challenger.observe_f256(F256::from_base(F128::new(claim.k_skip as u64, 0)));
+        challenger.observe_f256_slice(claim.x_rest);
+        challenger.observe_f256(claim.value);
+    }
+    let gammas = (0..claims.len())
+        .map(|_| challenger.sample_f256())
+        .collect::<Vec<_>>();
+    let target = claims
+        .iter()
+        .zip(&gammas)
+        .fold(F256::ZERO, |sum, (claim, &gamma)| sum + gamma * claim.value);
+    let transcript_micros = total_started.elapsed().as_micros();
+
+    let basefold_started = std::time::Instant::now();
+    let ntt = crate::ntt::AdditiveNttF128::standard(commitment.params.k_code());
+    let challenges = basefold::verify_c1(
+        target,
+        proof,
+        &commitment.root,
+        &ntt,
+        log_length,
+        commitment.params.log_inv_rate,
+        commitment.params.log_batch_size,
+        challenger,
+    )
+    .map_err(VerifyError::BaseFold)?;
+    let basefold_micros = basefold_started.elapsed().as_micros();
+
+    let final_b_started = std::time::Instant::now();
+    let eq_eval = |left: &[F256], right: &[F256]| {
+        assert_eq!(left.len(), right.len());
+        left.iter()
+            .zip(right)
+            .fold(F256::ONE, |product, (&left, &right)| {
+                product * (F256::ONE + left + right)
+            })
+    };
+    let mut expected_final_b = F256::ZERO;
+    for (claim, &gamma) in claims.iter().zip(&gammas) {
+        let skip = crate::zerocheck::field_c1::lagrange_weights(claim.k_skip, claim.z_skip, 0);
+        let eq_skip = crate::zerocheck::field_c1::build_eq_table(&challenges[..claim.k_skip]);
+        let skip_factor = skip
+            .iter()
+            .zip(&eq_skip)
+            .fold(F256::ZERO, |sum, (&weight, &eq)| sum + weight * eq);
+        expected_final_b +=
+            gamma * skip_factor * eq_eval(claim.x_rest, &challenges[claim.k_skip..]);
+    }
+    if expected_final_b != proof.final_b {
+        return Err(VerifyError::FinalBMismatch);
+    }
+    if timing {
+        eprintln!(
+            "[pcs-c1 verify] transcript_us={transcript_micros} basefold_us={basefold_micros} final_b_us={} total_us={}",
+            final_b_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
     }
     Ok(())
 }
@@ -1395,7 +1608,7 @@ pub fn verify_opening<Ch: Challenger>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::challenger::FsChallenger;
+    use crate::challenger::{FsChallenger, FsLaneChallenger};
     use crate::zerocheck::multilinear::lagrange_weights_naive;
     use crate::zerocheck::univariate_skip::build_eq;
 
@@ -1419,6 +1632,10 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+
+        fn f256(&mut self) -> F256 {
+            F256::new(self.f128(), self.f128())
         }
     }
 
@@ -1995,5 +2212,92 @@ mod tests {
                 "query truncation accepted at m={m}"
             );
         }
+    }
+
+    fn zhat_quirky_reference_c1(
+        values: &[F128],
+        k_skip: usize,
+        z_skip: F256,
+        x_rest: &[F256],
+    ) -> F256 {
+        let skip_size = 1usize << k_skip;
+        assert_eq!(values.len(), skip_size << x_rest.len());
+        let skip = crate::zerocheck::field_c1::lagrange_weights(k_skip, z_skip, 0);
+        let rest = crate::zerocheck::field_c1::build_eq_table(x_rest);
+        values
+            .iter()
+            .enumerate()
+            .fold(F256::ZERO, |sum, (index, &value)| {
+                sum + (skip[index % skip_size] * rest[index / skip_size]).scale_base(value)
+            })
+    }
+
+    #[test]
+    fn pcs_c1_quirky_direct_roundtrip_and_tampers() {
+        const K_SKIP: usize = 2;
+        let log_length = 8usize;
+        let mut rng = Rng::new(0xC1_0F1E1D);
+        let witness = (0..1usize << log_length)
+            .map(|_| rng.f128())
+            .collect::<Vec<_>>();
+        let make_claim = |rng: &mut Rng| {
+            let z_skip = rng.f256();
+            let x_rest = (0..log_length - K_SKIP)
+                .map(|_| rng.f256())
+                .collect::<Vec<_>>();
+            let value = zhat_quirky_reference_c1(&witness, K_SKIP, z_skip, &x_rest);
+            C1QuirkyDirectClaim {
+                z_skip,
+                k_skip: K_SKIP,
+                x_rest,
+                value,
+            }
+        };
+        let claims = vec![make_claim(&mut rng), make_claim(&mut rng)];
+        let params = PcsParams {
+            m: log_length + LOG_PACKING,
+            log_inv_rate: 2,
+            log_batch_size: 2,
+            profile: Default::default(),
+        };
+        let (commitment, prover_data) = commit(&witness, &params);
+
+        let mut prover = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+        let proof =
+            open_batch_quirky_direct_c1(&witness, &prover_data, &commitment, &claims, &mut prover);
+        let refs = claims
+            .iter()
+            .map(|claim| C1QuirkyDirectClaimRef {
+                z_skip: claim.z_skip,
+                k_skip: claim.k_skip,
+                x_rest: &claim.x_rest,
+                value: claim.value,
+            })
+            .collect::<Vec<_>>();
+        let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+        verify_opening_batch_quirky_direct_c1(&commitment, &refs, &proof, &mut verifier)
+            .unwrap_or_else(|error| panic!("honest C1 quirky batch rejected: {error:?}"));
+        assert_eq!(prover.sample_f256(), verifier.sample_f256());
+
+        let mut wrong_claim = refs.clone();
+        wrong_claim[0].value += F256::ONE;
+        let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+        assert!(
+            verify_opening_batch_quirky_direct_c1(
+                &commitment,
+                &wrong_claim,
+                &proof,
+                &mut verifier,
+            )
+            .is_err()
+        );
+
+        let mut truncated = proof;
+        truncated.queries.truncate(1);
+        let mut verifier = FsLaneChallenger::new_c1(b"history-c1-pcs-test");
+        assert!(
+            verify_opening_batch_quirky_direct_c1(&commitment, &refs, &truncated, &mut verifier,)
+                .is_err()
+        );
     }
 }

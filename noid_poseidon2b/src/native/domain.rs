@@ -70,14 +70,23 @@ pub const TAG_SEMHDR: DomainTag = DomainTag::new(b"SEMHDR__");
 /// Byte-oriented Fiat-Shamir challenger (`FsChallenger`: op headers +
 /// length-prefixed byte absorbs).
 pub const TAG_FSCHALNG: DomainTag = DomainTag::new(b"FSCHALNG");
+/// C1 byte-oriented Fiat-Shamir challenger with 255-bit extension-field
+/// challenges. Its framing is intentionally disjoint from `FSCHALNG`.
+pub const TAG_FSCH256: DomainTag = DomainTag::new(b"FSCH256_");
 /// Lane-oriented Fiat-Shamir challenger for the proof-core transcripts
 /// (`FsLaneChallenger` and its in-trace twin). Distinct from the other
 /// Fiat-Shamir families so no transcript state can be replayed across
 /// challenger constructions that absorb different framings.
 pub const TAG_LANECHAL: DomainTag = DomainTag::new(b"LANECHAL");
+/// C1 lane-oriented Fiat-Shamir challenger with 255-bit extension-field
+/// challenges and a two-coordinate absorb schedule.
+pub const TAG_LANE256: DomainTag = DomainTag::new(b"LANE256_");
 /// Killshot Fiat-Shamir channel (`Poseidon2bChannel`, the bare rate-2
 /// duplex every GKR verifier runs on) and its replays.
 pub const TAG_KSCHANNL: DomainTag = DomainTag::new(b"KSCHANNL");
+/// C1 GKR/Wallet channel. Every algebraic message occupies one complete
+/// two-lane rate block and every squeeze returns one GF(2^256) challenge.
+pub const TAG_KSCH256: DomainTag = DomainTag::new(b"KSCH256_");
 /// Wallet-capsule FRI transcript (`noid_fri::Channel`) and its replays.
 pub const TAG_FRICHANL: DomainTag = DomainTag::new(b"FRICHANL");
 pub const TAG_COMPRESS: DomainTag = DomainTag::new(b"COMPRESS");
@@ -105,6 +114,11 @@ pub const TAG_HISTPRF: DomainTag = DomainTag::new(b"HISTPRF_");
 pub const TAG_BYTEHASH: DomainTag = DomainTag::new(b"BYTEHASH");
 /// Wallet-capsule PCS tree leaf (flat sponge over one 16-symbol fold coset).
 pub const TAG_CAPSLEAF: DomainTag = DomainTag::new(b"CAPSLEAF");
+/// C1 Wallet-capsule PCS leaf containing sixteen GF(2^256) symbols.
+pub const TAG_CAPS256: DomainTag = DomainTag::new(b"CAPS256_");
+/// C1 Wallet source leaf containing eight GF(2^128) bank symbols and eight
+/// GF(2^256) companion symbols in a canonical packed representation.
+pub const TAG_CAPSMIX: DomainTag = DomainTag::new(b"CAPSMIX_");
 /// Wallet-capsule PCS tree inner node (1-permutation flat feed-forward
 /// compress — the same node shape as the proof-core PCS Merkle).
 pub const TAG_CAPSNODE: DomainTag = DomainTag::new(b"CAPSNODE");
@@ -126,8 +140,11 @@ mod tests {
             TAG_POWHDR,
             TAG_SEMHDR,
             TAG_FSCHALNG,
+            TAG_FSCH256,
             TAG_LANECHAL,
+            TAG_LANE256,
             TAG_KSCHANNL,
+            TAG_KSCH256,
             TAG_FRICHANL,
             TAG_COMPRESS,
             TAG_DAWTNSS,
@@ -142,6 +159,8 @@ mod tests {
             TAG_HISTPRF,
             TAG_BYTEHASH,
             TAG_CAPSLEAF,
+            TAG_CAPS256,
+            TAG_CAPSMIX,
             TAG_CAPSNODE,
         ];
         for i in 0..tags.len() {

@@ -5,7 +5,7 @@
 //! produces these structs; the verifier consumes them.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::lincheck::{self, QuirkyPoint};
 use crate::pcs::{self, Commitment};
 use crate::r1cs::BlockR1cs;
@@ -43,6 +43,14 @@ pub struct FieldR1csProof {
     pub pcs_open: pcs::BaseFoldProof,
 }
 
+/// Complete native proof for the C1 History algebraic profile.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct C1FieldR1csProof {
+    pub zerocheck: zerocheck::field_c1::C1ZerocheckProof,
+    pub lincheck: lincheck::c1::C1LincheckProof,
+    pub pcs_open: pcs::C1BaseFoldProof,
+}
+
 /// Canonical statement byte encoding of the PCS parameters — shared by the
 /// native statement bindings below and their in-trace twins, so the two can
 /// never drift on serialization details.
@@ -69,6 +77,27 @@ pub fn bind_statement_field_parts<Ch: Challenger>(
     commitment: &Commitment,
 ) {
     challenger.observe_label(b"history-field-r1cs");
+    challenger.observe_bytes(statement_digest);
+    challenger.observe_bytes(&pcs_params_statement_bytes(&commitment.params));
+    challenger.observe_bytes(&commitment.root);
+}
+
+/// C1 statement binding. The distinct label prevents either algebraic
+/// challenge schedule from replaying under the other profile.
+pub fn bind_statement_field_c1<Ch: Challenger>(
+    challenger: &mut Ch,
+    r1cs: &crate::field_r1cs::FieldR1cs,
+    commitment: &Commitment,
+) {
+    bind_statement_field_parts_c1(challenger, &r1cs.statement_digest(), commitment);
+}
+
+pub fn bind_statement_field_parts_c1<Ch: Challenger>(
+    challenger: &mut Ch,
+    statement_digest: &[u8; 32],
+    commitment: &Commitment,
+) {
+    challenger.observe_label(b"history-field-r1cs-c1");
     challenger.observe_bytes(statement_digest);
     challenger.observe_bytes(&pcs_params_statement_bytes(&commitment.params));
     challenger.observe_bytes(&commitment.root);
@@ -116,6 +145,18 @@ pub struct R1csClaim {
     /// From the zerocheck's extract_c interpolation: `ẑ(c.point) = c.value`.
     /// Bypasses lincheck because `C = I` ⇒ ĉ-claim is a direct z-claim.
     pub c: ZClaim,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1ZClaim {
+    pub point: lincheck::c1::C1QuirkyPoint,
+    pub value: F256,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct C1R1csClaim {
+    pub ab: C1ZClaim,
+    pub c: C1ZClaim,
 }
 
 /// Bind the Fiat-Shamir transcript to the statement: the R1CS instance digest

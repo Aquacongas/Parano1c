@@ -10,12 +10,13 @@
 //! byte, proof parameter, or primitive is changed.
 
 use noid_ivc_core::challenger::{
-    fs_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes, fs_pad_lane_flat, FS_KIND_SCALAR,
-    FS_KIND_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL, FS_OP_OBSERVE, FS_OP_POW, FS_OP_SQUEEZE,
+    fs_c1_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes, fs_pad_lane_flat, FS_KIND_SCALAR,
+    FS_KIND_SLICE, FS_KIND_WIDE_SCALAR, FS_KIND_WIDE_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL,
+    FS_OP_OBSERVE, FS_OP_POW, FS_OP_SQUEEZE,
 };
 use noid_ivc_core::field::F128;
 use noid_ivc_core::field_circuit::{
-    f128_from_u128, f128_to_u128, FieldR1csBuilder, FsChannelOps, LinExpr, RecordedChannel,
+    f128_from_u128, f128_to_u128, ExtExpr, FieldR1csBuilder, FsChannelOps, LinExpr, RecordedChannel,
 };
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
@@ -31,11 +32,15 @@ pub(super) struct BaseSelectableParentRecorder {
     data_flat: Vec<F128>,
     challenge_wires: Vec<LinExpr>,
     perms: usize,
+    c1: bool,
 }
 
 impl BaseSelectableParentRecorder {
-    pub(super) fn new(domain: &[u8]) -> Self {
-        let [iv0, iv1] = fs_lane_iv_flat();
+    pub(super) fn new_c1(domain: &[u8]) -> Self {
+        Self::with_profile(domain, fs_c1_lane_iv_flat(), true)
+    }
+
+    fn with_profile(domain: &[u8], [iv0, iv1]: [F128; 2], c1: bool) -> Self {
         let mut recorder = Self {
             state: [F128::ZERO, F128::ZERO, iv0, iv1],
             buffered: None,
@@ -46,6 +51,7 @@ impl BaseSelectableParentRecorder {
             data_flat: Vec::new(),
             challenge_wires: Vec::new(),
             perms: 0,
+            c1,
         };
         recorder.absorb_const(fs_op_lane(FS_OP_DOMAIN, 0, domain.len() as u64));
         for lane in fs_pack_bytes_lanes(domain) {
@@ -187,6 +193,26 @@ impl FsChannelOps for BaseSelectableParentRecorder {
         }
     }
 
+    fn observe_f256(&mut self, builder: &mut FieldR1csBuilder, value: &ExtExpr) {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(FS_OP_OBSERVE, FS_KIND_WIDE_SCALAR, 0));
+        self.absorb_expr(builder, &value.lo);
+        self.absorb_expr(builder, &value.hi);
+    }
+
+    fn observe_f256_slice(&mut self, builder: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_WIDE_SLICE,
+            values.len() as u64,
+        ));
+        for value in values {
+            self.absorb_expr(builder, &value.lo);
+            self.absorb_expr(builder, &value.hi);
+        }
+    }
+
     fn sample_f128(&mut self, builder: &mut FieldR1csBuilder) -> LinExpr {
         self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0));
         self.close_absorb();
@@ -205,6 +231,36 @@ impl FsChannelOps for BaseSelectableParentRecorder {
                 n,
             ));
         (0..n).map(|_| self.squeeze(builder)).collect()
+    }
+
+    fn sample_f256(&mut self, builder: &mut FieldR1csBuilder) -> ExtExpr {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SCALAR, 0));
+        self.close_absorb();
+        self.ops
+            .push(noid_ivc_core::deep_chain::schedule::TranscriptOp::Squeeze(
+                2,
+            ));
+        let lo = self.squeeze(builder);
+        let raw_hi = self.squeeze(builder);
+        builder.c1_challenge_from_raw(lo, raw_hi)
+    }
+
+    fn sample_f256_vec(&mut self, builder: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SLICE, n as u64));
+        self.close_absorb();
+        self.ops
+            .push(noid_ivc_core::deep_chain::schedule::TranscriptOp::Squeeze(
+                2 * n,
+            ));
+        (0..n)
+            .map(|_| {
+                let lo = self.squeeze(builder);
+                let raw_hi = self.squeeze(builder);
+                builder.c1_challenge_from_raw(lo, raw_hi)
+            })
+            .collect()
     }
 
     fn verify_pow(&mut self, builder: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
@@ -238,5 +294,85 @@ impl FsChannelOps for BaseSelectableParentRecorder {
         for lane in lanes {
             self.absorb_expr(builder, lane);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use noid_ivc_core::field::F256;
+    use noid_ivc_core::field_circuit::FsChannelUnionRecorder;
+
+    fn exercise_c1(
+        builder: &mut FieldR1csBuilder,
+        channel: &mut impl FsChannelOps,
+        values: &[ExtExpr],
+    ) -> Vec<F256> {
+        channel.observe_label(builder, b"parent-recorder-c1-test");
+        channel.observe_f256(builder, &values[0]);
+        channel.observe_f256_slice(builder, &values[1..]);
+        let mut sampled = vec![channel.sample_f256(builder).eval(builder.values())];
+        sampled.extend(
+            channel
+                .sample_f256_vec(builder, 3)
+                .iter()
+                .map(|value| value.eval(builder.values())),
+        );
+        let _query_seed = channel.sample_f128_vec(builder, 23);
+        sampled
+    }
+
+    #[test]
+    fn selectable_parent_c1_recorder_matches_union_recorder() {
+        const DOMAIN: &[u8] = b"parent-recorder-c1";
+        let native_values = [
+            F256::new(F128::new(1, 2), F128::new(3, 4)),
+            F256::new(F128::new(5, 6), F128::new(7, 8)),
+            F256::new(F128::new(9, 10), F128::new(11, 12)),
+        ];
+
+        let mut selectable_builder = FieldR1csBuilder::new();
+        let selectable_values = native_values.map(|value| {
+            ExtExpr::new(
+                LinExpr::from_wire(selectable_builder.alloc_f128(value.lo)),
+                LinExpr::from_wire(selectable_builder.alloc_f128(value.hi)),
+            )
+        });
+        let mut selectable =
+            BaseSelectableParentRecorder::with_profile(DOMAIN, fs_c1_lane_iv_flat(), true);
+        let selectable_samples =
+            exercise_c1(&mut selectable_builder, &mut selectable, &selectable_values);
+        let selectable_recording = selectable.finish();
+
+        let mut union_builder = FieldR1csBuilder::new();
+        let union_values = native_values.map(|value| {
+            ExtExpr::new(
+                LinExpr::from_wire(union_builder.alloc_f128(value.lo)),
+                LinExpr::from_wire(union_builder.alloc_f128(value.hi)),
+            )
+        });
+        let mut union = FsChannelUnionRecorder::new_c1(DOMAIN);
+        let union_samples = exercise_c1(&mut union_builder, &mut union, &union_values);
+        let union_recording = union.finish();
+
+        assert_eq!(selectable_samples, union_samples);
+        assert_eq!(selectable_recording.ops, union_recording.ops);
+        assert_eq!(selectable_recording.data_wires, union_recording.data_wires);
+        assert_eq!(selectable_recording.data_flat, union_recording.data_flat);
+        assert_eq!(
+            selectable_recording.challenge_wires,
+            union_recording.challenge_wires
+        );
+        assert_eq!(selectable_recording.post_state, union_recording.post_state);
+        assert_eq!(selectable_recording.perms, union_recording.perms);
+
+        let (selectable_r1cs, selectable_witness) = selectable_builder.build();
+        let (union_r1cs, union_witness) = union_builder.build();
+        assert_eq!(
+            selectable_r1cs.structural_statement_digest(),
+            union_r1cs.structural_statement_digest()
+        );
+        assert_eq!(selectable_witness, union_witness);
+        assert!(selectable_r1cs.satisfies(&selectable_witness));
     }
 }

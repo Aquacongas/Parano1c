@@ -58,7 +58,7 @@
 //! prover-side, ~4× smaller proofs.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::merkle::{self, Hash};
 use crate::ntt::AdditiveNttF128;
 use serde::{Deserialize, Serialize};
@@ -111,13 +111,23 @@ pub const QUERY_GRIND_BITS: u32 = 16;
 /// grind with which to repair such a domain.
 pub const DEFAULT_FRI_QUERIES: usize = 204;
 
+/// Consensus query floor for the rate-1/4 BaseFold profile used by the
+/// production History relation.  The C1 profile raises the previous floor of
+/// 125 to 133 without changing the code rate or any codeword domain.
+pub const BASEFOLD_RATE_QUARTER_C1_QUERIES: usize = 133;
+
 /// BaseFold's published classical query/proximity target. This is separate
 /// from the authorization capsule's QROM diagnostic.
 pub const BASEFOLD_UDR_TARGET_BITS: u32 = 100;
 
 const BASEFOLD_MAX_PUBLISHED_LOG_INV_RATE: usize = 5;
-const BASEFOLD_QUERY_FLOORS: [usize; BASEFOLD_MAX_PUBLISHED_LOG_INV_RATE] =
-    [DEFAULT_FRI_QUERIES, 125, 102, 93, 89];
+const BASEFOLD_QUERY_FLOORS: [usize; BASEFOLD_MAX_PUBLISHED_LOG_INV_RATE] = [
+    DEFAULT_FRI_QUERIES,
+    BASEFOLD_RATE_QUARTER_C1_QUERIES,
+    102,
+    93,
+    89,
+];
 
 /// Reviewed finite-length UDR configuration for one actual BaseFold domain.
 /// `log_domain_len = log_msg_cols + log_inv_rate` and therefore identifies
@@ -149,9 +159,11 @@ pub enum BaseFoldUdrConfigError {
 /// The integer precondition is `delta^2*n >= 18`, which is equivalent to the
 /// required lower endpoint `gamma >= delta/3` for the selected maximal
 /// finite radius. Query counts are the minimum needed for the remaining
-/// `100-QUERY_GRIND_BITS` query bits, clamped to the already-published
-/// rate-specific floors. The grind is a classical BaseFold transcript cost;
-/// this function makes no QROM claim and is not used by the auth capsule.
+/// `100-QUERY_GRIND_BITS` query bits, clamped to the consensus rate-specific
+/// floors.  In particular, the rate-1/4 floor is the selected C1 History
+/// count, which is deliberately stronger than this classical target.  The
+/// grind is a classical BaseFold transcript cost; this function makes no QROM
+/// claim and is not used by the auth capsule.
 pub fn checked_fri_configuration(
     log_msg_cols: usize,
     log_inv_rate: usize,
@@ -363,6 +375,43 @@ pub struct BaseFoldProof {
     pub queries: Vec<QueryOpening>,
 }
 
+/// C1 sumcheck message. The committed polynomial remains F128-valued, while
+/// every algebraic message and challenge after commitment lives in F256.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct C1RoundMessage {
+    pub u_0: F256,
+    pub u_2: F256,
+}
+
+/// One C1 FRI query. The T1 leaf is the original F128 codeword commitment;
+/// every layer after the first wide fold is encoded canonically as F256.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct C1QueryOpening {
+    pub position: usize,
+    pub initial_leaf: Vec<F128>,
+    pub initial_path: Vec<Hash>,
+    pub post_row_batch_leaf: Vec<F256>,
+    pub post_row_batch_path: Vec<Hash>,
+    pub epoch_leaves: Vec<Vec<F256>>,
+    pub epoch_paths: Vec<Vec<Hash>>,
+}
+
+/// BaseFold proof for the C1 History profile. T1 and its root are unchanged;
+/// sumcheck messages, folded codewords, FRI leaves, and terminal values are
+/// all F256 values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct C1BaseFoldProof {
+    pub round_messages: Vec<C1RoundMessage>,
+    pub post_row_batch_commit: RoundCommitment,
+    pub round_commitments: Vec<RoundCommitment>,
+    pub final_a: F256,
+    pub final_b: F256,
+    pub final_codeword: Vec<F256>,
+    pub plaintext_tail: Vec<F256>,
+    pub pow_nonce: u64,
+    pub queries: Vec<C1QueryOpening>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VerifyError {
     SumcheckFinalMismatch,
@@ -523,6 +572,146 @@ fn f128_slice_to_bytes(values: &[F128]) -> Vec<u8> {
         bytes.extend_from_slice(&f.hi.to_le_bytes());
     }
     bytes
+}
+
+/// Canonical low-coordinate-then-high-coordinate encoding used for C1 FRI
+/// leaves. Each coordinate retains the established little-endian F128 lane
+/// encoding.
+fn f256_slice_to_bytes(values: &[F256]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 32);
+    for &value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// Borrow the canonical C1 byte layout without a second codeword-sized copy.
+/// F128/F256 are repr(C) little-endian lane structs and all supported targets
+/// are little-endian, matching [`f256_slice_to_bytes`] exactly.
+fn f256_slice_as_bytes(values: &[F256]) -> &[u8] {
+    debug_assert!(cfg!(target_endian = "little"));
+    // SAFETY: F256 is repr(C), Copy, contains exactly two repr(C) F128
+    // coordinates, and the returned byte slice cannot outlive `values`.
+    unsafe {
+        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values))
+    }
+}
+
+#[inline]
+fn fold_pair_c1(twiddle: F128, u_in: F256, v_in: F256, challenge: F256) -> F256 {
+    let v = v_in + u_in;
+    let u = u_in + v.scale_base(twiddle);
+    u + challenge * (u + v)
+}
+
+#[inline]
+fn fold_pair_base_to_c1(twiddle: F128, u_in: F128, v_in: F128, challenge: F256) -> F256 {
+    let v = v_in + u_in;
+    let u = u_in + v * twiddle;
+    F256::from_base(u) + challenge.scale_base(u + v)
+}
+
+fn row_batch_fold_all_c1(codeword: &[F128], out: &mut [F256], challenges: &[F256]) -> usize {
+    use rayon::prelude::*;
+
+    let num_ntts = 1usize << challenges.len();
+    debug_assert_eq!(codeword.len() % num_ntts, 0);
+    let n_positions = codeword.len() / num_ntts;
+    const CHUNK: usize = 256;
+    out[..n_positions]
+        .par_chunks_mut(CHUNK)
+        .enumerate()
+        .for_each(|(chunk_index, output_chunk)| {
+            let mut buffer = vec![F256::ZERO; num_ntts];
+            for (offset, output) in output_chunk.iter_mut().enumerate() {
+                let base = (chunk_index * CHUNK + offset) * num_ntts;
+                for (slot, &value) in buffer.iter_mut().zip(&codeword[base..base + num_ntts]) {
+                    *slot = F256::from_base(value);
+                }
+                let mut length = num_ntts;
+                for &challenge in challenges {
+                    let half = length / 2;
+                    for index in 0..half {
+                        let low = buffer[2 * index];
+                        let high = buffer[2 * index + 1];
+                        buffer[index] = low + challenge * (low + high);
+                    }
+                    length = half;
+                }
+                *output = buffer[0];
+            }
+        });
+    n_positions
+}
+
+fn row_batch_fold_one_c1(lanes: &[F128], challenges: &[F256]) -> F256 {
+    let mut buffer = lanes
+        .iter()
+        .copied()
+        .map(F256::from_base)
+        .collect::<Vec<_>>();
+    for &challenge in challenges {
+        let half = buffer.len() / 2;
+        for index in 0..half {
+            let low = buffer[2 * index];
+            let high = buffer[2 * index + 1];
+            buffer[index] = low + challenge * (low + high);
+        }
+        buffer.truncate(half);
+    }
+    debug_assert_eq!(buffer.len(), 1);
+    buffer[0]
+}
+
+fn fri_fold_codeword_c1(
+    codeword: &[F256],
+    out: &mut [F256],
+    ntt: &AdditiveNttF128,
+    layer: usize,
+    challenge: F256,
+) -> usize {
+    use rayon::prelude::*;
+
+    let new_len = codeword.len() / 2;
+    out[..new_len]
+        .par_iter_mut()
+        .enumerate()
+        .for_each(|(index, output)| {
+            *output = fold_pair_c1(
+                ntt.twiddle(layer, index),
+                codeword[2 * index],
+                codeword[2 * index + 1],
+                challenge,
+            );
+        });
+    new_len
+}
+
+fn fri_fold_coset_c1(
+    coset: &[F256],
+    challenges: &[F256],
+    ntt: &AdditiveNttF128,
+    input_layer: usize,
+    coset_index: usize,
+) -> F256 {
+    debug_assert_eq!(coset.len(), 1usize << challenges.len());
+    let mut buffer = coset.to_vec();
+    for (round, &challenge) in challenges.iter().enumerate() {
+        let post_fold_layer = input_layer - round - 1;
+        let next_len = buffer.len() / 2;
+        for index in 0..next_len {
+            let position = coset_index * next_len + index;
+            buffer[index] = fold_pair_c1(
+                ntt.twiddle(post_fold_layer, position),
+                buffer[2 * index],
+                buffer[2 * index + 1],
+                challenge,
+            );
+        }
+        buffer.truncate(next_len);
+    }
+    debug_assert_eq!(buffer.len(), 1);
+    buffer[0]
 }
 
 /// Absorb a 32-byte commitment root into the transcript as two flat lanes
@@ -1329,18 +1518,752 @@ pub fn verify<Ch: Challenger>(
     Ok(challenges)
 }
 
+// ---------------------------------------------------------------------------
+// C1 prover and verifier
+// ---------------------------------------------------------------------------
+
+/// C1 BaseFold over an F128-valued committed polynomial. The commitment and
+/// its T1 openings stay byte-identical to the existing PCS; every algebraic
+/// value produced after the commitment is lifted to F256.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_c1<Ch: Challenger>(
+    a_init: &[F128],
+    b: Vec<F256>,
+    target: F256,
+    initial_codeword: &[F128],
+    initial_tree: &[Hash],
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    n_queries: usize,
+    challenger: &mut Ch,
+) -> C1BaseFoldProof {
+    prove_c1_with_precomputed_round0_prime(
+        a_init,
+        b,
+        target,
+        initial_codeword,
+        initial_tree,
+        ntt,
+        log_inv_rate,
+        log_batch_size,
+        n_queries,
+        None,
+        challenger,
+    )
+}
+
+/// C1 BaseFold with a round-zero message fused into the caller's construction
+/// of the wide transparent tensor.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_c1_with_precomputed_round0_prime<Ch: Challenger>(
+    a_init: &[F128],
+    mut b: Vec<F256>,
+    target: F256,
+    initial_codeword: &[F128],
+    initial_tree: &[Hash],
+    ntt: &AdditiveNttF128,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    n_queries: usize,
+    precomputed_round0_prime: Option<(F256, F256)>,
+    challenger: &mut Ch,
+) -> C1BaseFoldProof {
+    use rayon::prelude::*;
+
+    assert_eq!(a_init.len(), b.len());
+    assert!(a_init.len().is_power_of_two() && !a_init.is_empty());
+    let log_msg_len = a_init.len().trailing_zeros() as usize;
+    assert!(log_batch_size <= log_msg_len);
+    let log_dim = log_msg_len - log_batch_size;
+    let k_code = log_dim + log_inv_rate;
+    let num_ntts = 1usize << log_batch_size;
+    assert_eq!(initial_codeword.len(), (1usize << k_code) * num_ntts);
+
+    challenger.observe_label(b"history-basefold-c1");
+
+    let arities = crate::pcs::compute_fri_arities(log_dim);
+    debug_assert_eq!(arities.iter().sum::<usize>(), log_dim);
+    let (num_fri_commits, tail_layout) = fri_commit_layout(k_code, &arities);
+    let mut plaintext_tail = Vec::new();
+    let mut running_target = target;
+    let mut round_messages = Vec::with_capacity(log_msg_len);
+    let mut round_commitments = Vec::with_capacity(num_fri_commits);
+    let mut row_batch_challenges = Vec::with_capacity(log_batch_size);
+
+    let first_arity = arities.first().copied().unwrap_or(0);
+    let post_row_batch_leaf_f256 = 1usize << first_arity;
+    let mut post_row_batch_codeword = Vec::new();
+    let mut post_row_batch_tree = Vec::new();
+    let mut post_row_batch_commit_root = [0u8; 32];
+
+    // Every slot is written before it is read. At the production B255 width
+    // these are the dominant C1 transients, so avoid serial zero-fills.
+    let mut a_active: Vec<F256> = crate::alloc_uninit_vec(a_init.len());
+    let mut a_scratch: Vec<F256> = crate::alloc_uninit_vec(a_init.len());
+    let mut a_len = a_init.len();
+    let mut b_scratch: Vec<F256> = crate::alloc_uninit_vec(b.len());
+    let mut b_len = b.len();
+    let n_positions = 1usize << k_code;
+    let mut codeword_active: Vec<F256> = crate::alloc_uninit_vec(n_positions);
+    let mut codeword_scratch: Vec<F256> = crate::alloc_uninit_vec(n_positions);
+    let mut codeword_len = n_positions;
+
+    let mut epoch_codewords: Vec<Vec<F256>> = Vec::with_capacity(num_fri_commits);
+    let mut epoch_trees: Vec<Vec<Hash>> = Vec::with_capacity(num_fri_commits);
+    let mut epoch_leaf_f256s = Vec::with_capacity(num_fri_commits);
+
+    // With no row-batch rounds, T2 commits to the base codeword lifted into
+    // the extension before the first FRI challenge is drawn.
+    if log_batch_size == 0 {
+        codeword_active
+            .par_iter_mut()
+            .zip(initial_codeword.par_iter())
+            .for_each(|(output, &value)| *output = F256::from_base(value));
+        if !arities.is_empty() {
+            let leaf_count = codeword_len / post_row_batch_leaf_f256;
+            post_row_batch_tree =
+                merkle::merkle_tree(f256_slice_as_bytes(&codeword_active), leaf_count);
+            post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty T2");
+            observe_root(challenger, &post_row_batch_commit_root);
+            post_row_batch_codeword = codeword_active.clone();
+        }
+    }
+
+    let (mut current_u0, mut current_u2) = if let Some(message) = precomputed_round0_prime {
+        message
+    } else {
+        (0..b_len / 2)
+            .into_par_iter()
+            .map(|index| {
+                let a0 = a_init[2 * index];
+                let a1 = a_init[2 * index + 1];
+                let b0 = b[2 * index];
+                let b1 = b[2 * index + 1];
+                (b0.scale_base(a0), (b0 + b1).scale_base(a0 + a1))
+            })
+            .reduce(
+                || (F256::ZERO, F256::ZERO),
+                |left, right| (left.0 + right.0, left.1 + right.1),
+            )
+    };
+
+    let mut current_epoch = 0usize;
+    let mut rounds_in_epoch = 0usize;
+    for round in 0..log_msg_len {
+        let half = a_len / 2;
+        let u_0 = current_u0;
+        let u_2 = current_u2;
+        challenger.observe_f256(u_0);
+        challenger.observe_f256(u_2);
+        round_messages.push(C1RoundMessage { u_0, u_2 });
+
+        let challenge = challenger.sample_f256();
+        let u_1 = running_target + u_2;
+        running_target = u_0 + challenge * u_1 + challenge * challenge * u_2;
+
+        if round == 0 {
+            let b_source = &b[..b_len];
+            if half >= 2 {
+                let (next_u0, next_u2) = a_scratch[..half]
+                    .par_chunks_mut(2)
+                    .zip(b_scratch[..half].par_chunks_mut(2))
+                    .enumerate()
+                    .map(|(chunk, (a_output, b_output))| {
+                        let base = 4 * chunk;
+                        let a0 = a_init[base];
+                        let a1 = a_init[base + 1];
+                        let a2 = a_init[base + 2];
+                        let a3 = a_init[base + 3];
+                        let b0 = b_source[base];
+                        let b1 = b_source[base + 1];
+                        let b2 = b_source[base + 2];
+                        let b3 = b_source[base + 3];
+                        let a_fold0 = F256::from_base(a0) + challenge.scale_base(a0 + a1);
+                        let a_fold1 = F256::from_base(a2) + challenge.scale_base(a2 + a3);
+                        let b_fold0 = b0 + challenge * (b0 + b1);
+                        let b_fold1 = b2 + challenge * (b2 + b3);
+                        a_output[0] = a_fold0;
+                        a_output[1] = a_fold1;
+                        b_output[0] = b_fold0;
+                        b_output[1] = b_fold1;
+                        (a_fold0 * b_fold0, (a_fold0 + a_fold1) * (b_fold0 + b_fold1))
+                    })
+                    .reduce(
+                        || (F256::ZERO, F256::ZERO),
+                        |left, right| (left.0 + right.0, left.1 + right.1),
+                    );
+                current_u0 = next_u0;
+                current_u2 = next_u2;
+            } else {
+                a_scratch[0] =
+                    F256::from_base(a_init[0]) + challenge.scale_base(a_init[0] + a_init[1]);
+                b_scratch[0] = b_source[0] + challenge * (b_source[0] + b_source[1]);
+            }
+        } else {
+            let a_source = &a_active[..a_len];
+            let b_source = &b[..b_len];
+            if half >= 2 {
+                let (next_u0, next_u2) = a_scratch[..half]
+                    .par_chunks_mut(2)
+                    .zip(b_scratch[..half].par_chunks_mut(2))
+                    .enumerate()
+                    .map(|(chunk, (a_output, b_output))| {
+                        let base = 4 * chunk;
+                        let a0 = a_source[base];
+                        let a1 = a_source[base + 1];
+                        let a2 = a_source[base + 2];
+                        let a3 = a_source[base + 3];
+                        let b0 = b_source[base];
+                        let b1 = b_source[base + 1];
+                        let b2 = b_source[base + 2];
+                        let b3 = b_source[base + 3];
+                        let a_fold0 = a0 + challenge * (a0 + a1);
+                        let a_fold1 = a2 + challenge * (a2 + a3);
+                        let b_fold0 = b0 + challenge * (b0 + b1);
+                        let b_fold1 = b2 + challenge * (b2 + b3);
+                        a_output[0] = a_fold0;
+                        a_output[1] = a_fold1;
+                        b_output[0] = b_fold0;
+                        b_output[1] = b_fold1;
+                        (a_fold0 * b_fold0, (a_fold0 + a_fold1) * (b_fold0 + b_fold1))
+                    })
+                    .reduce(
+                        || (F256::ZERO, F256::ZERO),
+                        |left, right| (left.0 + right.0, left.1 + right.1),
+                    );
+                current_u0 = next_u0;
+                current_u2 = next_u2;
+            } else {
+                a_scratch[0] = a_source[0] + challenge * (a_source[0] + a_source[1]);
+                b_scratch[0] = b_source[0] + challenge * (b_source[0] + b_source[1]);
+            }
+        }
+        std::mem::swap(&mut a_active, &mut a_scratch);
+        std::mem::swap(&mut b, &mut b_scratch);
+        a_len = half;
+        b_len = half;
+
+        if round < log_batch_size {
+            row_batch_challenges.push(challenge);
+            if round + 1 == log_batch_size {
+                codeword_len = row_batch_fold_all_c1(
+                    initial_codeword,
+                    &mut codeword_scratch,
+                    &row_batch_challenges,
+                );
+                std::mem::swap(&mut codeword_active, &mut codeword_scratch);
+                if !arities.is_empty() {
+                    let leaf_count = codeword_len / post_row_batch_leaf_f256;
+                    post_row_batch_tree = merkle::merkle_tree(
+                        f256_slice_as_bytes(&codeword_active[..codeword_len]),
+                        leaf_count,
+                    );
+                    post_row_batch_commit_root = *post_row_batch_tree.last().expect("non-empty T2");
+                    observe_root(challenger, &post_row_batch_commit_root);
+                    post_row_batch_codeword = codeword_active[..codeword_len].to_vec();
+                }
+            }
+        } else {
+            let fri_round = round - log_batch_size;
+            let layer = k_code - fri_round - 1;
+            codeword_len = fri_fold_codeword_c1(
+                &codeword_active[..codeword_len],
+                &mut codeword_scratch,
+                ntt,
+                layer,
+                challenge,
+            );
+            std::mem::swap(&mut codeword_active, &mut codeword_scratch);
+
+            rounds_in_epoch += 1;
+            if rounds_in_epoch == arities[current_epoch] {
+                let boundary = current_epoch + 1;
+                if boundary <= num_fri_commits {
+                    let next_arity = arities[boundary];
+                    let leaf_f256 = 1usize << next_arity;
+                    let leaf_count = codeword_len / leaf_f256;
+                    let tree = merkle::merkle_tree(
+                        f256_slice_as_bytes(&codeword_active[..codeword_len]),
+                        leaf_count,
+                    );
+                    let root = *tree.last().expect("non-empty C1 epoch tree");
+                    observe_root(challenger, &root);
+                    round_commitments.push(RoundCommitment { root });
+                    epoch_codewords.push(codeword_active[..codeword_len].to_vec());
+                    epoch_trees.push(tree);
+                    epoch_leaf_f256s.push(leaf_f256);
+                } else if let Some((tail_len, _)) = tail_layout
+                    && boundary == num_fri_commits + 1
+                {
+                    debug_assert_eq!(codeword_len, tail_len);
+                    challenger.observe_f256_slice(&codeword_active[..codeword_len]);
+                    plaintext_tail = codeword_active[..codeword_len].to_vec();
+                }
+                rounds_in_epoch = 0;
+                current_epoch += 1;
+            }
+        }
+    }
+
+    debug_assert_eq!(a_len, 1);
+    debug_assert_eq!(b_len, 1);
+    let final_a = a_active[0];
+    let final_b = b[0];
+    let final_codeword = codeword_active[..codeword_len].to_vec();
+
+    let pow_nonce = challenger.grind_pow(QUERY_GRIND_BITS);
+    let mut queries = Vec::with_capacity(n_queries);
+    let initial_leaf_f128 = num_ntts;
+    let initial_leaf_count = initial_codeword.len() / initial_leaf_f128;
+    for position in sample_query_positions(challenger, n_queries, k_code) {
+        let initial_start = position * initial_leaf_f128;
+        let initial_leaf =
+            initial_codeword[initial_start..initial_start + initial_leaf_f128].to_vec();
+        let initial_path = merkle::merkle_proof(initial_tree, initial_leaf_count, position);
+
+        let (post_row_batch_leaf, post_row_batch_path) = if arities.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let leaf_index = position >> first_arity;
+            let start = leaf_index * post_row_batch_leaf_f256;
+            let leaf_count = post_row_batch_codeword.len() / post_row_batch_leaf_f256;
+            (
+                post_row_batch_codeword[start..start + post_row_batch_leaf_f256].to_vec(),
+                merkle::merkle_proof(&post_row_batch_tree, leaf_count, leaf_index),
+            )
+        };
+
+        let mut epoch_leaves = Vec::with_capacity(num_fri_commits);
+        let mut epoch_paths = Vec::with_capacity(num_fri_commits);
+        let mut cumulative_arity = first_arity;
+        for epoch in 0..num_fri_commits {
+            let position_at_epoch = position >> cumulative_arity;
+            let leaf_f256 = epoch_leaf_f256s[epoch];
+            let leaf_index = position_at_epoch / leaf_f256;
+            let start = leaf_index * leaf_f256;
+            let leaf_count = epoch_codewords[epoch].len() / leaf_f256;
+            epoch_leaves.push(epoch_codewords[epoch][start..start + leaf_f256].to_vec());
+            epoch_paths.push(merkle::merkle_proof(
+                &epoch_trees[epoch],
+                leaf_count,
+                leaf_index,
+            ));
+            cumulative_arity += arities[epoch + 1];
+        }
+
+        queries.push(C1QueryOpening {
+            position,
+            initial_leaf,
+            initial_path,
+            post_row_batch_leaf,
+            post_row_batch_path,
+            epoch_leaves,
+            epoch_paths,
+        });
+    }
+
+    C1BaseFoldProof {
+        round_messages,
+        post_row_batch_commit: RoundCommitment {
+            root: post_row_batch_commit_root,
+        },
+        round_commitments,
+        final_a,
+        final_b,
+        final_codeword,
+        plaintext_tail,
+        pow_nonce,
+        queries,
+    }
+}
+
+/// Verify C1 BaseFold and return its wide sumcheck/FRI challenges.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_c1<Ch: Challenger>(
+    target: F256,
+    proof: &C1BaseFoldProof,
+    initial_codeword_root: &Hash,
+    ntt: &AdditiveNttF128,
+    log_msg_len: usize,
+    log_inv_rate: usize,
+    log_batch_size: usize,
+    challenger: &mut Ch,
+) -> Result<Vec<F256>, VerifyError> {
+    use rayon::prelude::*;
+
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    if proof.round_messages.len() != log_msg_len || log_batch_size > log_msg_len {
+        return Err(VerifyError::InvalidProofShape);
+    }
+    let log_dim = log_msg_len - log_batch_size;
+    let k_code = log_dim + log_inv_rate;
+    let num_ntts = 1usize << log_batch_size;
+    let arities = crate::pcs::compute_fri_arities(log_dim);
+    let (num_fri_commits, tail_layout) = fri_commit_layout(k_code, &arities);
+
+    challenger.observe_label(b"history-basefold-c1");
+    if proof.round_commitments.len() != num_fri_commits
+        || proof.plaintext_tail.len() != tail_layout.map_or(0, |layout| layout.0)
+        || proof.queries.len() != default_fri_queries(log_dim, log_inv_rate)
+    {
+        return Err(VerifyError::InvalidProofShape);
+    }
+
+    // With no row batching, T2 is transcript-bound before round zero.
+    if log_batch_size == 0 && !arities.is_empty() {
+        observe_root(challenger, &proof.post_row_batch_commit.root);
+    }
+
+    let mut running_target = target;
+    let mut challenges = Vec::with_capacity(log_msg_len);
+    let mut current_epoch = 0usize;
+    let mut rounds_in_epoch = 0usize;
+    for round in 0..log_msg_len {
+        let message = proof.round_messages[round];
+        challenger.observe_f256(message.u_0);
+        challenger.observe_f256(message.u_2);
+        let challenge = challenger.sample_f256();
+        challenges.push(challenge);
+
+        let u_1 = running_target + message.u_2;
+        running_target = message.u_0 + challenge * u_1 + challenge * challenge * message.u_2;
+
+        if round + 1 == log_batch_size && !arities.is_empty() {
+            observe_root(challenger, &proof.post_row_batch_commit.root);
+        }
+        if round >= log_batch_size {
+            rounds_in_epoch += 1;
+            if rounds_in_epoch == arities[current_epoch] {
+                let boundary = current_epoch + 1;
+                if boundary <= num_fri_commits {
+                    observe_root(challenger, &proof.round_commitments[current_epoch].root);
+                } else if tail_layout.is_some() && boundary == num_fri_commits + 1 {
+                    challenger.observe_f256_slice(&proof.plaintext_tail);
+                }
+                rounds_in_epoch = 0;
+                current_epoch += 1;
+            }
+        }
+    }
+
+    if proof.final_a * proof.final_b != running_target {
+        return Err(VerifyError::SumcheckFinalMismatch);
+    }
+    if proof.final_codeword.len() != 1usize << log_inv_rate {
+        return Err(VerifyError::FinalCodewordNotConstant);
+    }
+    let constant = proof.final_codeword[0];
+    if proof.final_codeword.iter().any(|&value| value != constant) {
+        return Err(VerifyError::FinalCodewordNotConstant);
+    }
+    if constant != proof.final_a {
+        return Err(VerifyError::SumcheckFriMismatch);
+    }
+
+    if !challenger.verify_pow(proof.pow_nonce, QUERY_GRIND_BITS) {
+        return Err(VerifyError::GrindingFailed);
+    }
+    let positions = sample_query_positions(challenger, proof.queries.len(), k_code);
+    let first_arity = arities.first().copied().unwrap_or(0);
+    let initial_leaf_f128 = num_ntts;
+    let post_row_batch_leaf_f256 = 1usize << first_arity;
+    let prefix_micros = total_started.elapsed().as_micros();
+    let queries_started = std::time::Instant::now();
+
+    // Query positions are transcript-bound above. Every opening can now be
+    // checked independently through the node's bounded Rayon pool. Collect
+    // indexed results before returning an error so rejection remains ordered
+    // by query index even though the work itself is parallel.
+    let query_results = proof
+        .queries
+        .par_iter()
+        .enumerate()
+        .map(|(query_index, query)| -> Result<(), VerifyError> {
+            if query.position != positions[query_index] {
+                return Err(VerifyError::FoldMismatch {
+                    query_index,
+                    epoch: 0,
+                });
+            }
+            if query.initial_leaf.len() != initial_leaf_f128
+                || query.initial_path.len() != k_code
+                || query.epoch_leaves.len() != num_fri_commits
+                || query.epoch_paths.len() != num_fri_commits
+            {
+                return Err(VerifyError::InvalidProofShape);
+            }
+            let initial_hash = merkle::hash_leaf(&f128_slice_to_bytes(&query.initial_leaf));
+            if !merkle::verify_merkle_proof(
+                initial_codeword_root,
+                &initial_hash,
+                query.position,
+                &query.initial_path,
+            ) {
+                return Err(VerifyError::InitialMerkleFailed { query_index });
+            }
+
+            let post_row_batch_value =
+                row_batch_fold_one_c1(&query.initial_leaf, &challenges[..log_batch_size]);
+            let fri_challenge_start = log_batch_size;
+            let mut cumulative_arity = first_arity;
+            let mut expected = if arities.is_empty() {
+                post_row_batch_value
+            } else {
+                if query.post_row_batch_leaf.len() != post_row_batch_leaf_f256
+                    || query.post_row_batch_path.len() != k_code - first_arity
+                {
+                    return Err(VerifyError::InvalidProofShape);
+                }
+                let leaf_index = query.position >> first_arity;
+                let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(&query.post_row_batch_leaf));
+                if !merkle::verify_merkle_proof(
+                    &proof.post_row_batch_commit.root,
+                    &leaf_hash,
+                    leaf_index,
+                    &query.post_row_batch_path,
+                ) {
+                    return Err(VerifyError::InitialMerkleFailed { query_index });
+                }
+                let offset = query.position & ((1usize << first_arity) - 1);
+                if query.post_row_batch_leaf[offset] != post_row_batch_value {
+                    return Err(VerifyError::FoldMismatch {
+                        query_index,
+                        epoch: 0,
+                    });
+                }
+                fri_fold_coset_c1(
+                    &query.post_row_batch_leaf,
+                    &challenges[fri_challenge_start..fri_challenge_start + first_arity],
+                    ntt,
+                    k_code,
+                    leaf_index,
+                )
+            };
+
+            for epoch in 0..num_fri_commits {
+                let leaf = &query.epoch_leaves[epoch];
+                let next_arity = arities[epoch + 1];
+                if leaf.len() != 1usize << next_arity {
+                    return Err(VerifyError::InvalidProofShape);
+                }
+                let position_at_layer = query.position >> cumulative_arity;
+                let leaf_index = position_at_layer >> next_arity;
+                let offset = position_at_layer & ((1usize << next_arity) - 1);
+                if query.epoch_paths[epoch].len() != k_code - cumulative_arity - next_arity {
+                    return Err(VerifyError::InvalidProofShape);
+                }
+                let leaf_hash = merkle::hash_leaf(&f256_slice_to_bytes(leaf));
+                if !merkle::verify_merkle_proof(
+                    &proof.round_commitments[epoch].root,
+                    &leaf_hash,
+                    leaf_index,
+                    &query.epoch_paths[epoch],
+                ) {
+                    return Err(VerifyError::RoundMerkleFailed { query_index, epoch });
+                }
+                if leaf[offset] != expected {
+                    return Err(VerifyError::FoldMismatch { query_index, epoch });
+                }
+                let input_layer = k_code - cumulative_arity;
+                expected = fri_fold_coset_c1(
+                    leaf,
+                    &challenges[fri_challenge_start + cumulative_arity
+                        ..fri_challenge_start + cumulative_arity + next_arity],
+                    ntt,
+                    input_layer,
+                    leaf_index,
+                );
+                cumulative_arity += next_arity;
+            }
+
+            if let Some((_, tail_cumulative_arity)) = tail_layout {
+                debug_assert_eq!(cumulative_arity, tail_cumulative_arity);
+                let tail_position = query.position >> cumulative_arity;
+                if proof.plaintext_tail[tail_position] != expected {
+                    return Err(VerifyError::FoldMismatch {
+                        query_index,
+                        epoch: num_fri_commits,
+                    });
+                }
+            } else {
+                let final_position = query.position >> cumulative_arity;
+                if proof.final_codeword[final_position] != expected {
+                    return Err(VerifyError::FoldMismatch {
+                        query_index,
+                        epoch: num_fri_commits,
+                    });
+                }
+            }
+            Ok(())
+        })
+        .collect::<Vec<_>>();
+    for result in query_results {
+        result?;
+    }
+    let queries_micros = queries_started.elapsed().as_micros();
+
+    let tail_started = std::time::Instant::now();
+    if let Some((tail_len, tail_cumulative_arity)) = tail_layout {
+        let remaining = log_dim - tail_cumulative_arity;
+        let coset_len = 1usize << remaining;
+        debug_assert_eq!(tail_len >> remaining, 1usize << log_inv_rate);
+        let fri_challenge_start = log_batch_size;
+        let remaining_challenges =
+            &challenges[fri_challenge_start + tail_cumulative_arity..fri_challenge_start + log_dim];
+        let input_layer = k_code - tail_cumulative_arity;
+        for final_index in 0..tail_len >> remaining {
+            let folded = fri_fold_coset_c1(
+                &proof.plaintext_tail[final_index * coset_len..(final_index + 1) * coset_len],
+                remaining_challenges,
+                ntt,
+                input_layer,
+                final_index,
+            );
+            if folded != proof.final_codeword[final_index] {
+                return Err(VerifyError::FoldMismatch {
+                    query_index: 0,
+                    epoch: num_fri_commits,
+                });
+            }
+        }
+    }
+    if timing {
+        eprintln!(
+            "[basefold-c1 verify] prefix_us={prefix_micros} queries_us={queries_micros} tail_us={} total_us={}",
+            tail_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
+    }
+
+    Ok(challenges)
+}
+
+#[cfg(test)]
+mod c1_tests {
+    use super::*;
+    use crate::challenger::FsLaneChallenger;
+    use crate::pcs::{PcsParams, commit};
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut value = self.0;
+            value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            value ^ (value >> 31)
+        }
+
+        fn f128(&mut self) -> F128 {
+            F128::new(self.next_u64(), self.next_u64())
+        }
+
+        fn f256(&mut self) -> F256 {
+            F256::new(self.f128(), self.f128())
+        }
+    }
+
+    #[test]
+    fn c1_basefold_roundtrips_with_and_without_row_batching() {
+        for log_batch_size in [0usize, 2] {
+            let log_message_len = 8;
+            let params = PcsParams {
+                m: log_message_len + crate::pcs::LOG_PACKING,
+                log_inv_rate: 2,
+                log_batch_size,
+                profile: Default::default(),
+            };
+            let mut rng = Rng(0xC1_BA5E_F01D + log_batch_size as u64);
+            let message = (0..1usize << log_message_len)
+                .map(|_| rng.f128())
+                .collect::<Vec<_>>();
+            let transparent = (0..message.len()).map(|_| rng.f256()).collect::<Vec<_>>();
+            let target = message
+                .iter()
+                .zip(&transparent)
+                .fold(F256::ZERO, |sum, (&left, &right)| {
+                    sum + right.scale_base(left)
+                });
+            let (commitment, prover_data) = commit(&message, &params);
+            let ntt = AdditiveNttF128::standard(params.k_code());
+            let query_count = default_fri_queries(params.log_dim(), params.log_inv_rate);
+
+            let mut prover = FsLaneChallenger::new_c1(b"c1-basefold-roundtrip");
+            let proof = prove_c1(
+                &message,
+                transparent,
+                target,
+                &prover_data.codeword,
+                &prover_data.merkle_tree,
+                &ntt,
+                params.log_inv_rate,
+                params.log_batch_size,
+                query_count,
+                &mut prover,
+            );
+            let mut verifier = FsLaneChallenger::new_c1(b"c1-basefold-roundtrip");
+            let challenges = verify_c1(
+                target,
+                &proof,
+                &commitment.root,
+                &ntt,
+                params.log_msg_len(),
+                params.log_inv_rate,
+                params.log_batch_size,
+                &mut verifier,
+            )
+            .unwrap_or_else(|error| {
+                panic!("C1 BaseFold rejected at log_batch_size={log_batch_size}: {error:?}")
+            });
+            assert_eq!(challenges.len(), log_message_len);
+            assert_eq!(prover.sample_f256(), verifier.sample_f256());
+
+            let mut tampered = proof;
+            tampered.round_messages[0].u_0 += F256::ONE;
+            let mut verifier = FsLaneChallenger::new_c1(b"c1-basefold-roundtrip");
+            assert!(
+                verify_c1(
+                    target,
+                    &tampered,
+                    &commitment.root,
+                    &ntt,
+                    params.log_msg_len(),
+                    params.log_inv_rate,
+                    params.log_batch_size,
+                    &mut verifier,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn c1_fri_leaf_raw_and_canonical_encodings_match() {
+        let mut rng = Rng(0xC1_1EA5);
+        let values = (0..32).map(|_| rng.f256()).collect::<Vec<_>>();
+        assert_eq!(f256_slice_as_bytes(&values), f256_slice_to_bytes(&values));
+    }
+}
+
 #[cfg(test)]
 mod security_configuration_tests {
     use super::*;
 
     #[test]
     fn every_published_basefold_domain_rate_is_finite_length_checked() {
-        // Production recursive ladder: B64, B255/Link. Production
+        // Production recursive ladder: B25, B255/Link. Production
         // fixed helpers: checkpoint chunk core and receipt projection.
         let published = [
-            ("recursive-m22", 17usize, 2usize, 125usize),
-            ("recursive-m23", 18, 2, 125),
-            ("recursive-m24", 19, 2, 125),
+            (
+                "recursive-m22",
+                17usize,
+                2usize,
+                BASEFOLD_RATE_QUARTER_C1_QUERIES,
+            ),
+            ("recursive-m24", 19, 2, BASEFOLD_RATE_QUARTER_C1_QUERIES),
             ("checkpoint-chunk", 4, 4, 96),
             ("receipt-projection", 5, 4, 94),
         ];
@@ -1389,6 +2312,45 @@ mod security_configuration_tests {
                 assert!((config.per_query_bits - ligerito_query).abs() < 1e-12);
                 assert!((config.proximity_term_bits - ligerito_pg).abs() < 1e-12);
             }
+        }
+    }
+
+    #[test]
+    fn c1_history_query_positions_have_exact_lane_geometry() {
+        #[derive(Default)]
+        struct CountingChallenger {
+            requested_lanes: Vec<usize>,
+        }
+
+        impl Challenger for CountingChallenger {
+            fn observe_f128(&mut self, _value: F128) {}
+
+            fn sample_f128(&mut self) -> F128 {
+                unreachable!("sample_query_positions must use one vector squeeze")
+            }
+
+            fn sample_f128_vec(&mut self, n: usize) -> Vec<F128> {
+                self.requested_lanes.push(n);
+                (0..n)
+                    .map(|lane| F128 {
+                        lo: lane as u64,
+                        hi: !(lane as u64),
+                    })
+                    .collect()
+            }
+        }
+
+        for k_code in [20usize, 21] {
+            let mut challenger = CountingChallenger::default();
+            let positions =
+                sample_query_positions(&mut challenger, BASEFOLD_RATE_QUARTER_C1_QUERIES, k_code);
+            assert_eq!(positions.len(), BASEFOLD_RATE_QUARTER_C1_QUERIES);
+            assert_eq!(challenger.requested_lanes, [23]);
+            assert!(
+                positions
+                    .iter()
+                    .all(|&position| position < (1usize << k_code))
+            );
         }
     }
 

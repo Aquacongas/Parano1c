@@ -1,6 +1,6 @@
-# Parano1d
+# Parano1d ①
 
-**A proof-native Layer 1 network secured by proof of work**
+**Proof-native Layer 1 ordered by proof of work.**
 
 Blockchains have a fundamental architectural flaw: to validate the present,
 you must replay the past. Bitcoin, Ethereum, and nearly every major network
@@ -50,6 +50,55 @@ make every node carry that burden. Privacy here comes from non-retention, not
 concealment. Zero knowledge protects the spending witness; proof-native
 validation removes redundant execution.
 
+## Soundness
+
+| Security statement | Current production result |
+|---|---:|
+| Target FRI security | **128 bits** |
+| Provable Block–Tiwari FS-FRI security | **127 bits** |
+| Conjectured Block–Tiwari FS-FRI security | **127 bits** |
+| Sequential ideal-QROM half-success boundary | **64.707407428576 bits** |
+| NIST Post-Quantum Cryptography Category | **Category 1** |
+| Dominant Category 1 gate-depth floor | **173.273866314232 bits** |
+| Margin over the NIST `2^170` reference | **3.273866314232 bits** |
+| Complete ideal bound at the Category 1 envelope | **0.053364140323608411** |
+
+### Block–Tiwari FS-FRI comparison
+
+[Block and Tiwari](https://eprint.iacr.org/2024/1161) define concrete FS-FRI
+security as the minimum expected classical random-oracle query work over every
+positive integer query budget. Applying their definitions, 256-bit
+random-oracle setting and whole-bit presentation to the production B25 and
+B255 profiles gives 127 provable bits and 127 conjectured bits against a
+128-bit target. Both expected-work values lie in the exact interval
+`[127, 128)`. The complete substitutions, integer optimization and comparison
+with the systems in their published table are given in the
+[Block–Tiwari derivation](noid_soundness/docs/block-tiwari.md).
+
+### End-to-end Category 1
+
+The end-to-end security game asks whether one stateful quantum adversary can
+make the production verifier accept an invalid terminal State whose recursive
+ancestry starts at genesis. The reduction covers wallet authorization, the
+block relation, parent links, the exact State transition, recursive
+verification and the claimed ancestry under one adversarial resource budget.
+
+`C1` is the source identifier for the production wide-challenge profile. It
+uses 65 wallet queries, 133 History queries and algebraic challenges sampled
+uniformly from a trace-one affine set of cardinality `2^255` in `GF(2^256)`.
+The Category 1 assessment follows from the depth-aware resource theorem, which
+evaluates the NIST Post-Quantum Cryptography Category 1 reference at every
+specified `MAXDEPTH` point.
+
+The fixed Poseidon2b production corollary requires
+`Delta_P2b^C1 < 0.446635859676391589` and the coherent response-cost premise
+stated by the resource theorem. Under these premises, the theorem gives
+provable end-to-end post-quantum soundness for state validation from genesis at
+NIST PQC Category 1: every adversary inside the Category 1 resource envelope
+has success probability below one half in the from-genesis invalid-State game.
+The complete theorem is in the
+[end-to-end QROM and Category 1 derivation](noid_soundness/docs/category-one.md).
+
 ## How It Works
 
 ### Execution Is Local
@@ -88,9 +137,10 @@ terminal inside the same relation. Proof size and verification work do not
 increase with block height.
 
 An active node keeps the exact live state, compact headers for cumulative work,
-and the latest 18 complete blocks for competing miners and reorgs. A joining
-node authenticates a finalized current state with its matching terminal, then
-verifies that recent suffix normally.
+and the latest 18 canonical block bodies for competing miners and reorgs. A
+joining node authenticates a finalized current state with its matching
+terminal, then verifies one recursive terminal at the recent suffix tip before
+applying the linked bodies.
 
 Parano1d is history-stateless, not state-free. State transfer scales with the
 live UTXO set. What no longer scales with chain age is the execution required
@@ -142,9 +192,11 @@ paths.
 
 ### One Binary Proof Stack
 
-The protocol is built over the binary tower field `GF(2^128)`. Poseidon2b is
-the common permutation for addresses, transactions, Merkle trees, state roots,
-transcripts, block identifiers and PoW.
+The committed trace arithmetic is built over the binary tower field
+`GF(2^128)`. The production wide-challenge layer lifts Fiat–Shamir challenges,
+terminal claims and recursive region authentication into `GF(2^256)`.
+Poseidon2b is the common permutation for addresses, transactions, Merkle trees,
+state roots, transcripts, block identifiers and PoW.
 
 For Parano1d, we developed FROST-GKR (Frobenius Reduction Over Shifted
 Tables). It packs entire Poseidon2b batches and Merkle paths into direct
@@ -153,10 +205,11 @@ low-degree sumcheck chain for every permutation. In a like-for-like
 59-permutation benchmark, this reduces median prover time by 10.69×, median
 protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
 Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
-relation without a trusted setup. The two authenticated launch matrices — B64
-at `m=23` and B255 at `m=24` — are embedded in the official binary and can be
-regenerated from source. The Parano1d Lab [FROST-GKR research
-article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
+relation without a trusted setup. One joint `GF(2^256)` transcript binds the
+three Link and six Block recursive regions into the outer PCS batch. The two
+authenticated launch matrices, B25 at `m=22` and B255 at `m=24`, are embedded
+in the official binary and can be regenerated from source. The Parano1d Lab
+[FROST-GKR research article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
 measurement record.
 
@@ -175,18 +228,19 @@ PoW has one job: choose the order of valid transitions. Hash power cannot make
 an invalid `HistoryStep` acceptable.
 
 The miner proves the nonce-independent block first, then searches a fixed
-Poseidon2b header with a 128-bit nonce. ASERT targets a 15-second mean interval,
-and cumulative work selects the chain. An external miner receives an immutable,
-single-use template and returns only a nonce; it cannot alter the transactions
-or state root.
+Poseidon2b header with a 128-bit nonce. ASERT targets the complete interval
+between accepted blocks, including proof preparation, nonce search and
+propagation, at a 15-second mean. Cumulative work selects the chain. An external
+miner receives an immutable, single-use template and returns only a nonce; it
+cannot alter the transactions or state root.
 
 ## Launch Profile
 
 | Parameter | Value |
 |---|---:|
 | Mean block target | 15 seconds |
-| Default miner class | B64, `m=23`, up to 64 user pages |
-| Large miner class | B255, `m=24`, up to 255 user pages |
+| Default miner class | B25, `m=22`, up to 25 effective page positions |
+| Large miner class | B255, `m=24`, up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
 | Maximum one-page throughput | 17 TPS |
 | Maximum inputs in one transaction | 1,020 |
@@ -194,40 +248,12 @@ or state root.
 | Recent block / reorg suffix | 18 blocks |
 | State domain | `2^24` to `2^32` slots |
 
-B64 is the laptop-class mining floor, not the protocol ceiling. On the
-reference 12-thread Intel Core i7-1365U, saturated B64 preparation measures
-14.387 seconds at p95 and verification measures 0.720 seconds at p95. Faster
-hardware may qualify B255; every node verifies both classes. Full measurements
-are in the [two-class benchmark](research/two_class/results/2026-07-17-history-step-lto-20-sample.md).
+B25 is the laptop-class mining floor, not the protocol ceiling. The production
+capacity selector measures complete preparation on each host and uses B255 only
+when that host sustains the larger class within the block cadence. Every node
+verifies both classes.
 
-## Proof Security Profile
-
-Parano1d reports proof security using the same scoped metrics published by
-established FRI and STARK projects. Under the literal Toy Problem convention
-used by Plonky2 and RISC Zero, the production wallet and `HistoryStep`
-parameters each reach the `GF(2^128)` field cap: **128 bits of conjectured FRI
-security**.
-
-| Published system and metric | Published value | Parano1d under the corresponding metric |
-|---|---:|---:|
-| [Plonky2 default FRI](https://github.com/0xPolygonZero/plonky2#security), Toy Problem conjecture | **100 bits conjectured**; default Poseidon estimated at about **95 bits** | **128 bits conjectured**, using the literal Plonky2 formula and production field cap |
-| [RISC Zero soundness calculator](https://github.com/risc0/risc0/blob/release-3.0/risc0/zkp/src/prove/soundness.rs#L15-L35), Toy Problem conjecture | **97 bits conjectured** at `2^20`; **95 bits conjectured** at `2^24` | **128 bits conjectured**, using the corresponding rate/query calculation |
-| [ethSTARK / StarkWare](https://www.starknet.io/blog/safe-and-sound-a-deep-dive-into-stark-security/), round-by-round and `t/e(t)` analysis | **96-bit RBR** IOP premise; **95-bit** compiled-STARK result under its stated operation-count definition | **96.047-bit** wallet generalized-RBR knowledge bound; **95.022-bit** fixed-invalid-block work-accounted finite composition |
-
-These are corresponding scalar conventions, not interchangeable security
-games. The exact production inputs, formulas and regression tests are published
-in the [Parano1d soundness workbench](https://github.com/ignotusnemo/parano1d-soundness).
-The corresponding Parano1d Lab
-[analysis](https://lab.parano1d.org/research/parano1d-soundness-industry-metrics/)
-defines the metrics and comparison in full.
-In the terminology used for transparent STARK and FRI systems, Parano1d has
-a post-quantum-resistant transaction proof stack: it is transparent and
-hash-based, requires no trusted setup and places no elliptic-curve signature
-in transaction consensus. The numerical claims above remain attached to their
-exact published conventions rather than being collapsed into a different
-end-to-end metric.
-
-### Development Allocation
+## Development Allocation
 
 Parano1d has no premine. For blocks 1 through 6,307,200 — exactly three
 365-day target-time years — each block reward is divided by consensus:
@@ -325,8 +351,8 @@ pinned Rust toolchain, a native C/C++ toolchain, CMake, libclang and
 
 Official binaries keep a portable process-wide baseline so they can inspect
 the host before entering proof code. Production requires SSE4.1 and
-PCLMULQDQ on x86-64, or NEON and PMULL on ARM64. Each binary then selects
-PCLMULQDQ, AVX2+VPCLMULQDQ, AVX-512 or NEON+PMULL kernels at runtime. The
+PCLMULQDQ on x86-64, or NEON and PMULL on ARM64. Each binary then selects the
+`pclmul`, `avx2+vpclmul`, `avx512bw+vpclmul` or `neon+pmull` backend at runtime. The
 scalar implementation is a differential-test oracle and is never used by a
 production node. Run `parano1d --check-hardware` before installation to see
 the selected backend without creating configuration, wallet or chain data.
@@ -372,6 +398,13 @@ tar -xzf /path/to/history-step-pack-v1.tar.gz -C ../release-pack
 
 ./scripts/build_release.sh \
   --pack ../release-pack/history-step-pack-v1
+```
+
+To reproduce the production soundness calculation, see
+[`noid_soundness`](noid_soundness/README.md) and run:
+
+```sh
+cargo run --release --locked -p noid_soundness
 ```
 
 Designed and developed by **Ignotus Nemo**. Licensed under the

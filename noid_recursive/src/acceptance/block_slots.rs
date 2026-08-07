@@ -142,7 +142,7 @@ mod selected_zk_capability_tests {
                 );
             }
             let pad = capability.slot(255);
-            assert_eq!(pad.kind(), CanonicalSelectedZkAuthorizationSlotKind::Pad255);
+            assert_eq!(pad.kind(), CanonicalSelectedZkAuthorizationSlotKind::Pad);
             assert!(pad.body_aliases().is_none());
             assert_eq!(pad.liveness().eval(b.values()), F128::ZERO);
             assert_eq!(pad.native_statement(), ghost_statement);
@@ -151,7 +151,7 @@ mod selected_zk_capability_tests {
 
     #[test]
     fn selected_capability_uses_each_canonical_class_capacity() {
-        for tier in [64usize, 255] {
+        for tier in [25usize, 255] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
             for live_count in [0usize, tier] {
                 let (b, capability) =
@@ -169,15 +169,12 @@ mod selected_zk_capability_tests {
                         }
                     );
                 }
-                if tier == 255 {
+                for index in tier..geometry.auth_tiles {
                     assert_eq!(
-                        capability.slot(255).kind(),
-                        CanonicalSelectedZkAuthorizationSlotKind::Pad255
+                        capability.slot(index).kind(),
+                        CanonicalSelectedZkAuthorizationSlotKind::Pad
                     );
-                    assert!(capability.slot(255).body_aliases().is_none());
-                } else {
-                    assert_eq!(capability.len(), tier);
-                    assert!(capability.slot(tier - 1).body_aliases().is_some());
+                    assert!(capability.slot(index).body_aliases().is_none());
                 }
             }
         }
@@ -789,7 +786,7 @@ fn bind_tx_epoch_anchors(
 pub(in crate::acceptance) enum CanonicalSelectedZkAuthorizationSlotKind {
     Live,
     Ghost,
-    Pad255,
+    Pad,
 }
 
 /// One statement/liveness tuple owned by the canonical Block relation.
@@ -826,7 +823,7 @@ impl CanonicalSelectedZkAuthorizationSlot {
 }
 
 /// Non-Clone statement authority minted only by `BlockSlots` after
-/// boolean/monotone liveness, complete dead-body ghost pins and PAD255=0 are
+/// boolean/monotone liveness and complete dead-body and PAD ghost pins are
 /// already in the same matrix. It intentionally has no raw constructor or
 /// statement-Vec extractor. Builder affinity comes from the private owning
 /// selected assembly choke point, not from this carrier by itself.
@@ -862,8 +859,8 @@ fn block_from_alias(b: &FieldR1csBuilder, expression: &LinExpr) -> Block128 {
 /// Extract one exact selected-class statement surface. Logical PagedSpend
 /// hashes/owners pass through compaction and live/ghost selection expressions,
 /// so every body slot is materialized into four canonical one-wire aliases
-/// before the transcript checker consumes it. B255's PAD has no body; its four
-/// protocol constants are materialized later by the selected assembly.
+/// before the transcript checker consumes it. PAD slots have no body; their
+/// four protocol constants are materialized later by the selected assembly.
 fn mint_canonical_selected_zk_authorization_capability(
     b: &mut FieldR1csBuilder,
     groups: &[PagedSpendGroupTrace],
@@ -874,9 +871,8 @@ fn mint_canonical_selected_zk_authorization_capability(
     let body_auth_slots = geometry.tier;
     assert_eq!(body_auth_slots, geometry.tier);
     assert_eq!(auth_slots, geometry.auth_tiles);
-    if auth_slots > body_auth_slots {
-        assert_eq!(geometry.tier, 255, "only B255 has an authorization PAD");
-        assert_eq!(groups[auth_slots - 1].live.eval(b.values()), F128::ZERO);
+    for group in &groups[body_auth_slots..] {
+        assert_eq!(group.live.eval(b.values()), F128::ZERO);
     }
 
     let ghost_body = noid_gkr::ghost_tx::ghost_tx_body();
@@ -923,13 +919,13 @@ fn mint_canonical_selected_zk_authorization_capability(
             kind,
         });
     }
-    if auth_slots > body_auth_slots {
+    for index in body_auth_slots..auth_slots {
         slots.push(CanonicalSelectedZkAuthorizationSlot {
             tx_body_hash: None,
             expected_address: None,
-            liveness: groups[auth_slots - 1].live.clone(),
+            liveness: groups[index].live.clone(),
             native_statement: ghost_statement,
-            kind: CanonicalSelectedZkAuthorizationSlotKind::Pad255,
+            kind: CanonicalSelectedZkAuthorizationSlotKind::Pad,
         });
     }
     CanonicalSelectedZkAuthorizationCapability { slots }
@@ -987,7 +983,7 @@ pub(in crate::acceptance) fn canonical_selected_zk_authorization_fixture_for_tie
             }
         })
         .collect::<Vec<_>>();
-    if geometry.auth_tiles > body_auth_slots {
+    for _ in body_auth_slots..geometry.auth_tiles {
         groups.push(PagedSpendGroupTrace {
             live: LinExpr::zero(),
             logical_txid: [LinExpr::zero(), LinExpr::zero()],
@@ -1144,8 +1140,8 @@ struct BlockSlotsCoreAssembly {
     nonce_seal: DirectBlockNonceSeal,
 }
 
-/// Private selected-B255 handoff for the production outer Block owner.  It
-/// keeps the ordinary Block statement aliases and the opaque bound V4 region
+/// Private selected-class handoff for the production outer Block owner. It
+/// keeps the ordinary Block statement aliases and the opaque bound region
 /// together until the owner has appended its public-IO pins and built the
 /// same builder.
 pub(in crate::acceptance) struct SelectedZkBlockSlotsAssembly {
@@ -1447,7 +1443,7 @@ fn build_selected_zk_block_slots_core(
     // Canonical body-order action candidates. Coinbase has exactly one live
     // mint, the selected payout view contributes two schedule-gated mints,
     // and each fixed user view contributes its eight input and two output
-    // bitmap positions. The extra B255 authorization PAD has no action slot.
+    // bitmap positions. Dyadic authorization PADs have no action slots.
     let user_action_slots = tier.saturating_mul(noid_tx::TX_ACTIONS);
     let mut action_candidates = Vec::with_capacity(user_action_slots + 3);
     let mut selected_input_bits = Vec::with_capacity(tier.saturating_mul(noid_tx::TX_INPUTS));

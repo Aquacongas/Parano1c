@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Canonical m23/m24 parent-proof union layout.
+//! Canonical m22/m24 parent-proof union layout.
 //!
 //! This module certifies the exact shape delta that a two-matrix HistoryStep
 //! must absorb. It deliberately does not claim to be the complete parent
@@ -17,7 +17,7 @@ use noid_ivc_core::pcs::{
 #[cfg(test)]
 use crate::circuit_support::{mul, pin_zero, FieldR1csBuilder, LinExpr, F128};
 
-pub const B64_OUTER_M: usize = 23;
+pub const B25_OUTER_M: usize = 22;
 pub const B255_OUTER_M: usize = 24;
 pub const HISTORY_K_SKIP: usize = 6;
 pub const HISTORY_PCS_LOG_INV_RATE: usize = 2;
@@ -25,14 +25,14 @@ pub const HISTORY_PCS_LOG_BATCH_SIZE: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParentProofClass {
-    B64,
+    B25,
     B255,
 }
 
 impl ParentProofClass {
     pub const fn outer_m(self) -> usize {
         match self {
-            Self::B64 => B64_OUTER_M,
+            Self::B25 => B25_OUTER_M,
             Self::B255 => B255_OUTER_M,
         }
     }
@@ -127,33 +127,33 @@ impl ParentProofGeometry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParentUnionLayout {
-    pub b64: ParentProofGeometry,
+    pub b25: ParentProofGeometry,
     pub b255: ParentProofGeometry,
-    /// Maximum-shape payload cells that are absent from canonical m23.
-    pub inactive_m23_suffix_fields: usize,
+    /// Maximum-shape payload cells that are absent from canonical m22.
+    pub inactive_m22_suffix_fields: usize,
 }
 
 impl ParentUnionLayout {
     pub fn canonical() -> Self {
-        let b64 = ParentProofGeometry::canonical(ParentProofClass::B64);
+        let b25 = ParentProofGeometry::canonical(ParentProofClass::B25);
         let b255 = ParentProofGeometry::canonical(ParentProofClass::B255);
-        assert_eq!(b64.fri_queries, b255.fri_queries);
-        assert_eq!(b64.fri_commitments, b255.fri_commitments);
-        assert_eq!(b64.region_query_leaf_fields, b255.region_query_leaf_fields);
-        let inactive_m23_suffix_fields = b255
+        assert_eq!(b25.fri_queries, b255.fri_queries);
+        assert_eq!(b25.fri_commitments, b255.fri_commitments);
+        assert_eq!(b25.region_query_leaf_fields, b255.region_query_leaf_fields);
+        let inactive_m22_suffix_fields = b255
             .path_free_proof_fields
-            .checked_sub(b64.path_free_proof_fields)
-            .expect("m24 parent payload contains m23");
+            .checked_sub(b25.path_free_proof_fields)
+            .expect("m24 parent payload contains m22");
         Self {
-            b64,
+            b25,
             b255,
-            inactive_m23_suffix_fields,
+            inactive_m22_suffix_fields,
         }
     }
 }
 
 /// Build the canonical inactive-suffix relation used by the future union
-/// verifier. The maximum m24 payload is always allocated. For an m23 parent,
+/// verifier. The maximum m24 payload is always allocated. For an m22 parent,
 /// every shape-only suffix cell is constrained to zero.
 #[cfg(test)]
 fn build_suffix_relation(
@@ -163,9 +163,9 @@ fn build_suffix_relation(
     let layout = ParentUnionLayout::canonical();
     let mut builder = FieldR1csBuilder::new();
     let parent_is_m24 = LinExpr::from_wire(builder.alloc_bool(class.is_m24()));
-    let parent_is_m23 = parent_is_m24.add_const(F128::ONE);
+    let parent_is_m22 = parent_is_m24.add_const(F128::ONE);
 
-    for index in 0..layout.inactive_m23_suffix_fields {
+    for index in 0..layout.inactive_m22_suffix_fields {
         let live_value = if class.is_m24() {
             F128::new(index as u64 + 1, 0)
         } else if corrupt_first_inactive && index == 0 {
@@ -174,7 +174,7 @@ fn build_suffix_relation(
             F128::ZERO
         };
         let cell = LinExpr::from_wire(builder.alloc_f128(live_value));
-        let inactive_residual = mul(&mut builder, &parent_is_m23, &cell);
+        let inactive_residual = mul(&mut builder, &parent_is_m22, &cell);
         pin_zero(&mut builder, &inactive_residual);
     }
     builder.build()
@@ -187,30 +187,30 @@ mod tests {
     #[test]
     fn production_shapes_have_one_canonical_union_delta() {
         let layout = ParentUnionLayout::canonical();
-        assert_eq!(layout.b64.fri_arities, [4, 4, 4, 4, 2]);
+        assert_eq!(layout.b25.fri_arities, [4, 4, 4, 4, 1]);
         assert_eq!(layout.b255.fri_arities, [4, 4, 4, 4, 3]);
-        assert_eq!(layout.b64.fri_commitments, 2);
+        assert_eq!(layout.b25.fri_commitments, 2);
         assert_eq!(layout.b255.fri_commitments, 2);
-        assert_eq!(layout.b64.plaintext_tail_fields, 256);
+        assert_eq!(layout.b25.plaintext_tail_fields, 128);
         assert_eq!(layout.b255.plaintext_tail_fields, 512);
-        assert_eq!(layout.b64.region_query_leaf_fields, 80);
+        assert_eq!(layout.b25.region_query_leaf_fields, 80);
         assert_eq!(layout.b255.region_query_leaf_fields, 80);
-        assert_eq!(layout.inactive_m23_suffix_fields, 266);
+        assert_eq!(layout.inactive_m22_suffix_fields, 404);
     }
 
     #[test]
     fn parent_class_changes_witness_not_suffix_matrix() {
-        let (m23_matrix, m23_witness) = build_suffix_relation(ParentProofClass::B64, false);
+        let (m22_matrix, m22_witness) = build_suffix_relation(ParentProofClass::B25, false);
         let (m24_matrix, m24_witness) = build_suffix_relation(ParentProofClass::B255, false);
-        assert!(m23_matrix.satisfies(&m23_witness));
+        assert!(m22_matrix.satisfies(&m22_witness));
         assert!(m24_matrix.satisfies(&m24_witness));
-        assert_eq!(m23_matrix.useful_rows, m24_matrix.useful_rows);
+        assert_eq!(m22_matrix.useful_rows, m24_matrix.useful_rows);
         assert_eq!(
-            m23_matrix.structural_statement_digest(),
+            m22_matrix.structural_statement_digest(),
             m24_matrix.structural_statement_digest()
         );
 
-        let (_, corrupt_m23) = build_suffix_relation(ParentProofClass::B64, true);
-        assert!(!m23_matrix.satisfies(&corrupt_m23));
+        let (_, corrupt_m22) = build_suffix_relation(ParentProofClass::B25, true);
+        assert!(!m22_matrix.satisfies(&corrupt_m22));
     }
 }

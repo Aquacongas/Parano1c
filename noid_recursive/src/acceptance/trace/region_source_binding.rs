@@ -9,15 +9,19 @@
 //! protocols below reconstruct their terminal openings from verifier-pinned
 //! layouts; prover-controlled region descriptors are never accepted.
 
-use noid_fri_binius::zk_capsule_pcs::ZK_CAPSULE_PCS_QUERY_COUNT as SELECTED_ZK_QUERY_COUNT;
+use noid_fri_binius::zk_capsule_pcs::{
+    ZK_CAPSULE_PCS_MID_PATH_DEPTH, ZK_CAPSULE_PCS_QUERY_COUNT as SELECTED_ZK_QUERY_COUNT,
+    ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+};
 use noid_poseidon2b::native::domain::{capacity_iv, DomainTag, TAG_CAPSNODE, TAG_EXSTNOD};
 #[cfg(test)]
-use noid_poseidon2b::native::domain::{TAG_FRICHANL, TAG_KSCHANNL};
+use noid_poseidon2b::native::domain::{TAG_FRICHANL, TAG_KSCH256, TAG_KSCHANNL};
 use noid_poseidon2b::native::permutation::STATE_SIZE;
 
 use noid_ivc_core::challenger::Challenger;
 #[cfg(test)]
 use noid_ivc_core::challenger::FsLaneChallenger;
+use noid_ivc_core::deep_chain::capsule_leaf::CAPSULE_LEAF_STRIDE;
 #[cfg(test)]
 use noid_ivc_core::deep_chain::ff_merkle::{
     build_ff_merkle_path_columns, ff_merkle_fixed_patterns, FfMerklePathFamily, FfMerklePathWitness,
@@ -75,9 +79,10 @@ use super::fri_pcs::mle_evaluate_small_trace;
 #[cfg(test)]
 use super::paired_merkle_update::paired_merkle_update_fixed_patterns;
 use super::paired_merkle_update::{
-    build_paired_merkle_update_columns, paired_merkle_update_refs,
-    paired_merkle_update_substitution_terms, paired_update_root_offsets, PairedMerkleUpdateRefs,
-    PAIRED_UPDATE_DEPTH, PAIRED_UPDATE_SLOTS_PER_LEVEL, PAIRED_UPDATE_STRIDE,
+    build_paired_merkle_update_columns, paired_merkle_update_consistency_terms,
+    paired_merkle_update_refs, paired_merkle_update_substitution_terms, paired_update_root_offsets,
+    PairedMerkleUpdateRefs, PAIRED_UPDATE_DEPTH, PAIRED_UPDATE_SLOTS_PER_LEVEL,
+    PAIRED_UPDATE_STRIDE,
 };
 use super::{mul, pin_eq};
 use crate::acceptance::zk_auth_capsule_schedule::{
@@ -211,8 +216,8 @@ pub struct PairedLocalExactStateCells {
     pub new_entry: [LinExpr; 2],
     pub old_root: [LinExpr; 2],
     pub new_root: [LinExpr; 2],
-    /// One old-even direction cell per level. The paired new-even copy is
-    /// tied to it by exact Stage-2 equality constraints.
+    /// One old-even direction cell per level. The committed four-slot copy
+    /// chain is enforced by the post-commit Merkle relation.
     pub directions: [LinExpr; PAIRED_UPDATE_DEPTH],
 }
 
@@ -271,9 +276,10 @@ pub fn auth_pcs_main_c_sidecar_purpose() -> [u8; 32] {
 }
 
 // Selected-ZK column counts shared by both canonical geometries. Domain
-// logs and class capacities come from the exact V4 geometry certificate in
+// logs and class capacities come from the exact geometry certificate in
 // `region_sidecar::block`; lower tiers never allocate B255-sized columns.
 const SELECTED_ZK_REGION_QUERY_LOG: usize = 6;
+const SELECTED_ZK_REGION_CORE_QUERY_COUNT: usize = 1 << SELECTED_ZK_REGION_QUERY_LOG;
 const SELECTED_ZK_REGION_WALLET_A_COLUMNS: usize = 6;
 const SELECTED_ZK_REGION_WALLET_B_COLUMNS: usize = 9;
 const SELECTED_ZK_REGION_META_B_COLUMNS: usize = 9;
@@ -300,7 +306,7 @@ const SELECTED_ZK_REGION_OWNER_LOG: usize = 15;
 #[cfg(test)]
 const SELECTED_ZK_REGION_COMMITTED_CELLS: usize = 7_536_640;
 
-const _: () = assert!(SELECTED_ZK_QUERY_COUNT == 1 << SELECTED_ZK_REGION_QUERY_LOG);
+const _: () = assert!(SELECTED_ZK_QUERY_COUNT == SELECTED_ZK_REGION_CORE_QUERY_COUNT + 1);
 const _: () = assert!(
     SELECTED_ZK_REGION_WALLET_A_COLUMNS
         + SELECTED_ZK_REGION_WALLET_B_COLUMNS
@@ -345,55 +351,119 @@ impl SelectedZkAuthPcsRegionAllocation {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum SelectedZkRegionFamily {
+    Main,
+    Owner,
+    WalletB,
+    WalletA,
+    MetaA,
+    MetaB,
+}
+
+impl SelectedZkRegionFamily {
+    const ALL: [Self; 6] = [
+        Self::Main,
+        Self::Owner,
+        Self::WalletB,
+        Self::WalletA,
+        Self::MetaA,
+        Self::MetaB,
+    ];
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+
+    fn dimensions(
+        self,
+        geometry: crate::region_sidecar::SelectedZkBlockGeometry,
+    ) -> (usize, usize) {
+        match self {
+            Self::Main => (geometry.main_w_log, SELECTED_ZK_REGION_MAIN_COLUMNS),
+            Self::Owner => (geometry.owner_w_log, SELECTED_ZK_REGION_OWNER_COLUMNS),
+            Self::WalletB => (geometry.wallet_b_w_log, SELECTED_ZK_REGION_WALLET_B_COLUMNS),
+            Self::WalletA => (geometry.wallet_a_w_log, SELECTED_ZK_REGION_WALLET_A_COLUMNS),
+            Self::MetaA => (geometry.meta_a_w_log, SELECTED_ZK_REGION_META_A_COLUMNS),
+            Self::MetaB => (geometry.meta_b_w_log, SELECTED_ZK_REGION_META_B_COLUMNS),
+        }
+    }
+}
+
+fn next_selected_family_permutation(order: &mut [SelectedZkRegionFamily; 6]) -> bool {
+    let Some(pivot) = (0..order.len() - 1)
+        .rev()
+        .find(|&index| order[index] < order[index + 1])
+    else {
+        return false;
+    };
+    let successor = (pivot + 1..order.len())
+        .rev()
+        .find(|&index| order[pivot] < order[index])
+        .expect("permutation pivot has a successor");
+    order.swap(pivot, successor);
+    order[pivot + 1..].reverse();
+    true
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SelectedZkRegionAllocationLedger {
     before: usize,
-    wallet_a: usize,
-    wallet_b: usize,
-    meta_b: usize,
+    order: [SelectedZkRegionFamily; 6],
     main: usize,
-    meta_a: usize,
     owner: usize,
+    wallet_b: usize,
+    wallet_a: usize,
+    meta_a: usize,
+    meta_b: usize,
     after: usize,
 }
 
 impl SelectedZkRegionAllocationLedger {
     fn new(before: usize, geometry: crate::region_sidecar::SelectedZkBlockGeometry) -> Self {
-        let wallet_a = before
-            .checked_next_multiple_of(1 << geometry.wallet_a_w_log)
-            .expect("selected wallet-A alignment overflow");
-        let wallet_a_end =
-            wallet_a + SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << geometry.wallet_a_w_log);
-        let wallet_b = wallet_a_end
-            .checked_next_multiple_of(1 << geometry.wallet_b_w_log)
-            .expect("selected wallet-B alignment overflow");
-        let wallet_b_end =
-            wallet_b + SELECTED_ZK_REGION_WALLET_B_COLUMNS * (1 << geometry.wallet_b_w_log);
-        let meta_b = wallet_b_end
-            .checked_next_multiple_of(1 << geometry.meta_b_w_log)
-            .expect("selected Meta-B alignment overflow");
-        let meta_b_end = meta_b + SELECTED_ZK_REGION_META_B_COLUMNS * (1 << geometry.meta_b_w_log);
-        let main = meta_b_end
-            .checked_next_multiple_of(1 << geometry.main_w_log)
-            .expect("selected Main alignment overflow");
-        let main_end = main + SELECTED_ZK_REGION_MAIN_COLUMNS * (1 << geometry.main_w_log);
-        let meta_a = main_end
-            .checked_next_multiple_of(1 << geometry.meta_a_w_log)
-            .expect("selected Meta-A alignment overflow");
-        let meta_a_end = meta_a + SELECTED_ZK_REGION_META_A_COLUMNS * (1 << geometry.meta_a_w_log);
-        let owner = meta_a_end
-            .checked_next_multiple_of(1 << geometry.owner_w_log)
-            .expect("selected Owner alignment overflow");
-        let after = owner + SELECTED_ZK_REGION_OWNER_COLUMNS * (1 << geometry.owner_w_log);
+        let mut candidate = SelectedZkRegionFamily::ALL;
+        let mut best_order = candidate;
+        let mut best_starts = [0usize; 6];
+        let mut best_after = usize::MAX;
+        loop {
+            let mut cursor = before;
+            let mut starts = [0usize; 6];
+            for family in candidate {
+                let (w_log, columns) = family.dimensions(geometry);
+                let width = 1usize
+                    .checked_shl(w_log as u32)
+                    .expect("selected family width overflow");
+                cursor = cursor
+                    .checked_next_multiple_of(width)
+                    .expect("selected family alignment overflow");
+                starts[family.index()] = cursor;
+                cursor = cursor
+                    .checked_add(
+                        columns
+                            .checked_mul(width)
+                            .expect("selected family column span overflow"),
+                    )
+                    .expect("selected family allocation overflow");
+            }
+            if cursor < best_after {
+                best_order = candidate;
+                best_starts = starts;
+                best_after = cursor;
+            }
+            if !next_selected_family_permutation(&mut candidate) {
+                break;
+            }
+        }
         Self {
             before,
-            wallet_a,
-            wallet_b,
-            meta_b,
-            main,
-            meta_a,
-            owner,
-            after,
+            order: best_order,
+            main: best_starts[SelectedZkRegionFamily::Main.index()],
+            owner: best_starts[SelectedZkRegionFamily::Owner.index()],
+            wallet_b: best_starts[SelectedZkRegionFamily::WalletB.index()],
+            wallet_a: best_starts[SelectedZkRegionFamily::WalletA.index()],
+            meta_a: best_starts[SelectedZkRegionFamily::MetaA.index()],
+            meta_b: best_starts[SelectedZkRegionFamily::MetaB.index()],
+            after: best_after,
         }
     }
 }
@@ -514,30 +584,6 @@ pub(crate) struct FfLegSpec {
     pub(crate) region: usize,
 }
 
-/// Place one ff-Merkle family's columns into the shared walk-B tables:
-/// CR → the shared E columns [4..6), SIB → [6..8), D → 8, plus the walk
-/// state columns.
-pub(crate) fn place_ff(
-    cb: &mut [Vec<F128>],
-    s0b: &mut [Vec<F128>; STATE_SIZE],
-    soutb: &mut [Vec<F128>; STATE_SIZE],
-    cols: &noid_ivc_core::deep_chain::ff_merkle::FfMerklePathColumns,
-    meta_base: usize,
-    n_slots: usize,
-) {
-    let rng = meta_base..meta_base + n_slots;
-    for j in 0..2 {
-        cb[4 + j][rng.clone()].copy_from_slice(&cols.cr[j][0..n_slots]);
-        cb[6 + j][rng.clone()].copy_from_slice(&cols.sib[j][0..n_slots]);
-    }
-    cb[8][rng.clone()].copy_from_slice(&cols.d[0..n_slots]);
-    for j in 0..STATE_SIZE {
-        cb[j][rng.clone()].copy_from_slice(&cols.c[j][0..n_slots]);
-        s0b[j][rng.clone()].copy_from_slice(&cols.s0[j][0..n_slots]);
-        soutb[j][rng.clone()].copy_from_slice(&cols.s_out[j][0..n_slots]);
-    }
-}
-
 /// The tx-root region handoff: every transaction body-hash Merkle path to the
 /// underlying universal 256-leaf tree root `M`, as ONE walk-B TAG_COMPRESS
 /// leg. Entries are the SPINE tx-hash wires (the leaf closure); `root_w` is
@@ -595,6 +641,7 @@ fn build_auth_pcs_meta_region_draft(
     es: Option<&ExactStateRegionData>,
     txr: Option<&TxRootRegionData>,
     spine: Option<&SpineRegionData>,
+    wallet_overflow: Option<&super::zk_authorization_region::SelectedZkAuthorizationOverflow>,
 ) -> AuthPcsMetaRegionDraft {
     assert!(k.is_power_of_two(), "meta region tile count must be dyadic");
 
@@ -622,7 +669,14 @@ fn build_auth_pcs_meta_region_draft(
     let spine_region_slots = k * spine_per_tx;
     let has_meta = es.is_some() || spine.is_some();
     let has_both_a_families = es.is_some() && spine.is_some();
-    let meta_half = es_region_slots.max(spine_region_slots);
+    let overflow_a_slots = wallet_overflow.map_or(0, |_| k * 2 * CAPSULE_LEAF_STRIDE);
+    let first_region_live = es_region_slots + overflow_a_slots;
+    let first_region_slots = if first_region_live == 0 {
+        0
+    } else {
+        first_region_live.next_power_of_two()
+    };
+    let meta_half = first_region_slots.max(spine_region_slots);
     let meta_p = if has_both_a_families {
         2 * meta_half
     } else {
@@ -667,6 +721,12 @@ fn build_auth_pcs_meta_region_draft(
     let paired_family_count = meta_slot_families.len();
     meta_slot_families
         .extend((0..n_legs).map(|f| leg_caps[f] * (2 * leg_depths[f]).next_power_of_two()));
+    if wallet_overflow.is_some() {
+        meta_slot_families.extend([
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+        ]);
+    }
     let meta_b =
         (!meta_slot_families.is_empty()).then(|| tiled_walk_layout(k, &meta_slot_families));
     let paired_bases: Option<[usize; 2]> = paired_caps_per_block.map(|_| {
@@ -675,9 +735,17 @@ fn build_auth_pcs_meta_region_draft(
             .expect("local and upper paired bases")
     });
     let meta_bases = meta_b.as_ref().map_or_else(Vec::new, |layout| {
-        layout.bases[paired_family_count..].to_vec()
+        layout.bases[paired_family_count..paired_family_count + n_legs].to_vec()
     });
-    let mut meta_b_families = Vec::with_capacity(paired_family_count + n_legs);
+    let overflow_b_bases: Option<[usize; 2]> = wallet_overflow.map(|_| {
+        meta_b.as_ref().expect("wallet overflow needs Meta-B").bases
+            [paired_family_count + n_legs..paired_family_count + n_legs + 2]
+            .try_into()
+            .expect("two Wallet overflow families")
+    });
+    let mut meta_b_families = Vec::with_capacity(
+        paired_family_count + n_legs + usize::from(wallet_overflow.is_some()) * 2,
+    );
     if let (Some(caps), Some(bases)) = (paired_caps_per_block, paired_bases) {
         let iv = iv_flat_of_tag(TAG_EXSTNOD);
         for family in 0..2 {
@@ -695,6 +763,23 @@ fn build_auth_pcs_meta_region_draft(
             n_paths: leg_caps[family],
             iv: leg_ivs[family],
         });
+    }
+    if let Some(bases) = overflow_b_bases {
+        let iv = iv_flat_of_tag(TAG_CAPSNODE);
+        for (base, depth) in bases.into_iter().zip([
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+        ]) {
+            meta_b_families.push(
+                crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
+                    offset: base,
+                    depth,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv,
+                },
+            );
+        }
     }
 
     // Canonical ghost initialization for both metadata walks.
@@ -726,6 +811,89 @@ fn build_auth_pcs_meta_region_draft(
             s0_meta_b[j][slot] = ghost_b_s0[j];
             sout_meta_b[j][slot] = ghost_b_out[j];
             cb_meta_b[j][slot] = ghost_b_out[j];
+        }
+    }
+
+    if let Some(overflow) = wallet_overflow {
+        let overflow_a = &overflow.wallet_a;
+        let overflow_b = &overflow.wallet_b;
+        let overflow_a_family_slots = k * CAPSULE_LEAF_STRIDE;
+        let expected_overflow_a_len = 2 * overflow_a_family_slots;
+        let overflow_b_depths = [
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+            ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+        ];
+        let overflow_b_offsets = [0, ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH];
+        let overflow_b_stride = overflow_b_depths.into_iter().sum::<usize>();
+        let expected_overflow_b_len = k * overflow_b_stride;
+        assert!(overflow_a
+            .committed()
+            .iter()
+            .all(|column| column.len() == expected_overflow_a_len));
+        assert!(overflow_a
+            .s0()
+            .iter()
+            .chain(overflow_a.s_out())
+            .all(|column| column.len() == expected_overflow_a_len));
+        assert!(overflow_b
+            .committed()
+            .iter()
+            .all(|column| column.len() == expected_overflow_b_len));
+        assert!(overflow_b
+            .s0()
+            .iter()
+            .chain(overflow_b.s_out())
+            .all(|column| column.len() == expected_overflow_b_len));
+
+        // Staging is tx-major. Meta-A is family-major so each family occupies
+        // one aligned dyadic region immediately after Exact State.
+        for tx in 0..k {
+            for family in 0..2 {
+                let source = tx * 2 * CAPSULE_LEAF_STRIDE + family * CAPSULE_LEAF_STRIDE;
+                let destination =
+                    es_region_slots + family * overflow_a_family_slots + tx * CAPSULE_LEAF_STRIDE;
+                for lane in 0..2 {
+                    meta_cols[IN0 + lane][destination..destination + CAPSULE_LEAF_STRIDE]
+                        .copy_from_slice(
+                            &overflow_a.committed()[lane][source..source + CAPSULE_LEAF_STRIDE],
+                        );
+                }
+                for lane in 0..STATE_SIZE {
+                    meta_cols[C0 + lane][destination..destination + CAPSULE_LEAF_STRIDE]
+                        .copy_from_slice(
+                            &overflow_a.committed()[2 + lane][source..source + CAPSULE_LEAF_STRIDE],
+                        );
+                    meta_s0[lane][destination..destination + CAPSULE_LEAF_STRIDE].copy_from_slice(
+                        &overflow_a.s0()[lane][source..source + CAPSULE_LEAF_STRIDE],
+                    );
+                    meta_s_out[lane][destination..destination + CAPSULE_LEAF_STRIDE]
+                        .copy_from_slice(
+                            &overflow_a.s_out()[lane][source..source + CAPSULE_LEAF_STRIDE],
+                        );
+                }
+            }
+        }
+
+        // Meta-B remains tx-blocked. Preserve the source/mid path split from
+        // the staging walk: ten source levels followed by six mid levels.
+        let bases = overflow_b_bases.expect("wallet overflow Meta-B bases");
+        let layout = meta_b.as_ref().expect("wallet overflow Meta-B layout");
+        for tx in 0..k {
+            for family in 0..2 {
+                let depth = overflow_b_depths[family];
+                let source = tx * overflow_b_stride + overflow_b_offsets[family];
+                let destination = tx * layout.block_slots + bases[family];
+                for column in 0..9 {
+                    cb_meta_b[column][destination..destination + depth]
+                        .copy_from_slice(&overflow_b.committed()[column][source..source + depth]);
+                }
+                for lane in 0..STATE_SIZE {
+                    s0_meta_b[lane][destination..destination + depth]
+                        .copy_from_slice(&overflow_b.s0()[lane][source..source + depth]);
+                    sout_meta_b[lane][destination..destination + depth]
+                        .copy_from_slice(&overflow_b.s_out()[lane][source..source + depth]);
+                }
+            }
         }
     }
 
@@ -991,7 +1159,6 @@ fn build_auth_pcs_meta_region_draft(
 /// makes the exact copy/overhang pins and the typed handoff part of the same
 /// metadata-only construction boundary as the raw columns.
 fn bind_auth_pcs_meta_paired_handoff(
-    b: &mut FieldR1csBuilder,
     meta_b_slices: &[WitnessSlice],
     meta_b: Option<&TiledWalkLayout>,
     paired_bases: Option<[usize; 2]>,
@@ -1002,16 +1169,6 @@ fn bind_auth_pcs_meta_paired_handoff(
         let layout = meta_b.expect("paired carrier needs meta-B slices");
         let bases = paired_bases.expect("paired family bases");
         let caps = paired_caps_per_block.expect("paired family capacities");
-        pin_paired_consistency_cells(b, meta_b_slices, layout, bases, caps);
-        pin_paired_overhang_ghost_cells(
-            b,
-            meta_b_slices,
-            layout,
-            bases,
-            caps,
-            [paired.touched_capacity, paired.segment_capacity],
-            iv_flat_of_tag(TAG_EXSTNOD),
-        );
         paired_exact_state_cells(meta_b_slices, layout, bases, caps, paired)
     })
 }
@@ -1050,6 +1207,8 @@ fn preflight_selected_zk_authorization_draft(
 
     let wallet_a = authorization.wallet_a();
     let wallet_b = authorization.wallet_b();
+    let overflow_a = &authorization.overflow().wallet_a;
+    let overflow_b = &authorization.overflow().wallet_b;
     let valid = authorization.changed_committed_columns() == 27
         && authorization.committed_cells()
             == SELECTED_ZK_REGION_WALLET_A_COLUMNS * (1 << geometry.wallet_a_w_log)
@@ -1072,7 +1231,24 @@ fn preflight_selected_zk_authorization_draft(
             SELECTED_ZK_REGION_WALLET_B_COLUMNS,
             geometry.wallet_b_w_log,
         )
+        && exact_raw_walk(
+            overflow_a.committed(),
+            overflow_a.s0(),
+            overflow_a.s_out(),
+            SELECTED_ZK_REGION_WALLET_A_COLUMNS,
+            geometry.tx_log + 5,
+        )
+        && exact_raw_walk(
+            overflow_b.committed(),
+            overflow_b.s0(),
+            overflow_b.s_out(),
+            SELECTED_ZK_REGION_WALLET_B_COLUMNS,
+            geometry.tx_log + 4,
+        )
         && wallet_b.committed()[8]
+            .iter()
+            .all(|&value| value == F128::ZERO || value == F128::ONE)
+        && overflow_b.committed()[8]
             .iter()
             .all(|&value| value == F128::ZERO || value == F128::ONE);
     if valid {
@@ -1195,7 +1371,7 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
     let geometry = preflight_selected_zk_authorization_draft(&authorization)?;
     preflight_selected_zk_meta_inputs(es, txr, spine, geometry)?;
 
-    let (owner, main, wallet_a, wallet_b) = authorization.into_parts();
+    let (owner, main, wallet_a, wallet_b, overflow) = authorization.into_parts();
     let (wallet_a_columns, wallet_a_s0, wallet_a_s_out) = wallet_a.into_parts();
     let (wallet_b_columns, wallet_b_s0, wallet_b_s_out) = wallet_b.into_parts();
 
@@ -1225,7 +1401,14 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         acc_root_wires,
         acc_path_slots,
         ..
-    } = build_auth_pcs_meta_region_draft(b, geometry.auth_tiles, Some(es), Some(txr), Some(spine));
+    } = build_auth_pcs_meta_region_draft(
+        b,
+        geometry.auth_tiles,
+        Some(es),
+        Some(txr),
+        Some(spine),
+        Some(&overflow),
+    );
     let meta_b_layout = meta_b
         .as_ref()
         .expect("selected paired Meta input must construct Meta-B");
@@ -1263,50 +1446,82 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         &acc_path_slots,
     );
 
-    // One exact descending-domain allocation. Because every family begins at
-    // the preceding family's end, only Wallet-A may insert alignment padding:
-    // WA6@m19, WB9@m18, MetaB9@m17, Main6@m16, MetaA8@m15, Owner6@m15.
+    // One canonical allocation ordered to minimize alignment loss at the
+    // production HistoryStep boundary. The six family domains and their
+    // committed contents are unchanged.
     let allocation_ledger = SelectedZkRegionAllocationLedger::new(b.num_wires(), geometry);
-    let wallet_a_slices = alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_A_COLUMNS>(
-        b,
-        &wallet_a_columns,
-        geometry.wallet_a_w_log,
-        None,
-    );
-    drop(wallet_a_columns);
-    let wallet_b_slices = alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_B_COLUMNS>(
-        b,
-        &wallet_b_columns,
-        geometry.wallet_b_w_log,
-        Some(8),
-    );
+    let mut main_slices = None;
+    let mut owner_slices = None;
+    let mut wallet_b_slices = None;
+    let mut wallet_a_slices = None;
+    let mut meta_a_slices = None;
+    let mut meta_b_slices = None;
+    for family in allocation_ledger.order {
+        match family {
+            SelectedZkRegionFamily::Main => {
+                main_slices = Some(alloc_selected_columns::<SELECTED_ZK_REGION_MAIN_COLUMNS>(
+                    b,
+                    &main.committed,
+                    geometry.main_w_log,
+                    None,
+                ));
+            }
+            SelectedZkRegionFamily::Owner => {
+                owner_slices = Some(alloc_selected_columns::<SELECTED_ZK_REGION_OWNER_COLUMNS>(
+                    b,
+                    &owner.committed,
+                    geometry.owner_w_log,
+                    None,
+                ));
+            }
+            SelectedZkRegionFamily::WalletB => {
+                wallet_b_slices = Some(
+                    alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_B_COLUMNS>(
+                        b,
+                        &wallet_b_columns,
+                        geometry.wallet_b_w_log,
+                        Some(8),
+                    ),
+                );
+            }
+            SelectedZkRegionFamily::WalletA => {
+                wallet_a_slices = Some(
+                    alloc_selected_columns::<SELECTED_ZK_REGION_WALLET_A_COLUMNS>(
+                        b,
+                        &wallet_a_columns,
+                        geometry.wallet_a_w_log,
+                        None,
+                    ),
+                );
+            }
+            SelectedZkRegionFamily::MetaA => {
+                meta_a_slices = Some(alloc_selected_columns::<SELECTED_ZK_REGION_META_A_COLUMNS>(
+                    b,
+                    &meta_cols,
+                    geometry.meta_a_w_log,
+                    None,
+                ));
+            }
+            SelectedZkRegionFamily::MetaB => {
+                meta_b_slices = Some(alloc_selected_columns::<SELECTED_ZK_REGION_META_B_COLUMNS>(
+                    b,
+                    &cb_meta_b,
+                    geometry.meta_b_w_log,
+                    Some(8),
+                ));
+            }
+        }
+    }
+    let main_slices = main_slices.expect("selected Main family allocation");
+    let owner_slices = owner_slices.expect("selected Owner family allocation");
+    let wallet_b_slices = wallet_b_slices.expect("selected wallet-B family allocation");
+    let wallet_a_slices = wallet_a_slices.expect("selected wallet-A family allocation");
+    let meta_a_slices = meta_a_slices.expect("selected Meta-A family allocation");
+    let meta_b_slices = meta_b_slices.expect("selected Meta-B family allocation");
     drop(wallet_b_columns);
-    let meta_b_slices = alloc_selected_columns::<SELECTED_ZK_REGION_META_B_COLUMNS>(
-        b,
-        &cb_meta_b,
-        geometry.meta_b_w_log,
-        Some(8),
-    );
-    drop(cb_meta_b);
-    let main_slices = alloc_selected_columns::<SELECTED_ZK_REGION_MAIN_COLUMNS>(
-        b,
-        &main.committed,
-        geometry.main_w_log,
-        None,
-    );
-    let meta_a_slices = alloc_selected_columns::<SELECTED_ZK_REGION_META_A_COLUMNS>(
-        b,
-        &meta_cols,
-        geometry.meta_a_w_log,
-        None,
-    );
+    drop(wallet_a_columns);
     drop(meta_cols);
-    let owner_slices = alloc_selected_columns::<SELECTED_ZK_REGION_OWNER_COLUMNS>(
-        b,
-        &owner.committed,
-        geometry.owner_w_log,
-        None,
-    );
+    drop(cb_meta_b);
     let owner_vk = crate::region_sidecar::DuplexRegionVk::from_union(
         selected_zk_auth_owner_sidecar_purpose(),
         owner_slices,
@@ -1333,19 +1548,19 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         ..
     } = main;
     drop(main_committed);
-    assert_eq!(wallet_a_slices[0].start(), allocation_ledger.wallet_a);
-    assert_eq!(wallet_b_slices[0].start(), allocation_ledger.wallet_b);
-    assert_eq!(meta_b_slices[0].start(), allocation_ledger.meta_b);
     assert_eq!(main_slices[0].start(), allocation_ledger.main);
-    assert_eq!(meta_a_slices[0].start(), allocation_ledger.meta_a);
     assert_eq!(owner_slices[0].start(), allocation_ledger.owner);
+    assert_eq!(wallet_b_slices[0].start(), allocation_ledger.wallet_b);
+    assert_eq!(wallet_a_slices[0].start(), allocation_ledger.wallet_a);
+    assert_eq!(meta_a_slices[0].start(), allocation_ledger.meta_a);
+    assert_eq!(meta_b_slices[0].start(), allocation_ledger.meta_b);
     assert_eq!(b.num_wires(), allocation_ledger.after);
 
-    // Complete every unchanged Meta closure in the canonical legacy order:
-    // paired copy/overhang first, then the Meta-A/B statement-cell pins.
+    // Export only the class-bounded paired prefix, then bind the Meta-A/B
+    // statement cells. Ceil-tiling overhang is internal committed witness and
+    // cannot reach the typed handoff.
     let before_paired_closure = b.num_wires();
     let paired = bind_auth_pcs_meta_paired_handoff(
-        b,
         &meta_b_slices,
         Some(meta_b_layout),
         paired_bases,
@@ -1353,16 +1568,10 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         Some(&es.paired),
     )
     .expect("selected paired Meta preflight made the handoff mandatory");
-    let allocated_updates = geometry.auth_tiles
-        * (geometry.paired_caps_per_block[0] + geometry.paired_caps_per_block[1]);
-    let class_updates = geometry.touched_capacity + geometry.segment_capacity;
-    let consistency_rows_per_update = 7 * PAIRED_UPDATE_DEPTH - 2;
-    let expected_paired_rows = consistency_rows_per_update * allocated_updates
-        + 9 * PAIRED_UPDATE_STRIDE * (allocated_updates - class_updates);
     assert_eq!(
         b.num_wires() - before_paired_closure,
-        expected_paired_rows,
-        "selected paired copy/overhang ledger"
+        0,
+        "selected paired handoff must allocate no rows"
     );
     let before_statement_pins = b.num_wires();
     pin_stage2_cells(b, &meta_a_slices, &cell_pins_meta);
@@ -1387,16 +1596,18 @@ pub(super) fn allocate_selected_zk_auth_pcs_region(
         wallet_b_slices,
         10,
         vec![
-            crate::region_sidecar::MerkleRegionFamily::FeedForward {
+            crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
                 offset: 0,
-                depth: 8,
-                n_paths: SELECTED_ZK_QUERY_COUNT,
+                depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                n_paths: SELECTED_ZK_REGION_CORE_QUERY_COUNT,
+                stride: 16,
                 iv: capsule_iv,
             },
-            crate::region_sidecar::MerkleRegionFamily::FeedForward {
-                offset: 512,
-                depth: 8,
-                n_paths: SELECTED_ZK_QUERY_COUNT,
+            crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
+                offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                n_paths: SELECTED_ZK_REGION_CORE_QUERY_COUNT,
+                stride: 16,
                 iv: capsule_iv,
             },
         ],
@@ -1459,60 +1670,37 @@ mod selected_zk_common_allocator_tests {
     }
 
     #[test]
-    fn selected_b255_column_ledger_is_exact_and_only_initially_aligned() {
+    fn selected_b255_column_ledger_minimizes_alignment_exactly() {
         let geometry = crate::region_sidecar::selected_zk_block_geometry(255).unwrap();
         let ledger = SelectedZkRegionAllocationLedger::new(966_647, geometry);
         assert_eq!(ledger.before, 966_647);
-        assert_eq!(ledger.wallet_a, 1_048_576);
-        assert_eq!(ledger.wallet_b, 4_194_304);
-        assert_eq!(ledger.meta_b, 6_553_600);
-        assert_eq!(ledger.main, 7_733_248);
-        assert_eq!(ledger.meta_a, 8_126_464);
-        assert_eq!(ledger.owner, 8_388_608);
-        assert_eq!(ledger.after, 8_585_216);
-        assert_eq!(ledger.wallet_a - ledger.before, 81_929);
+        assert_eq!(ledger.main, 983_040);
+        assert_eq!(ledger.owner, 1_376_256);
+        assert_eq!(ledger.wallet_b, 1_572_864);
+        assert_eq!(ledger.wallet_a, 4_194_304);
+        assert_eq!(ledger.meta_a, 3_932_160);
+        assert_eq!(ledger.meta_b, 7_340_032);
+        assert_eq!(ledger.after, 8_519_680);
         assert_eq!(
-            ledger.after - ledger.wallet_a,
-            SELECTED_ZK_REGION_COMMITTED_CELLS
+            ledger.after - ledger.before - SELECTED_ZK_REGION_COMMITTED_CELLS,
+            16_393
         );
 
-        let families = [
-            (
-                ledger.wallet_a,
-                SELECTED_ZK_REGION_WALLET_A_LOG,
-                SELECTED_ZK_REGION_WALLET_A_COLUMNS,
-            ),
-            (
-                ledger.wallet_b,
-                SELECTED_ZK_REGION_WALLET_B_LOG,
-                SELECTED_ZK_REGION_WALLET_B_COLUMNS,
-            ),
-            (
-                ledger.meta_b,
-                SELECTED_ZK_REGION_META_B_LOG,
-                SELECTED_ZK_REGION_META_B_COLUMNS,
-            ),
-            (
-                ledger.main,
-                SELECTED_ZK_REGION_MAIN_LOG,
-                SELECTED_ZK_REGION_MAIN_COLUMNS,
-            ),
-            (
-                ledger.meta_a,
-                SELECTED_ZK_REGION_META_A_LOG,
-                SELECTED_ZK_REGION_META_A_COLUMNS,
-            ),
-            (
-                ledger.owner,
-                SELECTED_ZK_REGION_OWNER_LOG,
-                SELECTED_ZK_REGION_OWNER_COLUMNS,
-            ),
-        ];
         let mut ranges = Vec::new();
-        let mut cursor = ledger.wallet_a;
-        for (start, w_log, columns) in families {
-            assert_eq!(start, cursor, "only Wallet-A may add alignment");
+        let mut cursor = ledger.before;
+        for family in ledger.order {
+            let (w_log, columns) = family.dimensions(geometry);
+            let start = match family {
+                SelectedZkRegionFamily::Main => ledger.main,
+                SelectedZkRegionFamily::Owner => ledger.owner,
+                SelectedZkRegionFamily::WalletB => ledger.wallet_b,
+                SelectedZkRegionFamily::WalletA => ledger.wallet_a,
+                SelectedZkRegionFamily::MetaA => ledger.meta_a,
+                SelectedZkRegionFamily::MetaB => ledger.meta_b,
+            };
             let len = 1usize << w_log;
+            cursor = cursor.checked_next_multiple_of(len).unwrap();
+            assert_eq!(start, cursor, "optimal family alignment");
             for column in 0..columns {
                 ranges.push(start + column * len..start + (column + 1) * len);
             }
@@ -1534,7 +1722,7 @@ mod selected_zk_common_allocator_tests {
     #[test]
     fn selected_lower_classes_keep_their_own_committed_domains() {
         for (tier, expected_cells, expected_span, class_m) in [
-            (64usize, 2_244_608usize, 2_244_608usize, 23usize),
+            (25usize, 1_384_448usize, 1_384_448usize, 22usize),
             (255, 7_536_640, 7_536_640, 24),
         ] {
             let geometry = crate::region_sidecar::selected_zk_block_geometry(tier).unwrap();
@@ -1553,7 +1741,7 @@ mod selected_zk_common_allocator_tests {
     }
 
     #[test]
-    fn selected_b255_planned_slices_form_the_exact_v4_certificate() {
+    fn selected_b255_planned_slices_form_the_exact_v5_certificate() {
         let geometry = crate::region_sidecar::selected_zk_block_geometry(255).unwrap();
         let ledger = SelectedZkRegionAllocationLedger::new(966_647, geometry);
         let wallet_a = crate::region_sidecar::WalkARegionVk::new_wallet(
@@ -1578,16 +1766,18 @@ mod selected_zk_common_allocator_tests {
             family_slices(ledger.wallet_b, SELECTED_ZK_REGION_WALLET_B_LOG),
             10,
             vec![
-                crate::region_sidecar::MerkleRegionFamily::FeedForward {
+                crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
                     offset: 0,
-                    depth: 8,
-                    n_paths: SELECTED_ZK_QUERY_COUNT,
+                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    n_paths: SELECTED_ZK_REGION_CORE_QUERY_COUNT,
+                    stride: 16,
                     iv: capsule_iv,
                 },
-                crate::region_sidecar::MerkleRegionFamily::FeedForward {
-                    offset: 512,
-                    depth: 8,
-                    n_paths: SELECTED_ZK_QUERY_COUNT,
+                crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
+                    offset: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    n_paths: SELECTED_ZK_REGION_CORE_QUERY_COUNT,
+                    stride: 16,
                     iv: capsule_iv,
                 },
             ],
@@ -1616,13 +1806,27 @@ mod selected_zk_common_allocator_tests {
                     n_paths: 1,
                     iv: compress_iv_flat(),
                 },
+                crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
+                    offset: 464,
+                    depth: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv: capsule_iv,
+                },
+                crate::region_sidecar::MerkleRegionFamily::FeedForwardStrided {
+                    offset: 474,
+                    depth: ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    n_paths: 1,
+                    stride: ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH + ZK_CAPSULE_PCS_MID_PATH_DEPTH,
+                    iv: capsule_iv,
+                },
             ],
         )
         .unwrap();
         let schedules =
             crate::acceptance::zk_auth_capsule_schedule::ZkAuthCapsuleDuplexSchedules::selected();
-        let channel_iv = iv_flat_of_tag(TAG_KSCHANNL);
-        let owner_layout = schedules.owner_layout();
+        let channel_iv = iv_flat_of_tag(TAG_KSCH256);
+        let owner_layout = schedules.owner_sidecar_layout();
         let owner = crate::region_sidecar::DuplexRegionVk::new(
             selected_zk_auth_owner_sidecar_purpose(),
             SELECTED_ZK_REGION_OWNER_LOG,
@@ -1632,7 +1836,7 @@ mod selected_zk_common_allocator_tests {
             &owner_layout,
         )
         .unwrap();
-        let main_layout = schedules.main_layout();
+        let main_layout = schedules.main_sidecar_layout();
         let main = crate::region_sidecar::DuplexRegionVk::new(
             selected_zk_auth_main_sidecar_purpose(),
             SELECTED_ZK_REGION_MAIN_LOG,
@@ -2013,9 +2217,10 @@ fn paired_update_base(
     base
 }
 
-/// Exact (non challenge-mixed) copy constraints of the paired primitive:
-/// old-even SIB/D → new-even and both lane bridges `E(w)=C(w-2)` on every
-/// allocated local/upper update, including K-tile overhang ghosts.
+/// Test-only exact reference for the paired consistency relation. Production
+/// discharges these equalities against the committed columns in the
+/// post-commit Merkle sidecar.
+#[cfg(test)]
 fn pin_paired_consistency_cells(
     b: &mut FieldR1csBuilder,
     slices: &[WitnessSlice],
@@ -2033,13 +2238,14 @@ fn pin_paired_consistency_cells(
                     + update * PAIRED_UPDATE_STRIDE;
                 for level in 0..PAIRED_UPDATE_DEPTH {
                     let old_even = base + level * PAIRED_UPDATE_SLOTS_PER_LEVEL;
-                    let new_even = old_even + 2;
                     for col in [6usize, 7, 8] {
-                        pin_eq(
-                            b,
-                            &slot_cell(&slices[col], old_even),
-                            &slot_cell(&slices[col], new_even),
-                        );
+                        for offset in 1..PAIRED_UPDATE_SLOTS_PER_LEVEL {
+                            pin_eq(
+                                b,
+                                &slot_cell(&slices[col], old_even + offset - 1),
+                                &slot_cell(&slices[col], old_even + offset),
+                            );
+                        }
                     }
                     for lane in 0..2 {
                         // new-odd E carries this level's old-odd C.
@@ -2063,11 +2269,12 @@ fn pin_paired_consistency_cells(
     }
 }
 
-/// Bind the ceil-tiling suffix of each paired family to the native builder's
-/// canonical ghost update. The fixed walk matrix remains class-constant: this
-/// is a Stage-2 exact-cell hardening over only the non-exported update suffix.
+/// Test-only reference that binds the ceil-tiling suffix of each paired family
+/// to the native builder's canonical ghost update. Production leaves this
+/// non-exported committed suffix internal to the sound paired-walk relation.
 ///
 /// One overhang update costs exactly `9 * PAIRED_UPDATE_STRIDE = 576` rows.
+#[cfg(test)]
 fn pin_paired_overhang_ghost_cells(
     b: &mut FieldR1csBuilder,
     slices: &[WitnessSlice],
@@ -2258,7 +2465,7 @@ mod split_walk_a_layout_tests {
         };
         let mut b = FieldR1csBuilder::new();
         let before = b.num_wires();
-        let draft = build_auth_pcs_meta_region_draft(&mut b, 1, None, None, Some(&spine));
+        let draft = build_auth_pcs_meta_region_draft(&mut b, 1, None, None, Some(&spine), None);
 
         assert!(draft.has_meta);
         assert!(!draft.has_both_a_families);
@@ -2634,6 +2841,73 @@ mod split_walk_a_layout_tests {
     }
 
     #[test]
+    fn merkle_postcommit_rejects_each_paired_consistency_mutation() {
+        let w_log = 6;
+        let iv = iv_flat_of_tag(TAG_EXSTNOD);
+        let columns = build_paired_merkle_update_columns(&[paired_witness(0x51de)], iv, w_log);
+        let committed = vec![
+            columns.c[0].clone(),
+            columns.c[1].clone(),
+            columns.c[2].clone(),
+            columns.c[3].clone(),
+            columns.e[0].clone(),
+            columns.e[1].clone(),
+            columns.sib[0].clone(),
+            columns.sib[1].clone(),
+            columns.d.clone(),
+        ];
+        let mut fixed = paired_merkle_update_fixed_patterns(iv);
+        fixed.push(common_period_ones(0, PAIRED_UPDATE_STRIDE, w_log));
+        let families = [MerkleProtocolFamily::paired_update(0)];
+
+        for (column, slot, domain, label) in [
+            (
+                4usize,
+                3usize,
+                b"paired-bad-e-bridge".as_slice(),
+                "E bridge",
+            ),
+            (6, 2, b"paired-bad-sibling-copy".as_slice(), "sibling copy"),
+            (
+                8,
+                2,
+                b"paired-bad-direction-copy".as_slice(),
+                "direction copy",
+            ),
+        ] {
+            let mut malformed = committed.clone();
+            malformed[column][slot] += F128::ONE;
+            let malformed_refs = malformed.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let mut prover = FsLaneChallenger::new(domain);
+            let (proof, _) = prove_merkle_union_with_challenger(
+                w_log,
+                &fixed,
+                &[0, 1, 2, 3],
+                &families,
+                &malformed_refs,
+                &columns.s0,
+                &columns.s_out,
+                &mut prover,
+            );
+            let mut verifier = FsLaneChallenger::new(domain);
+            assert!(
+                matches!(
+                    verify_merkle_union_with_challenger(
+                        w_log,
+                        &fixed,
+                        &[0, 1, 2, 3],
+                        &families,
+                        &proof,
+                        &mut verifier,
+                    ),
+                    Err(MerkleUnionVerifyError::Zero(_))
+                ),
+                "{label} mutation escaped the post-commit zero relation"
+            );
+        }
+    }
+
+    #[test]
     fn merkle_postcommit_protocol_matches_mixed_production_meta_b_order() {
         let w_log = 8;
         let block_log = 8;
@@ -2925,7 +3199,7 @@ mod split_walk_a_layout_tests {
     }
 
     #[test]
-    fn paired_k2_overhang_is_canonical_and_stays_outside_handoff() {
+    fn paired_k2_reference_pins_cover_overhang_and_handoff_stops_at_capacity() {
         let k = 2usize;
         let class_capacities = [3usize, 1usize];
         let caps_per_block = [2usize, 1usize];
@@ -2984,7 +3258,7 @@ mod split_walk_a_layout_tests {
         );
         assert_eq!(
             b.num_wires() - before_copies,
-            110 * 6,
+            206 * 6,
             "exact copies cover all four local/upper tiles"
         );
         let before_ghosts = b.num_wires();
@@ -3021,6 +3295,58 @@ mod split_walk_a_layout_tests {
         );
         assert_eq!(handoff.local.len(), class_capacities[0]);
         assert_eq!(handoff.upper.len(), class_capacities[1]);
+        for (ordinal, cells) in handoff.local.iter().enumerate() {
+            let base = paired_update_base(&layout, layout.bases[0], caps_per_block[0], ordinal);
+            let [old_root, new_root] = paired_update_root_offsets(PAIRED_UPDATE_DEPTH);
+            for lane in 0..2 {
+                assert_eq!(cells.old_entry[lane], slot_cell(&slices[4 + lane], base));
+                assert_eq!(
+                    cells.new_entry[lane],
+                    slot_cell(&slices[4 + lane], base + 2)
+                );
+                assert_eq!(
+                    cells.old_root[lane],
+                    slot_cell(&slices[lane], base + old_root)
+                );
+                assert_eq!(
+                    cells.new_root[lane],
+                    slot_cell(&slices[lane], base + new_root)
+                );
+            }
+            for level in 0..PAIRED_UPDATE_DEPTH {
+                assert_eq!(
+                    cells.directions[level],
+                    slot_cell(&slices[8], base + level * PAIRED_UPDATE_SLOTS_PER_LEVEL,)
+                );
+            }
+        }
+        for (ordinal, cells) in handoff.upper.iter().enumerate() {
+            let base = paired_update_base(&layout, layout.bases[1], caps_per_block[1], ordinal);
+            for lane in 0..2 {
+                assert_eq!(cells.old_entry[lane], slot_cell(&slices[4 + lane], base));
+                assert_eq!(
+                    cells.new_entry[lane],
+                    slot_cell(&slices[4 + lane], base + 2)
+                );
+            }
+            for level in 0..PAIRED_UPDATE_DEPTH {
+                let [old_root, new_root] = paired_update_root_offsets(level + 1);
+                for lane in 0..2 {
+                    assert_eq!(
+                        cells.old_roots[level][lane],
+                        slot_cell(&slices[lane], base + old_root)
+                    );
+                    assert_eq!(
+                        cells.new_roots[level][lane],
+                        slot_cell(&slices[lane], base + new_root)
+                    );
+                }
+                assert_eq!(
+                    cells.directions[level],
+                    slot_cell(&slices[8], base + level * PAIRED_UPDATE_SLOTS_PER_LEVEL,)
+                );
+            }
+        }
 
         let (r1cs, witness) = b.build();
         assert!(r1cs.satisfies(&witness));
@@ -3047,12 +3373,17 @@ mod split_walk_a_layout_tests {
             caps_per_block[0],
             class_capacities[0],
         );
-        // Pick cells not covered by the copy constraints, so rejection comes
-        // specifically from the canonical-ghost pins in every committed col.
-        let ghost_probe_offsets = [0usize, 0, 0, 0, 0, 0, 1, 1, 1];
+        // Preserve the SIB/D copy chain while mutating those columns, so every
+        // rejection below comes specifically from the canonical-ghost pins.
         for column in 0..9 {
             let mut bad = witness.clone();
-            bad[slices[column].start() + local_ghost + ghost_probe_offsets[column]] += F128::ONE;
+            if column < 6 {
+                bad[slices[column].start() + local_ghost] += F128::ONE;
+            } else {
+                for offset in 0..PAIRED_UPDATE_SLOTS_PER_LEVEL {
+                    bad[slices[column].start() + local_ghost + offset] += F128::ONE;
+                }
+            }
             assert!(
                 !r1cs.satisfies(&bad),
                 "local overhang mutation accepted in committed column {column}"
@@ -3072,8 +3403,8 @@ mod split_walk_a_layout_tests {
             "upper overhang mutation accepted"
         );
 
-        // Mutating a real new-even D without its old-even source exercises the
-        // exact D-copy constraint at the K-tile boundary.
+        // Mutating one interior D cell exercises the exact copy-chain reference
+        // at the K-tile boundary.
         let mut bad_d_copy = witness;
         bad_d_copy[slices[8].start() + last_live + 2] += F128::ONE;
         assert!(
@@ -3180,7 +3511,7 @@ mod split_walk_a_layout_tests {
         assert!(leg_pins.is_empty(), "paired family has no legacy leg pins");
         let before = b.num_wires();
         pin_paired_consistency_cells(&mut b, &slices, &layout, [0, 64], [1, 1]);
-        assert_eq!(b.num_wires() - before, 220, "110 exact copies per update");
+        assert_eq!(b.num_wires() - before, 412, "206 exact rows per update");
         let handoff = paired_exact_state_cells(&slices, &layout, [0, 64], [1, 1], &paired);
         assert_eq!(handoff.local.len(), 1);
         assert_eq!(handoff.upper.len(), 1);
@@ -3504,9 +3835,7 @@ pub(crate) struct WalkAUnionWalkDeferredProof {
     pub(crate) spine_exposure: Option<ColumnRelationProof>,
 }
 
-/// Borrowed view shared by the legacy single-walk wrapper and a genuinely
-/// walk-deferred authority.  Keeping this view borrowed avoids cloning the
-/// relation and shift proofs merely to enter the phased verifier.
+/// Borrowed view of an embedded standalone Walk-A authority.
 #[derive(Clone, Copy)]
 pub(crate) struct WalkAUnionWalkDeferredProofRef<'a> {
     pub(crate) selection: &'a ColumnRelationProof,
@@ -3517,17 +3846,6 @@ pub(crate) struct WalkAUnionWalkDeferredProofRef<'a> {
 
 impl WalkAUnionProof {
     pub(crate) fn walk_deferred(&self) -> WalkAUnionWalkDeferredProofRef<'_> {
-        WalkAUnionWalkDeferredProofRef {
-            selection: &self.selection,
-            substitution: &self.substitution,
-            shifts: &self.shifts,
-            spine_exposure: self.spine_exposure.as_ref(),
-        }
-    }
-}
-
-impl WalkAUnionWalkDeferredProof {
-    pub(crate) fn as_ref(&self) -> WalkAUnionWalkDeferredProofRef<'_> {
         WalkAUnionWalkDeferredProofRef {
             selection: &self.selection,
             substitution: &self.substitution,
@@ -3602,8 +3920,63 @@ fn gated_sponge_native_terms(
     terms.extend(t);
 }
 
+/// One transcript suffix relocated into Wallet-A. `region` selects every live
+/// suffix permutation, `carry` selects all but the first, and `first` selects
+/// only the first. The immediately preceding carrier slot stores prefix
+/// capacity lanes in A0/A1 while the first live A0/A1 cells contain prefix
+/// rate lanes plus that slot's dynamic absorb value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SplitDuplexTailRefs {
+    pub(crate) a: [usize; 2],
+    pub(crate) c: [usize; STATE_SIZE],
+    pub(crate) region: usize,
+    pub(crate) carry: usize,
+    pub(crate) first: usize,
+    pub(crate) consts: [usize; 2],
+}
+
+fn split_duplex_tail_native_terms(refs: &SplitDuplexTailRefs, alpha: F128) -> Vec<RelationTerm> {
+    let m = mds_weights_pub(alpha);
+    let mut terms = Vec::with_capacity(14);
+    for lane in 0..2 {
+        terms.push(RelationTerm {
+            coeff: m[lane],
+            factors: vec![ColRef::Fixed(refs.region), ColRef::Committed(refs.a[lane])],
+        });
+        terms.push(RelationTerm {
+            coeff: m[lane],
+            factors: vec![ColRef::Fixed(refs.consts[lane])],
+        });
+        terms.push(RelationTerm {
+            coeff: m[lane],
+            factors: vec![
+                ColRef::Fixed(refs.carry),
+                ColRef::CommittedShift(refs.c[lane]),
+            ],
+        });
+    }
+    for lane in 2..STATE_SIZE {
+        terms.push(RelationTerm {
+            coeff: m[lane],
+            factors: vec![
+                ColRef::Fixed(refs.first),
+                ColRef::CommittedShift(refs.a[lane - 2]),
+            ],
+        });
+        terms.push(RelationTerm {
+            coeff: m[lane],
+            factors: vec![
+                ColRef::Fixed(refs.carry),
+                ColRef::CommittedShift(refs.c[lane]),
+            ],
+        });
+    }
+    terms
+}
+
 fn union_native_terms(
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
     alpha: F128,
@@ -3614,6 +3987,9 @@ fn union_native_terms(
     // claimed-ref set (and claim count) stays family-count independent.
     for (sr, region) in leaf_refs {
         gated_sponge_native_terms(sr, *region, alpha, &mut terms);
+    }
+    for refs in split_tails {
+        terms.extend(split_duplex_tail_native_terms(refs, alpha));
     }
     // Exact-state sponge family: same shape, its own patterns.
     if let Some((sr, region)) = es_sponge {
@@ -3693,6 +4069,7 @@ pub(crate) fn prove_walk_a_union_walk_suffix_with_challenger<Ch: Challenger>(
     w_log: usize,
     fixed: &[FixedPattern],
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
     committed: &[&[F128]],
@@ -3715,7 +4092,7 @@ pub(crate) fn prove_walk_a_union_walk_suffix_with_challenger<Ch: Challenger>(
     } = prefix;
 
     let alpha = challenger.sample_f128();
-    let substitution_terms = union_native_terms(leaf_refs, es_sponge, spine, alpha);
+    let substitution_terms = union_native_terms(leaf_refs, split_tails, es_sponge, spine, alpha);
     let mut target = F128::ZERO;
     let mut alpha_power = F128::ONE;
     for value in terminal.values {
@@ -3869,6 +4246,7 @@ pub(crate) fn verify_walk_a_union_walk_suffix_with_challenger<Ch: Challenger>(
     w_log: usize,
     fixed: &[FixedPattern],
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
     prefix: WalkAUnionVerifierWalkPrefix<'_>,
@@ -3881,7 +4259,7 @@ pub(crate) fn verify_walk_a_union_walk_suffix_with_challenger<Ch: Challenger>(
         walk_group: _,
     } = prefix;
     let alpha = challenger.sample_f128();
-    let substitution_terms = union_native_terms(leaf_refs, es_sponge, spine, alpha);
+    let substitution_terms = union_native_terms(leaf_refs, split_tails, es_sponge, spine, alpha);
     let mut target = F128::ZERO;
     let mut alpha_power = F128::ONE;
     for value in terminal.values {
@@ -3998,6 +4376,7 @@ pub(crate) fn prove_walk_a_union_with_challenger<Ch: Challenger>(
     fixed: &[FixedPattern],
     meta_c: &[usize; STATE_SIZE],
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
     committed: &[&[F128]],
@@ -4017,6 +4396,7 @@ pub(crate) fn prove_walk_a_union_with_challenger<Ch: Challenger>(
         w_log,
         fixed,
         leaf_refs,
+        split_tails,
         es_sponge,
         spine,
         committed,
@@ -4046,6 +4426,7 @@ pub(crate) fn verify_walk_a_union_with_challenger<Ch: Challenger>(
     fixed: &[FixedPattern],
     meta_c: &[usize; STATE_SIZE],
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
     proof: &WalkAUnionProof,
@@ -4059,7 +4440,15 @@ pub(crate) fn verify_walk_a_union_with_challenger<Ch: Challenger>(
     let terminal = verify_deep_chain_walk(w_log, &groups, &proof.walk, challenger)
         .map_err(WalkAUnionVerifyError::Walk)?;
     verify_walk_a_union_walk_suffix_with_challenger(
-        w_log, fixed, leaf_refs, es_sponge, spine, prefix, &terminal, challenger,
+        w_log,
+        fixed,
+        leaf_refs,
+        split_tails,
+        es_sponge,
+        spine,
+        prefix,
+        &terminal,
+        challenger,
     )
 }
 
@@ -4085,6 +4474,7 @@ pub(crate) fn run_union_native(
         fixed,
         meta_c,
         leaf_refs,
+        &[],
         es_sponge,
         spine,
         committed,
@@ -4094,7 +4484,15 @@ pub(crate) fn run_union_native(
         &mut ch_p,
     );
     let verifier_claims = verify_walk_a_union_with_challenger(
-        w_log, fixed, meta_c, leaf_refs, es_sponge, spine, &proof, &mut ch_v,
+        w_log,
+        fixed,
+        meta_c,
+        leaf_refs,
+        &[],
+        es_sponge,
+        spine,
+        &proof,
+        &mut ch_v,
     )
     .expect("native Walk-A union");
     assert_eq!(prover_claims, verifier_claims, "Walk-A terminal claims");
@@ -4114,15 +4512,20 @@ pub(crate) fn run_union_native(
         .map(|claim| (claim.column, claim.point.clone(), claim.value))
         .collect();
 
-    let shift_layout: Vec<(usize, usize)> =
-        claimed_refs(&union_native_terms(leaf_refs, es_sponge, spine, F128::ONE))
-            .into_iter()
-            .filter_map(|reference| match reference {
-                ColRef::CommittedShift(column) => Some((0, column)),
-                ColRef::CommittedShift2(column) => Some((1, column)),
-                _ => None,
-            })
-            .collect();
+    let shift_layout: Vec<(usize, usize)> = claimed_refs(&union_native_terms(
+        leaf_refs,
+        &[],
+        es_sponge,
+        spine,
+        F128::ONE,
+    ))
+    .into_iter()
+    .filter_map(|reference| match reference {
+        ColRef::CommittedShift(column) => Some((0, column)),
+        ColRef::CommittedShift2(column) => Some((1, column)),
+        _ => None,
+    })
+    .collect();
     assert_eq!(shift_layout.len(), proof.shifts.len());
     let shifts = shift_layout
         .into_iter()
@@ -4210,12 +4613,48 @@ fn gated_sponge_trace_terms(
 pub(crate) fn union_trace_terms(
     m: &[LinExpr],
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
 ) -> Vec<RelationTermTrace> {
     let mut terms = Vec::new();
     for (sr, region) in leaf_refs {
         gated_sponge_trace_terms(m, sr, *region, &mut terms);
+    }
+    for refs in split_tails {
+        for lane in 0..2 {
+            terms.push(RelationTermTrace {
+                coeff: m[lane].clone(),
+                factors: vec![ColRef::Fixed(refs.region), ColRef::Committed(refs.a[lane])],
+            });
+            terms.push(RelationTermTrace {
+                coeff: m[lane].clone(),
+                factors: vec![ColRef::Fixed(refs.consts[lane])],
+            });
+            terms.push(RelationTermTrace {
+                coeff: m[lane].clone(),
+                factors: vec![
+                    ColRef::Fixed(refs.carry),
+                    ColRef::CommittedShift(refs.c[lane]),
+                ],
+            });
+        }
+        for lane in 2..STATE_SIZE {
+            terms.push(RelationTermTrace {
+                coeff: m[lane].clone(),
+                factors: vec![
+                    ColRef::Fixed(refs.first),
+                    ColRef::CommittedShift(refs.a[lane - 2]),
+                ],
+            });
+            terms.push(RelationTermTrace {
+                coeff: m[lane].clone(),
+                factors: vec![
+                    ColRef::Fixed(refs.carry),
+                    ColRef::CommittedShift(refs.c[lane]),
+                ],
+            });
+        }
     }
     if let Some((sr, region)) = es_sponge {
         gated_sponge_trace_terms(m, sr, *region, &mut terms);
@@ -4229,10 +4668,11 @@ pub(crate) fn union_trace_terms(
 
 pub(crate) fn union_ref_terms(
     leaf_refs: &[(SpongeLeafRefs, usize)],
+    split_tails: &[SplitDuplexTailRefs],
     es_sponge: Option<&(SpongeLeafRefs, usize)>,
     spine: Option<&SpineUnionSpec>,
 ) -> Vec<RelationTerm> {
-    union_native_terms(leaf_refs, es_sponge, spine, F128::ONE)
+    union_native_terms(leaf_refs, split_tails, es_sponge, spine, F128::ONE)
 }
 
 // ===========================================================================
@@ -4308,21 +4748,7 @@ fn union_zero_terms(
         t.extend(ff_merkle_chain_terms(&spec.refs, lambda));
     }
     for spec in paired_specs {
-        t.push(RelationTerm {
-            coeff: F128::ONE,
-            factors: vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-                ColRef::Committed(spec.refs.d),
-            ],
-        });
-        t.push(RelationTerm {
-            coeff: F128::ONE,
-            factors: vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-            ],
-        });
+        t.extend(paired_merkle_update_consistency_terms(&spec.refs, lambda));
     }
     t
 }
@@ -4370,22 +4796,71 @@ fn union_zero_terms_trace(
             }
         }
     }
+    let mut paired_weights = vec![LinExpr::constant(F128::ONE)];
+    for _ in 1..6 {
+        let next = mul(b, paired_weights.last().expect("paired weight"), lambda);
+        paired_weights.push(next);
+    }
     for spec in paired_specs {
-        for factors in [
-            vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-                ColRef::Committed(spec.refs.d),
-            ],
-            vec![
-                ColRef::Fixed(spec.refs.old_even),
-                ColRef::Committed(spec.refs.d),
-            ],
-        ] {
-            t.push(RelationTermTrace {
-                coeff: LinExpr::constant(F128::ONE),
-                factors,
-            });
+        let refs = &spec.refs;
+        let equations = [
+            (
+                vec![
+                    ColRef::Fixed(refs.old_even),
+                    ColRef::Committed(refs.d),
+                    ColRef::Committed(refs.d),
+                ],
+                vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
+            ),
+            (
+                vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[0])],
+                vec![
+                    ColRef::Fixed(refs.bridge),
+                    ColRef::CommittedShift2(refs.c[0]),
+                ],
+            ),
+            (
+                vec![ColRef::Fixed(refs.bridge), ColRef::Committed(refs.e[1])],
+                vec![
+                    ColRef::Fixed(refs.bridge),
+                    ColRef::CommittedShift2(refs.c[1]),
+                ],
+            ),
+            (
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::Committed(refs.sib[0]),
+                ],
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::CommittedShift(refs.sib[0]),
+                ],
+            ),
+            (
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::Committed(refs.sib[1]),
+                ],
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::CommittedShift(refs.sib[1]),
+                ],
+            ),
+            (
+                vec![ColRef::Fixed(refs.copy_step), ColRef::Committed(refs.d)],
+                vec![
+                    ColRef::Fixed(refs.copy_step),
+                    ColRef::CommittedShift(refs.d),
+                ],
+            ),
+        ];
+        for (weight, (left, right)) in paired_weights.iter().zip(equations) {
+            for factors in [left, right] {
+                t.push(RelationTermTrace {
+                    coeff: weight.clone(),
+                    factors,
+                });
+            }
         }
     }
     t
@@ -4441,8 +4916,8 @@ fn union_sub_terms_native(
 }
 
 /// Trace-coefficient twin of `paired_merkle_update_substitution_terms`.
-/// Exact SIB/D copies and E bridges are intentionally absent here: they are
-/// direct Stage-2 cell equalities, never challenge-mixed relation terms.
+/// SIB/D copies and E bridges belong to the post-commit consistency relation,
+/// so the substitution relation intentionally does not duplicate them.
 #[cfg(test)]
 fn paired_substitution_terms_trace(
     m: &[LinExpr],
@@ -4716,18 +5191,6 @@ impl MerkleUnionProof {
     }
 }
 
-impl MerkleUnionWalkDeferredProof {
-    pub(crate) fn as_ref(&self) -> MerkleUnionWalkDeferredProofRef<'_> {
-        MerkleUnionWalkDeferredProofRef {
-            zero: &self.zero,
-            zero_shifts: &self.zero_shifts,
-            selection: &self.selection,
-            substitution: &self.substitution,
-            shifts: &self.shifts,
-        }
-    }
-}
-
 pub(crate) struct MerkleUnionProverWalkPrefix {
     zero: ColumnRelationProof,
     zero_shifts: Vec<ShiftDischargeProof>,
@@ -4791,18 +5254,7 @@ pub(crate) fn merkle_protocol_zero_terms(
     }
     for family in families {
         if let MerkleProtocolFamily::PairedUpdate { refs, .. } = family {
-            terms.push(RelationTerm {
-                coeff: F128::ONE,
-                factors: vec![
-                    ColRef::Fixed(refs.old_even),
-                    ColRef::Committed(refs.d),
-                    ColRef::Committed(refs.d),
-                ],
-            });
-            terms.push(RelationTerm {
-                coeff: F128::ONE,
-                factors: vec![ColRef::Fixed(refs.old_even), ColRef::Committed(refs.d)],
-            });
+            terms.extend(paired_merkle_update_consistency_terms(refs, lambda));
         }
     }
     terms
@@ -5793,6 +6245,7 @@ pub(crate) struct DuplexUnion {
 /// `perm([0;4])` ghost slots: the duplex substitution's leading carry term is
 /// ungated, so every block must be a valid IV-seeded chain (the START pattern
 /// cancels the cross-block carry in char 2, re-seeding each block).
+#[cfg(test)]
 pub(crate) fn build_duplex_union(
     layout: &DuplexLayout,
     iv_flat: [F128; 2],
@@ -6221,7 +6674,7 @@ pub(crate) fn gate_recording_patterns(
 /// ghost gap is a chain permutation), then each pattern set's gated
 /// START/ABS/CONST wiring. The claimed refs stay the six A/C columns —
 /// identical discharge plumbing to the single-set terms.
-fn duplex_substitution_terms_multi(sets: &[DuplexFamilyRefs], alpha: F128) -> Vec<RelationTerm> {
+fn duplex_mds_weights(alpha: F128) -> [F128; STATE_SIZE] {
     let flat = |v: u128| flat_of_tower_u128(v);
     let mut alphas = [F128::ZERO; STATE_SIZE];
     let mut pw = F128::ONE;
@@ -6229,13 +6682,40 @@ fn duplex_substitution_terms_multi(sets: &[DuplexFamilyRefs], alpha: F128) -> Ve
         pw = pw * alpha;
         *a = pw;
     }
-    let m: [F128; STATE_SIZE] = std::array::from_fn(|j| {
+    std::array::from_fn(|j| {
         let mut acc = F128::ZERO;
         for e in 0..STATE_SIZE {
             acc += alphas[e] * flat(noid_poseidon2b::native::permutation::MDS_FULL[e][j]);
         }
         acc
-    });
+    })
+}
+
+fn append_duplex_pattern_terms(
+    terms: &mut Vec<RelationTerm>,
+    refs: &DuplexFamilyRefs,
+    weights: &[F128; STATE_SIZE],
+) {
+    for j in 0..STATE_SIZE {
+        terms.push(RelationTerm {
+            coeff: weights[j],
+            factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
+        });
+        if j < 2 {
+            terms.push(RelationTerm {
+                coeff: weights[j],
+                factors: vec![ColRef::Fixed(refs.abs[j]), ColRef::Committed(refs.a[j])],
+            });
+        }
+        terms.push(RelationTerm {
+            coeff: weights[j],
+            factors: vec![ColRef::Fixed(refs.consts[j])],
+        });
+    }
+}
+
+fn duplex_substitution_terms_multi(sets: &[DuplexFamilyRefs], alpha: F128) -> Vec<RelationTerm> {
+    let m = duplex_mds_weights(alpha);
     let mut terms = Vec::new();
     for j in 0..STATE_SIZE {
         terms.push(RelationTerm {
@@ -6244,22 +6724,33 @@ fn duplex_substitution_terms_multi(sets: &[DuplexFamilyRefs], alpha: F128) -> Ve
         });
     }
     for refs in sets {
-        for j in 0..STATE_SIZE {
-            terms.push(RelationTerm {
-                coeff: m[j],
-                factors: vec![ColRef::Fixed(refs.start), ColRef::CommittedShift(refs.c[j])],
-            });
-            if j < 2 {
-                terms.push(RelationTerm {
-                    coeff: m[j],
-                    factors: vec![ColRef::Fixed(refs.abs[j]), ColRef::Committed(refs.a[j])],
-                });
-            }
-            terms.push(RelationTerm {
-                coeff: m[j],
-                factors: vec![ColRef::Fixed(refs.consts[j])],
-            });
-        }
+        append_duplex_pattern_terms(&mut terms, refs, &m);
+    }
+    terms
+}
+
+/// Selector-aware recording wiring. `sets` is ordered as
+/// `(arm-0 base, arm-0/arm-1 delta)` for each recording chunk. Over the
+/// characteristic-two base field, `base + selector * delta` is exactly the
+/// selected fixed schedule while retaining one proof shape for both arms.
+pub(crate) fn duplex_substitution_terms_selected(
+    sets: &[DuplexFamilyRefs],
+    selector: F128,
+    alpha: F128,
+) -> Vec<RelationTerm> {
+    assert!(!sets.is_empty() && sets.len() % 2 == 0);
+    let m = duplex_mds_weights(alpha);
+    let selected_m = m.map(|weight| weight * selector);
+    let mut terms = Vec::new();
+    for j in 0..STATE_SIZE {
+        terms.push(RelationTerm {
+            coeff: m[j],
+            factors: vec![ColRef::CommittedShift(sets[0].c[j])],
+        });
+    }
+    for pair in sets.chunks_exact(2) {
+        append_duplex_pattern_terms(&mut terms, &pair[0], &m);
+        append_duplex_pattern_terms(&mut terms, &pair[1], &selected_m);
     }
     terms
 }
@@ -6332,16 +6823,6 @@ pub(crate) struct DuplexUnionWalkDeferredProofRef<'a> {
 
 impl DuplexUnionProof {
     pub(crate) fn walk_deferred(&self) -> DuplexUnionWalkDeferredProofRef<'_> {
-        DuplexUnionWalkDeferredProofRef {
-            selection: &self.selection,
-            substitution: &self.substitution,
-            shifts: &self.shifts,
-        }
-    }
-}
-
-impl DuplexUnionWalkDeferredProof {
-    pub(crate) fn as_ref(&self) -> DuplexUnionWalkDeferredProofRef<'_> {
         DuplexUnionWalkDeferredProofRef {
             selection: &self.selection,
             substitution: &self.substitution,
@@ -6477,6 +6958,31 @@ pub(crate) fn prove_duplex_union_walk_suffix_with_challenger<Ch: Challenger>(
     terminal: &LaneClaimGroup,
     challenger: &mut Ch,
 ) -> (DuplexUnionWalkDeferredProof, Vec<DuplexColumnClaim>) {
+    prove_duplex_union_walk_suffix_with_term_builder(
+        w_log,
+        fixed,
+        committed,
+        prefix,
+        terminal,
+        challenger,
+        |alpha| duplex_terms_from_refs(refs, rec_refs, alpha),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_duplex_union_walk_suffix_with_term_builder<Ch, BuildTerms>(
+    w_log: usize,
+    fixed: &[FixedPattern],
+    committed: &[&[F128]],
+    prefix: DuplexUnionProverWalkPrefix,
+    terminal: &LaneClaimGroup,
+    challenger: &mut Ch,
+    build_terms: BuildTerms,
+) -> (DuplexUnionWalkDeferredProof, Vec<DuplexColumnClaim>)
+where
+    Ch: Challenger,
+    BuildTerms: FnOnce(F128) -> Vec<RelationTerm>,
+{
     let w = 1usize << w_log;
     assert!(committed.iter().all(|column| column.len() == w));
     let DuplexUnionProverWalkPrefix {
@@ -6486,7 +6992,7 @@ pub(crate) fn prove_duplex_union_walk_suffix_with_challenger<Ch: Challenger>(
     } = prefix;
 
     let alpha = challenger.sample_f128();
-    let substitution_terms = duplex_terms_from_refs(refs, rec_refs, alpha);
+    let substitution_terms = build_terms(alpha);
     let mut target = F128::ZERO;
     let mut alpha_power = F128::ONE;
     for value in terminal.values {
@@ -6603,13 +7109,35 @@ pub(crate) fn verify_duplex_union_walk_suffix_with_challenger<Ch: Challenger>(
     terminal: &LaneClaimGroup,
     challenger: &mut Ch,
 ) -> Result<Vec<DuplexColumnClaim>, DuplexUnionVerifyError> {
+    verify_duplex_union_walk_suffix_with_term_builder(
+        w_log,
+        fixed,
+        prefix,
+        terminal,
+        challenger,
+        |alpha| duplex_terms_from_refs(refs, rec_refs, alpha),
+    )
+}
+
+fn verify_duplex_union_walk_suffix_with_term_builder<Ch, BuildTerms>(
+    w_log: usize,
+    fixed: &[FixedPattern],
+    prefix: DuplexUnionVerifierWalkPrefix<'_>,
+    terminal: &LaneClaimGroup,
+    challenger: &mut Ch,
+    build_terms: BuildTerms,
+) -> Result<Vec<DuplexColumnClaim>, DuplexUnionVerifyError>
+where
+    Ch: Challenger,
+    BuildTerms: FnOnce(F128) -> Vec<RelationTerm>,
+{
     let DuplexUnionVerifierWalkPrefix {
         proof,
         mut pending,
         walk_group: _,
     } = prefix;
     let alpha = challenger.sample_f128();
-    let substitution_terms = duplex_terms_from_refs(refs, rec_refs, alpha);
+    let substitution_terms = build_terms(alpha);
     let mut target = F128::ZERO;
     let mut alpha_power = F128::ONE;
     for value in terminal.values {
@@ -6814,8 +7342,8 @@ pub(crate) fn duplex_sub_terms_trace(
     (terms, ap)
 }
 
-/// Trace twin of [`duplex_substitution_terms_multi`] (same term order).
-pub(crate) fn duplex_sub_terms_trace_multi(
+#[cfg(test)]
+fn duplex_sub_terms_trace_multi(
     b: &mut FieldR1csBuilder,
     sets: &[DuplexFamilyRefs],
     alpha: &LinExpr,

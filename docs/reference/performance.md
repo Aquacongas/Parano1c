@@ -1,84 +1,85 @@
-# Performance measurements
+# Performance measurement
 
-Performance figures describe a measured implementation on a named machine.
-They are not consensus constants and should not be projected onto an unrelated
-CPU from core count alone.
+Performance belongs to one source revision, proof profile, authenticated matrix
+pack, build profile and host. It is not a consensus constant and cannot be
+inferred from core count alone.
 
-The reference system used:
+The measurements below use Parano1d revision
+`39626b22d53cf2f2c480a7e28446c197dca68043`, the production C1 profile and the
+authenticated B25/B255 matrix pack. The table contains isolated production
+benchmarks only.
 
-```text
-CPU       Intel Core i7-1365U
-Topology  10 cores / 12 threads
-ISA       AVX2 + VPCLMULQDQ, no AVX-512
-OS        Linux 6.17 x86-64
-Rust      1.96.0
-```
+| Host | Class | `HistoryStep` construction | Statistic | Terminal |
+|---|---|---:|---|---:|
+| Low-cost AVX2 laptop, 12 threads | B25 | **10.734 s** | p50 of 3 samples | 971,732 B |
+| Low-cost AVX2 laptop, 12 threads | B255 | **34.938 s** | 1 isolated sample | 1,081,108 B |
+| AVX-512 PC, 24 threads | B25 | **6.905 s** | p50 of 3 samples | 971,732 B |
+| AVX-512 PC, 24 threads | B255 | **21.053 s** | p50 of 3 samples | 1,081,108 B |
 
-Each table reports 20 measured samples after warm-up. p95 uses the
-nearest-rank estimator.
+PoW nonce search is not included in the table. ASERT targets the complete
+elapsed interval between accepted blocks. It does not assign a separate
+15-second budget to nonce search. Proof preparation, nonce search and network
+propagation all occupy the same observed block interval, and ASERT adjusts the
+nonce target against that complete cadence.
 
-## Wallet authorization path
+## Wallet authorization
 
-The wallet benchmark includes page construction, logical hashing, one
+The wallet harness measures page construction, logical hashing, one
 authorization capsule, complete intent encode/decode and local capsule
 admission. It excludes network latency and block `HistoryStep` proving.
 
-| Case | Pages | Total p50 | Total p95 | Proof / intent size |
-|---|---:|---:|---:|---:|
-| 1 input | 1 | 228.30 ms | 352.47 ms | 56.49 / 56.81 KiB |
-| 100 inputs | 13 | 217.32 ms | 255.46 ms | 56.58 / 60.69 KiB |
-| 1,020 inputs | 128 | 233.06 ms | 285.81 ms | 56.11 / 96.50 KiB |
-
-The 1,020-input case still produces one authorization capsule. Larger input
-sets increase page hashing and serialized intent size, but not the number of
-wallet proofs.
-
-Reproduce the harness with:
-
 ```sh
-NOID_WALLET_BENCH_SAMPLES=20 cargo run --release \
+NOID_WALLET_BENCH_SAMPLES=20 cargo run --release --locked \
   --manifest-path research/two_class/Cargo.toml \
   --bin two-class-wallet-bench
 ```
 
-## HistoryStep classes
+The production C1 wallet uses 65 Fiat–Shamir queries. One `PagedSpend` contains
+one authorization capsule whether it occupies one page or the full 128 pages.
+The canonical serialized authorization has a 92,696-byte worst-case bound.
 
-Complete preparation is assembly plus proving. Verification measures the
-terminal verifier used by a full node.
+## HistoryStep
 
-| Class | Useful rows | Prepare p50 / p95 | Verify p50 / p95 | Terminal |
-|---|---:|---:|---:|---:|
-| B64, `m=23` | 5,705,307 | 11.472 / 14.387 s | 0.666 / 0.720 s | 766,549 B |
-| B255, `m=24` | 15,368,233 | 24.189 / 29.755 s | 0.770 / 1.012 s | 807,189 B |
+The isolated production benchmark requires a completed and authenticated
+matrix pack. Run each class separately so the output identifies the exact
+parent and child class.
 
-On this host, B64 passed the strict 15-second p95 preparation gate with 613 ms
-of margin. B255 did not, so the production capacity selector correctly kept
-the miner at B64. Both classes remain inexpensive for an ordinary node to
-verify relative to proving them.
+```sh
+NOID_PACK_ROOT=../parano1d-artifacts/history-step-pack-v1
+source "$NOID_PACK_ROOT/pins.env"
+export NOID_HISTORY_STEP_PACK_DIR="$NOID_PACK_ROOT"
 
-The benchmark used Thin LTO, one codegen unit and `target-cpu=native` to
-measure the exact host. Official binaries keep a portable process baseline and
-select proof and PoW kernels at runtime; therefore release-package timing must
-also be checked on its destination.
+NOID_HISTORY_STEP_BENCH_FILTER=B25 \
+NOID_HISTORY_STEP_BENCH_SAMPLES=20 \
+cargo bench --locked -p bench_prover --bench history_step_proof
 
-## Reading the figures
+NOID_HISTORY_STEP_BENCH_FILTER=B255 \
+NOID_HISTORY_STEP_BENCH_SAMPLES=20 \
+cargo bench --locked -p bench_prover --bench history_step_proof
+```
 
-The wallet table measures local authorization, not time to confirmation. The
-HistoryStep table measures block preparation, not expected proof-of-work search
-time. Network propagation and nonce search vary independently.
+`cargo bench` uses the optimized bench profile. Transaction construction,
+wallet proving, block-template construction and matrix authentication are
+setup. `history_step_ms` covers parent-terminal decoding, bounded input and
+authorization preparation, recursive assembly, nonce sealing, proof
+construction and terminal encoding. `verify_ms` covers bounded wire decoding
+and complete terminal verification.
 
-For a miner, qualify the complete path:
+## End-to-end block production
+
+The isolated proof measurement is not the complete mining latency. Capacity
+decisions must measure:
 
 ```text
 select intents
-  + assemble witness
+  + assemble the current block trace
+  + replay and bind the parent terminal
   + prove HistoryStep
-  + search nonce
-  + submit and accept block
+  + search the nonce
+  + submit and accept the block
 ```
 
-Optimizing one internal phase does not justify enabling a larger proof class
-if complete preparation misses the target interval.
-
-The archived reports in the source repository record command lines, commits,
-matrix digests and raw samples under `research/two_class/results/`.
+Nonce search and network propagation vary independently from proof
+construction. B25 and B255 qualification must use the complete production path
+on the final host. Official binaries keep a portable baseline and select the
+`pclmul`, `avx2+vpclmul`, `avx512bw+vpclmul` or `neon+pmull` backend at runtime.

@@ -69,10 +69,10 @@ pub struct ZkMleCheckMaskRankCertificate {
     pub remaining_active_degrees_of_freedom: usize,
 }
 
-pub fn certify_zk_mlecheck_mask_rank(
-    mask_batch_challenge: Block128,
+pub fn certify_zk_mlecheck_mask_rank<F: TowerField>(
+    mask_batch_challenge: F,
 ) -> Result<ZkMleCheckMaskRankCertificate, ZkMleCheckError> {
-    if mask_batch_challenge == Block128::ZERO {
+    if mask_batch_challenge == F::ZERO {
         return Err(ZkMleCheckError::ZeroMaskBatchChallenge);
     }
     Ok(ZkMleCheckMaskRankCertificate {
@@ -127,23 +127,25 @@ impl<'a> ZkMleCheckMaskView<'a> {
     }
 
     /// Evaluate one `g_i(x)` in monomial basis using Horner's rule.
-    pub fn evaluate_univariate(
-        &self,
-        var_index: usize,
-        x: Block128,
-    ) -> Result<Block128, ZkMleCheckError> {
+    pub fn evaluate_univariate<F>(&self, var_index: usize, x: F) -> Result<F, ZkMleCheckError>
+    where
+        F: TowerField + From<Block128>,
+    {
         let coeffs = self
             .coefficients_for_var(var_index)
             .ok_or(ZkMleCheckError::VariableOutOfRange)?;
-        Ok(evaluate_coefficients(&coeffs, x))
+        Ok(evaluate_coefficients(&coeffs.map(F::from), x))
     }
 
     /// Evaluate the multilinear extension of `g` at the input claim point.
     ///
     /// Although each `g_i` has degree ten, its Boolean-table MLE contribution
     /// is the endpoint line `(1-z_i)g_i(0) + z_i g_i(1)`.
-    pub fn evaluate_mle(&self, input_point: &[Block128; ZK_MLECHECK_N_VARS]) -> Block128 {
-        let mut value = Block128::ZERO;
+    pub fn evaluate_mle<F>(&self, input_point: &[F; ZK_MLECHECK_N_VARS]) -> F
+    where
+        F: TowerField + From<Block128>,
+    {
+        let mut value = F::ZERO;
         for (var_index, &z_i) in input_point.iter().enumerate() {
             value += self.endpoint_line(var_index, z_i);
         }
@@ -152,28 +154,34 @@ impl<'a> ZkMleCheckMaskView<'a> {
 
     /// Evaluate the separable degree-ten mask at the final arbitrary point:
     /// `g(r) = sum_i g_i(r_i)`.
-    pub fn evaluate_final(&self, terminal_point: &[Block128; ZK_MLECHECK_N_VARS]) -> Block128 {
+    pub fn evaluate_final<F>(&self, terminal_point: &[F; ZK_MLECHECK_N_VARS]) -> F
+    where
+        F: TowerField + From<Block128>,
+    {
         terminal_point
             .iter()
             .enumerate()
-            .fold(Block128::ZERO, |acc, (var_index, &r_i)| {
+            .fold(F::ZERO, |acc, (var_index, &r_i)| {
                 acc + self.evaluate_univariate_unchecked(var_index, r_i)
             })
     }
 
     /// Build the current separable mask round in high-to-low variable order.
     /// `prior_challenges[0]` belongs to variable ten, then variable nine, etc.
-    pub fn round_coefficients(
+    pub fn round_coefficients<F>(
         &self,
-        input_point: &[Block128; ZK_MLECHECK_N_VARS],
-        prior_challenges: &[Block128],
-    ) -> Result<LibraMaskRoundCoefficients, ZkMleCheckError> {
+        input_point: &[F; ZK_MLECHECK_N_VARS],
+        prior_challenges: &[F],
+    ) -> Result<LibraMaskRoundCoefficients<F>, ZkMleCheckError>
+    where
+        F: TowerField + From<Block128>,
+    {
         if prior_challenges.len() >= ZK_MLECHECK_N_VARS {
             return Err(ZkMleCheckError::TooManyPriorChallenges);
         }
 
         let var_index = ZK_MLECHECK_N_VARS - 1 - prior_challenges.len();
-        let mut constant_offset = Block128::ZERO;
+        let mut constant_offset = F::ZERO;
 
         // Already-bound high variables contribute g_j(r_j).
         for (round, &challenge) in prior_challenges.iter().enumerate() {
@@ -186,33 +194,42 @@ impl<'a> ZkMleCheckMaskView<'a> {
             constant_offset += self.endpoint_line(lower_var, z_i);
         }
 
-        let mut coeffs = self
+        let base_coeffs = self
             .coefficients_for_var(var_index)
             .expect("var_index is derived in range");
+        let mut coeffs = base_coeffs.map(F::from);
         coeffs[0] += constant_offset;
         Ok(LibraMaskRoundCoefficients { coeffs })
     }
 
     #[inline]
-    fn evaluate_univariate_unchecked(&self, var_index: usize, x: Block128) -> Block128 {
+    fn evaluate_univariate_unchecked<F>(&self, var_index: usize, x: F) -> F
+    where
+        F: TowerField + From<Block128>,
+    {
         evaluate_coefficients(
             &self
                 .coefficients_for_var(var_index)
-                .expect("internal variable index in range"),
+                .expect("internal variable index in range")
+                .map(F::from),
             x,
         )
     }
 
     #[inline]
-    fn endpoint_line(&self, var_index: usize, z_i: Block128) -> Block128 {
+    fn endpoint_line<F>(&self, var_index: usize, z_i: F) -> F
+    where
+        F: TowerField + From<Block128>,
+    {
         let coeffs = self
             .coefficients_for_var(var_index)
             .expect("internal variable index in range");
-        let at_zero = coeffs[0];
+        let at_zero = F::from(coeffs[0]);
         let at_one = coeffs
             .iter()
             .copied()
-            .fold(Block128::ZERO, |acc, coeff| acc + coeff);
+            .map(F::from)
+            .fold(F::ZERO, |acc, coeff| acc + coeff);
         // `at_one - at_zero == at_one + at_zero` in characteristic two.
         at_zero + z_i * (at_one - at_zero)
     }
@@ -247,20 +264,20 @@ impl OwnedZkMleCheckMask {
 
 /// One full degree-ten mask round in monomial coefficient order.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LibraMaskRoundCoefficients {
-    pub coeffs: [Block128; ZK_MLECHECK_MASK_COEFFS],
+pub struct LibraMaskRoundCoefficients<F = Block128> {
+    pub coeffs: [F; ZK_MLECHECK_MASK_COEFFS],
 }
 
-impl LibraMaskRoundCoefficients {
-    pub fn evaluate(&self, x: Block128) -> Block128 {
+impl<F: TowerField> LibraMaskRoundCoefficients<F> {
+    pub fn evaluate(&self, x: F) -> F {
         evaluate_coefficients(&self.coeffs, x)
     }
 
-    pub fn endpoint_claim(&self, alpha: Block128) -> Block128 {
+    pub fn endpoint_claim(&self, alpha: F) -> F {
         mlecheck_endpoint_claim(&self.coeffs, alpha)
     }
 
-    pub fn as_round_polynomial(&self) -> RoundPolynomial<Block128> {
+    pub fn as_round_polynomial(&self) -> RoundPolynomial<F> {
         RoundPolynomial::from_coeffs(self.coeffs.to_vec())
     }
 }
@@ -271,13 +288,13 @@ impl LibraMaskRoundCoefficients {
 /// which omits the linear coefficient for a standard characteristic-two
 /// sumcheck. Here the MLE-check endpoint identity makes `a_0` redundant.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ZkMleCheckRoundProof {
+pub struct ZkMleCheckRoundProof<F = Block128> {
     /// `[a_1, ..., a_10]`; the constant `a_0` is recovered from the claim.
-    pub coeffs_without_constant: [Block128; ZK_MLECHECK_ROUND_PROOF_COEFFS],
+    pub coeffs_without_constant: [F; ZK_MLECHECK_ROUND_PROOF_COEFFS],
 }
 
-impl ZkMleCheckRoundProof {
-    pub fn truncate(full: &RoundPolynomial<Block128>) -> Result<Self, ZkMleCheckError> {
+impl<F: TowerField> ZkMleCheckRoundProof<F> {
+    pub fn truncate(full: &RoundPolynomial<F>) -> Result<Self, ZkMleCheckError> {
         if full.coeffs.len() != ZK_MLECHECK_MASK_COEFFS {
             return Err(ZkMleCheckError::CombinedRoundCoefficientCount {
                 expected: ZK_MLECHECK_MASK_COEFFS,
@@ -291,12 +308,12 @@ impl ZkMleCheckRoundProof {
 
     /// Recover `a_0 = claim - alpha * sum(a_1, ..., a_d)` exactly as in
     /// the MLE-check endpoint relation.
-    pub fn recover(&self, claim: Block128, alpha: Block128) -> RoundPolynomial<Block128> {
+    pub fn recover(&self, claim: F, alpha: F) -> RoundPolynomial<F> {
         let nonconstant_sum = self
             .coeffs_without_constant
             .iter()
             .copied()
-            .fold(Block128::ZERO, |acc, coeff| acc + coeff);
+            .fold(F::ZERO, |acc, coeff| acc + coeff);
         let constant = claim - alpha * nonconstant_sum;
         let mut coeffs = Vec::with_capacity(ZK_MLECHECK_MASK_COEFFS);
         coeffs.push(constant);
@@ -305,16 +322,16 @@ impl ZkMleCheckRoundProof {
     }
 
     pub const fn byte_len(&self) -> usize {
-        ZK_MLECHECK_ROUND_PROOF_COEFFS * 16
+        ZK_MLECHECK_ROUND_PROOF_COEFFS * (F::BITS / 8)
     }
 }
 
 /// Pad a main round through degree ten and add `lambda * mask_round`.
-pub fn combine_main_and_mask_round(
-    main_round: &RoundPolynomial<Block128>,
-    mask_round: &LibraMaskRoundCoefficients,
-    lambda: Block128,
-) -> Result<RoundPolynomial<Block128>, ZkMleCheckError> {
+pub fn combine_main_and_mask_round<F: TowerField>(
+    main_round: &RoundPolynomial<F>,
+    mask_round: &LibraMaskRoundCoefficients<F>,
+    lambda: F,
+) -> Result<RoundPolynomial<F>, ZkMleCheckError> {
     certify_zk_mlecheck_mask_rank(lambda)?;
     if main_round.coeffs.is_empty() {
         return Err(ZkMleCheckError::MainRoundEmpty);
@@ -335,57 +352,57 @@ pub fn combine_main_and_mask_round(
 
 /// `(1-alpha)R(0) + alpha R(1)` for monomial coefficients in
 /// characteristic two.
-pub fn mlecheck_endpoint_claim(coeffs: &[Block128], alpha: Block128) -> Block128 {
+pub fn mlecheck_endpoint_claim<F: TowerField>(coeffs: &[F], alpha: F) -> F {
     let Some((&constant, nonconstant)) = coeffs.split_first() else {
-        return Block128::ZERO;
+        return F::ZERO;
     };
     let nonconstant_sum = nonconstant
         .iter()
         .copied()
-        .fold(Block128::ZERO, |acc, coeff| acc + coeff);
+        .fold(F::ZERO, |acc, coeff| acc + coeff);
     // R(1) - R(0) is exactly the sum of nonconstant coefficients.
     constant + alpha * nonconstant_sum
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZkMleCheckVerifierOutput {
+pub struct ZkMleCheckVerifierOutput<F = Block128> {
     /// Unbatched main-polynomial evaluation at `terminal_point`.
-    pub main_eval: Block128,
+    pub main_eval: F,
     /// Caller-supplied final mask evaluation at the same point.
-    pub mask_eval: Block128,
+    pub mask_eval: F,
     /// Variable order is low-to-high, despite rounds running high-to-low.
-    pub terminal_point: [Block128; ZK_MLECHECK_N_VARS],
+    pub terminal_point: [F; ZK_MLECHECK_N_VARS],
 }
 
 /// Native verifier telescope. Fiat-Shamir absorption/sampling is deliberately
 /// left to the future protocol wrapper; this state consumes explicit caller
 /// challenges and creates none.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZkMleCheckVerifierState {
-    input_point: [Block128; ZK_MLECHECK_N_VARS],
-    lambda: Block128,
-    running_claim: Block128,
+pub struct ZkMleCheckVerifierState<F = Block128> {
+    input_point: [F; ZK_MLECHECK_N_VARS],
+    lambda: F,
+    running_claim: F,
     completed_rounds: usize,
-    terminal_point: [Block128; ZK_MLECHECK_N_VARS],
+    terminal_point: [F; ZK_MLECHECK_N_VARS],
 }
 
-impl ZkMleCheckVerifierState {
+impl<F: TowerField> ZkMleCheckVerifierState<F> {
     pub fn new(
-        input_point: [Block128; ZK_MLECHECK_N_VARS],
-        main_claim: Block128,
-        mask_mle_eval: Block128,
-        lambda: Block128,
+        input_point: [F; ZK_MLECHECK_N_VARS],
+        main_claim: F,
+        mask_mle_eval: F,
+        lambda: F,
     ) -> Self {
         Self {
             input_point,
             lambda,
             running_claim: main_claim + lambda * mask_mle_eval,
             completed_rounds: 0,
-            terminal_point: [Block128::ZERO; ZK_MLECHECK_N_VARS],
+            terminal_point: [F::ZERO; ZK_MLECHECK_N_VARS],
         }
     }
 
-    pub const fn running_claim(&self) -> Block128 {
+    pub const fn running_claim(&self) -> F {
         self.running_claim
     }
 
@@ -405,9 +422,9 @@ impl ZkMleCheckVerifierState {
     /// and advance the high-to-low telescope by one variable.
     pub fn transition(
         &mut self,
-        round: &ZkMleCheckRoundProof,
-        challenge: Block128,
-    ) -> Result<RoundPolynomial<Block128>, ZkMleCheckError> {
+        round: &ZkMleCheckRoundProof<F>,
+        challenge: F,
+    ) -> Result<RoundPolynomial<F>, ZkMleCheckError> {
         let var_index = self
             .current_var_index()
             .ok_or(ZkMleCheckError::RoundExhausted)?;
@@ -426,8 +443,8 @@ impl ZkMleCheckVerifierState {
     /// Unbatch the final mask evaluation after exactly eleven transitions.
     pub fn finish(
         self,
-        mask_final_eval: Block128,
-    ) -> Result<ZkMleCheckVerifierOutput, ZkMleCheckError> {
+        mask_final_eval: F,
+    ) -> Result<ZkMleCheckVerifierOutput<F>, ZkMleCheckError> {
         if self.completed_rounds != ZK_MLECHECK_N_VARS {
             return Err(ZkMleCheckError::RoundsIncomplete {
                 completed: self.completed_rounds,
@@ -444,9 +461,9 @@ impl ZkMleCheckVerifierState {
     /// caller's independently computed main terminal evaluation.
     pub fn finish_checked(
         self,
-        mask_final_eval: Block128,
-        expected_main_final: Block128,
-    ) -> Result<ZkMleCheckVerifierOutput, ZkMleCheckError> {
+        mask_final_eval: F,
+        expected_main_final: F,
+    ) -> Result<ZkMleCheckVerifierOutput<F>, ZkMleCheckError> {
         let output = self.finish(mask_final_eval)?;
         if output.main_eval != expected_main_final {
             return Err(ZkMleCheckError::MainFinalMismatch);
@@ -455,11 +472,11 @@ impl ZkMleCheckVerifierState {
     }
 }
 
-fn evaluate_coefficients(coeffs: &[Block128], x: Block128) -> Block128 {
+fn evaluate_coefficients<F: TowerField>(coeffs: &[F], x: F) -> F {
     coeffs
         .iter()
         .rev()
-        .fold(Block128::ZERO, |acc, &coeff| acc * x + coeff)
+        .fold(F::ZERO, |acc, &coeff| acc * x + coeff)
 }
 
 #[cfg(test)]

@@ -11,7 +11,8 @@ use noid_core::{Block128, CanonicalSerialize, TowerField};
 use zeroize::Zeroize;
 
 const STATE_SIZE: usize = 4;
-const RATE: usize = 2;
+/// Number of field lanes absorbed or squeezed per permutation.
+pub const RATE: usize = 2;
 
 const PADDING_START: u8 = 0x80;
 const PADDING_END: u8 = 0x01;

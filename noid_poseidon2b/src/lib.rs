@@ -17,7 +17,7 @@ pub mod hasher_impl;
 pub mod native;
 pub mod primitives;
 
-pub use channel::Poseidon2bChannel;
+pub use channel::{Poseidon2bChannel, Poseidon2bWideChannel};
 pub use hasher::*;
 pub use native::*;
 pub use primitives::{
@@ -36,5 +36,5 @@ pub mod prelude {
         derive_address, hash_leaf, hash_tx8x2_leaves, hash_utxo_leaf, Address, Commitment, Digest,
         SpendSecret, TxBodyHash, TX8X2_LEAF_COUNT, TX8X2_TREE_DEPTH,
     };
-    pub use crate::Poseidon2bChannel;
+    pub use crate::{Poseidon2bChannel, Poseidon2bWideChannel};
 }

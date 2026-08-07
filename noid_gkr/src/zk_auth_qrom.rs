@@ -26,7 +26,7 @@ use crate::zk_authorization::affine_blend_gamma_is_admissible;
 #[cfg(test)]
 use crate::zk_authorization::{
     absorb_mid_commitment, absorb_owner_prefix, absorb_phase_a_round, absorb_phase_b_prefix,
-    absorb_round, absorb_tail, absorb_terminal, init_main_channel, squeeze_array,
+    absorb_round, absorb_tail, absorb_terminal, init_main_channel, squeeze_wide_array,
     verify_phase_b_upper_tail_link, verify_zk_auth_capsule_owner,
     zk_authorization_queries_from_seeds, ZkAuthCapsuleOwnerError, ZkAuthCapsuleOwnerProof,
     ZkAuthCapsuleOwnerProverOutput, ZkAuthCapsuleOwnerStatement, ZkAuthorizationError,
@@ -41,13 +41,11 @@ use crate::zk_authorization::{
 use crate::zk_mlecheck::ZK_MLECHECK_MASK_DEGREE;
 #[cfg(test)]
 use crate::zk_mlecheck::{ZkMleCheckRoundProof, ZkMleCheckVerifierState};
-#[cfg(test)]
-use noid_core::transcript::FiatShamir;
-use noid_core::{Block128, TowerField};
+use noid_core::{Block128, Block256, TowerField};
 #[cfg(test)]
 use noid_fri::hasher::CryptographicHasher;
 #[cfg(test)]
-use noid_fri_binius::capsule::{capsule_leaf_hash, CapsuleNodeHasher};
+use noid_fri_binius::capsule::{capsule_leaf_hash_wide, CapsuleNodeHasher};
 #[cfg(test)]
 use noid_fri_binius::interleaved_commit::{
     canonical_source_batched_merkle_sibling_positions, MerkleCap, SourceHash,
@@ -58,10 +56,10 @@ use noid_fri_binius::zk_affine_code::{AffineHighPaddingRankCertificate, ZkAffine
 use noid_fri_binius::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
 #[cfg(test)]
 use noid_fri_binius::zk_capsule_algebra::{
-    build_mid_leaf, certify_source_query_hiding_rank, contract_high3_for_each_low8,
-    fold_joint_source_leaf, interleave_joint_source_leaf, joint_source_leaf_positions,
-    map_source_query_leaf, mid_standard_fold4, JOINT_SOURCE_BANK_SYMBOLS,
-    JOINT_SOURCE_LEAF_SYMBOLS, PHASE_B_HIGH_VARS,
+    build_fold_normal_mid_leaf, certify_source_query_hiding_rank, contract_high3_for_each_low8,
+    fold_normal_joint_source_leaf, fold_normal_mid_leaf, fold_normal_mid_raw_member,
+    interleave_joint_source_leaf, joint_source_leaf_positions, map_source_query_leaf,
+    JOINT_SOURCE_BANK_SYMBOLS, JOINT_SOURCE_LEAF_SYMBOLS, PHASE_B_HIGH_VARS,
 };
 use noid_fri_binius::zk_capsule_algebra::{
     MID_STANDARD_FOLDS, PHASE_B_LOW_VARS, SOURCE_STANDARD_FOLDS, TAIL_SYMBOLS, UPPER_SYMBOLS,
@@ -70,15 +68,15 @@ use noid_fri_binius::zk_capsule_algebra::{
 use noid_fri_binius::zk_capsule_pcs::{
     tower_lanes_to_flat_digest, ZkCapsulePcsError, ZkCapsulePcsMidCommitment,
     ZkCapsulePcsSourceCommitment, ZkCapsulePcsTailReveal, ZK_CAPSULE_PCS_MID_CAP_DEPTH,
-    ZK_CAPSULE_PCS_MID_CAP_HASHES, ZK_CAPSULE_PCS_MID_LEAF_COUNT, ZK_CAPSULE_PCS_MID_TREE_DEPTH,
-    ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH, ZK_CAPSULE_PCS_SOURCE_TREE_DEPTH,
-    ZK_CAPSULE_PCS_WORST_MID_SIBLINGS, ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS,
+    ZK_CAPSULE_PCS_MID_CAP_HASHES, ZK_CAPSULE_PCS_MID_LEAF_COUNT, ZK_CAPSULE_PCS_MID_SYMBOLS,
+    ZK_CAPSULE_PCS_MID_TREE_DEPTH, ZK_CAPSULE_PCS_SOURCE_CAP_DEPTH, ZK_CAPSULE_PCS_SOURCE_SYMBOLS,
+    ZK_CAPSULE_PCS_SOURCE_TREE_DEPTH, ZK_CAPSULE_PCS_WORST_MID_SIBLINGS,
+    ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS,
 };
 use noid_fri_binius::zk_capsule_pcs::{
-    ZK_CAPSULE_PCS_MID_CODE_LEN, ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG, ZK_CAPSULE_PCS_MID_SYMBOLS,
+    ZK_CAPSULE_PCS_MID_CODE_LEN, ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG,
     ZK_CAPSULE_PCS_SOURCE_CAP_HASHES, ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT,
     ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG, ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH,
-    ZK_CAPSULE_PCS_SOURCE_SYMBOLS,
 };
 #[cfg(test)]
 use noid_fri_binius::zk_phase_a::{
@@ -87,12 +85,12 @@ use noid_fri_binius::zk_phase_a::{
 };
 use noid_fri_binius::zk_phase_a::{PHASE_A_ROUND_DEGREE, PHASE_A_VARS};
 #[cfg(test)]
-use noid_poseidon2b::channel::Poseidon2bChannel;
+use noid_poseidon2b::channel::Poseidon2bWideChannel;
 #[cfg(test)]
 use rand_core::{CryptoRng, RngCore};
 
-pub const WALLET_BASE_IOP_BITS: u32 = 95;
-pub const WALLET_QROM_TARGET_BITS: u32 = 79;
+pub const WALLET_BASE_IOP_BITS: u32 = 136;
+pub const WALLET_QROM_TARGET_BITS: u32 = 103;
 pub const HISTORY_STEP_CLASSICAL_BITS: u32 = 100;
 /// `min(100 - 2*8, 128 - 3*8) - 1` under the shared QROM budget.
 pub const HISTORY_STEP_QROM_BITS: u32 = 83;
@@ -134,8 +132,8 @@ pub const SOUNDNESS_LEDGER: SoundnessLedger = SoundnessLedger {
     hash_collision_pq_bits: HASH_COLLISION_PQ_BITS,
 };
 
-/// One transcript challenge lane is one uniformly modeled F_{2^128} value.
-pub const ZK_AUTH_EFFECTIVE_CHALLENGE_BITS: u32 = 128;
+/// Exact min-entropy of the trace-one GF(2^256) challenge sampler.
+pub const ZK_AUTH_EFFECTIVE_CHALLENGE_BITS: u32 = 255;
 /// CAPSLEAF/CAPSNODE commitments expose 256-bit digests.
 pub const ZK_AUTH_MERKLE_DIGEST_BITS: u32 = 256;
 /// Grinding is an accepted-output predicate, not unconditional soundness.
@@ -153,7 +151,7 @@ pub const ZK_AUTH_QROM_MAX_PROGRAMMED_SOURCE_NODES: usize =
     ZK_AUTH_QUERY_COUNT * ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH;
 pub const ZK_AUTH_QROM_MAX_PROGRAMMING_POINTS: usize =
     ZK_AUTH_QROM_MAX_PROGRAMMED_SOURCE_LEAVES + ZK_AUTH_QROM_MAX_PROGRAMMED_SOURCE_NODES;
-/// The first transcript message carries 32 fresh 256-bit ideal cap values.
+/// The first transcript message carries eight fresh 256-bit ideal cap values.
 /// Turning this structural width into conditional min-entropy is deliberately
 /// left to the adaptive multi-proof QROM argument.
 pub const ZK_AUTH_SOURCE_CAP_STRUCTURAL_BITS: usize =
@@ -419,7 +417,7 @@ const fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
 pub fn conditional_zk_auth_pcs_proximity_ledger(
     parameters: ZkAuthPcsProximityParameters,
 ) -> Result<ZkAuthConditionalPcsProximityLedger, ZkAuthPcsProximityConfigError> {
-    if parameters.field_bits != 128 {
+    if parameters.field_bits != ZK_AUTH_EFFECTIVE_CHALLENGE_BITS {
         return Err(ZkAuthPcsProximityConfigError::InvalidFieldSize);
     }
     if parameters.inverse_rate < 2 {
@@ -552,10 +550,9 @@ pub fn conditional_zk_auth_pcs_proximity_ledger(
     })
 }
 
-/// Conditional Johnson/list-correlated-agreement screen for the unchanged
-/// q=64 geometry.  The simple rational radius 7/10 stays far enough below the
-/// Johnson radius that BCHKS Theorem 4.2/4.6 uses multiplicity three on every
-/// selected RS layer.
+/// Conditional Johnson/list-correlated-agreement screen for the selected
+/// q=65 geometry. The radius 49/64 gives a per-query miss fraction of 15/64;
+/// BCHKS Theorem 4.2/4.6 uses multiplicity four on every selected RS layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthJohnsonPcsParameters {
     pub field_bits: u32,
@@ -568,8 +565,8 @@ pub struct ZkAuthJohnsonPcsParameters {
 pub const ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS: ZkAuthJohnsonPcsParameters =
     ZkAuthJohnsonPcsParameters {
         field_bits: ZK_AUTH_EFFECTIVE_CHALLENGE_BITS,
-        radius_numerator: 7,
-        radius_denominator: 10,
+        radius_numerator: 49,
+        radius_denominator: 64,
         query_count: ZK_AUTH_QUERY_COUNT,
         fixed_grind_credit_bits: ZK_AUTH_QROM_FIXED_GRIND_SOUNDNESS_CREDIT_BITS,
     };
@@ -581,7 +578,7 @@ pub enum ZkAuthJohnsonPcsConfigError {
     InvalidQueryCount,
     GrindCreditMustBeZero,
     JohnsonRadiusPrecondition,
-    MultiplicityThreePrecondition,
+    SelectedMultiplicityPrecondition,
     ArithmeticOverflow,
     InvalidSquareRootBound,
 }
@@ -621,7 +618,7 @@ pub struct ZkAuthConditionalJohnsonPcsLedger {
 }
 
 /// Multiplicity-one Sudan interpolation dimension certificate for a bounded
-/// Johnson candidate list at the selected 7/10 distance radius.
+/// Johnson candidate list at the selected 49/64 distance radius.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkAuthJohnsonListSizeLineLedger {
     pub code_len: usize,
@@ -630,7 +627,7 @@ pub struct ZkAuthJohnsonListSizeLineLedger {
     pub required_agreements: usize,
     pub interpolation_weighted_degree: usize,
     pub interpolation_y_degree: usize,
-    pub monomials_by_y_degree: [usize; 4],
+    pub monomials_by_y_degree: [usize; 8],
     pub interpolation_unknowns: usize,
     pub interpolation_constraints: usize,
     pub interpolation_dimension_margin: usize,
@@ -657,9 +654,9 @@ const fn selected_johnson_list_size_line(
     let required_agreements = (agreement_numerator * layer.code_len).div_ceil(radius_denominator);
     let interpolation_weighted_degree = required_agreements - 1;
     let paper_degree = layer.message_len - 1;
-    let mut monomials_by_y_degree = [0usize; 4];
+    let mut monomials_by_y_degree = [0usize; 8];
     let mut y_degree = 0;
-    while y_degree <= 3 {
+    while y_degree <= 7 {
         let weight = paper_degree * y_degree;
         if weight <= interpolation_weighted_degree {
             monomials_by_y_degree[y_degree] = interpolation_weighted_degree - weight + 1;
@@ -669,19 +666,23 @@ const fn selected_johnson_list_size_line(
     let interpolation_unknowns = monomials_by_y_degree[0]
         + monomials_by_y_degree[1]
         + monomials_by_y_degree[2]
-        + monomials_by_y_degree[3];
+        + monomials_by_y_degree[3]
+        + monomials_by_y_degree[4]
+        + monomials_by_y_degree[5]
+        + monomials_by_y_degree[6]
+        + monomials_by_y_degree[7];
     ZkAuthJohnsonListSizeLineLedger {
         code_len: layer.code_len,
         message_len: layer.message_len,
         paper_degree,
         required_agreements,
         interpolation_weighted_degree,
-        interpolation_y_degree: 3,
+        interpolation_y_degree: 7,
         monomials_by_y_degree,
         interpolation_unknowns,
         interpolation_constraints: layer.code_len,
         interpolation_dimension_margin: interpolation_unknowns - layer.code_len,
-        max_candidate_list_size: 3,
+        max_candidate_list_size: 7,
     }
 }
 
@@ -703,7 +704,7 @@ pub const fn selected_zk_auth_johnson_list_size_ledger() -> ZkAuthJohnsonListSiz
             as usize,
         agreement_denominator: ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS.radius_denominator as usize,
         lines,
-        global_max_candidate_list_size: 3,
+        global_max_candidate_list_size: 7,
         polynomial_time_decoder_implemented: false,
     }
 }
@@ -728,6 +729,7 @@ impl ZkAuthConditionalJohnsonPcsLedger {
 }
 
 const ZK_AUTH_JOHNSON_SQRT_SCALE: u128 = 1u128 << 48;
+const ZK_AUTH_SELECTED_JOHNSON_MULTIPLICITY: u128 = 4;
 
 fn floor_sqrt_u128(value: u128) -> u128 {
     if value < 2 {
@@ -777,19 +779,40 @@ fn conditional_johnson_line_ledger(
         return Err(ZkAuthJohnsonPcsConfigError::JohnsonRadiusPrecondition);
     }
 
-    // ceil(sqrt(rho)/(1-sqrt(rho)-gamma)) <= 3 is equivalent to
-    // 4*sqrt(rho) <= 3*(1-gamma).  This pins theorem multiplicity m=3.
-    if 16u128
+    // ceil(sqrt(rho)/(1-sqrt(rho)-gamma)) <= m is equivalent to
+    // (m+1)*sqrt(rho) <= m*(1-gamma). This pins one multiplicity uniformly
+    // over all eight layers.
+    let multiplicity = ZK_AUTH_SELECTED_JOHNSON_MULTIPLICITY;
+    let multiplicity_plus_one_squared = (multiplicity + 1)
+        .checked_mul(multiplicity + 1)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    let multiplicity_squared = multiplicity
+        .checked_mul(multiplicity)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    if multiplicity_plus_one_squared
         .checked_mul(rho_numerator)
         .and_then(|value| value.checked_mul(radius_denominator_squared))
         .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?
-        > 9u128
+        > multiplicity_squared
             .checked_mul(rho_denominator)
             .and_then(|value| value.checked_mul(radius_complement_squared))
             .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?
     {
-        return Err(ZkAuthJohnsonPcsConfigError::MultiplicityThreePrecondition);
+        return Err(ZkAuthJohnsonPcsConfigError::SelectedMultiplicityPrecondition);
     }
+    let h_numerator = multiplicity
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    let h_numerator_squared = h_numerator
+        .checked_mul(h_numerator)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    let h_numerator_fourth = h_numerator_squared
+        .checked_mul(h_numerator_squared)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
+    let h_numerator_fifth = h_numerator_fourth
+        .checked_mul(h_numerator)
+        .ok_or(ZkAuthJohnsonPcsConfigError::ArithmeticOverflow)?;
 
     let sqrt_scale_squared = ZK_AUTH_JOHNSON_SQRT_SCALE
         .checked_mul(ZK_AUTH_JOHNSON_SQRT_SCALE)
@@ -813,7 +836,7 @@ fn conditional_johnson_line_ledger(
         return Err(ZkAuthJohnsonPcsConfigError::InvalidSquareRootBound);
     }
 
-    // For m=3, h=m+1/2=7/2.  Theorem 4.2/4.6 bounds one degree-one
+    // For selected m and h=m+1/2, Theorem 4.2/4.6 bounds one degree-one
     // exceptional set by
     //
     // n * (2h^5 + 3h*gamma*rho)/(3*rho^(3/2)) + h/sqrt(rho).
@@ -822,12 +845,15 @@ fn conditional_johnson_line_ledger(
     // bound gives a rational upper bound.  The expression below is that
     // rational with common denominator.  Ceiling division deliberately keeps
     // the integer exceptional-set ledger conservative as well.
-    let curve_term = 16_807u128
+    // Clearing the h denominator gives the common numerator
+    // h_num^5*rden*rhoden + 24*h_num*rnum*rhonum.
+    let curve_term = h_numerator_fifth
         .checked_mul(radius_denominator)
         .and_then(|value| value.checked_mul(rho_denominator))
         .and_then(|value| {
-            168u128
-                .checked_mul(radius_numerator)
+            24u128
+                .checked_mul(h_numerator)
+                .and_then(|second| second.checked_mul(radius_numerator))
                 .and_then(|second| second.checked_mul(rho_numerator))
                 .and_then(|second| value.checked_add(second))
         })
@@ -835,8 +861,9 @@ fn conditional_johnson_line_ledger(
     let upper_numerator = (layer.code_len as u128)
         .checked_mul(curve_term)
         .and_then(|value| {
-            168u128
-                .checked_mul(radius_denominator)
+            24u128
+                .checked_mul(h_numerator)
+                .and_then(|second| second.checked_mul(radius_denominator))
                 .and_then(|second| second.checked_mul(rho_numerator))
                 .and_then(|second| value.checked_add(second))
         })
@@ -864,7 +891,7 @@ fn conditional_johnson_line_ledger(
         rho_denominator,
         sqrt_rho_lower_numerator,
         sqrt_rho_lower_denominator: ZK_AUTH_JOHNSON_SQRT_SCALE,
-        multiplicity: 3,
+        multiplicity: multiplicity as usize,
         bad_coin_upper_bound,
     })
 }
@@ -872,7 +899,7 @@ fn conditional_johnson_line_ledger(
 pub fn conditional_selected_zk_auth_johnson_pcs_ledger(
     parameters: ZkAuthJohnsonPcsParameters,
 ) -> Result<ZkAuthConditionalJohnsonPcsLedger, ZkAuthJohnsonPcsConfigError> {
-    if parameters.field_bits != 128 {
+    if parameters.field_bits != ZK_AUTH_EFFECTIVE_CHALLENGE_BITS {
         return Err(ZkAuthJohnsonPcsConfigError::InvalidFieldSize);
     }
     if parameters.radius_denominator == 0
@@ -1170,8 +1197,8 @@ pub const ZK_AUTH_RBR_IOP_PROFILE: ZkAuthRbrIopProfile = ZkAuthRbrIopProfile {
 
 pub const ZK_AUTH_BASE_SOURCE_ORACLE_FIELDS: usize = ZK_CAPSULE_PCS_SOURCE_LEAF_COUNT * 16;
 pub const ZK_AUTH_BASE_MID_ORACLE_FIELDS: usize = ZK_CAPSULE_PCS_MID_CODE_LEN;
-pub const ZK_AUTH_BASE_FINAL_QUERY_ANSWER_FIELDS: usize =
-    ZK_CAPSULE_PCS_SOURCE_SYMBOLS + ZK_CAPSULE_PCS_MID_SYMBOLS;
+pub const ZK_AUTH_BASE_FINAL_QUERY_ANSWER_FIELDS: usize = ZK_AUTH_QUERY_COUNT
+    * (ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_symbols + (1 << MID_STANDARD_FOLDS));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkAuthBaseIopProverMessageKind {
@@ -1501,7 +1528,7 @@ pub const fn conditional_zk_auth_algebraic_bad_coin_ledger(
     ledger
 }
 
-/// Fail-closed scalar union for the selected q=64 base IOP before the BCS
+/// Fail-closed scalar union for the selected q=65 base IOP before the BCS
 /// compiler.  The Main gamma algebraic root and gamma proximity exception use
 /// the same coin and are therefore added, never multiplied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1561,15 +1588,15 @@ pub fn conditional_selected_zk_auth_base_iop_ledger(
 /// RBR/HVZK arguments a concrete interactive object to reason about.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkAuthChallengeTape {
-    pub owner_rho: [Block128; ZK_AUTH_MLECHECK_VARS],
-    pub owner_lambda: Block128,
-    pub owner_rounds_high_to_low: [Block128; ZK_AUTH_MLECHECK_VARS],
-    pub owner_eta: Block128,
-    pub main_gamma: Block128,
-    pub phase_a_high_to_low: [Block128; PHASE_A_VARS],
-    pub beta_source: [Block128; SOURCE_STANDARD_FOLDS],
-    pub beta_mid: [Block128; MID_STANDARD_FOLDS],
-    pub beta_tail: Block128,
+    pub owner_rho: [Block256; ZK_AUTH_MLECHECK_VARS],
+    pub owner_lambda: Block256,
+    pub owner_rounds_high_to_low: [Block256; ZK_AUTH_MLECHECK_VARS],
+    pub owner_eta: Block256,
+    pub main_gamma: Block256,
+    pub phase_a_high_to_low: [Block256; PHASE_A_VARS],
+    pub beta_source: [Block256; SOURCE_STANDARD_FOLDS],
+    pub beta_mid: [Block256; MID_STANDARD_FOLDS],
+    pub beta_tail: Block256,
     /// Transform-level accepted-output lane. It is not returned through
     /// [`Self::challenge_group`] because it is not a base-IOP public coin.
     pub compiled_grind: Block128,
@@ -1597,7 +1624,7 @@ impl ZkAuthChallengeTape {
         }
     }
 
-    pub fn challenge_group(&self, move_: ZkAuthIopMove) -> Option<&[Block128]> {
+    pub fn algebraic_challenge_group(&self, move_: ZkAuthIopMove) -> Option<&[Block256]> {
         Some(match move_ {
             ZkAuthIopMove::OwnerRho => &self.owner_rho,
             ZkAuthIopMove::OwnerLambda => std::slice::from_ref(&self.owner_lambda),
@@ -1612,15 +1639,15 @@ impl ZkAuthChallengeTape {
             ZkAuthIopMove::BetaSource => &self.beta_source,
             ZkAuthIopMove::BetaMid => &self.beta_mid,
             ZkAuthIopMove::BetaTail => std::slice::from_ref(&self.beta_tail),
-            ZkAuthIopMove::QuerySeeds => &self.query_seeds,
+            ZkAuthIopMove::QuerySeeds => return None,
         })
     }
 
     pub fn has_admissible_base_challenges(&self) -> bool {
-        self.owner_lambda != Block128::ZERO
-            && self.owner_eta != Block128::ZERO
-            && self.main_gamma != Block128::ZERO
-            && self.main_gamma != Block128::ONE
+        self.owner_lambda != Block256::ZERO
+            && self.owner_eta != Block256::ZERO
+            && self.main_gamma != Block256::ZERO
+            && self.main_gamma != Block256::ONE
     }
 
     pub fn compiled_grind_is_valid(&self) -> bool {
@@ -1715,13 +1742,13 @@ pub fn zk_auth_qrom_required_term_budgets(
     })
 }
 
-/// Fail-closed feasibility screen for the selected q=64 base IOP under the
+/// Fail-closed feasibility screen for the selected q=65 base IOP under the
 /// pre-hidden-constant CMS/BCS expression.
 ///
 /// The exact symbolic bound represented here is
 ///
 /// ```text
-/// 2^L * (2^(2q) * (A / 2^128 + (3 / 10)^64) + 2^(3q-lambda)),
+/// 2^L * (2^(2q) * (A / 2^255 + (15 / 64)^65) + 2^(3q-lambda)),
 /// ```
 ///
 /// where `A` and the other base-IOP parameters come directly from
@@ -1809,7 +1836,7 @@ pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_QUERY_BUDGET_EXPONENT: u32 = 8;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_LIFETIME_EXPONENT: u32 = 0;
 pub const ZK_AUTH_SELECTED_QROM_DIAGNOSTIC_ORACLE_OUTPUT_BITS: u32 = HASH_PREIMAGE_PQ_BITS;
 
-/// The selected executable arithmetic gate for the q64/rate-1/32 capsule.
+/// The selected executable arithmetic gate for the q65/rate-1/32 capsule.
 ///
 /// It changes no capsule/PCS geometry.
 pub fn conditional_selected_zk_auth_qrom_diagnostic(
@@ -1824,8 +1851,17 @@ pub fn conditional_selected_zk_auth_qrom_diagnostic(
 
 #[inline]
 #[cfg(test)]
-fn draw_simulator_field(rng: &mut (impl CryptoRng + RngCore + ?Sized)) -> Block128 {
+fn draw_simulator_base_field(rng: &mut (impl CryptoRng + RngCore + ?Sized)) -> Block128 {
     Block128::from(((rng.next_u64() as u128) << 64) | rng.next_u64() as u128)
+}
+
+#[inline]
+#[cfg(test)]
+fn draw_simulator_field(rng: &mut (impl CryptoRng + RngCore + ?Sized)) -> Block256 {
+    Block256::new(
+        draw_simulator_base_field(rng),
+        draw_simulator_base_field(rng),
+    )
 }
 
 /// Construct one accepting Owner transcript view without a bank, state table,
@@ -1851,26 +1887,26 @@ fn simulate_zk_auth_capsule_owner_view(
     source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
     rng: &mut (impl CryptoRng + RngCore + ?Sized),
 ) -> Result<ZkAuthCapsuleOwnerProverOutput, ZkAuthCapsuleOwnerError> {
-    let mut channel = Poseidon2bChannel::new();
+    let mut channel = Poseidon2bWideChannel::new();
     absorb_owner_prefix(&mut channel, statement, source_cap);
-    let rho = squeeze_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
+    let rho = squeeze_wide_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
 
     let mask_mu = draw_simulator_field(rng);
-    channel.absorb(mask_mu);
-    let lambda = channel.squeeze();
-    if lambda == Block128::ZERO {
+    channel.absorb_wide(mask_mu);
+    let lambda = channel.squeeze_wide();
+    if lambda == Block256::ZERO {
         return Err(ZkAuthCapsuleOwnerError::LambdaZero);
     }
 
-    let mut verifier = ZkMleCheckVerifierState::new(rho, Block128::ZERO, mask_mu, lambda);
-    let mut round_challenges_high_to_low = [Block128::ZERO; ZK_AUTH_MLECHECK_VARS];
+    let mut verifier = ZkMleCheckVerifierState::new(rho, Block256::ZERO, mask_mu, lambda);
+    let mut round_challenges_high_to_low = [Block256::ZERO; ZK_AUTH_MLECHECK_VARS];
     let mut rounds = Vec::with_capacity(ZK_AUTH_OWNER_PROOF_ROUNDS);
     for (round_index, challenge_slot) in round_challenges_high_to_low.iter_mut().enumerate() {
         let round = ZkMleCheckRoundProof {
             coeffs_without_constant: std::array::from_fn(|_| draw_simulator_field(rng)),
         };
         absorb_round(&mut channel, &round);
-        let challenge = channel.squeeze();
+        let challenge = channel.squeeze_wide();
         *challenge_slot = challenge;
         verifier.transition(&round, challenge)?;
         debug_assert_eq!(round_index + 1, verifier.completed_rounds());
@@ -1892,8 +1928,8 @@ fn simulate_zk_auth_capsule_owner_view(
         ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS
     );
     absorb_terminal(&mut channel, mask_final, &terminal_operand_claims);
-    let eta = channel.squeeze();
-    if eta == Block128::ZERO {
+    let eta = channel.squeeze_wide();
+    if eta == Block256::ZERO {
         return Err(ZkAuthCapsuleOwnerError::EtaZero);
     }
     let expected_bridge =
@@ -1924,40 +1960,43 @@ fn simulate_zk_auth_capsule_owner_view(
 
 #[cfg(test)]
 fn random_merkle_digest(rng: &mut (impl CryptoRng + RngCore + ?Sized)) -> [u8; 32] {
-    tower_lanes_to_flat_digest([draw_simulator_field(rng), draw_simulator_field(rng)])
+    tower_lanes_to_flat_digest([
+        draw_simulator_base_field(rng),
+        draw_simulator_base_field(rng),
+    ])
 }
 
 #[cfg(test)]
 fn sample_uniform_affine_fiber(
-    weights: &[Block128],
-    claim: Block128,
+    weights: &[Block256],
+    claim: Block256,
     rng: &mut (impl CryptoRng + RngCore + ?Sized),
-) -> Result<Vec<Block128>, ZkAuthorizationError> {
+) -> Result<Vec<Block256>, ZkAuthorizationError> {
     let pivot = weights
         .iter()
-        .position(|&coefficient| coefficient != Block128::ZERO);
+        .position(|&coefficient| coefficient != Block256::ZERO);
     let mut values = (0..weights.len())
         .map(|_| draw_simulator_field(rng))
         .collect::<Vec<_>>();
     match pivot {
         Some(pivot) => {
-            values[pivot] = Block128::ZERO;
+            values[pivot] = Block256::ZERO;
             let fixed = weights
                 .iter()
                 .zip(&values)
-                .fold(Block128::ZERO, |sum, (&weight, &value)| {
+                .fold(Block256::ZERO, |sum, (&weight, &value)| {
                     sum + weight * value
                 });
             values[pivot] = (claim - fixed) * weights[pivot].invert();
         }
-        None if claim == Block128::ZERO => {}
+        None if claim == Block256::ZERO => {}
         None => return Err(ZkAuthorizationError::PhaseABindingMismatch),
     }
     debug_assert_eq!(
         weights
             .iter()
             .zip(&values)
-            .fold(Block128::ZERO, |sum, (&weight, &value)| {
+            .fold(Block256::ZERO, |sum, (&weight, &value)| {
                 sum + weight * value
             }),
         claim
@@ -1966,7 +2005,7 @@ fn sample_uniform_affine_fiber(
 }
 
 #[cfg(test)]
-fn fold_lowest_in_place(values: &mut Vec<Block128>, challenge: Block128) {
+fn fold_lowest_in_place(values: &mut Vec<Block256>, challenge: Block256) {
     assert!(values.len().is_power_of_two() && values.len() >= 2);
     let folded_len = values.len() / 2;
     for index in 0..folded_len {
@@ -2027,16 +2066,14 @@ impl ZkAuthHonestMerkleTree {
 
 #[cfg(test)]
 fn build_honest_mid_tree(
-    mid_codeword: &[Block128],
+    mid_codeword: &[Block256],
 ) -> Result<ZkAuthHonestMerkleTree, ZkAuthorizationError> {
+    let code = ZkAffineLchCode::selected().map_err(authorization_pcs_error)?;
     let mut leaf_hashes = Vec::with_capacity(ZK_CAPSULE_PCS_MID_LEAF_COUNT);
     for leaf_index in 0..ZK_CAPSULE_PCS_MID_LEAF_COUNT {
-        let leaf = build_mid_leaf(mid_codeword, leaf_index).map_err(authorization_pcs_error)?;
-        leaf_hashes.push(capsule_leaf_hash(
-            ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG,
-            leaf_index,
-            &leaf,
-        ));
+        let leaf = build_fold_normal_mid_leaf(&code, mid_codeword, leaf_index)
+            .map_err(authorization_pcs_error)?;
+        leaf_hashes.push(capsule_leaf_hash_wide(&leaf));
     }
     Ok(ZkAuthHonestMerkleTree::new(leaf_hashes))
 }
@@ -2059,19 +2096,19 @@ struct ZkAuthPreopeningAlgebraicView {
     source_commitment: ZkCapsulePcsSourceCommitment,
     source_merkle: ZkAuthMerkleProgrammingStatus,
     owner: ZkAuthCapsuleOwnerProverOutput,
-    sigma: Block128,
-    gamma: Block128,
-    phase_a: ZkPhaseAProof,
-    phase_a_challenges_high_to_low: [Block128; PHASE_A_VARS],
-    phase_b_value: Block128,
+    sigma: Block256,
+    gamma: Block256,
+    phase_a: ZkPhaseAProof<Block256>,
+    phase_a_challenges_high_to_low: [Block256; PHASE_A_VARS],
+    phase_b_value: Block256,
     upper: ZkAuthorizationUpper,
     mid_commitment: ZkCapsulePcsMidCommitment,
     mid_merkle: ZkAuthMerkleProgrammingStatus,
-    mid_codeword: Vec<Block128>,
+    mid_codeword: Vec<Block256>,
     mid_tree: ZkAuthHonestMerkleTree,
     tail: ZkCapsulePcsTailReveal,
-    beta: [Block128; PHASE_B_LOW_VARS],
-    virtual_oracle: Vec<Block128>,
+    beta: [Block256; PHASE_B_LOW_VARS],
+    virtual_oracle: Vec<Block256>,
 }
 
 #[cfg(test)]
@@ -2092,17 +2129,17 @@ fn simulate_zk_auth_preopening_algebraic_view(
     let bank_claim = owner.derived.bank_claim();
     let relation_is_zero = relation
         .iter()
-        .all(|&coefficient| coefficient == Block128::ZERO);
-    if relation_is_zero && bank_claim != Block128::ZERO {
+        .all(|&coefficient| coefficient == Block256::ZERO);
+    if relation_is_zero && bank_claim != Block256::ZERO {
         return Err(ZkAuthorizationError::PhaseABindingMismatch);
     }
     let sigma = if relation_is_zero {
-        Block128::ZERO
+        Block256::ZERO
     } else {
         draw_simulator_field(rng)
     };
     let mut channel = init_main_channel(&owner.derived, sigma);
-    let gamma = channel.squeeze();
+    let gamma = channel.squeeze_wide();
     if !affine_blend_gamma_is_admissible(gamma) {
         return Err(ZkAuthorizationError::GammaEndpoint);
     }
@@ -2113,7 +2150,7 @@ fn simulate_zk_auth_preopening_algebraic_view(
     };
     let virtual_claim = bank_claim + gamma * (bank_claim + sigma);
     let virtual_oracle = sample_uniform_affine_fiber(relation, virtual_claim, rng)?;
-    let mut phase_a_challenges_high_to_low = [Block128::ZERO; PHASE_A_VARS];
+    let mut phase_a_challenges_high_to_low = [Block256::ZERO; PHASE_A_VARS];
     let phase_a = prove_phase_a_from_virtual_oracle_adaptive(
         &virtual_oracle,
         relation,
@@ -2121,17 +2158,17 @@ fn simulate_zk_auth_preopening_algebraic_view(
         gamma,
         |round, round_proof| {
             absorb_phase_a_round(&mut channel, &round_proof);
-            let challenge = channel.squeeze();
+            let challenge = channel.squeeze_wide();
             phase_a_challenges_high_to_low[round] = challenge;
             challenge
         },
     )?;
     let phase_b_value = phase_a.terminal_oracle_value;
-    let virtual_oracle_array: &[Block128; 1 << PHASE_A_VARS] = virtual_oracle
+    let virtual_oracle_array: &[Block256; 1 << PHASE_A_VARS] = virtual_oracle
         .as_slice()
         .try_into()
         .expect("selected virtual oracle length");
-    let high_point: &[Block128; PHASE_B_HIGH_VARS] = phase_a.terminal_point[PHASE_B_LOW_VARS..]
+    let high_point: &[Block256; PHASE_B_HIGH_VARS] = phase_a.terminal_point[PHASE_B_LOW_VARS..]
         .try_into()
         .expect("selected Phase-A point splits 8+3");
     let upper = ZkAuthorizationUpper::new(contract_high3_for_each_low8(
@@ -2139,7 +2176,8 @@ fn simulate_zk_auth_preopening_algebraic_view(
         high_point,
     ));
     absorb_phase_b_prefix(&mut channel, phase_b_value, &upper);
-    let beta_source: [Block128; SOURCE_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze());
+    let beta_source: [Block256; SOURCE_STANDARD_FOLDS] =
+        std::array::from_fn(|_| channel.squeeze_wide());
 
     let mut folded = virtual_oracle.clone();
     for challenge in beta_source {
@@ -2147,7 +2185,7 @@ fn simulate_zk_auth_preopening_algebraic_view(
     }
     let code = ZkAffineLchCode::selected().map_err(authorization_pcs_error)?;
     let mid_codeword = code
-        .encode_after_low_folds(&folded, SOURCE_STANDARD_FOLDS)
+        .encode_extension_after_low_folds(&folded, SOURCE_STANDARD_FOLDS)
         .map_err(authorization_pcs_error)?;
     let mid_tree = build_honest_mid_tree(&mid_codeword)?;
     debug_assert_eq!(mid_tree.tree_depth(), ZK_CAPSULE_PCS_MID_TREE_DEPTH);
@@ -2161,7 +2199,7 @@ fn simulate_zk_auth_preopening_algebraic_view(
         ZK_CAPSULE_PCS_MID_CAP_HASHES
     );
     absorb_mid_commitment(&mut channel, &mid_commitment)?;
-    let beta_mid: [Block128; MID_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze());
+    let beta_mid: [Block256; MID_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze_wide());
     for challenge in beta_mid {
         fold_lowest_in_place(&mut folded, challenge);
     }
@@ -2173,8 +2211,8 @@ fn simulate_zk_auth_preopening_algebraic_view(
     };
     debug_assert_eq!(tail.coefficients.len(), TAIL_SYMBOLS);
     absorb_tail(&mut channel, &tail);
-    let beta_tail = channel.squeeze();
-    let mut beta = [Block128::ZERO; PHASE_B_LOW_VARS];
+    let beta_tail = channel.squeeze_wide();
+    let mut beta = [Block256::ZERO; PHASE_B_LOW_VARS];
     beta[..SOURCE_STANDARD_FOLDS].copy_from_slice(&beta_source);
     beta[SOURCE_STANDARD_FOLDS..PHASE_B_LOW_VARS - 1].copy_from_slice(&beta_mid);
     beta[PHASE_B_LOW_VARS - 1] = beta_tail;
@@ -2226,13 +2264,13 @@ fn authorization_pcs_error(error: impl Into<ZkCapsulePcsError>) -> ZkAuthorizati
 /// falsely imply that authentication siblings are present.
 #[cfg(test)]
 fn verify_zk_auth_algebraic_opening_links(
-    gamma: Block128,
-    beta_source: [Block128; SOURCE_STANDARD_FOLDS],
-    beta_mid: [Block128; MID_STANDARD_FOLDS],
+    gamma: Block256,
+    beta_source: [Block256; SOURCE_STANDARD_FOLDS],
+    beta_mid: [Block256; MID_STANDARD_FOLDS],
     tail: &ZkCapsulePcsTailReveal,
     queries: &[usize],
     source_joint_symbols: &[Block128],
-    mid_symbols: &[Block128],
+    mid_symbols: &[Block256],
 ) -> Result<AffineHighPaddingRankCertificate, ZkAuthorizationError> {
     if queries.len() != ZK_AUTH_QUERY_COUNT {
         return Err(authorization_pcs_error(ZkCapsulePcsError::QueryCount {
@@ -2269,7 +2307,7 @@ fn verify_zk_auth_algebraic_opening_links(
     let source_hiding_rank =
         certify_source_query_hiding_rank(&code, queries).map_err(authorization_pcs_error)?;
     let tail_codeword = code
-        .encode_after_low_folds(
+        .encode_extension_after_low_folds(
             &tail.coefficients,
             SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS,
         )
@@ -2277,7 +2315,7 @@ fn verify_zk_auth_algebraic_opening_links(
     let mut distinct_source_leaves =
         std::collections::BTreeMap::<usize, [Block128; JOINT_SOURCE_LEAF_SYMBOLS]>::new();
     let mut distinct_mid_leaves =
-        std::collections::BTreeMap::<usize, [Block128; 1 << MID_STANDARD_FOLDS]>::new();
+        std::collections::BTreeMap::<usize, [Block256; 1 << MID_STANDARD_FOLDS]>::new();
 
     for (query_index, &query) in queries.iter().enumerate() {
         let mapping = map_source_query_leaf(query).map_err(authorization_pcs_error)?;
@@ -2293,11 +2331,10 @@ fn verify_zk_auth_algebraic_opening_links(
                 )));
             }
         }
-        let source_folded = fold_joint_source_leaf(&code, source_leaf, gamma, query, &beta_source)
-            .map_err(authorization_pcs_error)?;
+        let source_folded = fold_normal_joint_source_leaf(source_leaf, gamma, &beta_source);
 
         let mid_start = query_index * (1 << MID_STANDARD_FOLDS);
-        let mid_leaf: &[Block128; 1 << MID_STANDARD_FOLDS] = mid_symbols
+        let mid_leaf: &[Block256; 1 << MID_STANDARD_FOLDS] = mid_symbols
             [mid_start..mid_start + (1 << MID_STANDARD_FOLDS)]
             .try_into()
             .expect("mid symbol count preflighted");
@@ -2308,13 +2345,19 @@ fn verify_zk_auth_algebraic_opening_links(
                 )));
             }
         }
-        if mid_leaf[mapping.mid_member_index] != source_folded {
+        let raw_mid_member = fold_normal_mid_raw_member(
+            &code,
+            mid_leaf,
+            mapping.mid_leaf_index,
+            mapping.mid_member_index,
+        )
+        .map_err(authorization_pcs_error)?;
+        if raw_mid_member != source_folded {
             return Err(authorization_pcs_error(
                 ZkCapsulePcsError::SourceToMidMismatch { query_index },
             ));
         }
-        let mid_folded = mid_standard_fold4(&code, mid_leaf, mapping.mid_leaf_index, &beta_mid)
-            .map_err(authorization_pcs_error)?;
+        let mid_folded = fold_normal_mid_leaf(mid_leaf, &beta_mid);
         if tail_codeword[mapping.mid_leaf_index] != mid_folded {
             return Err(authorization_pcs_error(
                 ZkCapsulePcsError::MidToTailMismatch { query_index },
@@ -2338,7 +2381,7 @@ struct ZkAuthAlgebraicOpeningView {
     query_seeds: [Block128; ZK_AUTH_QUERY_SEEDS],
     queries: [usize; ZK_AUTH_QUERY_COUNT],
     source_joint_symbols: Vec<Block128>,
-    mid_symbols: Vec<Block128>,
+    mid_symbols: Vec<Block256>,
     joint_hiding: ZkAuthJointHidingRankCertificate,
     conditioned_sigma: ZkAuthConditionedCompanionHyperplaneCertificate,
 }
@@ -2353,19 +2396,19 @@ fn simulate_zk_auth_algebraic_opening_view(
     let queries = zk_authorization_queries_from_seeds(&query_seeds);
     let code = ZkAffineLchCode::selected().map_err(authorization_pcs_error)?;
     let virtual_codeword = code
-        .encode(&preopening.virtual_oracle)
+        .encode_extension_after_low_folds(&preopening.virtual_oracle, 0)
         .map_err(authorization_pcs_error)?;
 
-    let beta_source: [Block128; SOURCE_STANDARD_FOLDS] = preopening.beta[..SOURCE_STANDARD_FOLDS]
+    let beta_source: [Block256; SOURCE_STANDARD_FOLDS] = preopening.beta[..SOURCE_STANDARD_FOLDS]
         .try_into()
         .expect("selected beta source width");
-    let beta_mid: [Block128; MID_STANDARD_FOLDS] = preopening.beta
+    let beta_mid: [Block256; MID_STANDARD_FOLDS] = preopening.beta
         [SOURCE_STANDARD_FOLDS..PHASE_B_LOW_VARS - 1]
         .try_into()
         .expect("selected beta mid width");
 
     let inverse_gamma = preopening.gamma.invert();
-    let bank_coefficient = Block128::ONE + preopening.gamma;
+    let bank_coefficient = Block256::ONE + preopening.gamma;
     let mut sampled_bank_leaves =
         std::collections::BTreeMap::<usize, [Block128; JOINT_SOURCE_BANK_SYMBOLS]>::new();
     let mut source_joint_symbols = Vec::with_capacity(ZK_CAPSULE_PCS_SOURCE_SYMBOLS);
@@ -2374,16 +2417,31 @@ fn simulate_zk_auth_algebraic_opening_view(
         let mapping = map_source_query_leaf(query).map_err(authorization_pcs_error)?;
         let bank_leaf = sampled_bank_leaves
             .entry(query)
-            .or_insert_with(|| std::array::from_fn(|_| draw_simulator_field(rng)));
+            .or_insert_with(|| std::array::from_fn(|_| draw_simulator_base_field(rng)));
         let positions = joint_source_leaf_positions(query).map_err(authorization_pcs_error)?;
-        let companion_leaf = std::array::from_fn(|member| {
+        let companion_leaf: [Block256; JOINT_SOURCE_BANK_SYMBOLS] = std::array::from_fn(|member| {
             inverse_gamma
-                * (virtual_codeword[positions[member]] + bank_coefficient * bank_leaf[member])
+                * (virtual_codeword[positions[member]]
+                    + bank_coefficient * Block256::from(bank_leaf[member]))
         });
-        source_joint_symbols
-            .extend_from_slice(&interleave_joint_source_leaf(bank_leaf, &companion_leaf));
+        let normalized_bank = code
+            .fold_normalize_coset(bank_leaf, 0, query)
+            .map_err(authorization_pcs_error)?;
+        let normalized_companion = code
+            .fold_normalize_coset(&companion_leaf, 0, query)
+            .map_err(authorization_pcs_error)?;
+        let normalized_bank: [Block128; JOINT_SOURCE_BANK_SYMBOLS] = normalized_bank
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("source normalization preserves leaf size"));
+        let normalized_companion: [Block256; JOINT_SOURCE_BANK_SYMBOLS] = normalized_companion
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("source normalization preserves leaf size"));
+        source_joint_symbols.extend_from_slice(&interleave_joint_source_leaf(
+            &normalized_bank,
+            &normalized_companion,
+        ));
         mid_symbols.extend_from_slice(
-            &build_mid_leaf(&preopening.mid_codeword, mapping.mid_leaf_index)
+            &build_fold_normal_mid_leaf(&code, &preopening.mid_codeword, mapping.mid_leaf_index)
                 .map_err(authorization_pcs_error)?,
         );
     }
@@ -2416,7 +2474,7 @@ fn simulate_zk_auth_algebraic_opening_view(
         .weights
         .iter()
         .zip(&preopening.virtual_oracle)
-        .fold(Block128::ZERO, |sum, (&weight, &value)| {
+        .fold(Block256::ZERO, |sum, (&weight, &value)| {
             sum + weight * value
         });
     if simulated_virtual_claim != conditioned_sigma.expected_blend_claim {
@@ -2810,7 +2868,7 @@ fn build_honest_merkle_siblings(
 fn verify_honest_mid_merkle(
     cap: &[SourceHash],
     queries: &[usize; ZK_AUTH_QUERY_COUNT],
-    mid_symbols: &[Block128],
+    mid_symbols: &[Block256],
     siblings: &[SourceHash],
 ) -> Result<(), ZkAuthMerkleSimulationError> {
     if cap.len() != 1 << ZK_CAPSULE_PCS_MID_CAP_DEPTH
@@ -2822,7 +2880,7 @@ fn verify_honest_mid_merkle(
     }
     let mut known = std::collections::BTreeMap::<usize, SourceHash>::new();
     let mut distinct_symbols =
-        std::collections::BTreeMap::<usize, [Block128; 1 << MID_STANDARD_FOLDS]>::new();
+        std::collections::BTreeMap::<usize, [Block256; 1 << MID_STANDARD_FOLDS]>::new();
     for (&query, symbols) in queries
         .iter()
         .zip(mid_symbols.chunks_exact(1 << MID_STANDARD_FOLDS))
@@ -2830,7 +2888,7 @@ fn verify_honest_mid_merkle(
         let mapping = map_source_query_leaf(query)
             .map_err(authorization_pcs_error)
             .map_err(ZkAuthMerkleSimulationError::from)?;
-        let symbols: [Block128; 1 << MID_STANDARD_FOLDS] = symbols.try_into().unwrap();
+        let symbols: [Block256; 1 << MID_STANDARD_FOLDS] = symbols.try_into().unwrap();
         if let Some(previous) = distinct_symbols.insert(mapping.mid_leaf_index, symbols) {
             if previous != symbols {
                 return Err(ZkAuthMerkleSimulationError::InconsistentLeaf {
@@ -2840,10 +2898,7 @@ fn verify_honest_mid_merkle(
         }
     }
     for (&leaf_index, symbols) in &distinct_symbols {
-        known.insert(
-            leaf_index,
-            capsule_leaf_hash(ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG, leaf_index, symbols),
-        );
+        known.insert(leaf_index, capsule_leaf_hash_wide(symbols));
     }
 
     let mut sibling_cursor = 0usize;
@@ -2955,19 +3010,19 @@ fn simulate_zk_auth_merkle_opening_view(
     })
 }
 
-const _: () = assert!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION == 2);
+const _: () = assert!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION == 3);
 const _: () = assert!(ZK_AUTH_OWNER_SQUEEZES == 24);
 const _: () = assert!(ZK_AUTH_MAIN_SQUEEZES == 28);
 const _: () = assert!(ZK_AUTH_TOTAL_VERIFIER_MOVES == 30);
 const _: () = assert!(ZK_AUTH_BASE_IOP_CHALLENGE_FIELDS == 51);
 const _: () = assert!(ZK_AUTH_CAPSULE_MAIN_DEGREE == ZK_MLECHECK_MASK_DEGREE);
-const _: () = assert!(ZK_AUTH_QROM_MAX_PROGRAMMED_SOURCE_NODES == 512);
-const _: () = assert!(ZK_AUTH_QROM_MAX_PROGRAMMING_POINTS == 576);
-const _: () = assert!(ZK_AUTH_SOURCE_CAP_STRUCTURAL_BITS == 8_192);
+const _: () = assert!(ZK_AUTH_QROM_MAX_PROGRAMMED_SOURCE_NODES == 650);
+const _: () = assert!(ZK_AUTH_QROM_MAX_PROGRAMMING_POINTS == 715);
+const _: () = assert!(ZK_AUTH_SOURCE_CAP_STRUCTURAL_BITS == 2_048);
 const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_LEAF_HASH_LOG != ZK_CAPSULE_PCS_MID_LEAF_HASH_LOG);
 const _: () = assert!(ZK_AUTH_BASE_SOURCE_ORACLE_FIELDS == 131_072);
 const _: () = assert!(ZK_AUTH_BASE_MID_ORACLE_FIELDS == 8_192);
-const _: () = assert!(ZK_AUTH_BASE_FINAL_QUERY_ANSWER_FIELDS == 2_048);
+const _: () = assert!(ZK_AUTH_BASE_FINAL_QUERY_ANSWER_FIELDS == 2_080);
 const _: () = assert!(ZK_AUTH_GENERIC_QUANTUM_GRIND_WORK_BITS == 8);
 const _: () = assert!(ZK_AUTH_QROM_FIXED_GRIND_SOUNDNESS_CREDIT_BITS == 0);
 
@@ -3040,13 +3095,13 @@ mod tests {
             ZK_AUTH_RBR_IOP_PROFILE.final_response,
             ZkAuthIopFinalResponseKind::SourceAndMidQueryAnswers
         );
-        assert_eq!(ZK_AUTH_RBR_IOP_PROFILE.final_query_answer_fields, 2_048);
+        assert_eq!(ZK_AUTH_RBR_IOP_PROFILE.final_query_answer_fields, 2_080);
         assert!(!ZK_AUTH_RBR_IOP_PROFILE.merkle_wrapper_fields_included);
         assert_eq!(ZK_AUTH_RBR_IOP_PROFILE.compiled_conditioned_grind_fields, 1);
     }
 
     #[test]
-    fn rbr_move_profile_is_exact_atomic_and_base_only() {
+    fn rbr_move_profile_is_exact_atomic_and_uses_wide_algebraic_coins() {
         let profiles = zk_auth_rbr_move_profiles();
         let moves = zk_auth_iop_moves();
         assert_eq!(profiles.len(), 30);
@@ -3103,8 +3158,8 @@ mod tests {
             profiles[29].bound_class,
             ZkAuthRbrBoundClass::OracleSampling {
                 seed_fields: 7,
-                used_bits: 832,
-                queries: 64,
+                used_bits: 845,
+                queries: 65,
                 index_bits: 13,
                 with_replacement: true,
             }
@@ -3143,7 +3198,7 @@ mod tests {
         assert_eq!(ledger.beta_tail_equality, 1);
         assert_eq!(ledger.rejected_endpoints_not_counted, 4);
         assert_eq!(ledger.total_bad_coin_upper_bound, 156);
-        assert_eq!(ledger.denominator_bits, 128);
+        assert_eq!(ledger.denominator_bits, 255);
 
         let proximity_or_query_rows = zk_auth_rbr_move_profiles()
             .into_iter()
@@ -3162,17 +3217,17 @@ mod tests {
     fn conditional_base_iop_union_adds_shared_gamma_events_and_claims_no_rbr() {
         let ledger = conditional_selected_zk_auth_base_iop_ledger()
             .expect("selected conditional base-IOP ledger");
-        assert_eq!(ledger.johnson.all_bad_coin_upper_bound, 8_301_954_862);
+        assert_eq!(ledger.johnson.all_bad_coin_upper_bound, 29_163_918_732);
         assert_eq!(ledger.algebraic.total_bad_coin_upper_bound, 156);
-        assert_eq!(ledger.all_field_bad_coin_upper_bound, 8_301_955_018);
-        assert_eq!(ledger.field_denominator_bits, 128);
-        assert_eq!(ledger.single_query_miss_numerator, 3);
-        assert_eq!(ledger.single_query_miss_denominator, 10);
-        assert_eq!(ledger.query_term_exponent, 64);
+        assert_eq!(ledger.all_field_bad_coin_upper_bound, 29_163_918_888);
+        assert_eq!(ledger.field_denominator_bits, 255);
+        assert_eq!(ledger.single_query_miss_numerator, 15);
+        assert_eq!(ledger.single_query_miss_denominator, 64);
+        assert_eq!(ledger.query_term_exponent, 65);
         assert!(ledger.shared_gamma_events_are_unioned);
-        assert!((ledger.diagnostic_query_term_bits() - 111.165_798_0).abs() < 1e-7);
-        assert!((ledger.diagnostic_field_bad_coin_bits() - 95.049_196_0).abs() < 1e-7);
-        assert!((ledger.diagnostic_conditional_union_bits() - 95.049_175_7).abs() < 1e-7);
+        assert!((ledger.diagnostic_query_term_bits() - 136.052_111_3).abs() < 1e-7);
+        assert!((ledger.diagnostic_field_bad_coin_bits() - 220.236_534_5).abs() < 1e-7);
+        assert!((ledger.diagnostic_conditional_union_bits() - 136.052_111_3).abs() < 1e-7);
         assert_eq!(
             ledger.diagnostic_conditional_union_bits().floor() as u32,
             WALLET_BASE_IOP_BITS
@@ -3184,14 +3239,14 @@ mod tests {
         let ledger =
             conditional_zk_auth_pcs_proximity_ledger(ZK_AUTH_SELECTED_PCS_PROXIMITY_PARAMETERS)
                 .expect("selected finite-length proximity parameters");
-        assert_eq!(ledger.parameters.field_bits, 128);
+        assert_eq!(ledger.parameters.field_bits, 255);
         assert_eq!(ledger.parameters.inverse_rate, 32);
         assert_eq!(ledger.parameters.source_domain_len, 65_536);
         assert_eq!(ledger.parameters.source_folds, 3);
         assert_eq!(ledger.parameters.mid_domain_len, 8_192);
         assert_eq!(ledger.parameters.mid_folds, 4);
         assert_eq!(ledger.parameters.tail_domain_len, 512);
-        assert_eq!(ledger.parameters.query_count, 64);
+        assert_eq!(ledger.parameters.query_count, 65);
         assert!(ledger.parameters.queries_with_replacement);
         assert_eq!(ledger.parameters.fixed_grind_credit_bits, 0);
         assert_eq!(
@@ -3220,7 +3275,7 @@ mod tests {
             ),
             (1_035, 1_984)
         );
-        assert_eq!(ledger.query_term_exponent, 64);
+        assert_eq!(ledger.query_term_exponent, 65);
         assert_eq!(
             ledger.fold_bad_coin_counts,
             [15_674, 7_837, 3_919, 1_960, 980, 490, 245]
@@ -3228,14 +3283,14 @@ mod tests {
         assert_eq!(ledger.fold_bad_coin_total, 31_105);
         assert_eq!(ledger.gamma_line_bad_coin_count, 31_348);
         assert_eq!(ledger.all_bad_coin_total, 62_453);
-        assert_eq!(ledger.bad_coin_denominator_bits, 128);
+        assert_eq!(ledger.bad_coin_denominator_bits, 255);
         assert_eq!(
             ledger.query_term_target_status,
             ZkAuthPcsTargetStatus::BelowEightyBits
         );
-        assert!((ledger.diagnostic_query_term_bits() - 60.082_000_5).abs() < 1e-7);
-        assert!((ledger.diagnostic_bad_coin_term_bits() - 112.069_516_7).abs() < 1e-7);
-        assert!((ledger.diagnostic_conditional_union_bits() - 60.082_000_5).abs() < 1e-7);
+        assert!((ledger.diagnostic_query_term_bits() - 61.020_781_8).abs() < 1e-7);
+        assert!((ledger.diagnostic_bad_coin_term_bits() - 239.069_516_7).abs() < 1e-7);
+        assert!((ledger.diagnostic_conditional_union_bits() - 61.020_781_8).abs() < 1e-7);
         assert_eq!(ledger.diagnostic_min_queries_for_query_term_bits(80), 86);
         assert_eq!(ledger.diagnostic_min_queries_for_query_term_bits(128), 137);
     }
@@ -3329,17 +3384,17 @@ mod tests {
     }
 
     #[test]
-    fn conditional_johnson_screen_preserves_q64_geometry_without_claiming_rbr() {
+    fn conditional_johnson_screen_certifies_selected_q65_geometry() {
         let ledger = conditional_selected_zk_auth_johnson_pcs_ledger(
             ZK_AUTH_SELECTED_JOHNSON_PCS_PARAMETERS,
         )
         .expect("selected conditional Johnson parameters");
-        assert_eq!(ledger.parameters.radius_numerator, 7);
-        assert_eq!(ledger.parameters.radius_denominator, 10);
-        assert_eq!(ledger.parameters.query_count, 64);
-        assert_eq!(ledger.single_query_miss_numerator, 3);
-        assert_eq!(ledger.single_query_miss_denominator, 10);
-        assert_eq!(ledger.query_term_exponent, 64);
+        assert_eq!(ledger.parameters.radius_numerator, 49);
+        assert_eq!(ledger.parameters.radius_denominator, 64);
+        assert_eq!(ledger.parameters.query_count, 65);
+        assert_eq!(ledger.single_query_miss_numerator, 15);
+        assert_eq!(ledger.single_query_miss_denominator, 64);
+        assert_eq!(ledger.query_term_exponent, 65);
         assert_eq!(
             ledger.lines.map(|line| line.kind),
             [
@@ -3364,19 +3419,19 @@ mod tests {
         assert_eq!(
             ledger.lines.map(|line| line.bad_coin_upper_bound),
             [
-                4_157_831_958,
-                2_080_440_085,
-                1_041_746_946,
-                522_405_991,
-                262_746_836,
-                132_940_269,
-                68_084_528,
-                35_758_249,
+                14_606_035_854,
+                7_308_372_401,
+                3_659_550_499,
+                1_835_159_278,
+                923_003_444,
+                467_006_370,
+                239_174_860,
+                125_616_026,
             ]
         );
-        assert_eq!(ledger.all_bad_coin_upper_bound, 8_301_954_862);
-        assert_eq!(ledger.bad_coin_denominator_bits, 128);
-        assert!(ledger.lines.iter().all(|line| line.multiplicity == 3));
+        assert_eq!(ledger.all_bad_coin_upper_bound, 29_163_918_732);
+        assert_eq!(ledger.bad_coin_denominator_bits, 255);
+        assert!(ledger.lines.iter().all(|line| line.multiplicity == 4));
         for line in ledger.lines {
             assert_eq!(line.paper_degree + 1, line.message_len);
             assert_eq!(line.rho_numerator, line.paper_degree as u128);
@@ -3389,44 +3444,44 @@ mod tests {
                     > line.rho_numerator * scale_squared
             );
         }
-        assert!((ledger.diagnostic_query_term_bits() - 111.165_798_0).abs() < 1e-7);
-        assert!((ledger.diagnostic_bad_coin_term_bits() - 95.049_196_1).abs() < 1e-7);
-        assert!((ledger.diagnostic_conditional_union_bits() - 95.049_175_8).abs() < 1e-7);
+        assert!((ledger.diagnostic_query_term_bits() - 136.052_111_3).abs() < 1e-7);
+        assert!((ledger.diagnostic_bad_coin_term_bits() - 220.236_534_5).abs() < 1e-7);
+        assert!((ledger.diagnostic_conditional_union_bits() - 136.052_111_3).abs() < 1e-7);
     }
 
     #[test]
-    fn johnson_sudan_dimension_certificate_bounds_every_candidate_list_by_three() {
+    fn johnson_sudan_dimension_certificate_bounds_every_candidate_list_by_seven() {
         let ledger = selected_zk_auth_johnson_list_size_ledger();
-        assert_eq!(ledger.distance_radius_numerator, 7);
-        assert_eq!(ledger.distance_radius_denominator, 10);
-        assert_eq!(ledger.agreement_numerator, 3);
-        assert_eq!(ledger.agreement_denominator, 10);
-        assert_eq!(ledger.global_max_candidate_list_size, 3);
+        assert_eq!(ledger.distance_radius_numerator, 49);
+        assert_eq!(ledger.distance_radius_denominator, 64);
+        assert_eq!(ledger.agreement_numerator, 15);
+        assert_eq!(ledger.agreement_denominator, 64);
+        assert_eq!(ledger.global_max_candidate_list_size, 7);
         assert!(!ledger.polynomial_time_decoder_implemented);
         assert_eq!(
             ledger.lines.map(|line| line.required_agreements),
-            [19_661, 9_831, 4_916, 2_458, 1_229, 615, 308, 154]
+            [15_360, 7_680, 3_840, 1_920, 960, 480, 240, 120]
         );
         assert_eq!(
             ledger.lines.map(|line| line.monomials_by_y_degree),
             [
-                [19_661, 17_614, 15_567, 13_520],
-                [9_831, 8_808, 7_785, 6_762],
-                [4_916, 4_405, 3_894, 3_383],
-                [2_458, 2_203, 1_948, 1_693],
-                [1_229, 1_102, 975, 848],
-                [615, 552, 489, 426],
-                [308, 277, 246, 215],
-                [154, 139, 124, 109],
+                [15_360, 13_313, 11_266, 9_219, 7_172, 5_125, 3_078, 1_031],
+                [7_680, 6_657, 5_634, 4_611, 3_588, 2_565, 1_542, 519],
+                [3_840, 3_329, 2_818, 2_307, 1_796, 1_285, 774, 263],
+                [1_920, 1_665, 1_410, 1_155, 900, 645, 390, 135],
+                [960, 833, 706, 579, 452, 325, 198, 71],
+                [480, 417, 354, 291, 228, 165, 102, 39],
+                [240, 209, 178, 147, 116, 85, 54, 23],
+                [120, 105, 90, 75, 60, 45, 30, 15],
             ]
         );
         assert_eq!(
             ledger.lines.map(|line| line.interpolation_unknowns),
-            [66_362, 33_186, 16_598, 8_302, 4_154, 2_082, 1_046, 526]
+            [65_564, 32_796, 16_412, 8_220, 4_124, 2_076, 1_052, 540]
         );
         assert_eq!(
             ledger.lines.map(|line| line.interpolation_dimension_margin),
-            [826, 418, 214, 110, 58, 34, 22, 14]
+            [28, 28, 28, 28, 28, 28, 28, 28]
         );
         for line in ledger.lines {
             assert_eq!(line.paper_degree + 1, line.message_len);
@@ -3434,9 +3489,9 @@ mod tests {
                 line.interpolation_weighted_degree + 1,
                 line.required_agreements
             );
-            assert_eq!(line.interpolation_y_degree, 3);
+            assert_eq!(line.interpolation_y_degree, 7);
             assert!(line.interpolation_unknowns > line.interpolation_constraints);
-            assert_eq!(line.max_candidate_list_size, 3);
+            assert_eq!(line.max_candidate_list_size, 7);
         }
     }
 
@@ -3477,7 +3532,7 @@ mod tests {
                 radius_denominator: 5,
                 ..selected
             }),
-            Err(ZkAuthJohnsonPcsConfigError::MultiplicityThreePrecondition)
+            Err(ZkAuthJohnsonPcsConfigError::SelectedMultiplicityPrecondition)
         );
         assert_eq!(
             conditional_selected_zk_auth_johnson_pcs_ledger(ZkAuthJohnsonPcsParameters {
@@ -3545,10 +3600,18 @@ mod tests {
         assert_eq!(ledger.rbr_term_bits, 96);
         assert_eq!(ledger.oracle_term_bits, 80);
         assert_eq!(ledger.preconstant_union_floor_bits, 79);
-        assert_eq!(ZK_AUTH_QROM_PROGRAMMING_BUDGET.max_total_programs, 576);
+        assert_eq!(ZK_AUTH_QROM_PROGRAMMING_BUDGET.max_total_programs, 715);
+        assert_eq!(
+            ZK_AUTH_QROM_PROGRAMMING_BUDGET.max_total_programs,
+            ZK_AUTH_QROM_MAX_PROGRAMMING_POINTS
+        );
         assert_eq!(
             ZK_AUTH_QROM_PROGRAMMING_BUDGET.source_cap_structural_bits,
-            8_192
+            2_048
+        );
+        assert_eq!(
+            ZK_AUTH_QROM_PROGRAMMING_BUDGET.source_cap_structural_bits,
+            ZK_AUTH_SOURCE_CAP_STRUCTURAL_BITS
         );
     }
 
@@ -3557,8 +3620,8 @@ mod tests {
         assert_eq!(
             SOUNDNESS_LEDGER,
             SoundnessLedger {
-                wallet_base_iop_bits: 95,
-                wallet_qrom_target_bits: 79,
+                wallet_base_iop_bits: 136,
+                wallet_qrom_target_bits: 103,
                 history_step_classical_bits: 100,
                 history_step_qrom_bits: 83,
                 hash_preimage_pq_bits: 128,
@@ -3576,7 +3639,7 @@ mod tests {
             history_step.preconstant_union_floor_bits,
             HISTORY_STEP_QROM_BITS as i32
         );
-        assert_eq!(SOUNDNESS_LEDGER.post_quantum_floor_bits(), 79);
+        assert_eq!(SOUNDNESS_LEDGER.post_quantum_floor_bits(), 83);
     }
 
     #[test]
@@ -3590,28 +3653,28 @@ mod tests {
         assert_eq!(ledger.rbr_total_multiplier_exponent, 16);
         assert_eq!(ledger.oracle_total_numerator_exponent, 24);
 
-        // These fields preserve A/2^128 + (3/10)^64 instead of first
+        // These fields preserve A/2^255 + (15/64)^65 instead of first
         // rounding the conditional base error down to an integer bit count.
         assert_eq!(
             ledger.base_iop.all_field_bad_coin_upper_bound,
-            8_301_955_018
+            29_163_918_888
         );
-        assert_eq!(ledger.base_iop.field_denominator_bits, 128);
-        assert_eq!(ledger.base_iop.single_query_miss_numerator, 3);
-        assert_eq!(ledger.base_iop.single_query_miss_denominator, 10);
+        assert_eq!(ledger.base_iop.field_denominator_bits, 255);
+        assert_eq!(ledger.base_iop.single_query_miss_numerator, 15);
+        assert_eq!(ledger.base_iop.single_query_miss_denominator, 64);
         assert_eq!(ledger.base_iop.query_term_exponent, ZK_AUTH_QUERY_COUNT);
 
-        assert!((ledger.diagnostic_scaled_rbr_term_bits() - 79.049_175_7).abs() < 1e-7);
+        assert!((ledger.diagnostic_scaled_rbr_term_bits() - 120.052_111_3).abs() < 1e-7);
         assert!((ledger.diagnostic_oracle_term_bits() - 104.0).abs() < f64::EPSILON);
-        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 79.049_175_7).abs() < 1e-7);
+        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 103.999_978_8).abs() < 1e-7);
         assert!(ledger.meets_target());
     }
 
     #[test]
-    fn seven_bit_qro_budget_screen_is_only_barely_above_eighty_before_gaps() {
+    fn seven_bit_qro_budget_screen_retains_the_wide_profile_margin() {
         let ledger = conditional_selected_zk_auth_qrom_feasibility_ledger(80, 7, 0, 128)
             .expect("conditional q=7 arithmetic screen");
-        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 81.049_175_7).abs() < 1e-7);
+        assert!((ledger.diagnostic_preconstant_lifetime_union_bits() - 106.999_957_5).abs() < 1e-7);
         assert!(ledger.meets_target());
         assert_eq!(ledger.required_term_budgets.required_base_iop_bits, 95);
         assert_eq!(
@@ -3633,9 +3696,9 @@ mod tests {
         assert_eq!(lifetime.rbr_total_multiplier_exponent, 19);
         assert_eq!(lifetime.oracle_total_numerator_exponent, 26);
         assert!(
-            (lifetime.diagnostic_preconstant_lifetime_union_bits() - 76.049_175_7).abs() < 1e-7
+            (lifetime.diagnostic_preconstant_lifetime_union_bits() - 101.999_957_5).abs() < 1e-7
         );
-        assert!(!lifetime.meets_target());
+        assert!(lifetime.meets_target());
 
         assert_eq!(
             zk_auth_qrom_required_term_budgets(80, u32::MAX, 0),
@@ -3705,7 +3768,7 @@ mod tests {
                 .is_err()
         );
         let mut changed_cap = source_cap;
-        changed_cap[17] += Block128::ONE;
+        changed_cap[7] += Block128::ONE;
         assert!(verify_zk_auth_capsule_owner(statement, &changed_cap, &simulated.proof).is_err());
     }
 
@@ -3778,7 +3841,7 @@ mod tests {
         .expect("simulated upper/tail link verifies");
 
         let mut channel = init_main_channel(&first.owner.derived, first.sigma);
-        assert_eq!(channel.squeeze(), first.gamma);
+        assert_eq!(channel.squeeze_wide(), first.gamma);
         for (round, &expected_challenge) in first
             .phase_a
             .rounds
@@ -3786,19 +3849,19 @@ mod tests {
             .zip(&first.phase_a_challenges_high_to_low)
         {
             absorb_phase_a_round(&mut channel, round);
-            assert_eq!(channel.squeeze(), expected_challenge);
+            assert_eq!(channel.squeeze_wide(), expected_challenge);
         }
         absorb_phase_b_prefix(&mut channel, first.phase_b_value, &first.upper);
         for &expected_challenge in &first.beta[..SOURCE_STANDARD_FOLDS] {
-            assert_eq!(channel.squeeze(), expected_challenge);
+            assert_eq!(channel.squeeze_wide(), expected_challenge);
         }
         absorb_mid_commitment(&mut channel, &first.mid_commitment)
             .expect("simulator emits the exact mid cap");
         for &expected_challenge in &first.beta[SOURCE_STANDARD_FOLDS..PHASE_B_LOW_VARS - 1] {
-            assert_eq!(channel.squeeze(), expected_challenge);
+            assert_eq!(channel.squeeze_wide(), expected_challenge);
         }
         absorb_tail(&mut channel, &first.tail);
-        assert_eq!(channel.squeeze(), first.beta[PHASE_B_LOW_VARS - 1]);
+        assert_eq!(channel.squeeze_wide(), first.beta[PHASE_B_LOW_VARS - 1]);
     }
 
     #[test]
@@ -3825,7 +3888,7 @@ mod tests {
         .expect("untampered simulated Phase A verifies");
 
         let mut bad_phase_a = view.phase_a.clone();
-        bad_phase_a.rounds[4].at_one += Block128::ONE;
+        bad_phase_a.rounds[4].at_one += Block256::ONE;
         assert!(verify_phase_a(
             &bad_phase_a,
             relation_claims,
@@ -3837,13 +3900,13 @@ mod tests {
         .is_err());
 
         let shifted_upper = ZkAuthorizationUpper::new(std::array::from_fn(|index| {
-            view.upper.as_array()[index] + Block128::ONE
+            view.upper.as_array()[index] + Block256::ONE
         }));
         assert_eq!(
             verify_phase_b_upper_tail_link(
                 shifted_upper.as_array(),
                 &verified_phase_a.terminal_point,
-                view.phase_b_value + Block128::ONE,
+                view.phase_b_value + Block256::ONE,
                 &view.beta,
                 &view.tail.coefficients,
             ),
@@ -3891,10 +3954,10 @@ mod tests {
             ZK_CAPSULE_PCS_SOURCE_SYMBOLS
         );
         assert_eq!(view.mid_symbols.len(), ZK_CAPSULE_PCS_MID_SYMBOLS);
-        assert_eq!(view.joint_hiding.source_rank, 512);
-        assert_eq!(view.joint_hiding.source.distinct_query_count, 512);
-        assert_eq!(view.joint_hiding.certified_joint_rank, 628);
-        assert_eq!(view.joint_hiding.public_conditioning_fields, 629);
+        assert_eq!(view.joint_hiding.source_rank, 520);
+        assert_eq!(view.joint_hiding.source.distinct_query_count, 520);
+        assert_eq!(view.joint_hiding.certified_joint_rank, 636);
+        assert_eq!(view.joint_hiding.public_conditioning_fields, 637);
         assert_eq!(view.joint_hiding.intended_relations, 1);
         view.conditioned_sigma
             .validate(&view.preopening.owner.derived.post_claim_relation.weights)
@@ -3950,15 +4013,15 @@ mod tests {
             .all(|leaf| leaf == first_mid));
         assert_ne!(view.source_joint_symbols, second.source_joint_symbols);
 
-        let beta_source: [Block128; SOURCE_STANDARD_FOLDS] = view.preopening.beta
+        let beta_source: [Block256; SOURCE_STANDARD_FOLDS] = view.preopening.beta
             [..SOURCE_STANDARD_FOLDS]
             .try_into()
             .unwrap();
-        let beta_mid: [Block128; MID_STANDARD_FOLDS] = view.preopening.beta
+        let beta_mid: [Block256; MID_STANDARD_FOLDS] = view.preopening.beta
             [SOURCE_STANDARD_FOLDS..PHASE_B_LOW_VARS - 1]
             .try_into()
             .unwrap();
-        let verify = |source: &[Block128], mid: &[Block128]| {
+        let verify = |source: &[Block128], mid: &[Block256]| {
             verify_zk_auth_algebraic_opening_links(
                 view.preopening.gamma,
                 beta_source,
@@ -3990,17 +4053,22 @@ mod tests {
             [..JOINT_SOURCE_LEAF_SYMBOLS]
             .try_into()
             .unwrap();
-        let shifted_source_fold = fold_joint_source_leaf(
-            &code,
-            shifted_source_leaf,
-            view.preopening.gamma,
-            0,
-            &beta_source,
-        )
-        .unwrap();
+        let shifted_source_fold =
+            fold_normal_joint_source_leaf(shifted_source_leaf, view.preopening.gamma, &beta_source);
+        let normalized_mid: &[Block256; 1 << MID_STANDARD_FOLDS] = view.mid_symbols
+            [..1 << MID_STANDARD_FOLDS]
+            .try_into()
+            .unwrap();
+        let mut raw_mid = code
+            .fold_denormalize_coset(normalized_mid, SOURCE_STANDARD_FOLDS, 0)
+            .unwrap();
+        raw_mid[0] = shifted_source_fold;
+        let normalized_mid = code
+            .fold_normalize_coset(&raw_mid, SOURCE_STANDARD_FOLDS, 0)
+            .unwrap();
         let mut shifted_mid = view.mid_symbols.clone();
         for leaf in shifted_mid.chunks_exact_mut(1 << MID_STANDARD_FOLDS) {
-            leaf[0] = shifted_source_fold;
+            leaf.copy_from_slice(&normalized_mid);
         }
         assert_eq!(
             verify(&shifted_source, &shifted_mid),
@@ -4032,7 +4100,7 @@ mod tests {
             ZkAuthMerkleProgrammingStatus::ProgrammedIdeal
         );
         assert_eq!(view.mid_merkle, ZkAuthMerkleProgrammingStatus::Honest);
-        assert_eq!(view.source_opening.leaf_programs.len(), 64);
+        assert_eq!(view.source_opening.leaf_programs.len(), 65);
         assert!(!view.source_opening.node_programs.is_empty());
         assert!(
             view.source_opening.leaf_programs.len() + view.source_opening.node_programs.len()
@@ -4067,9 +4135,18 @@ mod tests {
         let view = simulate_zk_auth_merkle_opening_view(statement, query_seeds, &mut rng)
             .expect("repeated-query Merkle opening view");
         assert_eq!(view.source_opening.leaf_programs.len(), 1);
-        assert_eq!(view.source_opening.siblings.len(), 8);
-        assert_eq!(view.source_opening.node_programs.len(), 8);
-        assert_eq!(view.mid_siblings.len(), 8);
+        assert_eq!(
+            view.source_opening.siblings.len(),
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH
+        );
+        assert_eq!(
+            view.source_opening.node_programs.len(),
+            ZK_CAPSULE_PCS_SOURCE_PATH_DEPTH
+        );
+        assert_eq!(
+            view.mid_siblings.len(),
+            ZK_CAPSULE_PCS_MID_TREE_DEPTH - ZK_CAPSULE_PCS_MID_CAP_DEPTH
+        );
 
         let mut cross_tree_conflict = view.source_opening.clone();
         let honest_mid_node = view.algebraic.preopening.mid_tree.queried_nodes()[0];
@@ -4134,12 +4211,12 @@ mod tests {
         );
 
         let mid_cap = &view.algebraic.preopening.mid_commitment.cap.hashes;
-        let verify_mid = |cap: &[SourceHash], symbols: &[Block128], siblings: &[SourceHash]| {
+        let verify_mid = |cap: &[SourceHash], symbols: &[Block256], siblings: &[SourceHash]| {
             verify_honest_mid_merkle(cap, &view.algebraic.queries, symbols, siblings)
         };
         let mut changed_mid_symbols = view.algebraic.mid_symbols.clone();
         for leaf in changed_mid_symbols.chunks_exact_mut(1 << MID_STANDARD_FOLDS) {
-            leaf[0] += Block128::ONE;
+            leaf[0] += Block256::ONE;
         }
         assert!(verify_mid(mid_cap, &changed_mid_symbols, &view.mid_siblings).is_err());
         let mut changed_mid_path = view.mid_siblings.clone();
@@ -4250,7 +4327,7 @@ mod tests {
                 "zk_capsule_pcs_bind_owner",
                 "zk_capsule_pcs_bind_phase_a",
                 "init_main_channel",
-                "let gamma = channel.squeeze()",
+                "let gamma = channel.squeeze_wide()",
                 "zk_capsule_pcs_prove_phase_a",
                 "absorb_phase_b_prefix",
                 "let beta_source",
@@ -4259,7 +4336,7 @@ mod tests {
                 "let beta_mid",
                 "zk_capsule_pcs_reveal_tail",
                 "absorb_tail",
-                "let beta_tail = channel.squeeze()",
+                "let beta_tail = channel.squeeze_wide()",
                 "grind_main_channel_with_bits",
                 "let query_seeds",
                 "zk_capsule_pcs_open",
@@ -4283,7 +4360,7 @@ mod tests {
                 "source_commitment.transcript_lanes",
                 "verify_zk_auth_capsule_owner",
                 "init_main_channel",
-                "let gamma = channel.squeeze()",
+                "let gamma = channel.squeeze_wide()",
                 "absorb_phase_a_round",
                 "verify_phase_a",
                 "absorb_phase_b_prefix",
@@ -4291,7 +4368,7 @@ mod tests {
                 "absorb_mid_commitment",
                 "let beta_mid",
                 "absorb_tail",
-                "let beta_tail = channel.squeeze()",
+                "let beta_tail = channel.squeeze_wide()",
                 "replay_grind",
                 "let query_seeds",
                 "zk_capsule_pcs_verify",

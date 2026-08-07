@@ -22,7 +22,7 @@ pub const BLOCK_PROOF_CLASS_TIERS: [usize; 2] = BLOCK_PAGE_CLASS_TIERS;
 /// The only two block proof classes accepted by the launch protocol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockProofClass {
-    B64,
+    B25,
     B255,
 }
 
@@ -30,7 +30,7 @@ impl BlockProofClass {
     /// Select the unique smallest proof class that holds `page_count` pages.
     pub const fn for_page_count(page_count: usize) -> Option<Self> {
         if page_count <= BLOCK_PROOF_CLASS_TIERS[0] {
-            Some(Self::B64)
+            Some(Self::B25)
         } else if page_count <= BLOCK_PROOF_CLASS_TIERS[1] {
             Some(Self::B255)
         } else {
@@ -40,41 +40,40 @@ impl BlockProofClass {
 
     pub const fn page_capacity(self) -> usize {
         match self {
-            Self::B64 => BLOCK_PROOF_CLASS_TIERS[0],
+            Self::B25 => BLOCK_PROOF_CLASS_TIERS[0],
             Self::B255 => BLOCK_PROOF_CLASS_TIERS[1],
         }
     }
 
-    /// Maximum live logical groups/capsules. B255 has one additional dead
-    /// authorization tile in its dyadic circuit domain.
+    /// Maximum live logical groups/capsules.
     pub const fn live_authorization_capacity(self) -> usize {
         self.page_capacity()
     }
 
     pub const fn authorization_tile_capacity(self) -> usize {
         match self {
-            Self::B64 => 64,
+            Self::B25 => 32,
             Self::B255 => 256,
         }
     }
 
     pub const fn input_capacity(self) -> usize {
         match self {
-            Self::B64 => 64 * MAX_INPUTS,
+            Self::B25 => 25 * MAX_INPUTS,
             Self::B255 => BLOCK_MAX_LIVE_INPUTS,
         }
     }
 
     pub const fn output_capacity(self) -> usize {
         match self {
-            Self::B64 => 64 * MAX_OUTPUTS,
+            Self::B25 => 25 * MAX_OUTPUTS,
             Self::B255 => BLOCK_MAX_USER_OUTPUTS,
         }
     }
 
     pub const fn outer_m(self) -> usize {
         match self {
-            Self::B64 => 23,
+            Self::B25 => 22,
             Self::B255 => 24,
         }
     }
@@ -346,10 +345,10 @@ fn checked_group_sum(
         .try_fold(0usize, |sum, group| sum.checked_add(value(group)))
 }
 
-const _: () = assert!(BLOCK_PROOF_CLASS_TIERS[0] == 64);
+const _: () = assert!(BLOCK_PROOF_CLASS_TIERS[0] == 25);
 const _: () = assert!(BLOCK_PROOF_CLASS_TIERS[1] == 255);
-const _: () = assert!(64 * MAX_INPUTS == 512);
-const _: () = assert!(64 * MAX_OUTPUTS == 128);
+const _: () = assert!(25 * MAX_INPUTS == 200);
+const _: () = assert!(25 * MAX_OUTPUTS == 50);
 const _: () = assert!(BLOCK_MAX_LIVE_INPUTS == 1_020);
 const _: () = assert!(BLOCK_MAX_USER_OUTPUTS == 510);
 
@@ -441,11 +440,11 @@ mod tests {
     }
 
     #[test]
-    fn class_boundary_is_exact_at_64_65_and_255() {
+    fn class_boundary_is_exact_at_25_26_and_255() {
         for (count, class) in [
-            (0, BlockProofClass::B64),
-            (64, BlockProofClass::B64),
-            (65, BlockProofClass::B255),
+            (0, BlockProofClass::B25),
+            (25, BlockProofClass::B25),
+            (26, BlockProofClass::B255),
             (255, BlockProofClass::B255),
         ] {
             let facts = validate_paged_spend_tx_page_stream(&independent_stream(count)).unwrap();
@@ -456,22 +455,22 @@ mod tests {
 
         assert_eq!(
             validate_paged_spend_tx_page_stream_for_class(
-                &independent_stream(64),
+                &independent_stream(25),
                 BlockProofClass::B255,
             ),
             Err(PagedSpendStreamError::ProofClassMismatch {
-                expected: BlockProofClass::B64,
+                expected: BlockProofClass::B25,
                 actual: BlockProofClass::B255,
             })
         );
         assert_eq!(
             validate_paged_spend_tx_page_stream_for_class(
-                &independent_stream(65),
-                BlockProofClass::B64,
+                &independent_stream(26),
+                BlockProofClass::B25,
             ),
             Err(PagedSpendStreamError::BlockPageLimit {
-                actual: 65,
-                capacity: 64,
+                actual: 26,
+                capacity: 25,
             })
         );
         assert_eq!(
@@ -504,10 +503,10 @@ mod tests {
     fn maximum_group_is_indivisible_and_requires_b255() {
         let group = maximum_group();
         assert_eq!(
-            validate_paged_spend_tx_page_stream_for_class(&group, BlockProofClass::B64),
+            validate_paged_spend_tx_page_stream_for_class(&group, BlockProofClass::B25),
             Err(PagedSpendStreamError::BlockPageLimit {
                 actual: 128,
-                capacity: 64,
+                capacity: 25,
             })
         );
         let facts =

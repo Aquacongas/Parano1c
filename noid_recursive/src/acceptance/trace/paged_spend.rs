@@ -41,8 +41,8 @@ pub struct PagedSpendGroupTrace {
 
 /// Page scan result shared by capsule, tx-root and fee arithmetic.
 pub struct PagedSpendBlockTrace {
-    /// Authorization-tile width: 64 for B64 and 256 for B255. The final B255
-    /// element is the permanently dead dyadic pad.
+    /// Power-of-two authorization-tile width for the selected proof class.
+    /// Slots above the physical page tier are permanently dead dyadic pads.
     pub groups: Vec<PagedSpendGroupTrace>,
     pub logical_count: LinExpr,
 }
@@ -253,7 +253,7 @@ pub fn bind_paged_spend_stream(
     arithmetic: &[UserPublicArithmeticTrace],
 ) -> PagedSpendBlockTrace {
     let tier = spines.len();
-    assert!(matches!(tier, 64 | 255));
+    assert!(matches!(tier, 25 | 255));
     assert_eq!(page_hashes.len(), tier);
     assert_eq!(page_live.len(), tier);
     assert_eq!(surfaces.len(), tier);
@@ -439,8 +439,8 @@ pub fn bind_paged_spend_stream(
 
     let groups = compact_end_records(b, candidates);
     assert_eq!(groups.len(), tier.next_power_of_two());
-    if tier == 255 {
-        pin_zero(b, &groups[255].live);
+    for group in &groups[tier..] {
+        pin_zero(b, &group.live);
     }
     let logical_count = sum_live_prefix(b, &groups[..tier]);
     PagedSpendBlockTrace {
@@ -521,7 +521,7 @@ mod tests {
         PagedSpendBlockTrace,
         Vec<ActionSurfaceTrace>,
     ) {
-        let tier = 64usize;
+        let tier = 25usize;
         let ghost = noid_gkr::ghost_tx::ghost_tx_body();
         let mut bodies = pages
             .iter()

@@ -277,7 +277,7 @@ impl TemplateBuilder {
         Self { mempool }
     }
 
-    /// Build a B64-default template from a pre-captured chain snapshot.
+    /// Build a B25-default template from a pre-captured chain snapshot.
     ///
     /// Computes the ASERT difficulty target correctly using `next_target()`.
     pub async fn build_from_snapshot(
@@ -290,7 +290,7 @@ impl TemplateBuilder {
             snapshot,
             miner_address,
             now_unix,
-            noid_chain::consensus::paged_spend::BlockProofClass::B64.page_capacity(),
+            noid_chain::consensus::paged_spend::BlockProofClass::B25.page_capacity(),
         )
         .await
     }

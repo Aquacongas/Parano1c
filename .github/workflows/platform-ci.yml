@@ -96,7 +96,7 @@ jobs:
           grep -q "CPU UNSUPPORTED" <<<"$legacy_output"
 
       - name: Test GUI wallet logic
-        run: cargo test --locked -p noid_gui
+        run: cargo test --locked --release -p noid_gui
 
       - name: Test proof kernels with runtime dispatch
         run: >-

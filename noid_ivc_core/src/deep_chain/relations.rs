@@ -42,6 +42,8 @@ use crate::field::F128;
 use crate::lincheck::build_eq_table;
 use rayon::prelude::*;
 
+pub mod c1;
+
 /// Maximum column factors per term (degree 4 with the eq prefix). Three
 /// factors admit selector-gated products like `EVEN·D·SIB` without minting
 /// combined selector columns — committed columns cost 2^w_log witness

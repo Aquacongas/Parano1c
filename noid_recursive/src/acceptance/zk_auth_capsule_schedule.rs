@@ -9,28 +9,30 @@
 //! scalars. It then closes on one fixed full absorb block. All four resulting
 //! sponge-state lanes are shared wires into the Main channel before `sigma`
 //! and `gamma`; they are never serialized.
-//! This executable schedule/bridge contract is consumed by the selected B255
+//! This executable schedule/bridge contract is consumed by the selected-class
 //! recursive assembly.
 
-use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout, TranscriptOp};
+use noid_ivc_core::deep_chain::capsule_leaf::{C1_CAPSULE_MID_SLOTS, C1_CAPSULE_SOURCE_SLOTS};
+use noid_ivc_core::deep_chain::schedule::{compile_duplex, DuplexLayout, LaneSource, TranscriptOp};
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
 pub use noid_gkr::zk_authorization::{
     affine_blend_gamma_is_admissible, ZK_AUTH_BETA_FIELDS, ZK_AUTH_BRIDGE_LANES, ZK_AUTH_GRIND_TAG,
-    ZK_AUTH_MAIN_BRIDGE_DATA_START, ZK_AUTH_MAIN_COMPILED_SLOTS, ZK_AUTH_MAIN_CONSTANT_LANES,
-    ZK_AUTH_MAIN_DYNAMIC_LANES, ZK_AUTH_MAIN_FROM_OWNER_TAG, ZK_AUTH_MAIN_MID_CAP_DATA_START,
-    ZK_AUTH_MAIN_NONCE_DATA_INDEX, ZK_AUTH_MAIN_PHASE_A_DATA_START,
-    ZK_AUTH_MAIN_PHASE_B_VALUE_DATA_INDEX, ZK_AUTH_MAIN_SIGMA_DATA_INDEX, ZK_AUTH_MAIN_SQUEEZES,
+    ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES, ZK_AUTH_MAIN_BRIDGE_DATA_START, ZK_AUTH_MAIN_COMPILED_SLOTS,
+    ZK_AUTH_MAIN_CONSTANT_LANES, ZK_AUTH_MAIN_DYNAMIC_LANES, ZK_AUTH_MAIN_FROM_OWNER_TAG,
+    ZK_AUTH_MAIN_MID_CAP_DATA_START, ZK_AUTH_MAIN_NONCE_DATA_INDEX,
+    ZK_AUTH_MAIN_PHASE_A_DATA_START, ZK_AUTH_MAIN_PHASE_B_VALUE_DATA_INDEX,
+    ZK_AUTH_MAIN_RAW_CHALLENGE_LANES, ZK_AUTH_MAIN_SIGMA_DATA_INDEX, ZK_AUTH_MAIN_SQUEEZES,
     ZK_AUTH_MAIN_TAIL_DATA_START, ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_MAIN_UPPER_DATA_START,
     ZK_AUTH_MID_CAP_LANES, ZK_AUTH_MID_CAP_TAG, ZK_AUTH_MLECHECK_ROUND_FIELDS,
     ZK_AUTH_MLECHECK_VARS, ZK_AUTH_OWNER_BRIDGE_SLOT, ZK_AUTH_OWNER_COMPILED_SLOTS,
     ZK_AUTH_OWNER_CONSTANT_LANES, ZK_AUTH_OWNER_CONSTRUCTION_VERSION, ZK_AUTH_OWNER_DYNAMIC_LANES,
     ZK_AUTH_OWNER_PREFIX_CONSTANTS, ZK_AUTH_OWNER_PROTOCOL_TAG,
-    ZK_AUTH_OWNER_PUBLIC_STATEMENT_FIELDS, ZK_AUTH_OWNER_SQUEEZES, ZK_AUTH_OWNER_TILE_LOG,
-    ZK_AUTH_OWNER_TO_MAIN_CLOSE_TAG, ZK_AUTH_PHASE_A_ROUND_FIELDS, ZK_AUTH_PHASE_B_TAG,
-    ZK_AUTH_QUERY_SEEDS, ZK_AUTH_REJECTED_SINGLE_CHANNEL_SLOTS, ZK_AUTH_SOURCE_CAP_HASHES,
-    ZK_AUTH_SOURCE_CAP_LANES, ZK_AUTH_TAIL_FIELDS, ZK_AUTH_TAIL_TAG, ZK_AUTH_TERMINAL_FIELDS,
-    ZK_AUTH_UPPER_FIELDS,
+    ZK_AUTH_OWNER_PUBLIC_STATEMENT_FIELDS, ZK_AUTH_OWNER_RAW_CHALLENGE_LANES,
+    ZK_AUTH_OWNER_SQUEEZES, ZK_AUTH_OWNER_TILE_LOG, ZK_AUTH_OWNER_TO_MAIN_CLOSE_TAG,
+    ZK_AUTH_PHASE_A_ROUND_FIELDS, ZK_AUTH_PHASE_B_TAG, ZK_AUTH_QUERY_SEEDS,
+    ZK_AUTH_REJECTED_SINGLE_CHANNEL_SLOTS, ZK_AUTH_SOURCE_CAP_HASHES, ZK_AUTH_SOURCE_CAP_LANES,
+    ZK_AUTH_TAIL_FIELDS, ZK_AUTH_TAIL_TAG, ZK_AUTH_TERMINAL_FIELDS, ZK_AUTH_UPPER_FIELDS,
 };
 
 const _: () =
@@ -38,9 +40,56 @@ const _: () =
 const _: () =
     assert!(ZK_AUTH_MLECHECK_ROUND_FIELDS == noid_gkr::zk_mlecheck::ZK_MLECHECK_ROUND_PROOF_COEFFS);
 const _: () = assert!(ZK_AUTH_UPPER_FIELDS == 1 << 8);
-const _: () = assert!(ZK_AUTH_QUERY_SEEDS * 128 >= 64 * 13);
+const _: () = assert!(ZK_AUTH_QUERY_SEEDS * 128 >= 65 * 13);
 const _: () = assert!(1 << ZK_AUTH_OWNER_TILE_LOG == 128);
 const _: () = assert!(1 << ZK_AUTH_MAIN_TILE_LOG == 256);
+
+/// The first 64 query leaves stay in Wallet-A. Source leaves are packed at
+/// their exact 12-slot schedule while mid leaves retain their exact 16 slots.
+/// The remaining 256 slots carry the two transcript suffixes without changing
+/// either selected outer matrix.
+pub const ZK_AUTH_WALLET_CORE_QUERY_COUNT: usize = 64;
+pub const ZK_AUTH_WALLET_A_TILE_LOG: usize = 11;
+pub const ZK_AUTH_WALLET_A_SOURCE_BASE: usize = 0;
+pub const ZK_AUTH_WALLET_A_SOURCE_SLOTS: usize =
+    ZK_AUTH_WALLET_CORE_QUERY_COUNT * C1_CAPSULE_SOURCE_SLOTS;
+pub const ZK_AUTH_WALLET_A_MID_BASE: usize = ZK_AUTH_WALLET_A_SOURCE_SLOTS;
+pub const ZK_AUTH_WALLET_A_MID_SLOTS: usize =
+    ZK_AUTH_WALLET_CORE_QUERY_COUNT * C1_CAPSULE_MID_SLOTS;
+pub const ZK_AUTH_WALLET_A_TRANSCRIPT_BASE: usize =
+    ZK_AUTH_WALLET_A_MID_BASE + ZK_AUTH_WALLET_A_MID_SLOTS;
+
+pub const ZK_AUTH_OWNER_PREFIX_SLOTS: usize = 1 << ZK_AUTH_OWNER_TILE_LOG;
+pub const ZK_AUTH_MAIN_PREFIX_SLOTS: usize = 1 << ZK_AUTH_MAIN_TILE_LOG;
+pub const ZK_AUTH_OWNER_TAIL_SLOTS: usize =
+    ZK_AUTH_OWNER_COMPILED_SLOTS - ZK_AUTH_OWNER_PREFIX_SLOTS;
+pub const ZK_AUTH_MAIN_TAIL_SLOTS: usize = ZK_AUTH_MAIN_COMPILED_SLOTS - ZK_AUTH_MAIN_PREFIX_SLOTS;
+
+/// Each split suffix receives one non-permutation carrier slot immediately
+/// before its first live permutation. The carrier stores the two capacity
+/// lanes of the preceding prefix state; the first suffix A cells store the
+/// two rate lanes plus that slot's absorb contribution.
+pub const ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT: usize = ZK_AUTH_WALLET_A_TRANSCRIPT_BASE;
+pub const ZK_AUTH_WALLET_A_OWNER_TAIL_BASE: usize = ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT + 1;
+pub const ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT: usize =
+    ZK_AUTH_WALLET_A_OWNER_TAIL_BASE + ZK_AUTH_OWNER_TAIL_SLOTS;
+pub const ZK_AUTH_WALLET_A_MAIN_TAIL_BASE: usize = ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT + 1;
+pub const ZK_AUTH_WALLET_A_OWNER_DATA_SLOT: usize =
+    ZK_AUTH_WALLET_A_MAIN_TAIL_BASE + ZK_AUTH_MAIN_TAIL_SLOTS;
+pub const ZK_AUTH_WALLET_A_MAIN_DATA_SLOT: usize = ZK_AUTH_WALLET_A_OWNER_DATA_SLOT + 1;
+pub const ZK_AUTH_WALLET_A_LIVE_SLOTS: usize = ZK_AUTH_WALLET_A_MAIN_DATA_SLOT + 1;
+
+const _: () = assert!(C1_CAPSULE_SOURCE_SLOTS == 12);
+const _: () = assert!(C1_CAPSULE_MID_SLOTS == 16);
+const _: () = assert!(ZK_AUTH_WALLET_A_SOURCE_SLOTS == 768);
+const _: () = assert!(ZK_AUTH_WALLET_A_MID_SLOTS == 1024);
+const _: () = assert!(ZK_AUTH_WALLET_A_TRANSCRIPT_BASE == 1792);
+const _: () = assert!(ZK_AUTH_OWNER_TAIL_SLOTS == 29);
+const _: () = assert!(ZK_AUTH_MAIN_TAIL_SLOTS == 79);
+const _: () = assert!(ZK_AUTH_WALLET_A_OWNER_DATA_SLOT == 1902);
+const _: () = assert!(ZK_AUTH_WALLET_A_MAIN_DATA_SLOT == 1903);
+const _: () = assert!(ZK_AUTH_WALLET_A_LIVE_SLOTS == 1904);
+const _: () = assert!(ZK_AUTH_WALLET_A_LIVE_SLOTS <= 1 << ZK_AUTH_WALLET_A_TILE_LOG);
 
 /// Construction identity of the selected post-commit Owner/Main region pair.
 ///
@@ -50,13 +99,13 @@ const _: () = assert!(1 << ZK_AUTH_MAIN_TILE_LOG == 256);
 pub const ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION: u8 =
     ZK_AUTH_OWNER_CONSTRUCTION_VERSION as u8;
 
-const ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V2";
+const ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN: &[u8] = b"NOID/REGION-SIDECAR/ZK-AUTH-SPLIT/V3";
 
 fn selected_zk_auth_region_sidecar_purpose(role: &[u8]) -> [u8; 32] {
     let version = [ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION];
     poseidon2b_hash_byte_slices(
         ZK_AUTH_REGION_SIDECAR_PURPOSE_DOMAIN,
-        &[&version, b"KSCHANNL", role],
+        &[&version, b"KSCH256_", role],
     )
 }
 
@@ -101,10 +150,56 @@ impl ZkAuthCapsuleDuplexSchedules {
     pub fn main_layout(&self) -> DuplexLayout {
         compile_duplex(&self.main_ops)
     }
+
+    pub fn owner_sidecar_layout(&self) -> DuplexLayout {
+        prefix_layout(&self.owner_layout(), ZK_AUTH_OWNER_PREFIX_SLOTS)
+    }
+
+    pub fn main_sidecar_layout(&self) -> DuplexLayout {
+        prefix_layout(&self.main_layout(), ZK_AUTH_MAIN_PREFIX_SLOTS)
+    }
+}
+
+/// Canonical physical prefix authenticated by the original Owner/Main child.
+/// Data indices in a compiled transcript are monotone, hence every prefix has
+/// a contiguous `0..n_data` data stream.
+fn prefix_layout(layout: &DuplexLayout, slots: usize) -> DuplexLayout {
+    assert!(
+        slots <= layout.slots.len(),
+        "duplex prefix exceeds schedule"
+    );
+    let prefix_slots = layout.slots[..slots].to_vec();
+    let n_data = prefix_slots
+        .iter()
+        .flat_map(|slot| slot.lanes)
+        .filter_map(|lane| match lane {
+            Some(LaneSource::Data(index)) => Some(index + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(prefix_slots
+        .iter()
+        .flat_map(|slot| slot.lanes)
+        .all(|lane| !matches!(lane, Some(LaneSource::Data(index)) if index >= n_data)));
+    DuplexLayout {
+        slots: prefix_slots,
+        challenges: layout
+            .challenges
+            .iter()
+            .copied()
+            .filter(|(slot, _)| *slot < slots)
+            .collect(),
+        n_data,
+    }
 }
 
 fn data_lanes(count: usize) -> Vec<Option<u128>> {
     vec![None; count]
+}
+
+fn squeeze_wide(count: usize) -> TranscriptOp {
+    TranscriptOp::Squeeze(2 * count)
 }
 
 /// Owner schedule. `close_for_bridge=false` is used only to screen and reject
@@ -119,24 +214,26 @@ fn owner_ops(close_for_bridge: bool) -> Vec<TranscriptOp> {
         ZK_AUTH_OWNER_PUBLIC_STATEMENT_FIELDS + ZK_AUTH_SOURCE_CAP_LANES,
     ));
     ops.push(TranscriptOp::Absorb(prefix));
-    ops.push(TranscriptOp::Squeeze(ZK_AUTH_MLECHECK_VARS));
+    ops.push(squeeze_wide(ZK_AUTH_MLECHECK_VARS));
 
     // mu = g_MLE(rho), then the characteristic-two-safe batching challenge.
-    ops.push(TranscriptOp::Absorb(data_lanes(1)));
-    ops.push(TranscriptOp::Squeeze(1));
+    ops.push(TranscriptOp::Absorb(data_lanes(2)));
+    ops.push(squeeze_wide(1));
 
     // Eleven high-to-low ZK MLE-check rounds.
     for _ in 0..ZK_AUTH_MLECHECK_VARS {
         ops.push(TranscriptOp::Absorb(data_lanes(
-            ZK_AUTH_MLECHECK_ROUND_FIELDS,
+            2 * ZK_AUTH_MLECHECK_ROUND_FIELDS,
         )));
-        ops.push(TranscriptOp::Squeeze(1));
+        ops.push(squeeze_wide(1));
     }
 
     // g(r), padded state_inc(r), and four padded lane operands must all be
     // absorbed before eta selects the transparent post-claim relation t.
-    ops.push(TranscriptOp::Absorb(data_lanes(ZK_AUTH_TERMINAL_FIELDS)));
-    ops.push(TranscriptOp::Squeeze(1));
+    ops.push(TranscriptOp::Absorb(data_lanes(
+        2 * ZK_AUTH_TERMINAL_FIELDS,
+    )));
+    ops.push(squeeze_wide(1));
 
     if close_for_bridge {
         // A full fixed block forces one final permutation. Its C0..C3 output is
@@ -155,40 +252,40 @@ fn main_ops(include_bridge: bool) -> Vec<TranscriptOp> {
     let mut ops = Vec::new();
     let mut prefix = vec![Some(ZK_AUTH_MAIN_FROM_OWNER_TAG)];
     prefix.extend(data_lanes(if include_bridge {
-        ZK_AUTH_BRIDGE_LANES + 1 // bridge + sigma
+        ZK_AUTH_BRIDGE_LANES + 2 // bridge + wide sigma
     } else {
-        1 // sigma only; prior channel state would be implicit
+        2 // wide sigma only; prior channel state would be implicit
     }));
     ops.push(TranscriptOp::Absorb(prefix));
-    ops.push(TranscriptOp::Squeeze(1)); // gamma
+    ops.push(squeeze_wide(1)); // gamma
 
     for _ in 0..ZK_AUTH_MLECHECK_VARS {
         ops.push(TranscriptOp::Absorb(data_lanes(
-            ZK_AUTH_PHASE_A_ROUND_FIELDS,
+            2 * ZK_AUTH_PHASE_A_ROUND_FIELDS,
         )));
-        ops.push(TranscriptOp::Squeeze(1));
+        ops.push(squeeze_wide(1));
     }
 
     let mut phase_b = vec![Some(ZK_AUTH_PHASE_B_TAG)];
-    phase_b.extend(data_lanes(1 + ZK_AUTH_UPPER_FIELDS)); // v + upper[256]
+    phase_b.extend(data_lanes(2 * (1 + ZK_AUTH_UPPER_FIELDS))); // wide v + upper[256]
     ops.push(TranscriptOp::Absorb(phase_b));
     // Commit/challenge order is part of FRI soundness.  Only the three
     // source-layer folds may be sampled from the source/upper commitment.
     // Sampling the mid challenges before committing the mid codeword would
     // let a prover adapt one cell per leaf to a chosen tail.
-    ops.push(TranscriptOp::Squeeze(3)); // beta0..beta2
+    ops.push(squeeze_wide(3)); // beta0..beta2
 
     let mut mid = vec![Some(ZK_AUTH_MID_CAP_TAG)];
     mid.extend(data_lanes(ZK_AUTH_MID_CAP_LANES));
     ops.push(TranscriptOp::Absorb(mid));
-    ops.push(TranscriptOp::Squeeze(4)); // beta3..beta6
+    ops.push(squeeze_wide(4)); // beta3..beta6
 
     let mut tail = vec![Some(ZK_AUTH_TAIL_TAG)];
-    tail.extend(data_lanes(ZK_AUTH_TAIL_FIELDS));
+    tail.extend(data_lanes(2 * ZK_AUTH_TAIL_FIELDS));
     ops.push(TranscriptOp::Absorb(tail));
     // The tail is the committed next layer for the final local fold.  beta7
     // must therefore be sampled only after all sixteen tail cells are bound.
-    ops.push(TranscriptOp::Squeeze(1)); // beta7
+    ops.push(squeeze_wide(1)); // beta7
 
     ops.push(TranscriptOp::Absorb(vec![
         Some(ZK_AUTH_GRIND_TAG),
@@ -213,8 +310,8 @@ mod tests {
     use noid_ivc_core::deep_chain::schedule::{
         build_duplex_columns, flat_of_tower_u128, LaneSource,
     };
-    use noid_ivc_core::field::F128;
-    use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX, TAG_KSCHANNL};
+    use noid_ivc_core::field::{F128, F256};
+    use noid_poseidon2b::native::domain::{capacity_iv, TAG_ADDRFIX, TAG_KSCH256};
 
     fn counts(ops: &[TranscriptOp]) -> (usize, usize, usize) {
         ops.iter().fold((0, 0, 0), |mut counts, op| {
@@ -259,8 +356,8 @@ mod tests {
         )
     }
 
-    fn kschanl_iv_flat() -> [F128; 2] {
-        let iv = capacity_iv(TAG_KSCHANNL);
+    fn ksch256_iv_flat() -> [F128; 2] {
+        let iv = capacity_iv(TAG_KSCH256);
         [flat_of_tower_u128(iv[0].0), flat_of_tower_u128(iv[1].0)]
     }
 
@@ -275,7 +372,7 @@ mod tests {
             (
                 ZK_AUTH_OWNER_DYNAMIC_LANES,
                 ZK_AUTH_OWNER_CONSTANT_LANES,
-                ZK_AUTH_OWNER_SQUEEZES,
+                ZK_AUTH_OWNER_RAW_CHALLENGE_LANES,
             )
         );
         assert_eq!(
@@ -283,22 +380,22 @@ mod tests {
             (
                 ZK_AUTH_MAIN_DYNAMIC_LANES,
                 ZK_AUTH_MAIN_CONSTANT_LANES,
-                ZK_AUTH_MAIN_SQUEEZES,
+                ZK_AUTH_MAIN_RAW_CHALLENGE_LANES,
             )
         );
         assert_eq!(owner.n_data, ZK_AUTH_OWNER_DYNAMIC_LANES);
         assert_eq!(main.n_data, ZK_AUTH_MAIN_DYNAMIC_LANES);
         assert_eq!(owner.slots.len(), ZK_AUTH_OWNER_COMPILED_SLOTS);
         assert_eq!(main.slots.len(), ZK_AUTH_MAIN_COMPILED_SLOTS);
-        assert_eq!(owner.slots.len().next_power_of_two(), 128);
-        assert_eq!(main.slots.len().next_power_of_two(), 256);
+        assert_eq!(owner.slots.len().next_power_of_two(), 256);
+        assert_eq!(main.slots.len().next_power_of_two(), 512);
     }
 
     #[test]
-    fn padded_terminal_operands_are_bound_to_construction_version_two() {
-        assert_eq!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION, 2);
-        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 2);
-        assert_eq!(ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION, 2);
+    fn padded_terminal_operands_are_bound_to_construction_version_three() {
+        assert_eq!(ZK_AUTH_OWNER_CONSTRUCTION_VERSION, 3);
+        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 3);
+        assert_eq!(ZK_AUTH_REGION_SIDECAR_CONSTRUCTION_VERSION, 3);
         let purposes = [
             selected_zk_auth_wallet_a_sidecar_purpose(),
             selected_zk_auth_wallet_b_sidecar_purpose(),
@@ -339,7 +436,7 @@ mod tests {
             main.slots[2].lanes,
             [Some(LaneSource::Data(3)), Some(LaneSource::Data(4))]
         );
-        assert_eq!(main.challenges[0], (2, 0));
+        assert_eq!(main.challenges[0], (3, 0));
         assert_eq!(ZK_AUTH_MAIN_SIGMA_DATA_INDEX, 4);
     }
 
@@ -381,23 +478,27 @@ mod tests {
             .collect();
         let owner_columns = build_duplex_columns(
             &owner_layout,
-            kschanl_iv_flat(),
+            ksch256_iv_flat(),
             &owner_flat_data,
-            ZK_AUTH_OWNER_TILE_LOG,
+            owner_layout
+                .slots
+                .len()
+                .next_power_of_two()
+                .trailing_zeros() as usize,
         );
 
         assert_eq!(owner_data.len(), ZK_AUTH_OWNER_DYNAMIC_LANES);
         assert_eq!(owner_layout.slots.len(), ZK_AUTH_OWNER_COMPILED_SLOTS);
         let owner_challenges = verified.owner.transcript_challenges();
-        assert_eq!(owner_columns.challenges.len(), owner_challenges.len());
-        for (index, (&tower, &flat)) in owner_challenges
+        assert_eq!(owner_columns.challenges.len(), 2 * owner_challenges.len());
+        for (index, (&tower, raw)) in owner_challenges
             .iter()
-            .zip(&owner_columns.challenges)
+            .zip(owner_columns.challenges.chunks_exact(2))
             .enumerate()
         {
             assert_eq!(
-                flat_of_tower_u128(tower.0),
-                flat,
+                F256::from_tower(tower),
+                F256::from_raw_challenge_lanes(raw[0], raw[1]),
                 "Owner native/compiled challenge {index}"
             );
         }
@@ -419,42 +520,59 @@ mod tests {
             .collect();
         let main_columns = build_duplex_columns(
             &main_layout,
-            kschanl_iv_flat(),
+            ksch256_iv_flat(),
             &main_flat_data,
-            ZK_AUTH_MAIN_TILE_LOG,
+            main_layout.slots.len().next_power_of_two().trailing_zeros() as usize,
         );
-        let main_challenges = verified.main_transcript_challenges();
+        let main_algebraic = verified.main_algebraic_challenges();
         assert_eq!(main_data.len(), ZK_AUTH_MAIN_DYNAMIC_LANES);
         assert_eq!(main_layout.slots.len(), ZK_AUTH_MAIN_COMPILED_SLOTS);
-        assert_eq!(main_columns.challenges.len(), main_challenges.len());
-        for (index, (&tower, &flat)) in main_challenges
+        assert_eq!(
+            main_columns.challenges.len(),
+            ZK_AUTH_MAIN_RAW_CHALLENGE_LANES
+        );
+        for (index, (&tower, raw)) in main_algebraic
             .iter()
-            .zip(&main_columns.challenges)
+            .zip(main_columns.challenges[..2 * ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES].chunks_exact(2))
+            .enumerate()
+        {
+            assert_eq!(
+                F256::from_tower(tower),
+                F256::from_raw_challenge_lanes(raw[0], raw[1]),
+                "Main native/compiled algebraic challenge {index}"
+            );
+        }
+        let base_challenges = std::iter::once(verified.grind)
+            .chain(verified.query_seeds)
+            .collect::<Vec<_>>();
+        for (index, (&tower, &flat)) in base_challenges
+            .iter()
+            .zip(&main_columns.challenges[2 * ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES..])
             .enumerate()
         {
             assert_eq!(
                 flat_of_tower_u128(tower.0),
                 flat,
-                "Main native/compiled challenge {index}"
+                "Main base challenge {index}"
             );
         }
     }
 
     #[test]
     fn main_data_offsets_and_proof_carried_count_are_exact() {
-        assert_eq!(ZK_AUTH_MAIN_PHASE_A_DATA_START, 5);
-        assert_eq!(ZK_AUTH_MAIN_PHASE_B_VALUE_DATA_INDEX, 5 + 11 * 2);
-        assert_eq!(ZK_AUTH_MAIN_UPPER_DATA_START, 28);
-        assert_eq!(ZK_AUTH_MAIN_MID_CAP_DATA_START, 28 + 256);
-        assert_eq!(ZK_AUTH_MAIN_TAIL_DATA_START, 284 + 4);
-        assert_eq!(ZK_AUTH_MAIN_NONCE_DATA_INDEX, 288 + 16);
+        assert_eq!(ZK_AUTH_MAIN_PHASE_A_DATA_START, 6);
+        assert_eq!(ZK_AUTH_MAIN_PHASE_B_VALUE_DATA_INDEX, 6 + 11 * 4);
+        assert_eq!(ZK_AUTH_MAIN_UPPER_DATA_START, 52);
+        assert_eq!(ZK_AUTH_MAIN_MID_CAP_DATA_START, 52 + 512);
+        assert_eq!(ZK_AUTH_MAIN_TAIL_DATA_START, 564 + 16);
+        assert_eq!(ZK_AUTH_MAIN_NONCE_DATA_INDEX, 580 + 32);
         assert_eq!(
             ZK_AUTH_MAIN_NONCE_DATA_INDEX + 1,
             ZK_AUTH_MAIN_DYNAMIC_LANES
         );
         assert_eq!(
             ZK_AUTH_MAIN_DYNAMIC_LANES - ZK_AUTH_BRIDGE_LANES,
-            301,
+            609,
             "bridge lanes are derived and not serialized"
         );
     }
@@ -463,13 +581,14 @@ mod tests {
     fn every_phase_b_layer_is_committed_before_its_fold_challenges() {
         let main = ZkAuthCapsuleDuplexSchedules::selected().main_layout();
         let beta_start = 1 + ZK_AUTH_MLECHECK_VARS;
-        let grind_index = beta_start + ZK_AUTH_BETA_FIELDS;
+        let beta_raw_start = 2 * beta_start;
+        let grind_index = 2 * ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES;
 
-        let beta0_slot = main.challenges[beta_start].0;
-        let beta2_slot = main.challenges[beta_start + 2].0;
-        let beta3_slot = main.challenges[beta_start + 3].0;
-        let beta6_slot = main.challenges[beta_start + 6].0;
-        let beta7_slot = main.challenges[beta_start + 7].0;
+        let beta0_slot = main.challenges[beta_raw_start].0;
+        let beta2_slot = main.challenges[beta_raw_start + 2 * 2].0;
+        let beta3_slot = main.challenges[beta_raw_start + 2 * 3].0;
+        let beta6_slot = main.challenges[beta_raw_start + 2 * 6].0;
+        let beta7_slot = main.challenges[beta_raw_start + 2 * 7].0;
 
         assert!(
             data_slot(
@@ -500,15 +619,18 @@ mod tests {
         let mut combined = owner_ops(false);
         combined.extend(main_ops(false));
         let layout = compile_duplex(&combined);
-        assert_eq!(layout.n_data, 486);
+        assert_eq!(layout.n_data, 863);
         assert_eq!(layout.slots.len(), ZK_AUTH_REJECTED_SINGLE_CHANNEL_SLOTS);
         assert_eq!(layout.slots.len().next_power_of_two(), 512);
     }
 
     #[test]
     fn affine_blend_rejects_both_erasing_endpoints() {
-        assert!(!affine_blend_gamma_is_admissible(Block128::ZERO));
-        assert!(!affine_blend_gamma_is_admissible(Block128::ONE));
-        assert!(affine_blend_gamma_is_admissible(Block128::from(2u128)));
+        assert!(!affine_blend_gamma_is_admissible(noid_core::Block256::ZERO));
+        assert!(!affine_blend_gamma_is_admissible(noid_core::Block256::ONE));
+        assert!(affine_blend_gamma_is_admissible(noid_core::Block256::new(
+            Block128::from(2u128),
+            Block128::ONE,
+        )));
     }
 }

@@ -13,10 +13,14 @@
 use noid_ivc_core::field_circuit::FsChannelOps;
 #[cfg(test)]
 use noid_ivc_core::field_circuit::FsChannelTrace;
+use noid_ivc_core::matrix_claim::c1::{C1MatrixAccClaim, C1MatrixFoldProof};
 use noid_ivc_core::matrix_claim::MatrixFoldProof;
 
-use super::self_verify::lagrange_weights_window_trace;
-use super::{mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
+use super::self_verify::{lagrange_weights_window_ext_trace, lagrange_weights_window_trace};
+use super::{
+    evaluate_slice_ext_trace, mul, mul_ext, pin_eq, pin_eq_ext, ExtExpr, FieldR1csBuilder, LinExpr,
+    F128, F256,
+};
 
 /// A plain accumulated claim as expressions (`2·k_log + 1` coordinates).
 #[derive(Clone)]
@@ -84,6 +88,71 @@ impl MatrixFoldProofTrace {
     }
 }
 
+#[derive(Clone)]
+pub struct C1MatrixAccClaimTrace {
+    pub point: Vec<ExtExpr>,
+    pub value: ExtExpr,
+}
+
+impl C1MatrixAccClaimTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &C1MatrixAccClaim) -> Self {
+        Self {
+            point: native
+                .point
+                .iter()
+                .map(|&value| alloc_ext(b, value))
+                .collect(),
+            value: alloc_ext(b, native.value),
+        }
+    }
+}
+
+pub struct C1FreshLincheckClaimTrace {
+    pub alpha: ExtExpr,
+    pub z_skip: ExtExpr,
+    pub x_inner_rest: Vec<ExtExpr>,
+    pub r_inner_rest: Vec<ExtExpr>,
+    pub z_partial: Vec<ExtExpr>,
+    pub value: ExtExpr,
+}
+
+pub struct C1MatrixFoldProofTrace {
+    pub phase1_rounds: Vec<[ExtExpr; 2]>,
+    pub g_v: ExtExpr,
+    pub g_e: ExtExpr,
+    pub phase2_rounds: Vec<[ExtExpr; 2]>,
+    pub final_matrix_eval: ExtExpr,
+}
+
+fn alloc_ext(b: &mut FieldR1csBuilder, value: F256) -> ExtExpr {
+    ExtExpr::new(
+        LinExpr::from_wire(b.alloc_f128(value.lo)),
+        LinExpr::from_wire(b.alloc_f128(value.hi)),
+    )
+}
+
+impl C1MatrixFoldProofTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &C1MatrixFoldProof, k_log: usize) -> Self {
+        assert_eq!(native.phase1_rounds.len(), k_log + 1);
+        assert_eq!(native.phase2_rounds.len(), k_log);
+        Self {
+            phase1_rounds: native
+                .phase1_rounds
+                .iter()
+                .map(|wire| [alloc_ext(b, wire[0]), alloc_ext(b, wire[1])])
+                .collect(),
+            g_v: alloc_ext(b, native.g_v),
+            g_e: alloc_ext(b, native.g_e),
+            phase2_rounds: native
+                .phase2_rounds
+                .iter()
+                .map(|wire| [alloc_ext(b, wire[0]), alloc_ext(b, wire[1])])
+                .collect(),
+            final_matrix_eval: alloc_ext(b, native.final_matrix_eval),
+        }
+    }
+}
+
 /// eq of an expression point against another expression point (pairwise
 /// closed form, 3 multiplications per coordinate).
 fn eq_points_trace(b: &mut FieldR1csBuilder, x: &[LinExpr], y: &[LinExpr]) -> LinExpr {
@@ -127,6 +196,31 @@ fn compressed_deg2_round(
     let t = mul(b, &wire[1], &r);
     let t = mul(b, &t.add(&c1), &r);
     (t.add(&wire[0]), r)
+}
+
+fn eq_points_c1_trace(b: &mut FieldR1csBuilder, left: &[ExtExpr], right: &[ExtExpr]) -> ExtExpr {
+    assert_eq!(left.len(), right.len());
+    left.iter()
+        .zip(right)
+        .fold(ExtExpr::one(), |product, (left, right)| {
+            mul_ext(b, &product, &left.add(right).add_const(F256::ONE))
+        })
+}
+
+fn compressed_deg2_round_c1(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    claim: &ExtExpr,
+    wire: &[ExtExpr; 2],
+) -> (ExtExpr, ExtExpr) {
+    channel.observe_f256_slice(b, wire);
+    let linear = claim.add(&wire[1]);
+    let challenge = channel.sample_f256(b);
+    let intermediate = mul_ext(b, &wire[1], &challenge).add(&linear);
+    (
+        mul_ext(b, &intermediate, &challenge).add(&wire[0]),
+        challenge,
+    )
 }
 
 /// Trace twin of `verify_matrix_claim_fold`. `gate` is an expression
@@ -224,11 +318,102 @@ pub fn verify_matrix_claim_fold_trace(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn verify_matrix_claim_fold_c1_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    k_log: usize,
+    k_skip: usize,
+    fresh: &C1FreshLincheckClaimTrace,
+    incoming: &C1MatrixAccClaimTrace,
+    gate: &LinExpr,
+    proof: &C1MatrixFoldProofTrace,
+) -> C1MatrixAccClaimTrace {
+    assert_eq!(fresh.x_inner_rest.len(), k_log - k_skip);
+    assert_eq!(fresh.r_inner_rest.len(), k_log - k_skip);
+    assert_eq!(fresh.z_partial.len(), 1usize << k_skip);
+    assert_eq!(incoming.point.len(), 2 * k_log + 1);
+
+    channel.observe_label(b, b"history-matrix-claim-fold-c1");
+    channel.observe_f256(b, &fresh.alpha);
+    channel.observe_f256(b, &fresh.z_skip);
+    channel.observe_f256_slice(b, &fresh.x_inner_rest);
+    channel.observe_f256_slice(b, &fresh.r_inner_rest);
+    channel.observe_f256_slice(b, &fresh.z_partial);
+    channel.observe_f256(b, &fresh.value);
+    channel.observe_f256_slice(b, &incoming.point);
+    channel.observe_f256(b, &incoming.value);
+    let gate_ext = ExtExpr::from_base(gate.clone());
+    channel.observe_f256(b, &gate_ext);
+    let gamma = channel.sample_f256(b);
+    let gamma_gate = super::mul_ext_base(b, &gamma, gate);
+    let (incoming_row, incoming_column) = incoming.point.split_at(k_log + 1);
+
+    let mut claim = fresh.value.add(&mul_ext(b, &gamma_gate, &incoming.value));
+    let mut rho = Vec::with_capacity(k_log + 1);
+    for wire in &proof.phase1_rounds {
+        let (next, challenge) = compressed_deg2_round_c1(b, channel, &claim, wire);
+        claim = next;
+        rho.push(challenge);
+    }
+
+    let count = 1usize << k_skip;
+    let lambda = lagrange_weights_window_ext_trace(b, &fresh.z_skip, 0, count, 0);
+    let low = evaluate_slice_ext_trace(b, &lambda, &rho[..k_skip]);
+    let rest = eq_points_c1_trace(b, &fresh.x_inner_rest, &rho[k_skip..k_log]);
+    let stack = fresh
+        .alpha
+        .add(&mul_ext(b, &rho[k_log], &fresh.alpha.add_const(F256::ONE)));
+    let low_rest = mul_ext(b, &low, &rest);
+    let fresh_weight = mul_ext(b, &low_rest, &stack);
+    let incoming_weight = eq_points_c1_trace(b, incoming_row, &rho);
+    let first = mul_ext(b, &fresh_weight, &proof.g_v);
+    let second = mul_ext(b, &gamma_gate, &incoming_weight);
+    let second = mul_ext(b, &second, &proof.g_e);
+    pin_eq_ext(b, &first.add(&second), &claim);
+
+    channel.observe_f256(b, &proof.g_v);
+    channel.observe_f256(b, &proof.g_e);
+    let delta = channel.sample_f256(b);
+    let delta_gate = super::mul_ext_base(b, &delta, gate);
+
+    let mut claim = proof.g_v.add(&mul_ext(b, &delta_gate, &proof.g_e));
+    let mut sigma = Vec::with_capacity(k_log);
+    for wire in &proof.phase2_rounds {
+        let (next, challenge) = compressed_deg2_round_c1(b, channel, &claim, wire);
+        claim = next;
+        sigma.push(challenge);
+    }
+    let partial = evaluate_slice_ext_trace(b, &fresh.z_partial, &sigma[..k_skip]);
+    let rest = eq_points_c1_trace(b, &fresh.r_inner_rest, &sigma[k_skip..]);
+    let fresh_weight = mul_ext(b, &partial, &rest);
+    let incoming_weight = eq_points_c1_trace(b, incoming_column, &sigma);
+    let incoming_weight = mul_ext(b, &delta_gate, &incoming_weight);
+    let expected = mul_ext(
+        b,
+        &fresh_weight.add(&incoming_weight),
+        &proof.final_matrix_eval,
+    );
+    pin_eq_ext(b, &expected, &claim);
+    channel.observe_f256(b, &proof.final_matrix_eval);
+
+    let mut point = rho;
+    point.extend(sigma);
+    C1MatrixAccClaimTrace {
+        point,
+        value: proof.final_matrix_eval.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
     use noid_ivc_core::field_r1cs::{FieldR1cs, SparseFieldMatrix};
+    use noid_ivc_core::matrix_claim::c1::{
+        fresh_claim_value_c1, prove_matrix_claim_fold_c1, stacked_matrix_mle_eval_c1,
+        C1FreshLincheckClaim, C1MatrixAccClaim,
+    };
     use noid_ivc_core::matrix_claim::{
         fresh_claim_value, prove_matrix_claim_fold, stacked_matrix_mle_eval, FreshLincheckClaim,
         MatrixAccClaim,
@@ -248,6 +433,9 @@ mod tests {
                 lo: self.next_u64(),
                 hi: self.next_u64(),
             }
+        }
+        fn f256(&mut self) -> F256 {
+            F256::new(self.f128(), self.f128())
         }
     }
 
@@ -360,5 +548,95 @@ mod tests {
             .flip_battery(&z)
             .survivors(mutation_start..mutation_end);
         assert!(survivors.is_empty(), "fold twin survivors: {survivors:?}");
+    }
+
+    #[test]
+    fn c1_matrix_fold_twin_lockstep_and_mutations() {
+        let k_log = 7;
+        let k_skip = 6;
+        let mut rng = Rng(0xC1F01D);
+        let relation = random_instance(&mut rng, k_log);
+        let rest = k_log - k_skip;
+        let mut fresh = C1FreshLincheckClaim {
+            alpha: rng.f256(),
+            z_skip: rng.f256(),
+            x_inner_rest: (0..rest).map(|_| rng.f256()).collect(),
+            r_inner_rest: (0..rest).map(|_| rng.f256()).collect(),
+            z_partial: (0..1 << k_skip).map(|_| rng.f256()).collect(),
+            value: F256::ZERO,
+        };
+        fresh.value = fresh_claim_value_c1(&relation, &fresh);
+        let mut incoming = C1MatrixAccClaim {
+            point: (0..2 * k_log + 1).map(|_| rng.f256()).collect(),
+            value: F256::ZERO,
+        };
+        incoming.value = stacked_matrix_mle_eval_c1(&relation, &incoming);
+
+        let mut native = FsLaneChallenger::new_c1(b"fold-twin-c1-test");
+        let (proof, native_accumulator) =
+            prove_matrix_claim_fold_c1(&relation, &fresh, &incoming, true, &mut native);
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut trace = FsChannelTrace::new_c1(&mut builder, b"fold-twin-c1-test");
+        let fresh_trace = C1FreshLincheckClaimTrace {
+            alpha: alloc_ext(&mut builder, fresh.alpha),
+            z_skip: alloc_ext(&mut builder, fresh.z_skip),
+            x_inner_rest: fresh
+                .x_inner_rest
+                .iter()
+                .map(|&value| alloc_ext(&mut builder, value))
+                .collect(),
+            r_inner_rest: fresh
+                .r_inner_rest
+                .iter()
+                .map(|&value| alloc_ext(&mut builder, value))
+                .collect(),
+            z_partial: fresh
+                .z_partial
+                .iter()
+                .map(|&value| alloc_ext(&mut builder, value))
+                .collect(),
+            value: alloc_ext(&mut builder, fresh.value),
+        };
+        let incoming_trace = C1MatrixAccClaimTrace::alloc(&mut builder, &incoming);
+        let mutation_start = builder.num_wires();
+        let proof_trace = C1MatrixFoldProofTrace::alloc(&mut builder, &proof, k_log);
+        let mutation_end = builder.num_wires();
+        let accumulator = verify_matrix_claim_fold_c1_trace(
+            &mut builder,
+            &mut trace,
+            k_log,
+            k_skip,
+            &fresh_trace,
+            &incoming_trace,
+            &LinExpr::constant(F128::ONE),
+            &proof_trace,
+        );
+
+        assert_eq!(
+            accumulator
+                .point
+                .iter()
+                .map(|value| value.eval(builder.values()))
+                .collect::<Vec<_>>(),
+            native_accumulator.point,
+        );
+        assert_eq!(
+            accumulator.value.eval(builder.values()),
+            native_accumulator.value,
+        );
+        let native_next = native.sample_f256();
+        let trace_next = trace.sample_f256(&mut builder);
+        assert_eq!(trace_next.eval(builder.values()), native_next);
+
+        let (trace_relation, witness) = builder.build();
+        assert!(trace_relation.satisfies(&witness));
+        let survivors = trace_relation
+            .flip_battery(&witness)
+            .survivors(mutation_start..mutation_end);
+        assert!(
+            survivors.is_empty(),
+            "C1 fold twin survivors: {survivors:?}"
+        );
     }
 }

@@ -352,7 +352,7 @@ def main():
                     entry["n_inputs"] == 1
                     and entry["n_outputs"] == 2
                     and entry["page_count"] == 1
-                    and entry["minimum_proof_class"] == "B64"
+                    and entry["minimum_proof_class"] == "B25"
                     and entry["has_authorization"],
                     f"{node.name} pending metadata wrong: {entry}",
                 )

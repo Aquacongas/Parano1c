@@ -42,9 +42,10 @@ Equality fails.
 
 ## ASERT
 
-The target block interval is 15 seconds. ASERT uses a six-block reference epoch
-and a 90-second half-life. At each height, validation derives the exact target
-from the canonical anchor, elapsed time and height delta.
+The target interval between accepted blocks is 15 seconds. Proof preparation,
+nonce search and propagation all occupy that interval. ASERT uses a six-block
+reference epoch and a 90-second half-life. At each height, validation derives
+the exact target from the canonical anchor, elapsed time and height delta.
 
 A timestamp must also be greater than median time past over the previous 11
 headers and no more than 120 seconds ahead of the validating node's wall clock.
@@ -54,10 +55,10 @@ headers and no more than 120 seconds ahead of the validating node's wall clock.
 The same fixed permutation is evaluated in packed nonce batches. The production
 binary selects the best supported implementation at runtime:
 
-- PCLMULQDQ baseline on x86-64;
-- AVX2 with VPCLMULQDQ where available;
-- AVX-512 on supported hosts;
-- NEON with PMULL on ARM64.
+- `pclmul` baseline on x86-64;
+- `avx2+vpclmul` where available;
+- `avx512bw+vpclmul` on supported hosts;
+- `neon+pmull` on ARM64.
 
 Packed execution changes throughput, not the digest. The scalar implementation
 is a test oracle and is not a production fallback.

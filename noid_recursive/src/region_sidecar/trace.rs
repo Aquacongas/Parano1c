@@ -13,19 +13,123 @@ use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 use crate::acceptance::trace::deep_chain::{
     verify_column_relation_trace, verify_deep_chain_walk_trace, verify_shift_discharge_trace,
-    ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace, RelationTermTrace,
-    ShiftDischargeProofTrace,
+    C1LaneClaimGroupTrace, ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace,
+    RelationTermTrace, ShiftDischargeProofTrace,
 };
 use crate::acceptance::trace::region_source_binding::{
     duplex_sub_terms_trace, DuplexUnionProof, DuplexUnionWalkDeferredProofRef,
 };
-use crate::acceptance::trace::self_verify::{FieldPostCommitTraceContext, QuirkyDirectClaimTrace};
-use crate::acceptance::trace::{mul, FieldR1csBuilder, LinExpr};
+use crate::acceptance::trace::region_source_binding_c1::{
+    verify_c1_duplex_walk_prefix_trace, verify_c1_duplex_walk_suffix_trace,
+    C1DuplexColumnClaimTrace, C1DuplexUnionTraceWalkPrefix,
+};
+use crate::acceptance::trace::self_verify::{
+    C1QuirkyDirectClaimTrace, FieldPostCommitTraceContext, QuirkyDirectClaimTrace,
+};
+use crate::acceptance::trace::{mul, ExtExpr, FieldR1csBuilder, LinExpr};
 
 use super::{
-    DuplexRegionSidecarProof, DuplexRegionVk, DuplexRegionWalkDeferredProof, RegionSidecarError,
+    C1DuplexRegionWalkDeferredProof, DuplexRegionSidecarProof, DuplexRegionVk, RegionSidecarError,
     DUPLEX_REGION_SIDECAR_VERSION, DUPLEX_SIDECAR_TRANSCRIPT_LABEL,
 };
+
+pub(crate) struct C1DuplexRegionTraceWalkContinuation<'a> {
+    vk: &'a DuplexRegionVk,
+    total_vars: usize,
+    prefix: C1DuplexUnionTraceWalkPrefix<'a>,
+}
+
+impl C1DuplexRegionTraceWalkContinuation<'_> {
+    pub(crate) fn walk_group(&self) -> C1LaneClaimGroupTrace {
+        self.prefix.walk_group().clone()
+    }
+
+    pub(crate) fn finish<C: FsChannelOps>(
+        self,
+        b: &mut FieldR1csBuilder,
+        context: &mut FieldPostCommitTraceContext<'_, C>,
+        walk_terminal: &C1LaneClaimGroupTrace,
+    ) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
+        if context.total_vars() != self.total_vars {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let terminal = verify_c1_duplex_walk_suffix_trace(
+            b,
+            context,
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.vk.refs,
+            &[],
+            self.prefix,
+            walk_terminal,
+        )?;
+        resolve_c1_duplex_terminal_claims_trace(self.vk, self.total_vars, terminal)
+    }
+}
+
+pub(crate) fn verify_c1_duplex_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    context: &mut FieldPostCommitTraceContext<'_, C>,
+    vk: &'a DuplexRegionVk,
+    proof: &'a C1DuplexRegionWalkDeferredProof,
+) -> Result<C1DuplexRegionTraceWalkContinuation<'a>, RegionSidecarError> {
+    let total_vars = context.total_vars();
+    vk.validate_in_witness(total_vars)?;
+    if proof.version != DUPLEX_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    context.observe_label(b, DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
+    let prefix = verify_c1_duplex_walk_prefix_trace(
+        b,
+        context,
+        vk.w_log,
+        &vk.fixed,
+        &vk.refs,
+        proof.authority.as_ref(),
+    )?;
+    Ok(C1DuplexRegionTraceWalkContinuation {
+        vk,
+        total_vars,
+        prefix,
+    })
+}
+
+fn resolve_c1_duplex_terminal_claims_trace(
+    vk: &DuplexRegionVk,
+    total_vars: usize,
+    terminal: Vec<C1DuplexColumnClaimTrace>,
+) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
+    terminal
+        .into_iter()
+        .map(|claim| {
+            let slice = *vk
+                .slices
+                .get(claim.column)
+                .ok_or(RegionSidecarError::InvalidProof)?;
+            if claim.point.len() != slice.log2_len {
+                return Err(RegionSidecarError::InvalidProof);
+            }
+            let mut x_rest = claim.point;
+            x_rest.extend(
+                slice
+                    .prefix_coords(total_vars)
+                    .into_iter()
+                    .map(|value| ExtExpr::constant(noid_ivc_core::field::F256::from_base(value))),
+            );
+            Ok(C1QuirkyDirectClaimTrace {
+                z_skip: ExtExpr::zero(),
+                k_skip: 0,
+                x_rest,
+                value: claim.value,
+            })
+        })
+        .collect()
+}
 
 /// A structurally derived duplex terminal claim. It is transient trace state,
 /// never serialized authority.
@@ -47,17 +151,6 @@ pub(crate) struct DuplexUnionTraceWalkPrefix<'a> {
 impl<'a> DuplexUnionTraceWalkPrefix<'a> {
     pub(crate) fn walk_group(&self) -> &LaneClaimGroupTrace {
         &self.walk_group
-    }
-
-    /// Consume the prefix into its deferred authority and the claims
-    /// accumulated so far (for a suffix twin living outside this module).
-    pub(crate) fn into_parts(
-        self,
-    ) -> (
-        DuplexUnionWalkDeferredProofRef<'a>,
-        Vec<DuplexColumnClaimTrace>,
-    ) {
-        (self.proof, self.terminal_claims)
     }
 }
 
@@ -228,79 +321,6 @@ pub(crate) fn verify_duplex_union_proof_trace<C: FsChannelOps>(
     let walk = DeepChainWalkProofTrace::alloc(b, &proof.walk, w_log);
     let walk_terminal = verify_deep_chain_walk_trace(b, channel, w_log, &walk_groups, &walk);
     verify_duplex_union_walk_suffix_trace(b, channel, w_log, fixed, refs, prefix, &walk_terminal)
-}
-
-/// High-level duplex continuation for an enclosing caller-owned walk.
-pub(crate) struct DuplexRegionTraceWalkContinuation<'a> {
-    vk: &'a DuplexRegionVk,
-    total_vars: usize,
-    prefix: DuplexUnionTraceWalkPrefix<'a>,
-}
-
-impl DuplexRegionTraceWalkContinuation<'_> {
-    pub(crate) fn walk_group(&self) -> LaneClaimGroupTrace {
-        self.prefix.walk_group().clone()
-    }
-
-    pub(crate) fn finish<C: FsChannelOps>(
-        self,
-        b: &mut FieldR1csBuilder,
-        context: &mut FieldPostCommitTraceContext<'_, C>,
-        walk_terminal: &LaneClaimGroupTrace,
-    ) -> Result<Vec<QuirkyDirectClaimTrace>, RegionSidecarError> {
-        if context.total_vars() != self.total_vars {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        let terminal = verify_duplex_union_walk_suffix_trace(
-            b,
-            context,
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            self.prefix,
-            walk_terminal,
-        )?;
-        resolve_duplex_terminal_claims_trace(self.vk, self.total_vars, terminal)
-    }
-}
-
-/// Bind and replay a walk-deferred duplex child through carry selection.
-pub(crate) fn verify_duplex_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
-    b: &mut FieldR1csBuilder,
-    context: &mut FieldPostCommitTraceContext<'_, C>,
-    vk: &'a DuplexRegionVk,
-    proof: &'a DuplexRegionWalkDeferredProof,
-) -> Result<DuplexRegionTraceWalkContinuation<'a>, RegionSidecarError> {
-    let total_vars = context.total_vars();
-    preflight_duplex_region_walk_deferred_trace(vk, total_vars, proof)?;
-    let deferred = proof.authority().as_ref();
-
-    context.observe_label(b, DUPLEX_SIDECAR_TRANSCRIPT_LABEL);
-    crate::acceptance::trace::self_verify::observe_pinned_digest(
-        b,
-        context,
-        &vk.transcript_digest(),
-    );
-    let prefix =
-        verify_duplex_union_walk_prefix_trace(b, context, vk.w_log, &vk.fixed, &vk.refs, deferred)?;
-    Ok(DuplexRegionTraceWalkContinuation {
-        vk,
-        total_vars,
-        prefix,
-    })
-}
-
-/// Allocation-free shape check for an enclosing composite preflight.
-pub(crate) fn preflight_duplex_region_walk_deferred_trace(
-    vk: &DuplexRegionVk,
-    total_vars: usize,
-    proof: &DuplexRegionWalkDeferredProof,
-) -> Result<(), RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
-    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    preflight_duplex_deferred_authority(vk.w_log, &vk.refs, proof.authority().as_ref())
 }
 
 fn resolve_duplex_terminal_claims_trace(

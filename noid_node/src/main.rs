@@ -469,14 +469,14 @@ pub enum NodeMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum HistoryStepCacheClass {
-    B64,
+    B25,
     B255,
 }
 
 impl HistoryStepCacheClass {
     fn class_id(self) -> noid_recursive::CanonicalHistoryStepClassId {
         noid_recursive::CanonicalHistoryStepClassId::new(match self {
-            Self::B64 => 0,
+            Self::B25 => 0,
             Self::B255 => 1,
         })
         .expect("GUI cache class is canonical")
@@ -484,7 +484,7 @@ impl HistoryStepCacheClass {
 
     fn label(self) -> &'static str {
         match self {
-            Self::B64 => "B64/m23",
+            Self::B25 => "B25/m22",
             Self::B255 => "B255/m24",
         }
     }
@@ -521,7 +521,7 @@ struct Cli {
 
     /// Permit isolated block production without a peer quorum.
     /// Used for the first network node and explicit local-chain testing.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     genesis: bool,
 
     /// Miner payout address (canonical bech32m, beginning with `o1`).

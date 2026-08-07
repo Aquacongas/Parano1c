@@ -15,7 +15,7 @@ stated otherwise.
 | Transaction epoch | 144 blocks |
 | Hard-finality depth | 18 blocks |
 | Maximum accepted reorganization | 17 blocks |
-| Recent complete-block retention | 18 blocks |
+| Recent block-body retention | 18 blocks |
 | Undo retention | 36 blocks |
 
 ## Block limits
@@ -59,8 +59,8 @@ stated otherwise.
 
 | Class | Dimension | Effective page positions |
 |---|---:|---:|
-| B64 | 23 | 0–64 |
-| B255 | 24 | 65–255 |
+| B25 | 22 | 0–25 |
+| B255 | 24 | 26–255 |
 
 The primary reward is excluded from effective page-position count. A live
 development payout counts as one position.

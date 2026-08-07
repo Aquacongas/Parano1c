@@ -3,6 +3,7 @@
 
 //! One-shot, nonce-independent HistoryStep witness preparation.
 
+use noid_chain::consensus::validation::validate_block_checks_template;
 use noid_chain::consensus::{
     validate_block_checks, validate_block_epoch_anchors, validate_block_resource_preflight,
     validate_mandatory_coinbase, validate_tx_consensus, AnchorInfo, ConsensusError,
@@ -86,6 +87,53 @@ pub struct PreparedHistoryStepWitness<const TIER: usize> {
 }
 
 impl<const TIER: usize> PreparedHistoryStepInputWitness<TIER> {
+    /// Consume release-tooling fixture preparation at the same nonce-free
+    /// boundary used by production mining.
+    #[doc(hidden)]
+    pub fn finish_template(
+        self,
+        start_accumulator: &ChainAccumulator,
+        end_accumulator: &ChainAccumulator,
+    ) -> Result<(Block, HistoryStepBlockInput<TIER>), HistoryStepWitnessError> {
+        let PreparedNativeHistoryStep {
+            template,
+            parent_header,
+            expected_start,
+            previous_timestamps,
+            finalized_active_counts,
+            asert_anchor,
+            local_time,
+            components,
+            authorizations,
+        } = self.native;
+        if start_accumulator != &expected_start {
+            return Err(HistoryStepWitnessError::StartAccumulatorChanged);
+        }
+        validate_block_checks_template(
+            &template,
+            &parent_header,
+            &previous_timestamps,
+            &finalized_active_counts,
+            local_time,
+            &asert_anchor,
+        )?;
+        let expected_end = start_accumulator
+            .advance(&parent_header, &template.header)
+            .map_err(HistoryStepWitnessError::AccumulatorAdvance)?;
+        if end_accumulator != &expected_end {
+            return Err(HistoryStepWitnessError::EndAccumulatorMismatch);
+        }
+        let input = HistoryStepBlockInput::try_new(
+            start_accumulator,
+            end_accumulator,
+            components,
+            authorizations,
+            &template.header,
+            &parent_header,
+        )?;
+        Ok((template, input))
+    }
+
     pub fn finish(
         self,
         nonce: u128,

@@ -4,7 +4,7 @@
 Poseidon2b 执行的全局承诺执行轨迹协议。**
 
 FROST 是 **Frobenius Reduction over Shifted Tables** 的缩写。该协议将整批
-四通道 Poseidon2b 执行归约为三个已承诺[多线性多项式](../reference/glossary.md#multilinear-extension)的打开。
+含四个状态元素的 Poseidon2b 执行归约为三个已承诺[多线性多项式](../reference/glossary.md#multilinear-extension)的打开。
 
 [阅读论文](https://lab.parano1d.org/papers/FROST_GKR.pdf) ·
 [阅读 Parano1d Lab 研究文章](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/) ·
@@ -16,14 +16,14 @@ FROST 是 **Frobenius Reduction over Shifted Tables** 的缩写。该协议将�
 和线性映射却保持不变。若将每次执行都表示为独立电路，同一结构便会反复占用
 列并重复执行 sumcheck。
 
-FROST-GKR 将整批计算视为一个对象。每个置换槽位、轮次和置换状态通道都成为
+FROST-GKR 将整批计算视为一个对象。每个置换槽位、轮次和置换状态元素都成为
 同一布尔乘积域中的一个坐标。协议持久承诺的是整条执行轨迹；全局关系直接归约
 为对该承诺的打开。
 
 ## 一条承诺执行轨迹
 
 对于 `B` 个实际置换，令 `L = 2^s >= B` 为补齐后的槽位数。Poseidon2b
-有四个通道和 66 个非线性轮。FROST-GKR 预留 128 个轮位置，得到布尔域
+有四个状态元素和 66 个非线性轮。FROST-GKR 预留 128 个轮位置，得到布尔域
 
 `(slot, round, lane) in {0,1}^s x {0,1}^7 x {0,1}^2`。
 
@@ -37,7 +37,7 @@ FROST-GKR 将整批计算视为一个对象。每个置换槽位、轮次和置�
 | `s_out` | 每个有效 `x^7` S-box 的输出 |
 
 在采样任何关系挑战值之前，[证明者](../reference/glossary.md#prover-verifier)先对这三列作出[承诺](../reference/glossary.md#commitment)。公开选择器标记实际
-槽位、有效轮次和有效 S-box 通道。
+槽位、有效轮次和有效 S-box 状态元素。
 
 ## 两次结构归约
 
@@ -95,10 +95,10 @@ $$
 
 对于论文中 $\mathbb{F}=\mathrm{GF}(2^{128})$ 上的 15 变量实例，该值小于
 $2^{-119}$；此后还需计入端点关系和多项式承诺的可靠性误差项。论文列出了
-完整的失败事件账本，其中包括主 zero-check、移位归约和终端批处理。
+完整的失败事件清单，其中包括主 zero-check、移位归约和终端批处理。
 
 当 Poseidon2b 的宽度和轮次安排固定时，证明者的工作量为 $O(N)$ 次域运算，
-承诺见证包含 $3N$ 个域元素。两次结构约束归约共使用 $2n$ 轮 sumcheck。
+已承诺的见证数据包含 $3N$ 个域元素。两次结构约束归约共使用 $2n$ 轮 sumcheck。
 采用完整的轮系数向量和通用终端批处理时，在加入承诺打开和序列化封装之前，
 代数交互记录包含 $22n+18$ 个域元素。
 
@@ -117,7 +117,7 @@ $2^{-119}$；此后还需计入端点关系和多项式承诺的可靠性误差�
 | 归约阶段验证者耗时中位数 | 984.269 ms | 66.499 ms | 加速 14.80 倍 |
 
 测量使用 Intel Core i7-1365U、发布模式的原生 CPU 代码、三次预热和 20 组
-交错样本。交互记录大小按未压缩域元素统计。多项式承诺打开与序列化封装均未
+交替采样。交互记录大小按未压缩域元素统计。多项式承诺打开与序列化封装均未
 计入两列数据，因此该比较只衡量论文所述的归约部分。
 
 ## 在 Parano1d 中的作用
@@ -127,5 +127,10 @@ Poseidon2b 执行的归约；应用关系将其承诺端点连接到钱包授权
 State 计算，外围 FRI-Binius/BaseFold 层则在无需可信设置的情况下闭合所得
 多线性断言。
 
+FROST-GKR 的承诺轨迹与关系仍在 `GF(2^128)` 上运算。实际部署的证明栈将
+Fiat-Shamir 挑战值、终端断言和递归区域认证提升到 `GF(2^256)`。这一扩展层
+位于 FROST-GKR 归约之外，不会改变三列轨迹、次数为九的关系，也不会改变论文中
+基于 `GF(2^128)` 的基准结果。
+
 因此，FROST-GKR 既是一项可复用的研究成果，也是 Parano1d 证明架构的具体
-组成部分。论文作者为 Andrew Boyle；FROST-GKR 是 **Parano1d Lab** 的研究成果。
+组成部分。FROST-GKR 是 **Parano1d Lab** 的研究成果。

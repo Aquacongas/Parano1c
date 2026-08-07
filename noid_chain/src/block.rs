@@ -934,28 +934,28 @@ mod tests {
             txs
         };
 
-        let b64 = with_users(63);
-        let facts = validate_block_page_stream(&b64).unwrap();
+        let b25 = with_users(24);
+        let facts = validate_block_page_stream(&b25).unwrap();
         assert!(facts.has_development_payout);
-        assert_eq!(facts.page_count, 63);
-        assert_eq!(facts.effective_page_count(), 64);
+        assert_eq!(facts.page_count, 24);
+        assert_eq!(facts.effective_page_count(), 25);
         assert_eq!(
             facts.proof_class,
-            crate::consensus::paged_spend::BlockProofClass::B64
+            crate::consensus::paged_spend::BlockProofClass::B25
         );
 
-        let mut ordinary_b64 = with_users(64);
-        ordinary_b64.remove(1);
-        let ordinary_facts = validate_block_page_stream(&ordinary_b64).unwrap();
+        let mut ordinary_b25 = with_users(25);
+        ordinary_b25.remove(1);
+        let ordinary_facts = validate_block_page_stream(&ordinary_b25).unwrap();
         assert!(!ordinary_facts.has_development_payout);
-        assert_eq!(ordinary_facts.page_count, 64);
-        assert_eq!(ordinary_facts.effective_page_count(), 64);
+        assert_eq!(ordinary_facts.page_count, 25);
+        assert_eq!(ordinary_facts.effective_page_count(), 25);
         assert_eq!(
             ordinary_facts.proof_class,
-            crate::consensus::paged_spend::BlockProofClass::B64
+            crate::consensus::paged_spend::BlockProofClass::B25
         );
 
-        let b255 = with_users(64);
+        let b255 = with_users(25);
         assert_eq!(
             validate_block_page_stream(&b255).unwrap().proof_class,
             crate::consensus::paged_spend::BlockProofClass::B255

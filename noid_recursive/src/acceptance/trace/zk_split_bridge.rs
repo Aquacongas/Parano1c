@@ -4,18 +4,20 @@
 //! Exact in-witness bridge between the disconnected Owner and Main duplex
 //! families of the selected ZK authorization capsule.
 //!
-//! The Owner transcript closes with a full fixed absorb at slot 117. Its four
-//! output carry cells are the bridge. The Main transcript absorbs those same
-//! four values as dynamic data lanes 0 through 3 before `sigma` (data lane 4):
+//! The fixed Owner and Main prefix domains end before their logical duplex
+//! schedules do. Wallet-A stores both remaining suffixes. Four pins bind each
+//! prefix state to the first raw state of its suffix, then four more bind the
+//! completed Owner state to Main dynamic data lanes 0 through 3 before
+//! `sigma` (data lane 4):
 //!
 //! ```text
-//! Owner C0..C3[117]
+//! Wallet-A Owner-suffix C0..C3[final]
 //!        |  |  |  |
 //!        v  v  v  v
-//! Main A1[0], A0[1], A1[1], A0[2]    Main A1[2] = sigma
+//! Main A1[0], A0[1], A1[1], A0[2]    Main (A1[2], A0[3]) = sigma
 //! ```
 //!
-//! This primitive adds four direct equality rows between already allocated
+//! This primitive adds twelve direct equality rows between already allocated
 //! committed-column cells. It deliberately allocates no intermediate bridge
 //! values: the bridge is neither a proof field nor a second witness copy.
 
@@ -23,12 +25,15 @@ use noid_ivc_core::deep_chain::schedule::{DuplexLayout, LaneSource};
 use noid_ivc_core::public_io::WitnessSlice;
 
 use super::region_source_binding::{duplex_data_positions, slot_cell};
-use super::{pin_eq, FieldR1csBuilder, LinExpr};
+use super::{pin_eq, ExtExpr, FieldR1csBuilder, LinExpr};
 use crate::acceptance::zk_auth_capsule_schedule::{
     ZkAuthCapsuleDuplexSchedules, ZK_AUTH_BRIDGE_LANES, ZK_AUTH_MAIN_COMPILED_SLOTS,
-    ZK_AUTH_MAIN_FROM_OWNER_TAG, ZK_AUTH_MAIN_SIGMA_DATA_INDEX, ZK_AUTH_MAIN_TILE_LOG,
-    ZK_AUTH_OWNER_BRIDGE_SLOT, ZK_AUTH_OWNER_COMPILED_SLOTS, ZK_AUTH_OWNER_TILE_LOG,
-    ZK_AUTH_OWNER_TO_MAIN_CLOSE_TAG,
+    ZK_AUTH_MAIN_FROM_OWNER_TAG, ZK_AUTH_MAIN_SIGMA_DATA_INDEX, ZK_AUTH_MAIN_TAIL_SLOTS,
+    ZK_AUTH_MAIN_TILE_LOG, ZK_AUTH_OWNER_BRIDGE_SLOT, ZK_AUTH_OWNER_COMPILED_SLOTS,
+    ZK_AUTH_OWNER_TAIL_SLOTS, ZK_AUTH_OWNER_TILE_LOG, ZK_AUTH_OWNER_TO_MAIN_CLOSE_TAG,
+    ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT, ZK_AUTH_WALLET_A_MAIN_DATA_SLOT,
+    ZK_AUTH_WALLET_A_MAIN_TAIL_BASE, ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+    ZK_AUTH_WALLET_A_OWNER_DATA_SLOT, ZK_AUTH_WALLET_A_OWNER_TAIL_BASE, ZK_AUTH_WALLET_A_TILE_LOG,
 };
 
 /// The four Main absorb cells that receive Owner `C0..C3`, in bridge-lane
@@ -38,23 +43,24 @@ pub const ZK_AUTH_MAIN_BRIDGE_CELLS: [(usize, usize); ZK_AUTH_BRIDGE_LANES] =
 
 /// The Main absorb cell carrying `sigma`, immediately after the four bridge
 /// lanes. This cell must remain distinct from every bridge destination.
-pub const ZK_AUTH_MAIN_SIGMA_CELL: (usize, usize) = (2, 1);
+pub const ZK_AUTH_MAIN_SIGMA_CELLS: [(usize, usize); 2] = [(2, 1), (3, 0)];
 
-/// Exact incremental R1CS cost of one selected Owner-to-Main bridge.
-pub const ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS: usize = ZK_AUTH_BRIDGE_LANES;
+/// Four Owner-final-to-Main-absorb pins plus two four-lane prefix-to-suffix
+/// continuity groups.
+pub const ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS: usize = 3 * ZK_AUTH_BRIDGE_LANES;
 
 const _: () = assert!(ZK_AUTH_BRIDGE_LANES == 4);
-const _: () = assert!(ZK_AUTH_OWNER_BRIDGE_SLOT == 117);
+const _: () = assert!(ZK_AUTH_OWNER_BRIDGE_SLOT == 156);
 const _: () = assert!(ZK_AUTH_MAIN_SIGMA_DATA_INDEX == ZK_AUTH_BRIDGE_LANES);
 
-/// Raw committed-cell aliases exposed by [`pin_zk_auth_split_bridge`]. None
-/// of these expressions allocates a wire; `sigma` is returned so the caller
-/// can consume the existing Main absorb cell directly.
+/// Raw committed-cell aliases exposed by [`pin_zk_auth_c1_split_bridge_at`].
+/// None of these expressions allocates a wire; `sigma` is returned so the
+/// caller can consume the existing Main absorb cell directly.
 #[derive(Clone, Debug)]
 pub struct ZkAuthSplitBridgeCells {
     pub owner_final_state: [LinExpr; ZK_AUTH_BRIDGE_LANES],
     pub main_absorb: [LinExpr; ZK_AUTH_BRIDGE_LANES],
-    pub sigma: LinExpr,
+    pub sigma: ExtExpr,
 }
 
 fn assert_pairwise_disjoint(slices: &[WitnessSlice]) {
@@ -74,12 +80,12 @@ fn assert_selected_layouts(owner: &DuplexLayout, main: &DuplexLayout) {
     assert_eq!(owner.slots.len(), ZK_AUTH_OWNER_COMPILED_SLOTS);
     assert_eq!(main.slots.len(), ZK_AUTH_MAIN_COMPILED_SLOTS);
     assert_eq!(
-        owner.slots.len().next_power_of_two(),
-        1 << ZK_AUTH_OWNER_TILE_LOG
+        owner.slots.len() - (1 << ZK_AUTH_OWNER_TILE_LOG),
+        ZK_AUTH_OWNER_TAIL_SLOTS
     );
     assert_eq!(
-        main.slots.len().next_power_of_two(),
-        1 << ZK_AUTH_MAIN_TILE_LOG
+        main.slots.len() - (1 << ZK_AUTH_MAIN_TILE_LOG),
+        ZK_AUTH_MAIN_TAIL_SLOTS
     );
     assert_eq!(ZK_AUTH_OWNER_BRIDGE_SLOT, owner.slots.len() - 1);
     assert_eq!(
@@ -99,11 +105,18 @@ fn assert_selected_layouts(owner: &DuplexLayout, main: &DuplexLayout) {
         "Main bridge data placement drifted"
     );
     assert_eq!(
-        positions[ZK_AUTH_MAIN_SIGMA_DATA_INDEX], ZK_AUTH_MAIN_SIGMA_CELL,
+        positions[ZK_AUTH_MAIN_SIGMA_DATA_INDEX], ZK_AUTH_MAIN_SIGMA_CELLS[0],
         "Main sigma placement drifted"
     );
+    assert_eq!(
+        positions[ZK_AUTH_MAIN_SIGMA_DATA_INDEX + 1],
+        ZK_AUTH_MAIN_SIGMA_CELLS[1],
+        "Main sigma high-coordinate placement drifted"
+    );
     assert!(
-        !ZK_AUTH_MAIN_BRIDGE_CELLS.contains(&ZK_AUTH_MAIN_SIGMA_CELL),
+        ZK_AUTH_MAIN_SIGMA_CELLS
+            .iter()
+            .all(|cell| !ZK_AUTH_MAIN_BRIDGE_CELLS.contains(cell)),
         "sigma aliases a bridge absorb cell"
     );
     assert_eq!(
@@ -161,30 +174,107 @@ fn validate_column_slices(
     owner_tiles
 }
 
-fn pin_zk_auth_split_bridge_at_validated(
+fn pin_prefix_to_wallet_tail(
+    b: &mut FieldR1csBuilder,
+    prefix_c: &[WitnessSlice; ZK_AUTH_BRIDGE_LANES],
+    prefix_base: usize,
+    prefix_last_slot: usize,
+    wallet_a: &[WitnessSlice; 6],
+    wallet_base: usize,
+    bridge_slot: usize,
+    tail_base: usize,
+    data_slot: usize,
+) {
+    for lane in 0..2 {
+        let prefix_rate = slot_cell(&prefix_c[lane], prefix_base + prefix_last_slot);
+        let first_data = slot_cell(&wallet_a[lane], wallet_base + data_slot);
+        let first_raw_rate = slot_cell(&wallet_a[lane], wallet_base + tail_base);
+        pin_eq(b, &first_raw_rate, &prefix_rate.add(&first_data));
+
+        let prefix_capacity = slot_cell(&prefix_c[2 + lane], prefix_base + prefix_last_slot);
+        let carrier = slot_cell(&wallet_a[lane], wallet_base + bridge_slot);
+        pin_eq(b, &carrier, &prefix_capacity);
+    }
+}
+
+/// Bind both relocated suffixes to their original prefix states and bind the
+/// completed Owner suffix to Main's first four absorbed data lanes.
+pub fn pin_zk_auth_c1_split_bridge_at(
     b: &mut FieldR1csBuilder,
     owner_c: &[WitnessSlice; ZK_AUTH_BRIDGE_LANES],
     main_a: &[WitnessSlice; 2],
+    main_c: &[WitnessSlice; ZK_AUTH_BRIDGE_LANES],
+    wallet_a: &[WitnessSlice; 6],
     tile_index: usize,
 ) -> ZkAuthSplitBridgeCells {
+    let schedules = ZkAuthCapsuleDuplexSchedules::selected();
+    assert_selected_layouts(&schedules.owner_layout(), &schedules.main_layout());
+    let tile_count = validate_column_slices(owner_c, main_a);
+    assert!(main_c
+        .iter()
+        .all(|slice| slice.log2_len == main_a[0].log2_len));
+    assert!(wallet_a.iter().all(|slice| {
+        slice.log2_len >= ZK_AUTH_WALLET_A_TILE_LOG && slice.log2_len == wallet_a[0].log2_len
+    }));
+    assert_eq!(
+        tile_count,
+        1usize << (wallet_a[0].log2_len - ZK_AUTH_WALLET_A_TILE_LOG)
+    );
+    assert!(
+        tile_index < tile_count,
+        "C1 split bridge tile index out of range"
+    );
+
     let owner_base = tile_index << ZK_AUTH_OWNER_TILE_LOG;
     let main_base = tile_index << ZK_AUTH_MAIN_TILE_LOG;
-    let owner_final_state = std::array::from_fn(|lane| {
-        slot_cell(&owner_c[lane], owner_base + ZK_AUTH_OWNER_BRIDGE_SLOT)
-    });
+    let wallet_base = tile_index << ZK_AUTH_WALLET_A_TILE_LOG;
+    pin_prefix_to_wallet_tail(
+        b,
+        owner_c,
+        owner_base,
+        (1 << ZK_AUTH_OWNER_TILE_LOG) - 1,
+        wallet_a,
+        wallet_base,
+        ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+        ZK_AUTH_WALLET_A_OWNER_TAIL_BASE,
+        ZK_AUTH_WALLET_A_OWNER_DATA_SLOT,
+    );
+    pin_prefix_to_wallet_tail(
+        b,
+        main_c,
+        main_base,
+        (1 << ZK_AUTH_MAIN_TILE_LOG) - 1,
+        wallet_a,
+        wallet_base,
+        ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT,
+        ZK_AUTH_WALLET_A_MAIN_TAIL_BASE,
+        ZK_AUTH_WALLET_A_MAIN_DATA_SLOT,
+    );
+
+    let owner_final_slot = ZK_AUTH_WALLET_A_OWNER_TAIL_BASE + ZK_AUTH_OWNER_TAIL_SLOTS - 1;
+    let owner_final_state =
+        std::array::from_fn(|lane| slot_cell(&wallet_a[2 + lane], wallet_base + owner_final_slot));
     let main_absorb = std::array::from_fn(|lane| {
         let (slot, rate_lane) = ZK_AUTH_MAIN_BRIDGE_CELLS[lane];
         slot_cell(&main_a[rate_lane], main_base + slot)
     });
-    let sigma = slot_cell(
-        &main_a[ZK_AUTH_MAIN_SIGMA_CELL.1],
-        main_base + ZK_AUTH_MAIN_SIGMA_CELL.0,
+    let sigma = ExtExpr::new(
+        slot_cell(
+            &main_a[ZK_AUTH_MAIN_SIGMA_CELLS[0].1],
+            main_base + ZK_AUTH_MAIN_SIGMA_CELLS[0].0,
+        ),
+        slot_cell(
+            &main_a[ZK_AUTH_MAIN_SIGMA_CELLS[1].1],
+            main_base + ZK_AUTH_MAIN_SIGMA_CELLS[1].0,
+        ),
     );
-
     for lane in 0..ZK_AUTH_BRIDGE_LANES {
         pin_eq(b, &owner_final_state[lane], &main_absorb[lane]);
     }
-
+    debug_assert_eq!(
+        ZK_AUTH_WALLET_A_MAIN_TAIL_BASE + ZK_AUTH_MAIN_TAIL_SLOTS,
+        ZK_AUTH_WALLET_A_OWNER_DATA_SLOT
+    );
     ZkAuthSplitBridgeCells {
         owner_final_state,
         main_absorb,
@@ -192,70 +282,14 @@ fn pin_zk_auth_split_bridge_at_validated(
     }
 }
 
-/// Pin one transaction tile inside production Owner/Main duplex unions.
-///
-/// Owner tiles have stride 128 and Main tiles stride 256. The committed
-/// column domains may be larger than those strides (B255 uses m15/m16), but
-/// all Owner columns must share a domain, all Main columns must share a
-/// domain, and both unions must contain the same number of transaction tiles.
-/// This call appends exactly four rows for `tile_index`.
-pub fn pin_zk_auth_split_bridge_at(
-    b: &mut FieldR1csBuilder,
-    owner_c: &[WitnessSlice; ZK_AUTH_BRIDGE_LANES],
-    main_a: &[WitnessSlice; 2],
-    tile_index: usize,
-) -> ZkAuthSplitBridgeCells {
-    let schedules = ZkAuthCapsuleDuplexSchedules::selected();
-    assert_selected_layouts(&schedules.owner_layout(), &schedules.main_layout());
-    let tile_count = validate_column_slices(owner_c, main_a);
-    assert!(tile_index < tile_count, "bridge tile index out of range");
-    pin_zk_auth_split_bridge_at_validated(b, owner_c, main_a, tile_index)
-}
-
-/// Pin every corresponding transaction tile in production Owner/Main duplex
-/// unions. The returned entries are raw cell aliases in transaction order;
-/// the helper appends exactly `4 * tile_count` rows.
-pub fn pin_zk_auth_split_bridges(
-    b: &mut FieldR1csBuilder,
-    owner_c: &[WitnessSlice; ZK_AUTH_BRIDGE_LANES],
-    main_a: &[WitnessSlice; 2],
-) -> Vec<ZkAuthSplitBridgeCells> {
-    let schedules = ZkAuthCapsuleDuplexSchedules::selected();
-    assert_selected_layouts(&schedules.owner_layout(), &schedules.main_layout());
-    let tile_count = validate_column_slices(owner_c, main_a);
-    (0..tile_count)
-        .map(|tile| pin_zk_auth_split_bridge_at_validated(b, owner_c, main_a, tile))
-        .collect()
-}
-
-/// Pin the four selected Owner closing-state cells directly to Main dynamic
-/// absorb cells 0 through 3.
-///
-/// `owner_c` must be the four separately committed Owner carry columns over
-/// its exact m7 tile; `main_a` must be the two separately committed Main absorb
-/// columns over its exact m8 tile. The six slices must not overlap. Exactly
-/// four equality rows are appended, and no bridge witness is allocated.
-pub fn pin_zk_auth_split_bridge(
-    b: &mut FieldR1csBuilder,
-    owner_c: &[WitnessSlice; ZK_AUTH_BRIDGE_LANES],
-    main_a: &[WitnessSlice; 2],
-) -> ZkAuthSplitBridgeCells {
-    let schedules = ZkAuthCapsuleDuplexSchedules::selected();
-    assert_selected_layouts(&schedules.owner_layout(), &schedules.main_layout());
-    assert_eq!(
-        validate_column_slices(owner_c, main_a),
-        1,
-        "single-tile bridge wrapper requires exact m7/m8 columns"
-    );
-    pin_zk_auth_split_bridge_at_validated(b, owner_c, main_a, 0)
-}
-
 #[cfg(test)]
 mod tests {
-    use noid_ivc_core::deep_chain::schedule::{build_duplex_columns, flat_of_tower_u128};
+    use noid_ivc_core::deep_chain::schedule::{
+        build_duplex_columns, flat_of_tower_u128, DuplexColumns,
+    };
     use noid_ivc_core::field::F128;
     use noid_ivc_core::field_r1cs::FieldR1cs;
-    use noid_poseidon2b::native::domain::{capacity_iv, TAG_KSCHANNL};
+    use noid_poseidon2b::native::domain::{capacity_iv, TAG_KSCH256};
 
     use super::super::region_source_binding::alloc_column_slice;
     use super::*;
@@ -276,13 +310,60 @@ mod tests {
     }
 
     fn iv_flat() -> [F128; 2] {
-        let [hi, lo] = capacity_iv(TAG_KSCHANNL);
+        let [hi, lo] = capacity_iv(TAG_KSCH256);
         [flat_of_tower_u128(hi.0), flat_of_tower_u128(lo.0)]
     }
 
     struct NativeFixture {
         owner_c: [Vec<F128>; ZK_AUTH_BRIDGE_LANES],
         main_a: [Vec<F128>; 2],
+        main_c: [Vec<F128>; ZK_AUTH_BRIDGE_LANES],
+        wallet_a: [Vec<F128>; 6],
+    }
+
+    fn split_fixture(owner: &DuplexColumns, main: &DuplexColumns) -> NativeFixture {
+        let owner_prefix = 1 << ZK_AUTH_OWNER_TILE_LOG;
+        let main_prefix = 1 << ZK_AUTH_MAIN_TILE_LOG;
+        let mut wallet_a: [Vec<F128>; 6] =
+            std::array::from_fn(|_| vec![F128::ZERO; 1 << ZK_AUTH_WALLET_A_TILE_LOG]);
+        for (columns, prefix, bridge_slot, tail_base, data_slot, full_slots) in [
+            (
+                owner,
+                owner_prefix,
+                ZK_AUTH_WALLET_A_OWNER_BRIDGE_SLOT,
+                ZK_AUTH_WALLET_A_OWNER_TAIL_BASE,
+                ZK_AUTH_WALLET_A_OWNER_DATA_SLOT,
+                ZK_AUTH_OWNER_COMPILED_SLOTS,
+            ),
+            (
+                main,
+                main_prefix,
+                ZK_AUTH_WALLET_A_MAIN_BRIDGE_SLOT,
+                ZK_AUTH_WALLET_A_MAIN_TAIL_BASE,
+                ZK_AUTH_WALLET_A_MAIN_DATA_SLOT,
+                ZK_AUTH_MAIN_COMPILED_SLOTS,
+            ),
+        ] {
+            let tail_slots = full_slots - prefix;
+            wallet_a[0][bridge_slot] = columns.c[2][prefix - 1];
+            wallet_a[1][bridge_slot] = columns.c[3][prefix - 1];
+            for lane in 0..2 {
+                wallet_a[lane][data_slot] = columns.a[lane][prefix];
+                wallet_a[lane][tail_base..tail_base + tail_slots]
+                    .copy_from_slice(&columns.a[lane][prefix..full_slots]);
+                wallet_a[lane][tail_base] += columns.c[lane][prefix - 1];
+            }
+            for lane in 0..4 {
+                wallet_a[2 + lane][tail_base..tail_base + tail_slots]
+                    .copy_from_slice(&columns.c[lane][prefix..full_slots]);
+            }
+        }
+        NativeFixture {
+            owner_c: std::array::from_fn(|lane| owner.c[lane][..owner_prefix].to_vec()),
+            main_a: std::array::from_fn(|lane| main.a[lane][..main_prefix].to_vec()),
+            main_c: std::array::from_fn(|lane| main.c[lane][..main_prefix].to_vec()),
+            wallet_a,
+        }
     }
 
     fn native_fixture(
@@ -299,14 +380,14 @@ mod tests {
             &owner_layout,
             iv_flat(),
             &stream(&owner_layout, owner_seed),
-            ZK_AUTH_OWNER_TILE_LOG,
+            ZK_AUTH_OWNER_TILE_LOG + 1,
         );
         let bridge: [F128; ZK_AUTH_BRIDGE_LANES] = if let Some(other_seed) = splice_seed {
             let other = build_duplex_columns(
                 &owner_layout,
                 iv_flat(),
                 &stream(&owner_layout, other_seed),
-                ZK_AUTH_OWNER_TILE_LOG,
+                ZK_AUTH_OWNER_TILE_LOG + 1,
             );
             std::array::from_fn(|lane| other.c[lane][ZK_AUTH_OWNER_BRIDGE_SLOT])
         } else {
@@ -315,11 +396,13 @@ mod tests {
 
         let mut main_data = stream(&main_layout, main_seed);
         main_data[..ZK_AUTH_BRIDGE_LANES].copy_from_slice(&bridge);
-        let main = build_duplex_columns(&main_layout, iv_flat(), &main_data, ZK_AUTH_MAIN_TILE_LOG);
-        NativeFixture {
-            owner_c: owner.c,
-            main_a: main.a,
-        }
+        let main = build_duplex_columns(
+            &main_layout,
+            iv_flat(),
+            &main_data,
+            ZK_AUTH_MAIN_TILE_LOG + 1,
+        );
+        split_fixture(&owner, &main)
     }
 
     fn native_k2_fixture(
@@ -338,7 +421,7 @@ mod tests {
                 &owner_layout,
                 iv_flat(),
                 &stream(&owner_layout, seed),
-                ZK_AUTH_OWNER_TILE_LOG,
+                ZK_AUTH_OWNER_TILE_LOG + 1,
             )
         });
         let mains = std::array::from_fn::<_, 2, _>(|tile| {
@@ -347,20 +430,33 @@ mod tests {
             for lane in 0..ZK_AUTH_BRIDGE_LANES {
                 data[lane] = owners[source].c[lane][ZK_AUTH_OWNER_BRIDGE_SLOT];
             }
-            build_duplex_columns(&main_layout, iv_flat(), &data, ZK_AUTH_MAIN_TILE_LOG)
+            build_duplex_columns(&main_layout, iv_flat(), &data, ZK_AUTH_MAIN_TILE_LOG + 1)
         });
-
+        let tiles =
+            std::array::from_fn::<_, 2, _>(|tile| split_fixture(&owners[tile], &mains[tile]));
         NativeFixture {
             owner_c: std::array::from_fn(|lane| {
-                owners
+                tiles
                     .iter()
-                    .flat_map(|owner| owner.c[lane].iter().copied())
+                    .flat_map(|tile| tile.owner_c[lane].iter().copied())
                     .collect()
             }),
             main_a: std::array::from_fn(|lane| {
-                mains
+                tiles
                     .iter()
-                    .flat_map(|main| main.a[lane].iter().copied())
+                    .flat_map(|tile| tile.main_a[lane].iter().copied())
+                    .collect()
+            }),
+            main_c: std::array::from_fn(|lane| {
+                tiles
+                    .iter()
+                    .flat_map(|tile| tile.main_c[lane].iter().copied())
+                    .collect()
+            }),
+            wallet_a: std::array::from_fn(|lane| {
+                tiles
+                    .iter()
+                    .flat_map(|tile| tile.wallet_a[lane].iter().copied())
                     .collect()
             }),
         }
@@ -384,15 +480,30 @@ mod tests {
         let main_slices: [WitnessSlice; 2] = std::array::from_fn(|lane| {
             alloc_column_slice(&mut b, &native.main_a[lane], ZK_AUTH_MAIN_TILE_LOG).0
         });
+        let main_c_slices: [WitnessSlice; ZK_AUTH_BRIDGE_LANES] = std::array::from_fn(|lane| {
+            alloc_column_slice(&mut b, &native.main_c[lane], ZK_AUTH_MAIN_TILE_LOG).0
+        });
+        let wallet_slices: [WitnessSlice; 6] = std::array::from_fn(|lane| {
+            alloc_column_slice(&mut b, &native.wallet_a[lane], ZK_AUTH_WALLET_A_TILE_LOG).0
+        });
+        let owner_final_slot = ZK_AUTH_WALLET_A_OWNER_TAIL_BASE + ZK_AUTH_OWNER_TAIL_SLOTS - 1;
         let owner_cells =
-            std::array::from_fn(|lane| owner_slices[lane].start() + ZK_AUTH_OWNER_BRIDGE_SLOT);
+            std::array::from_fn(|lane| wallet_slices[2 + lane].start() + owner_final_slot);
         let main_cells = std::array::from_fn(|lane| {
             let (slot, rate_lane) = ZK_AUTH_MAIN_BRIDGE_CELLS[lane];
             main_slices[rate_lane].start() + slot
         });
-        let sigma_cell = main_slices[ZK_AUTH_MAIN_SIGMA_CELL.1].start() + ZK_AUTH_MAIN_SIGMA_CELL.0;
+        let sigma_cell =
+            main_slices[ZK_AUTH_MAIN_SIGMA_CELLS[0].1].start() + ZK_AUTH_MAIN_SIGMA_CELLS[0].0;
         let bridge_row_start = b.num_wires();
-        let cells = pin_zk_auth_split_bridge(&mut b, &owner_slices, &main_slices);
+        let cells = pin_zk_auth_c1_split_bridge_at(
+            &mut b,
+            &owner_slices,
+            &main_slices,
+            &main_c_slices,
+            &wallet_slices,
+            0,
+        );
         assert_eq!(
             b.num_wires() - bridge_row_start,
             ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
@@ -409,8 +520,8 @@ mod tests {
                 main_cells[lane]
             );
         }
-        assert_eq!(cells.sigma.terms.len(), 1);
-        assert_eq!(cells.sigma.terms[0].0 as usize, sigma_cell);
+        assert_eq!(cells.sigma.lo.terms.len(), 1);
+        assert_eq!(cells.sigma.lo.terms[0].0 as usize, sigma_cell);
         assert!(!main_cells.contains(&sigma_cell));
         let (r1cs, witness) = b.build();
         BuiltFixture {
@@ -446,11 +557,23 @@ mod tests {
         let main_slices: [WitnessSlice; 2] = std::array::from_fn(|lane| {
             alloc_column_slice(&mut b, &native.main_a[lane], main_log).0
         });
+        let main_c_slices: [WitnessSlice; ZK_AUTH_BRIDGE_LANES] = std::array::from_fn(|lane| {
+            alloc_column_slice(&mut b, &native.main_c[lane], main_log).0
+        });
+        let wallet_slices: [WitnessSlice; 6] = std::array::from_fn(|lane| {
+            alloc_column_slice(
+                &mut b,
+                &native.wallet_a[lane],
+                ZK_AUTH_WALLET_A_TILE_LOG + 1,
+            )
+            .0
+        });
+        let owner_final_slot = ZK_AUTH_WALLET_A_OWNER_TAIL_BASE + ZK_AUTH_OWNER_TAIL_SLOTS - 1;
         let owner_cells = std::array::from_fn(|tile| {
             std::array::from_fn(|lane| {
-                owner_slices[lane].start()
-                    + (tile << ZK_AUTH_OWNER_TILE_LOG)
-                    + ZK_AUTH_OWNER_BRIDGE_SLOT
+                wallet_slices[2 + lane].start()
+                    + (tile << ZK_AUTH_WALLET_A_TILE_LOG)
+                    + owner_final_slot
             })
         });
         let main_cells = std::array::from_fn(|tile| {
@@ -461,7 +584,18 @@ mod tests {
         });
 
         let bridge_row_start = b.num_wires();
-        let cells = pin_zk_auth_split_bridges(&mut b, &owner_slices, &main_slices);
+        let cells = (0..2)
+            .map(|tile| {
+                pin_zk_auth_c1_split_bridge_at(
+                    &mut b,
+                    &owner_slices,
+                    &main_slices,
+                    &main_c_slices,
+                    &wallet_slices,
+                    tile,
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(cells.len(), 2);
         assert_eq!(
             b.num_wires() - bridge_row_start,
@@ -495,20 +629,25 @@ mod tests {
         let owner = schedules.owner_layout();
         let main = schedules.main_layout();
         assert_selected_layouts(&owner, &main);
-        assert_eq!(owner.slots.len(), 118);
-        assert_eq!(ZK_AUTH_OWNER_BRIDGE_SLOT, 117);
+        assert_eq!(owner.slots.len(), 157);
+        assert_eq!(ZK_AUTH_OWNER_BRIDGE_SLOT, 156);
+        assert_eq!(owner.slots.len() - (1 << ZK_AUTH_OWNER_TILE_LOG), 29);
+        assert_eq!(main.slots.len() - (1 << ZK_AUTH_MAIN_TILE_LOG), 79);
         assert_eq!(
             duplex_data_positions(&main)[..5],
             [(0, 1), (1, 0), (1, 1), (2, 0), (2, 1),]
         );
-        assert_eq!(main.challenges[0], (2, 0));
+        assert_eq!(main.challenges[0], (3, 0));
     }
 
     #[test]
-    fn real_duplex_columns_pin_honestly_in_exactly_four_rows() {
+    fn real_split_duplex_columns_pin_honestly_in_exactly_twelve_rows() {
         let fixture = build_fixture(0x0A11_CE01, 0x0A11_CE02, None);
-        assert_eq!(ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS, 4);
-        assert_eq!(fixture.r1cs.useful_rows, fixture.bridge_row_start + 4);
+        assert_eq!(ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS, 12);
+        assert_eq!(
+            fixture.r1cs.useful_rows,
+            fixture.bridge_row_start + ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS
+        );
         assert!(fixture.r1cs.satisfies(&fixture.witness));
         assert!(!fixture.main_cells.contains(&fixture.sigma_cell));
     }
@@ -546,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn k2_union_pins_both_tiles_in_exactly_four_rows_each() {
+    fn k2_union_pins_both_tiles_in_exactly_twelve_rows_each() {
         let fixture = build_k2_fixture([0, 1]);
         assert_eq!(
             fixture.r1cs.useful_rows,
@@ -599,12 +738,31 @@ mod tests {
         let main_slices: [WitnessSlice; 2] = std::array::from_fn(|lane| {
             alloc_column_slice(&mut b, &native.main_a[lane], ZK_AUTH_MAIN_TILE_LOG + 1).0
         });
+        let main_c_slices: [WitnessSlice; ZK_AUTH_BRIDGE_LANES] = std::array::from_fn(|lane| {
+            alloc_column_slice(&mut b, &native.main_c[lane], ZK_AUTH_MAIN_TILE_LOG + 1).0
+        });
+        let wallet_slices: [WitnessSlice; 6] = std::array::from_fn(|lane| {
+            alloc_column_slice(
+                &mut b,
+                &native.wallet_a[lane],
+                ZK_AUTH_WALLET_A_TILE_LOG + 1,
+            )
+            .0
+        });
         let before = b.num_wires();
-        let cells = pin_zk_auth_split_bridge_at(&mut b, &owner_slices, &main_slices, 1);
+        let cells = pin_zk_auth_c1_split_bridge_at(
+            &mut b,
+            &owner_slices,
+            &main_slices,
+            &main_c_slices,
+            &wallet_slices,
+            1,
+        );
         assert_eq!(b.num_wires() - before, ZK_AUTH_SPLIT_BRIDGE_PIN_ROWS);
+        let owner_final_slot = ZK_AUTH_WALLET_A_OWNER_TAIL_BASE + ZK_AUTH_OWNER_TAIL_SLOTS - 1;
         assert_eq!(
             cells.owner_final_state[0].terms[0].0 as usize,
-            owner_slices[0].start() + (1 << ZK_AUTH_OWNER_TILE_LOG) + ZK_AUTH_OWNER_BRIDGE_SLOT
+            wallet_slices[2].start() + (1 << ZK_AUTH_WALLET_A_TILE_LOG) + owner_final_slot
         );
         assert_eq!(
             cells.main_absorb[0].terms[0].0 as usize,

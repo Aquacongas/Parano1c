@@ -12,16 +12,125 @@ use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
 use crate::acceptance::trace::deep_chain::{
     verify_column_relation_trace, verify_deep_chain_walk_trace, verify_shift_discharge_trace,
-    ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace, RelationTermTrace,
-    ShiftDischargeProofTrace,
+    C1LaneClaimGroupTrace, ColumnRelationProofTrace, DeepChainWalkProofTrace, LaneClaimGroupTrace,
+    RelationTermTrace, ShiftDischargeProofTrace,
 };
 use crate::acceptance::trace::region_source_binding::{
     union_ref_terms, union_trace_terms, WalkAUnionWalkDeferredProofRef,
 };
-use crate::acceptance::trace::self_verify::{FieldPostCommitTraceContext, QuirkyDirectClaimTrace};
-use crate::acceptance::trace::{mul, FieldR1csBuilder, LinExpr};
+use crate::acceptance::trace::region_source_binding_c1::{
+    verify_c1_walk_a_walk_prefix_trace, verify_c1_walk_a_walk_suffix_trace,
+    C1WalkAColumnClaimTrace, C1WalkAUnionTraceWalkPrefix,
+};
+use crate::acceptance::trace::self_verify::{
+    C1QuirkyDirectClaimTrace, FieldPostCommitTraceContext, QuirkyDirectClaimTrace,
+};
+use crate::acceptance::trace::{mul, ExtExpr, FieldR1csBuilder, LinExpr};
 
 use super::*;
+
+pub(crate) struct C1WalkARegionTraceWalkContinuation<'a> {
+    vk: &'a WalkARegionVk,
+    total_vars: usize,
+    protocol: std::sync::Arc<CanonicalWalkAProtocol>,
+    prefix: C1WalkAUnionTraceWalkPrefix<'a>,
+}
+
+impl C1WalkARegionTraceWalkContinuation<'_> {
+    pub(crate) fn walk_group(&self) -> C1LaneClaimGroupTrace {
+        self.prefix.walk_group().clone()
+    }
+
+    pub(crate) fn finish<C: FsChannelOps>(
+        self,
+        b: &mut FieldR1csBuilder,
+        context: &mut FieldPostCommitTraceContext<'_, C>,
+        walk_terminal: &C1LaneClaimGroupTrace,
+    ) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
+        if context.total_vars() != self.total_vars {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let terminal = verify_c1_walk_a_walk_suffix_trace(
+            b,
+            context,
+            self.protocol.w_log,
+            &self.protocol.fixed,
+            &self.protocol.meta_c,
+            &self.protocol.leaf_refs,
+            &self.protocol.split_tails,
+            self.protocol.es_sponge.as_ref(),
+            self.protocol.spine.as_ref(),
+            self.prefix,
+            walk_terminal,
+        )?;
+        resolve_c1_walk_a_terminal_claims_trace(self.vk, self.total_vars, terminal)
+    }
+}
+
+pub(crate) fn verify_c1_walk_a_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
+    b: &mut FieldR1csBuilder,
+    context: &mut FieldPostCommitTraceContext<'_, C>,
+    vk: &'a WalkARegionVk,
+    proof: &'a C1WalkARegionWalkDeferredProof,
+) -> Result<C1WalkARegionTraceWalkContinuation<'a>, RegionSidecarError> {
+    let total_vars = context.total_vars();
+    let protocol = vk.certified_c1_protocol_in_witness(total_vars)?;
+    if proof.version() != WALK_A_REGION_SIDECAR_VERSION {
+        return Err(RegionSidecarError::UnsupportedVersion);
+    }
+    context.observe_label(b, WALK_A_SIDECAR_TRANSCRIPT_LABEL);
+    crate::acceptance::trace::self_verify::observe_pinned_digest(
+        b,
+        context,
+        &vk.transcript_digest(),
+    );
+    let prefix = verify_c1_walk_a_walk_prefix_trace(
+        b,
+        context,
+        protocol.w_log,
+        &protocol.fixed,
+        &protocol.meta_c,
+        proof.authority().as_ref(),
+    )?;
+    Ok(C1WalkARegionTraceWalkContinuation {
+        vk,
+        total_vars,
+        protocol,
+        prefix,
+    })
+}
+
+fn resolve_c1_walk_a_terminal_claims_trace(
+    vk: &WalkARegionVk,
+    total_vars: usize,
+    terminal: Vec<C1WalkAColumnClaimTrace>,
+) -> Result<Vec<C1QuirkyDirectClaimTrace>, RegionSidecarError> {
+    terminal
+        .into_iter()
+        .map(|claim| {
+            let slice = *vk
+                .slices()
+                .get(claim.column)
+                .ok_or(RegionSidecarError::InvalidProof)?;
+            if claim.point.len() != slice.log2_len {
+                return Err(RegionSidecarError::InvalidProof);
+            }
+            let mut x_rest = claim.point;
+            x_rest.extend(
+                slice
+                    .prefix_coords(total_vars)
+                    .into_iter()
+                    .map(|value| ExtExpr::constant(F256::from_base(value))),
+            );
+            Ok(C1QuirkyDirectClaimTrace {
+                z_skip: ExtExpr::zero(),
+                k_skip: 0,
+                x_rest,
+                value: claim.value,
+            })
+        })
+        .collect()
+}
 
 /// A verifier-derived Walk-A terminal opening. This is transient trace state,
 /// never serialized proof authority.
@@ -136,11 +245,13 @@ pub(super) fn verify_walk_a_union_walk_suffix_trace<C: FsChannelOps>(
     let substitution_terms = union_trace_terms(
         &mds_weights,
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     );
     let substitution_ref_terms = union_ref_terms(
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     );
@@ -269,8 +380,7 @@ pub(super) fn verify_walk_a_union_walk_suffix_trace<C: FsChannelOps>(
     Ok(terminal_claims)
 }
 
-/// Legacy single-walk replay retained as a thin composition of the phased
-/// API. The embedded walk is still fully verified and is never ignored.
+/// Replay the standalone Walk-A authority, including its embedded walk.
 pub(super) fn verify_walk_a_union_proof_trace<C: FsChannelOps>(
     b: &mut FieldR1csBuilder,
     channel: &mut C,
@@ -285,82 +395,6 @@ pub(super) fn verify_walk_a_union_proof_trace<C: FsChannelOps>(
     let walk_terminal =
         verify_deep_chain_walk_trace(b, channel, protocol.w_log, &walk_groups, &walk);
     verify_walk_a_union_walk_suffix_trace(b, channel, protocol, prefix, &walk_terminal)
-}
-
-/// High-level Walk-A continuation used by enclosing protocols that own the
-/// deep-chain walk. Prefix construction binds the exact child VK transcript;
-/// finishing returns claims without mutating the outer PCS claim order.
-pub(crate) struct WalkARegionTraceWalkContinuation<'a> {
-    vk: &'a WalkARegionVk,
-    total_vars: usize,
-    protocol: CanonicalWalkAProtocol,
-    prefix: WalkAUnionTraceWalkPrefix<'a>,
-}
-
-impl WalkARegionTraceWalkContinuation<'_> {
-    pub(crate) fn walk_group(&self) -> LaneClaimGroupTrace {
-        self.prefix.walk_group().clone()
-    }
-
-    pub(crate) fn finish<C: FsChannelOps>(
-        self,
-        b: &mut FieldR1csBuilder,
-        context: &mut FieldPostCommitTraceContext<'_, C>,
-        walk_terminal: &LaneClaimGroupTrace,
-    ) -> Result<Vec<QuirkyDirectClaimTrace>, RegionSidecarError> {
-        if context.total_vars() != self.total_vars {
-            return Err(RegionSidecarError::InvalidProof);
-        }
-        let terminal = verify_walk_a_union_walk_suffix_trace(
-            b,
-            context,
-            &self.protocol,
-            self.prefix,
-            walk_terminal,
-        )?;
-        resolve_walk_a_terminal_claims_trace(self.vk, self.total_vars, terminal)
-    }
-}
-
-/// Bind and replay a walk-deferred Walk-A child through its selection prefix.
-pub(crate) fn verify_walk_a_region_walk_deferred_prefix_trace<'a, C: FsChannelOps>(
-    b: &mut FieldR1csBuilder,
-    context: &mut FieldPostCommitTraceContext<'_, C>,
-    vk: &'a WalkARegionVk,
-    proof: &'a WalkARegionWalkDeferredProof,
-) -> Result<WalkARegionTraceWalkContinuation<'a>, RegionSidecarError> {
-    let total_vars = context.total_vars();
-    preflight_walk_a_region_walk_deferred_trace(vk, total_vars, proof)?;
-    let protocol = vk.validate_in_witness(total_vars)?;
-    let deferred = proof.authority().as_ref();
-
-    context.observe_label(b, WALK_A_SIDECAR_TRANSCRIPT_LABEL);
-    crate::acceptance::trace::self_verify::observe_pinned_digest(
-        b,
-        context,
-        &vk.transcript_digest(),
-    );
-    let prefix = verify_walk_a_union_walk_prefix_trace(b, context, &protocol, deferred)?;
-    Ok(WalkARegionTraceWalkContinuation {
-        vk,
-        total_vars,
-        protocol,
-        prefix,
-    })
-}
-
-/// Allocation-free shape check used by the block composite before any child
-/// proof witness is allocated or its transcript prefix is consumed.
-pub(crate) fn preflight_walk_a_region_walk_deferred_trace(
-    vk: &WalkARegionVk,
-    total_vars: usize,
-    proof: &WalkARegionWalkDeferredProof,
-) -> Result<(), RegionSidecarError> {
-    let protocol = vk.validate_in_witness(total_vars)?;
-    if proof.version() != WALK_A_REGION_SIDECAR_VERSION {
-        return Err(RegionSidecarError::UnsupportedVersion);
-    }
-    preflight_walk_a_deferred_authority(&protocol, proof.authority().as_ref())
 }
 
 fn resolve_walk_a_terminal_claims_trace(
@@ -458,6 +492,7 @@ fn preflight_walk_a_deferred_authority(
     let selection_values = claimed_refs(&carry_selection_terms(&protocol.meta_c, F128::ONE)).len();
     let substitution_refs = claimed_refs(&union_ref_terms(
         &protocol.leaf_refs,
+        &protocol.split_tails,
         protocol.es_sponge.as_ref(),
         protocol.spine.as_ref(),
     ));

@@ -9,7 +9,7 @@
 //! a fixed tuple, array, integer, or field element.
 
 use bincode::Options;
-use noid_core::Block128;
+use noid_core::Block256;
 use noid_fri_binius::zk_capsule_pcs::{
     ZkCapsulePcsMidCommitment, ZkCapsulePcsOpening, ZkCapsulePcsSourceCommitment,
     ZkCapsulePcsTailReveal,
@@ -37,7 +37,8 @@ use noid_fri_binius::zk_capsule_pcs::{
 pub const ZK_AUTHORIZATION_MAX_WIRE_BYTES: usize = ZK_AUTHORIZATION_WORST_SERIALIZED_BYTES;
 
 const LENGTH_BYTES: usize = 8;
-const FIELD_BYTES: usize = 16;
+const BASE_FIELD_BYTES: usize = 16;
+const WIDE_FIELD_BYTES: usize = 32;
 const HASH_BYTES: usize = 32;
 const VECTOR_COUNT: usize = 6;
 
@@ -51,19 +52,20 @@ const FIXED_AFTER_SOURCE_CAP: usize = ZK_AUTH_OWNER_PROOF_BYTES
     + ZK_AUTH_UPPER_BYTES;
 const FIXED_AFTER_MID_CAP: usize = ZK_CAPSULE_PCS_TAIL_BYTES + ZK_AUTH_GRIND_NONCE_BYTES;
 
-const _: () = assert!(ZK_AUTHORIZATION_MAX_WIRE_BYTES == 61_000);
+const _: () = assert!(ZK_AUTHORIZATION_MAX_WIRE_BYTES == 92_696);
 const _: () = assert!(ZK_AUTHORIZATION_MAX_WIRE_BYTES <= ZK_AUTHORIZATION_PAYLOAD_ROOFLINE_BYTES);
-const _: () = assert!(SOURCE_CAP_HASHES == 32);
-const _: () = assert!(MID_CAP_HASHES == 2);
-const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_SYMBOLS == 1_024);
-const _: () = assert!(ZK_CAPSULE_PCS_MID_SYMBOLS == 1_024);
+const _: () = assert!(SOURCE_CAP_HASHES == 8);
+const _: () = assert!(MID_CAP_HASHES == 8);
+const _: () = assert!(ZK_CAPSULE_PCS_SOURCE_SYMBOLS == 1_560);
+const _: () = assert!(ZK_CAPSULE_PCS_MID_SYMBOLS == 1_040);
 const _: () = assert!(VECTOR_COUNT * LENGTH_BYTES == 48);
 const _: () = assert!(
     ZK_CAPSULE_PCS_SOURCE_COMMITMENT_BYTES
         + FIXED_AFTER_SOURCE_CAP
         + ZK_CAPSULE_PCS_MID_COMMITMENT_BYTES
         + FIXED_AFTER_MID_CAP
-        + (ZK_CAPSULE_PCS_SOURCE_SYMBOLS + ZK_CAPSULE_PCS_MID_SYMBOLS) * FIELD_BYTES
+        + ZK_CAPSULE_PCS_SOURCE_SYMBOLS * BASE_FIELD_BYTES
+        + ZK_CAPSULE_PCS_MID_SYMBOLS * WIDE_FIELD_BYTES
         + (ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS + ZK_CAPSULE_PCS_WORST_MID_SIBLINGS) * HASH_BYTES
         + VECTOR_COUNT * LENGTH_BYTES
         == ZK_AUTHORIZATION_MAX_WIRE_BYTES
@@ -157,9 +159,9 @@ struct WirePreflight {
 struct ZkAuthorizationWireDto {
     source_commitment: ZkCapsulePcsSourceCommitment,
     owner: ZkAuthCapsuleOwnerProof,
-    sigma: Block128,
-    phase_a: ZkPhaseAProof,
-    phase_b_value: Block128,
+    sigma: Block256,
+    phase_a: ZkPhaseAProof<Block256>,
+    phase_b_value: Block256,
     upper: ZkAuthorizationUpper,
     mid_commitment: ZkCapsulePcsMidCommitment,
     tail: ZkCapsulePcsTailReveal,
@@ -340,7 +342,7 @@ fn preflight_wire(bytes: &[u8]) -> Result<WirePreflight, ZkAuthorizationWireDeco
         &mut cursor,
         ZkAuthorizationProofComponent::SourceSymbols,
         length,
-        FIELD_BYTES,
+        BASE_FIELD_BYTES,
     )?;
 
     // opening.source_batch.siblings: Vec<[u8; 32]>
@@ -358,7 +360,7 @@ fn preflight_wire(bytes: &[u8]) -> Result<WirePreflight, ZkAuthorizationWireDeco
         HASH_BYTES,
     )?;
 
-    // opening.mid_symbols: Vec<Block128>
+    // opening.mid_symbols: Vec<Block256>
     let (offset, length) = cursor.read_length()?;
     offsets[4] = offset;
     let length = exact_length(
@@ -370,7 +372,7 @@ fn preflight_wire(bytes: &[u8]) -> Result<WirePreflight, ZkAuthorizationWireDeco
         &mut cursor,
         ZkAuthorizationProofComponent::MidSymbols,
         length,
-        FIELD_BYTES,
+        WIDE_FIELD_BYTES,
     )?;
 
     // opening.mid_batch.siblings: Vec<[u8; 32]>
@@ -459,7 +461,7 @@ mod tests {
         ZkAuthCapsuleOwnerProof, ZkAuthorizationUpper, ZK_AUTH_OWNER_PROOF_ROUNDS,
     };
     use crate::zk_mlecheck::{ZkMleCheckRoundProof, ZK_MLECHECK_ROUND_PROOF_COEFFS};
-    use noid_core::Block128;
+    use noid_core::{Block128, Block256};
     use noid_fri_binius::interleaved_commit::{MerkleCap, SourceBatchedMerkleProof, SourceHash};
     use noid_fri_binius::zk_capsule_algebra::{TAIL_SYMBOLS, UPPER_SYMBOLS};
     use noid_fri_binius::zk_capsule_pcs::{
@@ -474,20 +476,23 @@ mod tests {
         hash
     }
 
+    fn wide(index: usize) -> Block256 {
+        Block256::new(
+            Block128::from(index as u128),
+            Block128::from((index as u128).rotate_left(37) ^ 0xC1_0256),
+        )
+    }
+
     fn fixture(source_siblings: usize, mid_siblings: usize) -> ZkAuthorizationProof {
         let owner = ZkAuthCapsuleOwnerProof {
-            mask_mu: Block128::from(1u128),
+            mask_mu: wide(1),
             rounds: std::array::from_fn(|round| ZkMleCheckRoundProof {
                 coeffs_without_constant: std::array::from_fn(|coefficient| {
-                    Block128::from(
-                        (round * ZK_MLECHECK_ROUND_PROOF_COEFFS + coefficient + 2) as u128,
-                    )
+                    wide(round * ZK_MLECHECK_ROUND_PROOF_COEFFS + coefficient + 2)
                 }),
             }),
-            mask_final: Block128::from(113u128),
-            terminal_operand_claims: std::array::from_fn(|index| {
-                Block128::from((index + 114) as u128)
-            }),
+            mask_final: wide(113),
+            terminal_operand_claims: std::array::from_fn(|index| wide(index + 114)),
         };
         assert_eq!(owner.rounds.len(), ZK_AUTH_OWNER_PROOF_ROUNDS);
         assert_eq!(
@@ -502,21 +507,17 @@ mod tests {
                 },
             },
             owner,
-            sigma: Block128::from(119u128),
+            sigma: wide(119),
             phase_a: ZkPhaseAProof::default(),
-            phase_b_value: Block128::from(120u128),
-            upper: ZkAuthorizationUpper::new(std::array::from_fn(|index| {
-                Block128::from((index + 121) as u128)
-            })),
+            phase_b_value: wide(120),
+            upper: ZkAuthorizationUpper::new(std::array::from_fn(|index| wide(index + 121))),
             mid_commitment: ZkCapsulePcsMidCommitment {
                 cap: MerkleCap {
                     hashes: (10_000..10_000 + MID_CAP_HASHES).map(hash).collect(),
                 },
             },
             tail: ZkCapsulePcsTailReveal {
-                coefficients: std::array::from_fn(|index| {
-                    Block128::from((index + UPPER_SYMBOLS + 121) as u128)
-                }),
+                coefficients: std::array::from_fn(|index| wide(index + UPPER_SYMBOLS + 121)),
             },
             grind_nonce: 0xA11C_E002,
             opening: ZkCapsulePcsOpening {
@@ -527,7 +528,7 @@ mod tests {
                     siblings: (20_000..20_000 + source_siblings).map(hash).collect(),
                 },
                 mid_symbols: (0..ZK_CAPSULE_PCS_MID_SYMBOLS)
-                    .map(|index| Block128::from((index + 3_000) as u128))
+                    .map(|index| wide(index + 3_000))
                     .collect(),
                 mid_batch: SourceBatchedMerkleProof {
                     siblings: (30_000..30_000 + mid_siblings).map(hash).collect(),
@@ -546,13 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn worst_canonical_shape_is_exactly_sixty_one_thousand_bytes() {
+    fn worst_canonical_shape_matches_the_selected_bound() {
         let proof = fixture(
             ZK_CAPSULE_PCS_WORST_SOURCE_SIBLINGS,
             ZK_CAPSULE_PCS_WORST_MID_SIBLINGS,
         );
         let bytes = proof.to_bytes().expect("worst canonical encode");
-        assert_eq!(proof.modeled_byte_len(), 60_952);
+        assert_eq!(proof.modeled_byte_len(), 92_648);
         assert_eq!(bytes.len(), ZK_AUTHORIZATION_MAX_WIRE_BYTES);
         assert_eq!(bytes.len(), ZK_AUTHORIZATION_WORST_SERIALIZED_BYTES);
         assert!(bytes.len() <= ZK_AUTHORIZATION_PAYLOAD_ROOFLINE_BYTES);
@@ -670,11 +671,11 @@ mod tests {
         let bytes = fixture(0, 0).to_bytes().unwrap();
         let offsets = preflight_wire(&bytes).unwrap().vector_length_offsets;
         assert_eq!(offsets[0], 0);
-        assert_eq!(offsets[1], 7_384);
-        assert_eq!(offsets[2], 7_720);
-        assert_eq!(offsets[3], 24_112);
-        assert_eq!(offsets[4], 24_120);
-        assert_eq!(offsets[5], 40_512);
-        assert_eq!(bytes.len(), 40_520);
+        assert_eq!(offsets[1], 12_968);
+        assert_eq!(offsets[2], 13_752);
+        assert_eq!(offsets[3], 38_720);
+        assert_eq!(offsets[4], 38_728);
+        assert_eq!(offsets[5], 72_016);
+        assert_eq!(bytes.len(), 72_024);
     }
 }

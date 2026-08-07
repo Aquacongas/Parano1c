@@ -8,7 +8,7 @@
 //! transcript.  The prover borrows a caller-owned, already length-checked
 //! bank.  A higher PCS typestate owns one-shot freshness; this algebraic
 //! layer does not.  The transcript-only verifier consumes only the canonical
-//! public statement, flattened 64-lane source cap, and 117-field proof
+//! public statement, flattened 16-lane source cap, and 117-field proof
 //! payload; it reconstructs the transparent post-claim relation which
 //! Main/PCS must discharge.  It never receives the private bank.
 //!
@@ -57,8 +57,7 @@ use crate::zk_mlecheck::{
 };
 use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::sumcheck::RoundPolynomial;
-use noid_core::transcript::FiatShamir;
-use noid_core::{Block128, TowerField};
+use noid_core::{Block128, Block256, TowerField};
 use noid_fri_binius::capsule::capsule_query_bit_location;
 use noid_fri_binius::zk_affine_code::AFFINE_CODE_LOG_RATE;
 use noid_fri_binius::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
@@ -82,7 +81,7 @@ use noid_fri_binius::zk_phase_a::{
     verify_phase_a, ZkPhaseAError, ZkPhaseAProof, ZkPhaseARelationClaims,
     PHASE_A_SERIALIZED_FIELDS_PER_ROUND, PHASE_A_VARS,
 };
-use noid_poseidon2b::channel::Poseidon2bChannel;
+use noid_poseidon2b::channel::Poseidon2bWideChannel;
 use rand_core::{CryptoRng, OsRng, RngCore};
 use rayon::prelude::*;
 use serde::de::{Error as DeError, SeqAccess, Visitor};
@@ -98,27 +97,31 @@ pub const ZK_AUTH_MID_CAP_TAG: u128 = 0x5A4B_A1DC_0000_0001;
 pub const ZK_AUTH_TAIL_TAG: u128 = 0x5A4B_7A11_0000_0001;
 pub const ZK_AUTH_GRIND_TAG: u128 = 0x5A4B_6A1D_0000_0001;
 
-/// Version 2 hard-cuts the ZK-padded terminal operand relation from the
-/// rejected version-1 state-only terminal relation.
-pub const ZK_AUTH_OWNER_CONSTRUCTION_VERSION: u128 = 2;
+/// Version 3 hard-cuts the C1 wide-challenge transcript and wire schedule
+/// from both legacy base-field authorization constructions.
+pub const ZK_AUTH_OWNER_CONSTRUCTION_VERSION: u128 = 3;
 
-pub const ZK_AUTH_OWNER_DYNAMIC_LANES: usize = 185;
+pub const ZK_AUTH_OWNER_DYNAMIC_LANES: usize = 254;
 pub const ZK_AUTH_OWNER_CONSTANT_LANES: usize = 11;
 pub const ZK_AUTH_OWNER_SQUEEZES: usize = 24;
-pub const ZK_AUTH_OWNER_COMPILED_SLOTS: usize = 118;
+pub const ZK_AUTH_OWNER_RAW_CHALLENGE_LANES: usize = 2 * ZK_AUTH_OWNER_SQUEEZES;
+pub const ZK_AUTH_OWNER_COMPILED_SLOTS: usize = 157;
 pub const ZK_AUTH_OWNER_BRIDGE_SLOT: usize = ZK_AUTH_OWNER_COMPILED_SLOTS - 1;
 
-pub const ZK_AUTH_MAIN_DYNAMIC_LANES: usize = 305;
+pub const ZK_AUTH_MAIN_DYNAMIC_LANES: usize = 613;
 pub const ZK_AUTH_MAIN_CONSTANT_LANES: usize = 5;
 pub const ZK_AUTH_MAIN_SQUEEZES: usize = 28;
-pub const ZK_AUTH_MAIN_COMPILED_SLOTS: usize = 177;
+pub const ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES: usize = 1 + PHASE_A_VARS + PHASE_B_LOW_VARS;
+pub const ZK_AUTH_MAIN_RAW_CHALLENGE_LANES: usize =
+    2 * ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES + (ZK_AUTH_MAIN_SQUEEZES - ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES);
+pub const ZK_AUTH_MAIN_COMPILED_SLOTS: usize = 335;
 
-pub const ZK_AUTH_REJECTED_SINGLE_CHANNEL_SLOTS: usize = 292;
+pub const ZK_AUTH_REJECTED_SINGLE_CHANNEL_SLOTS: usize = 489;
 pub const ZK_AUTH_OWNER_TILE_LOG: usize = 7;
 pub const ZK_AUTH_MAIN_TILE_LOG: usize = 8;
 
 pub const ZK_AUTH_BRIDGE_LANES: usize = 4;
-pub const ZK_AUTH_SOURCE_CAP_HASHES: usize = 32;
+pub const ZK_AUTH_SOURCE_CAP_HASHES: usize = 8;
 pub const ZK_AUTH_SOURCE_CAP_LANES: usize = 2 * ZK_AUTH_SOURCE_CAP_HASHES;
 pub const ZK_AUTH_MLECHECK_VARS: usize = 11;
 pub const ZK_AUTH_MLECHECK_ROUND_FIELDS: usize = 10;
@@ -126,7 +129,7 @@ pub const ZK_AUTH_TERMINAL_FIELDS: usize = 6;
 pub const ZK_AUTH_PHASE_A_ROUND_FIELDS: usize = 2;
 pub const ZK_AUTH_UPPER_FIELDS: usize = 256;
 pub const ZK_AUTH_BETA_FIELDS: usize = 8;
-pub const ZK_AUTH_MID_CAP_LANES: usize = 4;
+pub const ZK_AUTH_MID_CAP_LANES: usize = 16;
 pub const ZK_AUTH_TAIL_FIELDS: usize = 16;
 pub const ZK_AUTH_QUERY_SEEDS: usize = 7;
 
@@ -137,10 +140,10 @@ pub const ZK_AUTH_QUERY_WIDTH_BITS: usize = SOURCE_QUERY_BITS;
 pub const ZK_AUTH_GRIND_BITS: u32 = 16;
 
 pub const ZK_AUTH_PHASE_A_PROOF_BYTES: usize =
-    PHASE_A_VARS * PHASE_A_SERIALIZED_FIELDS_PER_ROUND * 16;
-pub const ZK_AUTH_UPPER_BYTES: usize = UPPER_SYMBOLS * 16;
-pub const ZK_AUTH_SIGMA_BYTES: usize = 16;
-pub const ZK_AUTH_PHASE_B_VALUE_BYTES: usize = 16;
+    PHASE_A_VARS * PHASE_A_SERIALIZED_FIELDS_PER_ROUND * 32;
+pub const ZK_AUTH_UPPER_BYTES: usize = UPPER_SYMBOLS * 32;
+pub const ZK_AUTH_SIGMA_BYTES: usize = 32;
+pub const ZK_AUTH_PHASE_B_VALUE_BYTES: usize = 32;
 pub const ZK_AUTH_GRIND_NONCE_BYTES: usize = 8;
 pub const ZK_AUTH_FIXED_NON_PCS_PROOF_BYTES: usize = ZK_AUTH_OWNER_PROOF_BYTES
     + ZK_AUTH_SIGMA_BYTES
@@ -155,25 +158,25 @@ pub const ZK_AUTHORIZATION_WORST_MODELED_BYTES: usize =
 pub const ZK_AUTHORIZATION_BINCODE_LENGTH_OVERHEAD: usize = 6 * 8;
 pub const ZK_AUTHORIZATION_WORST_SERIALIZED_BYTES: usize =
     ZK_AUTHORIZATION_WORST_MODELED_BYTES + ZK_AUTHORIZATION_BINCODE_LENGTH_OVERHEAD;
-/// Conservative roofline retained by the selected 64 KiB wallet budget.
-pub const ZK_AUTHORIZATION_PAYLOAD_ROOFLINE_BYTES: usize = 61_120;
+/// Conservative fixed decoder roofline for the selected C1 Wallet proof.
+pub const ZK_AUTHORIZATION_PAYLOAD_ROOFLINE_BYTES: usize = 96 * 1_024;
 
 // Main dynamic-data indices. Bridge cells are derived from Owner C0..C3 and
 // are not proof payload; every subsequent index is proof-carried.
 pub const ZK_AUTH_MAIN_BRIDGE_DATA_START: usize = 0;
 pub const ZK_AUTH_MAIN_SIGMA_DATA_INDEX: usize = 4;
-pub const ZK_AUTH_MAIN_PHASE_A_DATA_START: usize = 5;
-pub const ZK_AUTH_MAIN_PHASE_B_VALUE_DATA_INDEX: usize = 27;
-pub const ZK_AUTH_MAIN_UPPER_DATA_START: usize = 28;
-pub const ZK_AUTH_MAIN_MID_CAP_DATA_START: usize = 284;
-pub const ZK_AUTH_MAIN_TAIL_DATA_START: usize = 288;
-pub const ZK_AUTH_MAIN_NONCE_DATA_INDEX: usize = 304;
+pub const ZK_AUTH_MAIN_PHASE_A_DATA_START: usize = 6;
+pub const ZK_AUTH_MAIN_PHASE_B_VALUE_DATA_INDEX: usize = 50;
+pub const ZK_AUTH_MAIN_UPPER_DATA_START: usize = 52;
+pub const ZK_AUTH_MAIN_MID_CAP_DATA_START: usize = 564;
+pub const ZK_AUTH_MAIN_TAIL_DATA_START: usize = 580;
+pub const ZK_AUTH_MAIN_NONCE_DATA_INDEX: usize = 612;
 
 pub const ZK_AUTH_OWNER_PUBLIC_STATEMENT_FIELDS: usize = 4;
 pub const ZK_AUTH_OWNER_PROOF_ROUNDS: usize = ZK_AUTH_MLECHECK_VARS;
 pub const ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS: usize =
     1 + ZK_AUTH_OWNER_PROOF_ROUNDS * ZK_AUTH_MLECHECK_ROUND_FIELDS + ZK_AUTH_TERMINAL_FIELDS;
-pub const ZK_AUTH_OWNER_PROOF_BYTES: usize = ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS * 16;
+pub const ZK_AUTH_OWNER_PROOF_BYTES: usize = ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS * 32;
 
 /// Fixed prefix absorbed before the canonical public statement and source
 /// cap.  Its values are derived from the selected bank/code geometry except
@@ -193,24 +196,27 @@ pub const ZK_AUTH_OWNER_PREFIX_CONSTANTS: [u128; 9] = [
 const _: () = assert!(ZK_AUTH_MLECHECK_VARS == ZK_MLECHECK_N_VARS);
 const _: () = assert!(ZK_AUTH_MLECHECK_ROUND_FIELDS == ZK_MLECHECK_ROUND_PROOF_COEFFS);
 const _: () = assert!(ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS == 117);
-const _: () = assert!(ZK_AUTH_OWNER_PROOF_BYTES == 1_872);
+const _: () = assert!(ZK_AUTH_OWNER_PROOF_BYTES == 3_744);
 const _: () = assert!(
     ZK_AUTH_OWNER_PUBLIC_STATEMENT_FIELDS
         + ZK_AUTH_SOURCE_CAP_LANES
-        + ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS
+        + 2 * ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS
         == ZK_AUTH_OWNER_DYNAMIC_LANES
 );
 const _: () = assert!(ZK_AUTH_OWNER_SQUEEZES == 24);
+const _: () = assert!(ZK_AUTH_OWNER_RAW_CHALLENGE_LANES == 48);
+const _: () = assert!(ZK_AUTH_MAIN_ALGEBRAIC_SQUEEZES == 20);
+const _: () = assert!(ZK_AUTH_MAIN_RAW_CHALLENGE_LANES == 48);
 const _: () = assert!(ZK_AUTH_UPPER_FIELDS == 1 << 8);
-const _: () = assert!(ZK_AUTH_QUERY_SEEDS * 128 >= 64 * 13);
+const _: () = assert!(ZK_AUTH_QUERY_SEEDS * 128 >= 65 * 13);
 const _: () = assert!(1 << ZK_AUTH_OWNER_TILE_LOG == 128);
 const _: () = assert!(1 << ZK_AUTH_MAIN_TILE_LOG == 256);
-const _: () = assert!(ZK_AUTH_QUERY_COUNT == 64);
+const _: () = assert!(ZK_AUTH_QUERY_COUNT == 65);
 const _: () = assert!(ZK_AUTH_QUERY_WIDTH_BITS == 13);
 const _: () = assert!(ZK_AUTH_QUERY_SEEDS * 128 >= ZK_AUTH_QUERY_COUNT * ZK_AUTH_QUERY_WIDTH_BITS);
-const _: () = assert!(ZK_AUTH_PHASE_A_PROOF_BYTES == 352);
-const _: () = assert!(ZK_AUTH_UPPER_BYTES == 4_096);
-const _: () = assert!(ZK_AUTH_FIXED_NON_PCS_PROOF_BYTES == 6_360);
+const _: () = assert!(ZK_AUTH_PHASE_A_PROOF_BYTES == 704);
+const _: () = assert!(ZK_AUTH_UPPER_BYTES == 8_192);
+const _: () = assert!(ZK_AUTH_FIXED_NON_PCS_PROOF_BYTES == 12_712);
 const _: () = assert!(
     ZK_CAPSULE_PCS_SOURCE_COMMITMENT_BYTES
         + ZK_CAPSULE_PCS_MID_COMMITMENT_BYTES
@@ -218,15 +224,15 @@ const _: () = assert!(
         + ZK_CAPSULE_PCS_WORST_OPENING_BYTES
         == ZK_CAPSULE_PCS_WORST_TOTAL_BYTES
 );
-const _: () = assert!(ZK_AUTHORIZATION_WORST_MODELED_BYTES == 60_952);
-const _: () = assert!(ZK_AUTHORIZATION_WORST_SERIALIZED_BYTES == 61_000);
+const _: () = assert!(ZK_AUTHORIZATION_WORST_MODELED_BYTES == 92_648);
+const _: () = assert!(ZK_AUTHORIZATION_WORST_SERIALIZED_BYTES == 92_696);
 const _: () =
     assert!(ZK_AUTHORIZATION_WORST_SERIALIZED_BYTES <= ZK_AUTHORIZATION_PAYLOAD_ROOFLINE_BYTES);
 
 /// The affine blend is `(1-gamma)B + gamma C`. Both endpoints erase one of
 /// the two required oracles and are rejected before Phase A.
-pub fn affine_blend_gamma_is_admissible(gamma: Block128) -> bool {
-    gamma != Block128::ZERO && gamma != Block128::ONE
+pub fn affine_blend_gamma_is_admissible(gamma: Block256) -> bool {
+    gamma != Block256::ZERO && gamma != Block256::ONE && !gamma.is_in_base_subfield()
 }
 
 /// Canonical Owner public statement.  Body-hash lanes bind the
@@ -257,17 +263,17 @@ impl ZkAuthCapsuleOwnerStatement {
 /// supplied to verification separately and are not duplicated here.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ZkAuthCapsuleOwnerProof {
-    pub mask_mu: Block128,
-    pub rounds: [ZkMleCheckRoundProof; ZK_AUTH_OWNER_PROOF_ROUNDS],
+    pub mask_mu: Block256,
+    pub rounds: [ZkMleCheckRoundProof<Block256>; ZK_AUTH_OWNER_PROOF_ROUNDS],
     /// `g(r)` in the schedule's terminal absorb.
-    pub mask_final: Block128,
+    pub mask_final: Block256,
     /// Five ZK-padded operand evaluations in increment-then-lane order.
-    pub terminal_operand_claims: [Block128; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS],
+    pub terminal_operand_claims: [Block256; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS],
 }
 
 impl ZkAuthCapsuleOwnerProof {
     /// Prover-owned dynamic absorbs in exact Owner schedule order.
-    pub fn absorbed_values(&self) -> Vec<Block128> {
+    pub fn absorbed_values(&self) -> Vec<Block256> {
         let mut values = Vec::with_capacity(ZK_AUTH_OWNER_PROOF_DYNAMIC_FIELDS);
         values.push(self.mask_mu);
         for round in &self.rounds {
@@ -283,7 +289,7 @@ impl ZkAuthCapsuleOwnerProof {
         bincode::serialized_size(self).expect("fixed Owner proof length fits u64") as usize
     }
 
-    fn terminal_operands(&self) -> AuthCapsuleTerminalOperandClaims {
+    fn terminal_operands(&self) -> AuthCapsuleTerminalOperandClaims<Block256> {
         AuthCapsuleTerminalOperandClaims {
             increment: self.terminal_operand_claims[0],
             lane: std::array::from_fn(|lane| self.terminal_operand_claims[1 + lane]),
@@ -295,25 +301,25 @@ impl ZkAuthCapsuleOwnerProof {
 /// needed by the later Main/PCS side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkAuthCapsuleOwnerDerived {
-    pub rho: [Block128; ZK_AUTH_MLECHECK_VARS],
-    pub lambda: Block128,
-    pub round_challenges_high_to_low: [Block128; ZK_AUTH_MLECHECK_VARS],
-    pub terminal_point: [Block128; ZK_AUTH_MLECHECK_VARS],
-    pub terminal_operands: AuthCapsuleTerminalOperandClaims,
-    pub mask_mu: Block128,
-    pub mask_final: Block128,
-    pub main_final: Block128,
-    pub eta: Block128,
+    pub rho: [Block256; ZK_AUTH_MLECHECK_VARS],
+    pub lambda: Block256,
+    pub round_challenges_high_to_low: [Block256; ZK_AUTH_MLECHECK_VARS],
+    pub terminal_point: [Block256; ZK_AUTH_MLECHECK_VARS],
+    pub terminal_operands: AuthCapsuleTerminalOperandClaims<Block256>,
+    pub mask_mu: Block256,
+    pub mask_final: Block256,
+    pub main_final: Block256,
+    pub eta: Block256,
     /// The transparent relation `t`; its expected inner product is Phase A's
     /// bank claim and its weights are committed/opened by Main/PCS.
-    pub post_claim_relation: AuthCapsulePostClaimRelation,
+    pub post_claim_relation: AuthCapsulePostClaimRelation<Block256>,
     pub bridge: [Block128; 4],
 }
 
 impl ZkAuthCapsuleOwnerDerived {
     /// All Owner squeezes in exact compiled-layout order.
-    pub fn transcript_challenges(&self) -> [Block128; ZK_AUTH_OWNER_SQUEEZES] {
-        let mut challenges = [Block128::ZERO; ZK_AUTH_OWNER_SQUEEZES];
+    pub fn transcript_challenges(&self) -> [Block256; ZK_AUTH_OWNER_SQUEEZES] {
+        let mut challenges = [Block256::ZERO; ZK_AUTH_OWNER_SQUEEZES];
         challenges[..ZK_AUTH_MLECHECK_VARS].copy_from_slice(&self.rho);
         challenges[ZK_AUTH_MLECHECK_VARS] = self.lambda;
         let rounds_start = ZK_AUTH_MLECHECK_VARS + 1;
@@ -323,11 +329,11 @@ impl ZkAuthCapsuleOwnerDerived {
         challenges
     }
 
-    pub const fn bank_claim(&self) -> Block128 {
+    pub const fn bank_claim(&self) -> Block256 {
         self.post_claim_relation.expected_inner_product
     }
 
-    pub const fn post_claims(&self) -> AuthCapsulePostClaims {
+    pub const fn post_claims(&self) -> AuthCapsulePostClaims<Block256> {
         AuthCapsulePostClaims {
             terminal_operands: self.terminal_operands,
             mask_mle_at_input: self.mask_mu,
@@ -363,52 +369,57 @@ impl From<ZkMleCheckError> for ZkAuthCapsuleOwnerError {
 }
 
 pub(crate) fn absorb_owner_prefix(
-    channel: &mut Poseidon2bChannel,
+    channel: &mut Poseidon2bWideChannel,
     statement: ZkAuthCapsuleOwnerStatement,
     source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
 ) {
     for &constant in &ZK_AUTH_OWNER_PREFIX_CONSTANTS {
-        channel.absorb(Block128::from(constant));
+        channel.absorb_base(Block128::from(constant));
     }
     for value in statement.flattened() {
-        channel.absorb(value);
+        channel.absorb_base(value);
     }
     for &value in source_cap {
-        channel.absorb(value);
+        channel.absorb_base(value);
     }
 }
 
-pub(crate) fn squeeze_array<const N: usize>(channel: &mut Poseidon2bChannel) -> [Block128; N] {
-    std::array::from_fn(|_| channel.squeeze())
+pub(crate) fn squeeze_wide_array<const N: usize>(
+    channel: &mut Poseidon2bWideChannel,
+) -> [Block256; N] {
+    std::array::from_fn(|_| channel.squeeze_wide())
 }
 
-pub(crate) fn absorb_round(channel: &mut Poseidon2bChannel, round: &ZkMleCheckRoundProof) {
+pub(crate) fn absorb_round(
+    channel: &mut Poseidon2bWideChannel,
+    round: &ZkMleCheckRoundProof<Block256>,
+) {
     for &coefficient in &round.coeffs_without_constant {
-        channel.absorb(coefficient);
+        channel.absorb_wide(coefficient);
     }
 }
 
 pub(crate) fn absorb_terminal(
-    channel: &mut Poseidon2bChannel,
-    mask_final: Block128,
-    terminal_operand_claims: &[Block128; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS],
+    channel: &mut Poseidon2bWideChannel,
+    mask_final: Block256,
+    terminal_operand_claims: &[Block256; ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS],
 ) {
-    channel.absorb(mask_final);
+    channel.absorb_wide(mask_final);
     for &claim in terminal_operand_claims {
-        channel.absorb(claim);
+        channel.absorb_wide(claim);
     }
 }
 
-fn require_lambda_nonzero(lambda: Block128) -> Result<(), ZkAuthCapsuleOwnerError> {
-    if lambda == Block128::ZERO {
+fn require_lambda_nonzero(lambda: Block256) -> Result<(), ZkAuthCapsuleOwnerError> {
+    if lambda == Block256::ZERO {
         Err(ZkAuthCapsuleOwnerError::LambdaZero)
     } else {
         Ok(())
     }
 }
 
-fn require_eta_nonzero(eta: Block128) -> Result<(), ZkAuthCapsuleOwnerError> {
-    if eta == Block128::ZERO {
+fn require_eta_nonzero(eta: Block256) -> Result<(), ZkAuthCapsuleOwnerError> {
+    if eta == Block256::ZERO {
         Err(ZkAuthCapsuleOwnerError::EtaZero)
     } else {
         Ok(())
@@ -416,9 +427,9 @@ fn require_eta_nonzero(eta: Block128) -> Result<(), ZkAuthCapsuleOwnerError> {
 }
 
 fn endpoint_matches(
-    round: &RoundPolynomial<Block128>,
-    input_coordinate: Block128,
-    running_claim: Block128,
+    round: &RoundPolynomial<Block256>,
+    input_coordinate: Block256,
+    running_claim: Block256,
 ) -> bool {
     mlecheck_endpoint_claim(&round.coeffs, input_coordinate) == running_claim
 }
@@ -434,7 +445,10 @@ pub fn zk_auth_capsule_owner_dynamic_data(
     let mut values = Vec::with_capacity(ZK_AUTH_OWNER_DYNAMIC_LANES);
     values.extend_from_slice(&statement.flattened());
     values.extend_from_slice(source_cap);
-    values.extend(proof.absorbed_values());
+    for value in proof.absorbed_values() {
+        values.push(value.lo);
+        values.push(value.hi);
+    }
     debug_assert_eq!(values.len(), ZK_AUTH_OWNER_DYNAMIC_LANES);
     values
 }
@@ -453,18 +467,18 @@ pub(crate) fn prove_zk_auth_capsule_owner(
     validate_sparse_boundary(bank, statement.boundary())?;
 
     let mask = bank.libra_mask_view()?;
-    let mut channel = Poseidon2bChannel::new();
+    let mut channel = Poseidon2bWideChannel::new();
     absorb_owner_prefix(&mut channel, statement, source_cap);
-    let rho = squeeze_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
+    let rho = squeeze_wide_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
 
     let mask_mu = mask.evaluate_mle(&rho);
-    channel.absorb(mask_mu);
-    let lambda = channel.squeeze();
+    channel.absorb_wide(mask_mu);
+    let lambda = channel.squeeze_wide();
     require_lambda_nonzero(lambda)?;
 
     let mut prior_challenges = Vec::with_capacity(ZK_AUTH_MLECHECK_VARS);
     let mut round_proofs = Vec::with_capacity(ZK_AUTH_OWNER_PROOF_ROUNDS);
-    let mut main_running_claim = Block128::ZERO;
+    let mut main_running_claim = Block256::ZERO;
     for round_index in 0..ZK_AUTH_OWNER_PROOF_ROUNDS {
         let variable = ZK_AUTH_MLECHECK_VARS - 1 - round_index;
         let main_round = auth_main_round_polynomial(bank, &rho, &prior_challenges)?;
@@ -477,13 +491,13 @@ pub(crate) fn prove_zk_auth_capsule_owner(
         let combined = combine_main_and_mask_round(&main_round, &mask_round, lambda)?;
         let round_proof = ZkMleCheckRoundProof::truncate(&combined)?;
         absorb_round(&mut channel, &round_proof);
-        let challenge = channel.squeeze();
+        let challenge = channel.squeeze_wide();
         main_running_claim = main_round.evaluate(challenge);
         prior_challenges.push(challenge);
         round_proofs.push(round_proof);
     }
 
-    let round_challenges_high_to_low: [Block128; ZK_AUTH_MLECHECK_VARS] = prior_challenges
+    let round_challenges_high_to_low: [Block256; ZK_AUTH_MLECHECK_VARS] = prior_challenges
         .try_into()
         .unwrap_or_else(|_| unreachable!("exactly eleven adaptive Owner rounds"));
     let terminal_point = std::array::from_fn(|variable| {
@@ -498,7 +512,7 @@ pub(crate) fn prove_zk_auth_capsule_owner(
     let mask_final = mask.evaluate_final(&terminal_point);
     let terminal_operand_claims = terminal_operands.ordered();
     absorb_terminal(&mut channel, mask_final, &terminal_operand_claims);
-    let eta = channel.squeeze();
+    let eta = channel.squeeze_wide();
     require_eta_nonzero(eta)?;
 
     let post_claims = AuthCapsulePostClaims {
@@ -561,18 +575,18 @@ pub fn verify_zk_auth_capsule_owner(
     source_cap: &[Block128; ZK_AUTH_SOURCE_CAP_LANES],
     proof: &ZkAuthCapsuleOwnerProof,
 ) -> Result<ZkAuthCapsuleOwnerDerived, ZkAuthCapsuleOwnerError> {
-    let mut channel = Poseidon2bChannel::new();
+    let mut channel = Poseidon2bWideChannel::new();
     absorb_owner_prefix(&mut channel, statement, source_cap);
-    let rho = squeeze_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
+    let rho = squeeze_wide_array::<ZK_AUTH_MLECHECK_VARS>(&mut channel);
 
-    channel.absorb(proof.mask_mu);
-    let lambda = channel.squeeze();
+    channel.absorb_wide(proof.mask_mu);
+    let lambda = channel.squeeze_wide();
     require_lambda_nonzero(lambda)?;
-    let mut verifier = ZkMleCheckVerifierState::new(rho, Block128::ZERO, proof.mask_mu, lambda);
-    let mut round_challenges_high_to_low = [Block128::ZERO; ZK_AUTH_MLECHECK_VARS];
+    let mut verifier = ZkMleCheckVerifierState::new(rho, Block256::ZERO, proof.mask_mu, lambda);
+    let mut round_challenges_high_to_low = [Block256::ZERO; ZK_AUTH_MLECHECK_VARS];
     for (round_index, round) in proof.rounds.iter().enumerate() {
         absorb_round(&mut channel, round);
-        let challenge = channel.squeeze();
+        let challenge = channel.squeeze_wide();
         round_challenges_high_to_low[round_index] = challenge;
         verifier.transition(round, challenge)?;
     }
@@ -590,7 +604,7 @@ pub fn verify_zk_auth_capsule_owner(
         proof.mask_final,
         &proof.terminal_operand_claims,
     );
-    let eta = channel.squeeze();
+    let eta = channel.squeeze_wide();
     require_eta_nonzero(eta)?;
 
     let post_claims = AuthCapsulePostClaims {
@@ -643,18 +657,18 @@ pub fn verify_zk_auth_capsule_owner_witness_reference(
 /// The custom tuple serialization has no attacker-controlled length prefix:
 /// decoding reads exactly 256 field elements or fails.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ZkAuthorizationUpper([Block128; UPPER_SYMBOLS]);
+pub struct ZkAuthorizationUpper([Block256; UPPER_SYMBOLS]);
 
 impl ZkAuthorizationUpper {
-    pub const fn new(values: [Block128; UPPER_SYMBOLS]) -> Self {
+    pub const fn new(values: [Block256; UPPER_SYMBOLS]) -> Self {
         Self(values)
     }
 
-    pub const fn as_array(&self) -> &[Block128; UPPER_SYMBOLS] {
+    pub const fn as_array(&self) -> &[Block256; UPPER_SYMBOLS] {
         &self.0
     }
 
-    pub const fn into_array(self) -> [Block128; UPPER_SYMBOLS] {
+    pub const fn into_array(self) -> [Block256; UPPER_SYMBOLS] {
         self.0
     }
 }
@@ -688,7 +702,7 @@ impl<'de> Visitor<'de> for ZkAuthorizationUpperVisitor {
     where
         A: SeqAccess<'de>,
     {
-        let mut values = [Block128::ZERO; UPPER_SYMBOLS];
+        let mut values = [Block256::ZERO; UPPER_SYMBOLS];
         for (index, value) in values.iter_mut().enumerate() {
             *value = sequence
                 .next_element()?
@@ -724,9 +738,9 @@ impl<'de> Deserialize<'de> for ZkAuthorizationUpper {
 pub struct ZkAuthorizationProof {
     pub source_commitment: ZkCapsulePcsSourceCommitment,
     pub owner: ZkAuthCapsuleOwnerProof,
-    pub sigma: Block128,
-    pub phase_a: ZkPhaseAProof,
-    pub phase_b_value: Block128,
+    pub sigma: Block256,
+    pub phase_a: ZkPhaseAProof<Block256>,
+    pub phase_b_value: Block256,
     pub upper: ZkAuthorizationUpper,
     pub mid_commitment: ZkCapsulePcsMidCommitment,
     pub tail: ZkCapsulePcsTailReveal,
@@ -882,9 +896,9 @@ impl ZkAuthorizationProof {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ZkAuthorizationVerified {
     pub owner: ZkAuthCapsuleOwnerDerived,
-    pub gamma: Block128,
-    pub phase_a_challenges_high_to_low: [Block128; PHASE_A_VARS],
-    pub beta: [Block128; PHASE_B_LOW_VARS],
+    pub gamma: Block256,
+    pub phase_a_challenges_high_to_low: [Block256; PHASE_A_VARS],
+    pub beta: [Block256; PHASE_B_LOW_VARS],
     pub grind: Block128,
     pub query_seeds: [Block128; ZK_AUTH_QUERY_SEEDS],
     pub queries: [usize; ZK_AUTH_QUERY_COUNT],
@@ -894,19 +908,16 @@ pub struct ZkAuthorizationVerified {
 
 impl ZkAuthorizationVerified {
     /// All Main squeezes in exact compiled-layout order.
-    pub fn main_transcript_challenges(&self) -> [Block128; ZK_AUTH_MAIN_SQUEEZES] {
-        let mut challenges = [Block128::ZERO; ZK_AUTH_MAIN_SQUEEZES];
+    pub fn main_algebraic_challenges(&self) -> [Block256; 1 + PHASE_A_VARS + PHASE_B_LOW_VARS] {
+        let mut challenges = [Block256::ZERO; 1 + PHASE_A_VARS + PHASE_B_LOW_VARS];
         challenges[0] = self.gamma;
         challenges[1..1 + PHASE_A_VARS].copy_from_slice(&self.phase_a_challenges_high_to_low);
-        let beta_start = 1 + PHASE_A_VARS;
-        challenges[beta_start..beta_start + PHASE_B_LOW_VARS].copy_from_slice(&self.beta);
-        challenges[beta_start + PHASE_B_LOW_VARS] = self.grind;
-        challenges[beta_start + PHASE_B_LOW_VARS + 1..].copy_from_slice(&self.query_seeds);
+        challenges[1 + PHASE_A_VARS..].copy_from_slice(&self.beta);
         challenges
     }
 }
 
-fn require_main_gamma(gamma: Block128) -> Result<(), ZkAuthorizationError> {
+fn require_main_gamma(gamma: Block256) -> Result<(), ZkAuthorizationError> {
     if affine_blend_gamma_is_admissible(gamma) {
         Ok(())
     } else {
@@ -916,53 +927,57 @@ fn require_main_gamma(gamma: Block128) -> Result<(), ZkAuthorizationError> {
 
 pub(crate) fn init_main_channel(
     owner: &ZkAuthCapsuleOwnerDerived,
-    sigma: Block128,
-) -> Poseidon2bChannel {
-    let mut channel = Poseidon2bChannel::new();
-    channel.absorb(Block128::from(ZK_AUTH_MAIN_FROM_OWNER_TAG));
-    channel.absorb_slice(&owner.bridge);
-    channel.absorb(sigma);
+    sigma: Block256,
+) -> Poseidon2bWideChannel {
+    let mut channel = Poseidon2bWideChannel::new();
+    channel.absorb_base(Block128::from(ZK_AUTH_MAIN_FROM_OWNER_TAG));
+    channel.absorb_base_slice(&owner.bridge);
+    channel.absorb_wide(sigma);
     channel
 }
 
 pub(crate) fn absorb_phase_a_round(
-    channel: &mut Poseidon2bChannel,
-    round: &noid_fri_binius::ZkPhaseARoundProof,
+    channel: &mut Poseidon2bWideChannel,
+    round: &noid_fri_binius::ZkPhaseARoundProof<Block256>,
 ) {
-    channel.absorb(round.at_one);
-    channel.absorb(round.at_infinity);
+    channel.absorb_wide(round.at_one);
+    channel.absorb_wide(round.at_infinity);
 }
 
 pub(crate) fn absorb_phase_b_prefix(
-    channel: &mut Poseidon2bChannel,
-    phase_b_value: Block128,
+    channel: &mut Poseidon2bWideChannel,
+    phase_b_value: Block256,
     upper: &ZkAuthorizationUpper,
 ) {
-    channel.absorb(Block128::from(ZK_AUTH_PHASE_B_TAG));
-    channel.absorb(phase_b_value);
-    channel.absorb_slice(upper.as_array());
+    channel.absorb_base(Block128::from(ZK_AUTH_PHASE_B_TAG));
+    channel.absorb_wide(phase_b_value);
+    for &value in upper.as_array() {
+        channel.absorb_wide(value);
+    }
 }
 
 pub(crate) fn absorb_mid_commitment(
-    channel: &mut Poseidon2bChannel,
+    channel: &mut Poseidon2bWideChannel,
     mid: &ZkCapsulePcsMidCommitment,
 ) -> Result<(), ZkAuthorizationError> {
-    channel.absorb(Block128::from(ZK_AUTH_MID_CAP_TAG));
-    channel.absorb_slice(&mid.transcript_lanes()?);
+    channel.absorb_base(Block128::from(ZK_AUTH_MID_CAP_TAG));
+    channel.absorb_base_slice(&mid.transcript_lanes()?);
     Ok(())
 }
 
-pub(crate) fn absorb_tail(channel: &mut Poseidon2bChannel, tail: &ZkCapsulePcsTailReveal) {
-    channel.absorb(Block128::from(ZK_AUTH_TAIL_TAG));
-    channel.absorb_slice(&tail.coefficients);
+pub(crate) fn absorb_tail(channel: &mut Poseidon2bWideChannel, tail: &ZkCapsulePcsTailReveal) {
+    channel.absorb_base(Block128::from(ZK_AUTH_TAIL_TAG));
+    for &value in &tail.coefficients {
+        channel.absorb_wide(value);
+    }
 }
 
 pub(crate) fn verify_phase_b_upper_tail_link(
-    upper: &[Block128; UPPER_SYMBOLS],
-    phase_a_terminal_point: &[Block128; PHASE_A_VARS],
-    phase_b_value: Block128,
-    beta: &[Block128; PHASE_B_LOW_VARS],
-    tail: &[Block128; TAIL_SYMBOLS],
+    upper: &[Block256; UPPER_SYMBOLS],
+    phase_a_terminal_point: &[Block256; PHASE_A_VARS],
+    phase_b_value: Block256,
+    beta: &[Block256; PHASE_B_LOW_VARS],
+    tail: &[Block256; TAIL_SYMBOLS],
 ) -> Result<(), ZkAuthorizationError> {
     if evaluate_upper_at_low8(
         upper,
@@ -974,8 +989,8 @@ pub(crate) fn verify_phase_b_upper_tail_link(
         return Err(ZkAuthorizationError::PhaseBTerminalValueMismatch);
     }
     let upper_at_beta = evaluate_upper_at_low8(upper, beta);
-    let h: [Block128; FINAL_H_SYMBOLS] = tail16_local_fold(tail, beta[PHASE_B_LOW_VARS - 1]);
-    let high: &[Block128; PHASE_B_HIGH_VARS] = phase_a_terminal_point[PHASE_B_LOW_VARS..]
+    let h: [Block256; FINAL_H_SYMBOLS] = tail16_local_fold(tail, beta[PHASE_B_LOW_VARS - 1]);
+    let high: &[Block256; PHASE_B_HIGH_VARS] = phase_a_terminal_point[PHASE_B_LOW_VARS..]
         .try_into()
         .unwrap_or_else(|_| unreachable!("11-variable point splits as 8+3"));
     if upper_at_beta != evaluate_slice(&h, high) {
@@ -994,17 +1009,17 @@ fn grind_mask(bits: u32) -> u128 {
     (1u128 << bits) - 1
 }
 
-fn probe_grind(channel: &Poseidon2bChannel, nonce: u64) -> Block128 {
+fn probe_grind(channel: &Poseidon2bWideChannel, nonce: u64) -> Block128 {
     let mut probe = channel.clone();
-    probe.absorb(Block128::from(nonce as u128));
-    probe.squeeze()
+    probe.absorb_base(Block128::from(nonce as u128));
+    probe.squeeze_base()
 }
 
 fn grind_main_channel_with_bits(
-    channel: &mut Poseidon2bChannel,
+    channel: &mut Poseidon2bWideChannel,
     bits: u32,
 ) -> Result<(u64, Block128), ZkAuthorizationError> {
-    channel.absorb(Block128::from(ZK_AUTH_GRIND_TAG));
+    channel.absorb_base(Block128::from(ZK_AUTH_GRIND_TAG));
     let mask = grind_mask(bits);
     let block = 1u64 << (bits + 1);
     let mut start = 0u64;
@@ -1025,8 +1040,8 @@ fn grind_main_channel_with_bits(
         start = end;
     };
     let expected = probe_grind(channel, nonce);
-    channel.absorb(Block128::from(nonce as u128));
-    let grind = channel.squeeze();
+    channel.absorb_base(Block128::from(nonce as u128));
+    let grind = channel.squeeze_base();
     debug_assert_eq!(grind, expected);
     if grind.0 & mask != 0 {
         return Err(ZkAuthorizationError::GrindRejected);
@@ -1035,19 +1050,19 @@ fn grind_main_channel_with_bits(
 }
 
 fn replay_grind(
-    channel: &mut Poseidon2bChannel,
+    channel: &mut Poseidon2bWideChannel,
     nonce: u64,
 ) -> Result<Block128, ZkAuthorizationError> {
-    channel.absorb(Block128::from(ZK_AUTH_GRIND_TAG));
-    channel.absorb(Block128::from(nonce as u128));
-    let grind = channel.squeeze();
+    channel.absorb_base(Block128::from(ZK_AUTH_GRIND_TAG));
+    channel.absorb_base(Block128::from(nonce as u128));
+    let grind = channel.squeeze_base();
     if !zk_authorization_grind_is_valid(grind) {
         return Err(ZkAuthorizationError::GrindRejected);
     }
     Ok(grind)
 }
 
-/// Decode the fixed seven transcript seeds into 64 independent 13-bit query
+/// Decode the fixed seven transcript seeds into 65 independent 13-bit query
 /// indices using the protocol's LSB-first packed bit stream.
 pub fn zk_authorization_queries_from_seeds(
     seeds: &[Block128; ZK_AUTH_QUERY_SEEDS],
@@ -1061,7 +1076,7 @@ pub fn zk_authorization_queries_from_seeds(
     })
 }
 
-/// Exact 305-lane Main dynamic stream consumed by the recursive duplex
+/// Exact 601-lane Main dynamic stream consumed by the recursive duplex
 /// columns.  Derived challenges and query seeds are not part of this adapter.
 pub fn zk_authorization_main_dynamic_data(
     owner: &ZkAuthCapsuleOwnerDerived,
@@ -1070,15 +1085,19 @@ pub fn zk_authorization_main_dynamic_data(
     proof.preflight_shape()?;
     let mut values = Vec::with_capacity(ZK_AUTH_MAIN_DYNAMIC_LANES);
     values.extend_from_slice(&owner.bridge);
-    values.push(proof.sigma);
+    values.extend_from_slice(&[proof.sigma.lo, proof.sigma.hi]);
     for round in &proof.phase_a.rounds {
-        values.push(round.at_one);
-        values.push(round.at_infinity);
+        values.extend_from_slice(&[round.at_one.lo, round.at_one.hi]);
+        values.extend_from_slice(&[round.at_infinity.lo, round.at_infinity.hi]);
     }
-    values.push(proof.phase_b_value);
-    values.extend_from_slice(proof.upper.as_array());
+    values.extend_from_slice(&[proof.phase_b_value.lo, proof.phase_b_value.hi]);
+    for &value in proof.upper.as_array() {
+        values.extend_from_slice(&[value.lo, value.hi]);
+    }
     values.extend_from_slice(&proof.mid_commitment.transcript_lanes()?);
-    values.extend_from_slice(&proof.tail.coefficients);
+    for &value in &proof.tail.coefficients {
+        values.extend_from_slice(&[value.lo, value.hi]);
+    }
     values.push(Block128::from(proof.grind_nonce as u128));
     Ok(values
         .try_into()
@@ -1142,13 +1161,13 @@ fn prove_zk_authorization_from_state_with_rng(
     )?;
     let sigma = phase_a_binding.companion_claim;
     let mut channel = init_main_channel(&owner_output.derived, sigma);
-    let gamma = channel.squeeze();
+    let gamma = channel.squeeze_wide();
     require_main_gamma(gamma)?;
 
     let (phase_a_output, phase_a_complete) =
         zk_capsule_pcs_prove_phase_a(phase_a_bound, gamma, |_round, round_proof| {
             absorb_phase_a_round(&mut channel, &round_proof);
-            channel.squeeze()
+            channel.squeeze_wide()
         })?;
     if phase_a_output.relation_claims.bank != owner_output.derived.bank_claim()
         || phase_a_output.relation_claims.companion != sigma
@@ -1161,17 +1180,18 @@ fn prove_zk_authorization_from_state_with_rng(
         zk_capsule_pcs_link_phase_b(phase_a_complete, phase_b_value)?;
     let upper = ZkAuthorizationUpper::new(phase_b_link.upper);
     absorb_phase_b_prefix(&mut channel, phase_b_value, &upper);
-    let beta_source: [Block128; SOURCE_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze());
+    let beta_source: [Block256; SOURCE_STANDARD_FOLDS] =
+        std::array::from_fn(|_| channel.squeeze_wide());
 
     let (mid_commitment, mid_state) = zk_capsule_pcs_commit_mid(phase_b_ready, beta_source)?;
     absorb_mid_commitment(&mut channel, &mid_commitment)?;
-    let beta_mid: [Block128; MID_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze());
+    let beta_mid: [Block256; MID_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze_wide());
 
     let tail_state = zk_capsule_pcs_reveal_tail(mid_state, beta_mid)?;
     let tail = tail_state.tail.clone();
     absorb_tail(&mut channel, &tail);
-    let beta_tail = channel.squeeze();
-    let mut beta = [Block128::ZERO; PHASE_B_LOW_VARS];
+    let beta_tail = channel.squeeze_wide();
+    let mut beta = [Block256::ZERO; PHASE_B_LOW_VARS];
     beta[..SOURCE_STANDARD_FOLDS].copy_from_slice(&beta_source);
     beta[SOURCE_STANDARD_FOLDS..SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS]
         .copy_from_slice(&beta_mid);
@@ -1185,7 +1205,8 @@ fn prove_zk_authorization_from_state_with_rng(
     )?;
 
     let (grind_nonce, _grind) = grind_main_channel_with_bits(&mut channel, ZK_AUTH_GRIND_BITS)?;
-    let query_seeds: [Block128; ZK_AUTH_QUERY_SEEDS] = std::array::from_fn(|_| channel.squeeze());
+    let query_seeds: [Block128; ZK_AUTH_QUERY_SEEDS] =
+        std::array::from_fn(|_| channel.squeeze_base());
     let queries = zk_authorization_queries_from_seeds(&query_seeds);
     let opening = zk_capsule_pcs_open(tail_state, &queries)?;
 
@@ -1218,13 +1239,13 @@ pub fn verify_zk_authorization(
     let owner = verify_zk_auth_capsule_owner(statement, &source_cap, &proof.owner)?;
 
     let mut channel = init_main_channel(&owner, proof.sigma);
-    let gamma = channel.squeeze();
+    let gamma = channel.squeeze_wide();
     require_main_gamma(gamma)?;
 
-    let mut phase_a_challenges_high_to_low = [Block128::ZERO; PHASE_A_VARS];
+    let mut phase_a_challenges_high_to_low = [Block256::ZERO; PHASE_A_VARS];
     for (index, round) in proof.phase_a.rounds.iter().enumerate() {
         absorb_phase_a_round(&mut channel, round);
-        phase_a_challenges_high_to_low[index] = channel.squeeze();
+        phase_a_challenges_high_to_low[index] = channel.squeeze_wide();
     }
     let phase_a = verify_phase_a(
         &proof.phase_a,
@@ -1239,14 +1260,15 @@ pub fn verify_zk_authorization(
     )?;
 
     absorb_phase_b_prefix(&mut channel, proof.phase_b_value, &proof.upper);
-    let beta_source: [Block128; SOURCE_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze());
+    let beta_source: [Block256; SOURCE_STANDARD_FOLDS] =
+        std::array::from_fn(|_| channel.squeeze_wide());
 
     absorb_mid_commitment(&mut channel, &proof.mid_commitment)?;
-    let beta_mid: [Block128; MID_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze());
+    let beta_mid: [Block256; MID_STANDARD_FOLDS] = std::array::from_fn(|_| channel.squeeze_wide());
 
     absorb_tail(&mut channel, &proof.tail);
-    let beta_tail = channel.squeeze();
-    let mut beta = [Block128::ZERO; PHASE_B_LOW_VARS];
+    let beta_tail = channel.squeeze_wide();
+    let mut beta = [Block256::ZERO; PHASE_B_LOW_VARS];
     beta[..SOURCE_STANDARD_FOLDS].copy_from_slice(&beta_source);
     beta[SOURCE_STANDARD_FOLDS..SOURCE_STANDARD_FOLDS + beta_mid.len()].copy_from_slice(&beta_mid);
     beta[PHASE_B_LOW_VARS - 1] = beta_tail;
@@ -1259,7 +1281,7 @@ pub fn verify_zk_authorization(
     )?;
 
     let grind = replay_grind(&mut channel, proof.grind_nonce)?;
-    let query_seeds = std::array::from_fn(|_| channel.squeeze());
+    let query_seeds = std::array::from_fn(|_| channel.squeeze_base());
     let queries = zk_authorization_queries_from_seeds(&query_seeds);
     let pcs = zk_capsule_pcs_verify(
         &proof.source_commitment,
@@ -1387,7 +1409,7 @@ mod tests {
 
     #[test]
     fn owner_prove_verify_roundtrip_is_deterministic_and_payload_is_exact() {
-        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 2);
+        assert_eq!(ZK_AUTH_OWNER_PREFIX_CONSTANTS[1], 3);
         let fixture = fixture(0xA11C_E001);
         let first = prove_fixture(&fixture);
         let second = prove_fixture(&fixture);
@@ -1402,8 +1424,8 @@ mod tests {
         let decoded: ZkAuthCapsuleOwnerProof =
             bincode::deserialize(&encoded).expect("Owner proof decoding");
         assert_eq!(decoded, first.proof);
-        assert_ne!(first.derived.lambda, Block128::ZERO);
-        assert_ne!(first.derived.eta, Block128::ZERO);
+        assert_ne!(first.derived.lambda, Block256::ZERO);
+        assert_ne!(first.derived.eta, Block256::ZERO);
         for variable in 0..ZK_AUTH_MLECHECK_VARS {
             assert_eq!(
                 first.derived.terminal_point[variable],
@@ -1462,30 +1484,30 @@ mod tests {
         );
 
         let mut changed_cap = fixture.source_cap;
-        changed_cap[37] += Block128::ONE;
+        changed_cap[13] += Block128::ONE;
         assert!(
             verify_zk_auth_capsule_owner(fixture.statement, &changed_cap, &output.proof,).is_err()
         );
 
         let mut proof = output.proof.clone();
-        proof.mask_mu += Block128::ONE;
+        proof.mask_mu += Block256::ONE;
         assert_rejected(&fixture, &proof, "mask mu");
 
         let mut proof = output.proof.clone();
-        proof.rounds[0].coeffs_without_constant[0] += Block128::ONE;
+        proof.rounds[0].coeffs_without_constant[0] += Block256::ONE;
         assert_rejected(&fixture, &proof, "first round coefficient");
 
         let mut proof = output.proof.clone();
-        proof.rounds[10].coeffs_without_constant[9] += Block128::ONE;
+        proof.rounds[10].coeffs_without_constant[9] += Block256::ONE;
         assert_rejected(&fixture, &proof, "last round coefficient");
 
         let mut proof = output.proof.clone();
-        proof.mask_final += Block128::ONE;
+        proof.mask_final += Block256::ONE;
         assert_rejected(&fixture, &proof, "terminal mask");
 
         for claim in 0..ZK_AUTH_CAPSULE_TERMINAL_OPERAND_CLAIMS {
             let mut proof = output.proof.clone();
-            proof.terminal_operand_claims[claim] += Block128::ONE;
+            proof.terminal_operand_claims[claim] += Block256::ONE;
             assert_rejected(&fixture, &proof, &format!("terminal operand claim {claim}"));
         }
 
@@ -1510,30 +1532,32 @@ mod tests {
         assert!(challenge_tape.has_admissible_base_challenges());
         assert!(challenge_tape.compiled_grind_is_valid());
         for move_ in crate::zk_auth_qrom::zk_auth_iop_moves() {
+            if move_ == crate::zk_auth_qrom::ZkAuthIopMove::QuerySeeds {
+                assert_eq!(replayed.query_seeds.len(), move_.challenge_fields());
+                continue;
+            }
             assert_eq!(
                 challenge_tape
-                    .challenge_group(move_)
+                    .algebraic_challenge_group(move_)
                     .expect("manifest emits only bounded rounds")
                     .len(),
                 move_.challenge_fields()
             );
         }
         assert!(challenge_tape
-            .challenge_group(crate::zk_auth_qrom::ZkAuthIopMove::OwnerMleCheckRound(
+            .algebraic_challenge_group(crate::zk_auth_qrom::ZkAuthIopMove::OwnerMleCheckRound(
                 ZK_AUTH_MLECHECK_VARS,
             ))
             .is_none());
         assert!(challenge_tape
-            .challenge_group(crate::zk_auth_qrom::ZkAuthIopMove::PhaseARound(
+            .algebraic_challenge_group(crate::zk_auth_qrom::ZkAuthIopMove::PhaseARound(
                 PHASE_A_VARS,
             ))
             .is_none());
-        assert_eq!(
-            challenge_tape
-                .challenge_group(crate::zk_auth_qrom::ZkAuthIopMove::QuerySeeds)
-                .expect("base query-seed move"),
-            &replayed.query_seeds
-        );
+        assert!(challenge_tape
+            .algebraic_challenge_group(crate::zk_auth_qrom::ZkAuthIopMove::QuerySeeds)
+            .is_none());
+        assert_eq!(challenge_tape.query_seeds, replayed.query_seeds);
         assert_eq!(challenge_tape.compiled_grind, replayed.grind);
         assert_eq!(replayed.queries.len(), ZK_AUTH_QUERY_COUNT);
         assert!(replayed
@@ -1640,23 +1664,23 @@ mod tests {
         assert_full_rejected(&changed, "source commitment");
 
         let mut changed = fixture.proof.clone();
-        changed.owner.mask_mu += Block128::ONE;
+        changed.owner.mask_mu += Block256::ONE;
         assert_full_rejected(&changed, "Owner proof");
 
         let mut changed = fixture.proof.clone();
-        changed.sigma += Block128::ONE;
+        changed.sigma += Block256::ONE;
         assert_full_rejected(&changed, "sigma");
 
         let mut changed = fixture.proof.clone();
-        changed.phase_a.rounds[3].at_infinity += Block128::ONE;
+        changed.phase_a.rounds[3].at_infinity += Block256::ONE;
         assert_full_rejected(&changed, "Phase-A proof");
 
         let mut changed = fixture.proof.clone();
-        changed.phase_b_value += Block128::ONE;
+        changed.phase_b_value += Block256::ONE;
         assert_full_rejected(&changed, "Phase-B value");
 
         let mut changed = fixture.proof.clone();
-        changed.upper.0[91] += Block128::ONE;
+        changed.upper.0[91] += Block256::ONE;
         assert_full_rejected(&changed, "upper table");
 
         let mut changed = fixture.proof.clone();
@@ -1664,7 +1688,7 @@ mod tests {
         assert_full_rejected(&changed, "mid commitment");
 
         let mut changed = fixture.proof.clone();
-        changed.tail.coefficients[5] += Block128::ONE;
+        changed.tail.coefficients[5] += Block256::ONE;
         assert_full_rejected(&changed, "tail reveal");
 
         let mut changed = fixture.proof.clone();
@@ -1740,21 +1764,21 @@ mod tests {
         assert_eq!(zk_authorization_queries_from_seeds(&seeds), expected);
         assert_eq!(
             zk_authorization_queries_from_seeds(&[Block128::ZERO; 7]),
-            [0; 64]
+            [0; 65]
         );
         assert_eq!(
             zk_authorization_queries_from_seeds(&[Block128::from(u128::MAX); 7]),
-            [(1 << 13) - 1; 64]
+            [(1 << 13) - 1; 65]
         );
     }
 
     #[test]
     fn parallel_grind_is_smallest_and_low16_predicate_is_exact() {
-        let mut channel = Poseidon2bChannel::new();
-        channel.absorb(Block128::from(0xA11C_E170u128));
-        channel.absorb(Block128::from(0xA11C_E171u128));
+        let mut channel = Poseidon2bWideChannel::new();
+        channel.absorb_base(Block128::from(0xA11C_E170u128));
+        channel.absorb_base(Block128::from(0xA11C_E171u128));
         let mut sequential_base = channel.clone();
-        sequential_base.absorb(Block128::from(ZK_AUTH_GRIND_TAG));
+        sequential_base.absorb_base(Block128::from(ZK_AUTH_GRIND_TAG));
         let small_bits = 6;
         let mask = grind_mask(small_bits);
         let sequential = (0u64..)
@@ -1777,14 +1801,14 @@ mod tests {
     #[test]
     fn gamma_and_phase_b_link_endpoint_guards_are_explicit() {
         assert_eq!(
-            require_main_gamma(Block128::ZERO),
+            require_main_gamma(Block256::ZERO),
             Err(ZkAuthorizationError::GammaEndpoint)
         );
         assert_eq!(
-            require_main_gamma(Block128::ONE),
+            require_main_gamma(Block256::ONE),
             Err(ZkAuthorizationError::GammaEndpoint)
         );
-        assert!(require_main_gamma(Block128::from(2u128)).is_ok());
+        assert!(require_main_gamma(Block256::new(Block128::from(2u128), Block128::ONE)).is_ok());
 
         let fixture = full_fixture();
         assert!(verify_phase_b_upper_tail_link(
@@ -1792,7 +1816,7 @@ mod tests {
             &fixture
                 .verified
                 .phase_a_challenges_high_to_low
-                .map(|_| Block128::ZERO),
+                .map(|_| Block256::ZERO),
             fixture.proof.phase_b_value,
             &fixture.verified.beta,
             &fixture.proof.tail.coefficients,
@@ -1803,17 +1827,17 @@ mod tests {
     #[test]
     fn zero_lambda_and_eta_guards_are_explicit() {
         assert_eq!(
-            require_lambda_nonzero(Block128::ZERO),
+            require_lambda_nonzero(Block256::ZERO),
             Err(ZkAuthCapsuleOwnerError::LambdaZero)
         );
         assert_eq!(
-            require_eta_nonzero(Block128::ZERO),
+            require_eta_nonzero(Block256::ZERO),
             Err(ZkAuthCapsuleOwnerError::EtaZero)
         );
-        assert!(require_lambda_nonzero(Block128::ONE).is_ok());
-        assert!(require_eta_nonzero(Block128::ONE).is_ok());
+        assert!(require_lambda_nonzero(Block256::ONE).is_ok());
+        assert!(require_eta_nonzero(Block256::ONE).is_ok());
         assert_eq!(
-            certify_terminal_blinding_rank(&[Block128::ZERO; ZK_AUTH_MLECHECK_VARS]),
+            certify_terminal_blinding_rank(&[Block256::ZERO; ZK_AUTH_MLECHECK_VARS]),
             Err(ZkAuthCapsuleError::ZeroTerminalBlindingWeight)
         );
     }

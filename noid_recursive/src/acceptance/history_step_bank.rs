@@ -4,7 +4,7 @@
 //! Canonical class bank for the atomic `HistoryStep` relation.
 //!
 //! A `HistoryStep` class is selected by the current block
-//! physical-page tier. The launch bank has exactly B64 and B255. Every class
+//! physical-page tier. The launch bank has exactly B25 and B255. Every class
 //! exposes the same public-IO layout:
 //!
 //! * the exact ordered matrix and post-commit class whitelists;
@@ -21,17 +21,17 @@
 use noid_chain::consensus::params::BLOCK_PAGE_CLASS_TIERS;
 use noid_core::Block128;
 use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
-use noid_ivc_core::field::F128;
+use noid_ivc_core::field::{F128, F256};
 use noid_ivc_core::field_circuit::{f128_from_u128, f128_to_u128, FieldR1csBuilder, FsChannelOps};
 use std::sync::Arc;
 
 use noid_ivc_core::field_r1cs::{CompactFieldR1cs, FieldR1cs};
-use noid_ivc_core::matrix_claim::{
-    fresh_claim_value, prove_matrix_claim_fold, prove_matrix_claim_fold_compact,
-    stacked_matrix_mle_eval, FreshLincheckClaim, MatrixAccClaim, MatrixClaimEvaluator,
-    MatrixFoldProof,
+use noid_ivc_core::matrix_claim::c1::{
+    fresh_claim_value_c1, prove_matrix_claim_fold_c1, prove_matrix_claim_fold_compact_c1,
+    stacked_matrix_mle_eval_c1, C1FreshLincheckClaim, C1MatrixAccClaim, C1MatrixClaimEvaluator,
+    C1MatrixFoldProof,
 };
-use noid_ivc_core::pcs::{PcsParams, LOG_PACKING};
+use noid_ivc_core::pcs::{PcsParams, BASEFOLD_RATE_QUARTER_C1_QUERIES, LOG_PACKING};
 use noid_ivc_core::proof::{pcs_params_statement_bytes, FieldShape};
 use noid_ivc_core::public_io::{PublicIoSpec, WitnessSlice};
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
@@ -43,6 +43,7 @@ use crate::accumulator::{ChainAccumulator, CHAIN_ACCUMULATOR_LANES};
 pub const ACC_LANES: usize = CHAIN_ACCUMULATOR_LANES;
 const HISTORY_STEP_PCS_LOG_INV_RATE: usize = 2;
 const HISTORY_STEP_PCS_LOG_BATCH_SIZE: usize = 5;
+pub const HISTORY_STEP_FRI_QUERIES: usize = BASEFOLD_RATE_QUARTER_C1_QUERIES;
 
 pub(crate) fn block_acc_lanes(accumulator: &ChainAccumulator) -> [F128; ACC_LANES] {
     accumulator.to_lanes().map(flat_of)
@@ -101,13 +102,13 @@ impl HistoryStepMatrixLease {
 }
 
 /// Frozen outer dimensions selected solely by the current physical-page
-/// class. Both matrices contain the same two-arm B64/B255 parent selector, so
+/// class. Both matrices contain the same two-arm B25/B255 parent selector, so
 /// parent shape changes witness data rather than the current matrix identity.
-pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] = [23, 24];
+pub const HISTORY_STEP_CURRENT_CLASS_MS: [usize; HISTORY_STEP_TIER_SLOT_COUNT] = [22, 24];
 
 const _: () = assert!(
     HISTORY_STEP_CURRENT_CLASS_MS[0]
-        == noid_chain::consensus::paged_spend::BlockProofClass::B64.outer_m()
+        == noid_chain::consensus::paged_spend::BlockProofClass::B25.outer_m()
         && HISTORY_STEP_CURRENT_CLASS_MS[1]
             == noid_chain::consensus::paged_spend::BlockProofClass::B255.outer_m(),
     "HistoryStep and consensus proof-class dimensions must match"
@@ -201,18 +202,19 @@ pub struct HistoryStepBankLaneLayout {
 impl HistoryStepBankLaneLayout {
     fn new(offset: usize, k_log: usize) -> (Self, usize) {
         let point_len = 2 * k_log + 1;
+        let point_lanes = 2 * point_len;
         (
             Self {
                 point: offset,
-                value: offset + point_len,
-                live: offset + point_len + 1,
+                value: offset + point_lanes,
+                live: offset + point_lanes + 2,
             },
-            offset + point_len + 2,
+            offset + point_lanes + 3,
         )
     }
 
     pub const fn point_len(self) -> usize {
-        self.value - self.point
+        (self.value - self.point) / 2
     }
 }
 
@@ -455,7 +457,7 @@ impl PinnedHistoryStepClassBank {
         class_id: CanonicalHistoryStepClassId,
         observed_matrix_digest: [u8; 32],
         observed_post_commit_digest: [u8; 32],
-        fresh: FreshLincheckClaim,
+        fresh: C1FreshLincheckClaim,
     ) -> Result<VerifiedHistoryStepTipReplay, HistoryStepBankError> {
         let entry = self.entry(class_id);
         if observed_matrix_digest != entry.matrix_digest {
@@ -569,7 +571,7 @@ fn write_bank_pins(bank: &PinnedHistoryStepClassBank, io: &mut [F128]) {
 /// Canonical base terminal before any predecessor matrix has been folded.
 /// The caller supplies the block accumulator reached from the exact genesis
 /// parent boundary; all matrix lanes start dead. The current block selects
-/// either the B64 or B255 launch class.
+/// either the B25 or B255 launch class.
 pub fn history_step_bank_base_output_io(
     bank: &PinnedHistoryStepClassBank,
     class_id: CanonicalHistoryStepClassId,
@@ -588,7 +590,7 @@ pub fn history_step_bank_base_output_io(
 struct ParsedHistoryStepBankIo {
     base: bool,
     tip_class: CanonicalHistoryStepClassId,
-    lanes: [Option<MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT],
+    lanes: [Option<C1MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT],
     block_accumulator: [F128; ACC_LANES],
 }
 
@@ -633,13 +635,13 @@ fn parse_history_step_bank_io(
         return Err(HistoryStepBankError::BankDigest);
     }
 
-    let mut parsed_lanes: [Option<MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT] =
+    let mut parsed_lanes: [Option<C1MatrixAccClaim>; HISTORY_STEP_CLASS_COUNT] =
         std::array::from_fn(|_| None);
     for (index, lane) in layout.matrix_lanes.iter().enumerate() {
         let class_id = CanonicalHistoryStepClassId::from_index(index).expect("canonical class");
         match io[lane.live] {
             F128::ZERO => {
-                if io[lane.point..=lane.value]
+                if io[lane.point..lane.live]
                     .iter()
                     .any(|value| *value != F128::ZERO)
                 {
@@ -647,9 +649,12 @@ fn parse_history_step_bank_io(
                 }
             }
             F128::ONE => {
-                parsed_lanes[index] = Some(MatrixAccClaim {
-                    point: io[lane.point..lane.value].to_vec(),
-                    value: io[lane.value],
+                parsed_lanes[index] = Some(C1MatrixAccClaim {
+                    point: io[lane.point..lane.value]
+                        .chunks_exact(2)
+                        .map(|coordinates| F256::new(coordinates[0], coordinates[1]))
+                        .collect(),
+                    value: F256::new(io[lane.value], io[lane.value + 1]),
                 });
             }
             _ => return Err(HistoryStepBankError::LaneLiveness(class_id)),
@@ -671,7 +676,7 @@ pub fn history_step_bank_lane_claim(
     bank: &PinnedHistoryStepClassBank,
     io: &[F128],
     class_id: CanonicalHistoryStepClassId,
-) -> Result<Option<MatrixAccClaim>, HistoryStepBankError> {
+) -> Result<Option<C1MatrixAccClaim>, HistoryStepBankError> {
     Ok(parse_history_step_bank_io(bank, io)?.lanes[class_id.index()].clone())
 }
 
@@ -701,22 +706,29 @@ fn install_folded_lane(
     bank: &PinnedHistoryStepClassBank,
     io: &mut [F128],
     class_id: CanonicalHistoryStepClassId,
-    claim: &MatrixAccClaim,
+    claim: &C1MatrixAccClaim,
 ) -> Result<(), HistoryStepBankError> {
     let lane = bank.layout.matrix_lanes[class_id.index()];
     if claim.point.len() != lane.point_len() {
         return Err(HistoryStepBankError::LaneWidth(class_id));
     }
-    io[lane.point..lane.value].copy_from_slice(&claim.point);
-    io[lane.value] = claim.value;
+    for (lanes, coordinate) in io[lane.point..lane.value]
+        .chunks_exact_mut(2)
+        .zip(&claim.point)
+    {
+        lanes[0] = coordinate.lo;
+        lanes[1] = coordinate.hi;
+    }
+    io[lane.value] = claim.value.lo;
+    io[lane.value + 1] = claim.value.hi;
     io[lane.live] = F128::ONE;
     Ok(())
 }
 
 /// Result of routing one parent class and folding its fresh matrix claim.
 pub struct RoutedHistoryStepBankFold {
-    fold_proof: MatrixFoldProof,
-    outgoing_claim: MatrixAccClaim,
+    fold_proof: C1MatrixFoldProof,
+    outgoing_claim: C1MatrixAccClaim,
     io: Vec<F128>,
 }
 
@@ -751,11 +763,11 @@ pub(crate) fn observe_history_step_bank_fold_route_trace(
 }
 
 impl RoutedHistoryStepBankFold {
-    pub fn fold_proof(&self) -> &MatrixFoldProof {
+    pub fn fold_proof(&self) -> &C1MatrixFoldProof {
         &self.fold_proof
     }
 
-    pub fn outgoing_claim(&self) -> &MatrixAccClaim {
+    pub fn outgoing_claim(&self) -> &C1MatrixAccClaim {
         &self.outgoing_claim
     }
 
@@ -763,7 +775,7 @@ impl RoutedHistoryStepBankFold {
         &self.io
     }
 
-    pub fn into_parts(self) -> (MatrixFoldProof, MatrixAccClaim, Vec<F128>) {
+    pub fn into_parts(self) -> (C1MatrixFoldProof, C1MatrixAccClaim, Vec<F128>) {
         (self.fold_proof, self.outgoing_claim, self.io)
     }
 }
@@ -777,7 +789,7 @@ pub fn route_carry_and_fold_history_step_lane<Ch: Challenger>(
     selected_parent_class: CanonicalHistoryStepClassId,
     current_class: CanonicalHistoryStepClassId,
     selected_parent_matrix: &HistoryStepMatrixLease,
-    fresh_parent_claim: &FreshLincheckClaim,
+    fresh_parent_claim: &C1FreshLincheckClaim,
     current_block_accumulator: &ChainAccumulator,
     challenger: &mut Ch,
 ) -> Result<RoutedHistoryStepBankFold, HistoryStepBankError> {
@@ -793,19 +805,19 @@ pub fn route_carry_and_fold_history_step_lane<Ch: Challenger>(
     validate_fresh_shape(fresh_parent_claim, entry.shape, selected_parent_class)?;
     let incoming = parsed.lanes[selected_parent_class.index()]
         .clone()
-        .unwrap_or_else(|| MatrixAccClaim::zero(entry.shape.k_log));
+        .unwrap_or_else(|| C1MatrixAccClaim::zero(entry.shape.k_log));
     let incoming_live = parsed.lanes[selected_parent_class.index()].is_some();
 
     observe_history_step_bank_fold_route(challenger, selected_parent_class);
     let (fold_proof, outgoing_claim) = match selected_parent_matrix {
-        HistoryStepMatrixLease::Resident(matrix) => prove_matrix_claim_fold(
+        HistoryStepMatrixLease::Resident(matrix) => prove_matrix_claim_fold_c1(
             matrix.as_ref(),
             fresh_parent_claim,
             &incoming,
             incoming_live,
             challenger,
         ),
-        HistoryStepMatrixLease::Compact(matrix) => prove_matrix_claim_fold_compact(
+        HistoryStepMatrixLease::Compact(matrix) => prove_matrix_claim_fold_compact_c1(
             matrix.as_ref(),
             fresh_parent_claim,
             &incoming,
@@ -839,10 +851,10 @@ pub fn route_carry_and_fold_history_step_lane_canonical(
     selected_parent_class: CanonicalHistoryStepClassId,
     current_class: CanonicalHistoryStepClassId,
     selected_parent_matrix: &HistoryStepMatrixLease,
-    fresh_parent_claim: &FreshLincheckClaim,
+    fresh_parent_claim: &C1FreshLincheckClaim,
     current_block_accumulator: &ChainAccumulator,
 ) -> Result<RoutedHistoryStepBankFold, HistoryStepBankError> {
-    let mut challenger = FsLaneChallenger::new(HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN);
+    let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN);
     route_carry_and_fold_history_step_lane(
         bank,
         parent_io,
@@ -856,7 +868,7 @@ pub fn route_carry_and_fold_history_step_lane_canonical(
 }
 
 fn validate_fresh_shape(
-    fresh: &FreshLincheckClaim,
+    fresh: &C1FreshLincheckClaim,
     shape: FieldShape,
     class_id: CanonicalHistoryStepClassId,
 ) -> Result<(), HistoryStepBankError> {
@@ -882,12 +894,12 @@ fn validate_fresh_shape(
 pub struct VerifiedHistoryStepTipReplay {
     class_id: CanonicalHistoryStepClassId,
     bank_digest: [u8; 32],
-    fresh: FreshLincheckClaim,
+    fresh: C1FreshLincheckClaim,
 }
 
 enum PendingBankLane {
     Dead,
-    Pending(MatrixAccClaim),
+    Pending(C1MatrixAccClaim),
     Checked,
 }
 
@@ -902,7 +914,7 @@ struct MatrixRequirement {
 #[must_use = "a HistoryStep tip is not accepted until finish() checks every matrix obligation"]
 pub struct PendingHistoryStepBankDecision {
     tip_class: CanonicalHistoryStepClassId,
-    tip_fresh: Option<FreshLincheckClaim>,
+    tip_fresh: Option<C1FreshLincheckClaim>,
     lanes: [PendingBankLane; HISTORY_STEP_CLASS_COUNT],
     requirements: [MatrixRequirement; HISTORY_STEP_CLASS_COUNT],
     bank_digest: [u8; 32],
@@ -953,7 +965,8 @@ impl PendingHistoryStepBankDecision {
     fn claims_for(
         &self,
         class_id: CanonicalHistoryStepClassId,
-    ) -> Result<(Option<FreshLincheckClaim>, Option<MatrixAccClaim>), HistoryStepBankError> {
+    ) -> Result<(Option<C1FreshLincheckClaim>, Option<C1MatrixAccClaim>), HistoryStepBankError>
+    {
         let fresh = if class_id == self.tip_class {
             self.tip_fresh.clone()
         } else {
@@ -974,10 +987,10 @@ impl PendingHistoryStepBankDecision {
         class_id: CanonicalHistoryStepClassId,
         actual_shape: FieldShape,
         actual_digest: [u8; 32],
-        fresh: Option<&FreshLincheckClaim>,
-        accumulated: Option<&MatrixAccClaim>,
-        actual_fresh_value: Option<F128>,
-        actual_accumulated_value: Option<F128>,
+        fresh: Option<&C1FreshLincheckClaim>,
+        accumulated: Option<&C1MatrixAccClaim>,
+        actual_fresh_value: Option<F256>,
+        actual_accumulated_value: Option<F256>,
     ) -> Result<(), HistoryStepBankError> {
         let requirement = self.requirements[class_id.index()];
         if actual_shape != requirement.shape {
@@ -1007,11 +1020,11 @@ impl PendingHistoryStepBankDecision {
     pub fn check_class_matrix(
         &mut self,
         class_id: CanonicalHistoryStepClassId,
-        matrix: &mut dyn MatrixClaimEvaluator,
+        matrix: &mut dyn C1MatrixClaimEvaluator,
     ) -> Result<(), HistoryStepBankError> {
         let (fresh, accumulated) = self.claims_for(class_id)?;
         let evaluated = matrix
-            .evaluate_matrix_claims(fresh.as_ref(), accumulated.as_ref())
+            .evaluate_matrix_claims_c1(fresh.as_ref(), accumulated.as_ref())
             .map_err(|_| HistoryStepBankError::MatrixEvaluation(class_id))?;
         if !evaluated.is_bound_to(fresh.as_ref(), accumulated.as_ref()) {
             return Err(HistoryStepBankError::MatrixEvaluationBinding(class_id));
@@ -1044,10 +1057,12 @@ impl PendingHistoryStepBankDecision {
         if actual_digest != requirement.digest {
             return Err(HistoryStepBankError::MatrixDigest(class_id));
         }
-        let actual_fresh_value = fresh.as_ref().map(|claim| fresh_claim_value(matrix, claim));
+        let actual_fresh_value = fresh
+            .as_ref()
+            .map(|claim| fresh_claim_value_c1(matrix, claim));
         let actual_accumulated_value = accumulated
             .as_ref()
-            .map(|claim| stacked_matrix_mle_eval(matrix, claim));
+            .map(|claim| stacked_matrix_mle_eval_c1(matrix, claim));
         self.complete_matrix_check(
             class_id,
             actual_shape,
@@ -1074,7 +1089,7 @@ impl PendingHistoryStepBankDecision {
             HistoryStepMatrixLease::Compact(matrix) => {
                 let (fresh, accumulated) = self.claims_for(class_id)?;
                 let evaluated = matrix
-                    .evaluate_matrix_claims_authenticated(fresh.as_ref(), accumulated.as_ref())
+                    .evaluate_matrix_claims_c1_authenticated(fresh.as_ref(), accumulated.as_ref())
                     .map_err(|_| HistoryStepBankError::MatrixEvaluation(class_id))?;
                 if !evaluated.is_bound_to(fresh.as_ref(), accumulated.as_ref()) {
                     return Err(HistoryStepBankError::MatrixEvaluationBinding(class_id));
@@ -1399,7 +1414,7 @@ mod tests {
         let first = CanonicalHistoryStepClassId::new(0).unwrap();
         let last = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(first.index(), 0);
-        assert_eq!(first.current_tier(), 64);
+        assert_eq!(first.current_tier(), 25);
         assert_eq!(last.index(), 1);
         assert_eq!(last.current_tier(), 255);
         assert!(CanonicalHistoryStepClassId::new(2).is_none());
@@ -1435,7 +1450,7 @@ mod tests {
             bank.entry(CanonicalHistoryStepClassId::new(0).unwrap())
                 .shape()
                 .m,
-            23
+            22
         );
         let class = CanonicalHistoryStepClassId::new(1).unwrap();
         assert_eq!(bank.entry(class).shape().m, 24);
@@ -1477,9 +1492,9 @@ mod tests {
         let before = io.clone();
         let selected = CanonicalHistoryStepClassId::new(1).unwrap();
         let lane = bank.layout.matrix_lanes[selected.index()];
-        let claim = MatrixAccClaim {
-            point: vec![F128::ONE; lane.point_len()],
-            value: F128::ONE,
+        let claim = C1MatrixAccClaim {
+            point: vec![F256::ONE; lane.point_len()],
+            value: F256::ONE,
         };
         install_folded_lane(&bank, &mut io, selected, &claim).unwrap();
         for index in 0..HISTORY_STEP_CLASS_COUNT {
@@ -1592,16 +1607,16 @@ mod tests {
             digest_cache: std::sync::OnceLock::new(),
             csc_cache: std::sync::OnceLock::new(),
         };
-        let fresh = FreshLincheckClaim {
-            alpha: F128::ZERO,
-            z_skip: F128::ZERO,
-            x_inner_rest: vec![F128::ZERO],
-            r_inner_rest: vec![F128::ZERO],
-            z_partial: vec![F128::ZERO; 64],
-            value: F128::ZERO,
+        let fresh = C1FreshLincheckClaim {
+            alpha: F256::ZERO,
+            z_skip: F256::ZERO,
+            x_inner_rest: vec![F256::ZERO],
+            r_inner_rest: vec![F256::ZERO],
+            z_partial: vec![F256::ZERO; 64],
+            value: F256::ZERO,
         };
         let matrix = HistoryStepMatrixLease::resident(matrix);
-        let mut challenger = FsLaneChallenger::new(HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN);
+        let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_BANK_FOLD_TRANSCRIPT_DOMAIN);
         assert!(matches!(
             route_carry_and_fold_history_step_lane(
                 &bank,
@@ -1685,13 +1700,13 @@ mod tests {
         .unwrap();
         parent_io[bank.layout.base] = F128::ZERO;
 
-        let fresh = FreshLincheckClaim {
-            alpha: F128::ZERO,
-            z_skip: F128::ZERO,
-            x_inner_rest: vec![F128::ZERO; shape.k_log - shape.k_skip],
-            r_inner_rest: vec![F128::ZERO; shape.k_log - shape.k_skip],
-            z_partial: vec![F128::ZERO; 1usize << shape.k_skip],
-            value: F128::ZERO,
+        let fresh = C1FreshLincheckClaim {
+            alpha: F256::ZERO,
+            z_skip: F256::ZERO,
+            x_inner_rest: vec![F256::ZERO; shape.k_log - shape.k_skip],
+            r_inner_rest: vec![F256::ZERO; shape.k_log - shape.k_skip],
+            z_partial: vec![F256::ZERO; 1usize << shape.k_skip],
+            value: F256::ZERO,
         };
         let matrix = HistoryStepMatrixLease::resident(matrix);
         let first_accumulator = crate::accumulator::genesis_accumulator();

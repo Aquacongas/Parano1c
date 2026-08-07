@@ -122,6 +122,8 @@ use crate::r1cs::SparseBinaryMatrix;
 use crate::zerocheck::multilinear::lagrange_weights_naive;
 use serde::{Deserialize, Serialize};
 
+pub mod c1;
+
 // ---------------------------------------------------------------------------
 // LincheckCircuit: the per-block linear structure lincheck consumes
 // ---------------------------------------------------------------------------
@@ -170,6 +172,49 @@ pub trait LincheckCircuit: Sync {
     ) -> Vec<F128> {
         let eq_inner = build_quirky_eq_table(z_skip, x_inner_rest, k_skip);
         self.fold_alpha_batched(alpha, &eq_inner)
+    }
+
+    /// C1 extension-field analogue of [`Self::fold_alpha_batched`].  The
+    /// default reconstructs the separate A and B marginals coordinate-wise
+    /// from four legacy folds. Production F128-coefficient relations override
+    /// this path with a single matrix scan.
+    fn fold_alpha_batched_c1(
+        &self,
+        alpha: crate::field::F256,
+        eq_inner: &[crate::field::F256],
+    ) -> Vec<crate::field::F256> {
+        let low = eq_inner.iter().map(|value| value.lo).collect::<Vec<_>>();
+        let high = eq_inner.iter().map(|value| value.hi).collect::<Vec<_>>();
+        let b_low = self.fold_alpha_batched(F128::ZERO, &low);
+        let ab_low = self.fold_alpha_batched(F128::ONE, &low);
+        let b_high = self.fold_alpha_batched(F128::ZERO, &high);
+        let ab_high = self.fold_alpha_batched(F128::ONE, &high);
+        (0..self.n_cols())
+            .map(|column| {
+                let a = crate::field::F256::new(
+                    ab_low[column] + b_low[column],
+                    ab_high[column] + b_high[column],
+                );
+                let b = crate::field::F256::new(b_low[column], b_high[column]);
+                alpha * a + b
+            })
+            .collect()
+    }
+
+    fn fold_alpha_batched_quirky_c1(
+        &self,
+        alpha: crate::field::F256,
+        z_skip: crate::field::F256,
+        x_inner_rest: &[crate::field::F256],
+        k_skip: usize,
+    ) -> Vec<crate::field::F256> {
+        let skip = crate::zerocheck::field_c1::lagrange_weights(k_skip, z_skip, 0);
+        let rest = crate::zerocheck::field_c1::build_eq_table(x_inner_rest);
+        let skip_size = 1usize << k_skip;
+        let eq_inner = (0..self.n_cols())
+            .map(|row| skip[row & (skip_size - 1)] * rest[row >> k_skip])
+            .collect::<Vec<_>>();
+        self.fold_alpha_batched_c1(alpha, &eq_inner)
     }
 
     /// Column index of a constant-one wire to pin, or `None` if the circuit has

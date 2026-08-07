@@ -16,6 +16,10 @@
 //! walks, S-boxes on claimed values, per-group eq evaluations, and claim
 //! batching.
 
+use noid_ivc_core::deep_chain::c1::C1MultiDeepChainWalkProof;
+use noid_ivc_core::deep_chain::relations::c1::{
+    claimed_refs as c1_claimed_refs, C1ColumnRelationProof, C1RelationTerm, C1ShiftDischargeProof,
+};
 use noid_ivc_core::deep_chain::relations::{
     claimed_refs, ColRef, ColumnRelationProof, FixedPattern, RelationTerm, ShiftDischargeProof,
     WeightedSumProof, MAX_TERM_FACTORS, RELATION_DEGREE,
@@ -30,7 +34,9 @@ use noid_ivc_core::field_circuit::FsChannelOps;
 use noid_ivc_core::field_circuit::FsChannelTrace;
 use noid_poseidon2b::native::permutation::{N_ROUNDS, STATE_SIZE};
 
-use super::{mul, pin_eq, FieldR1csBuilder, LinExpr, F128};
+use super::{
+    mul, mul_ext, pin_eq, pin_eq_ext, pow7_ext, ExtExpr, FieldR1csBuilder, LinExpr, F128, F256,
+};
 
 // ---------------------------------------------------------------------------
 // Proof wires
@@ -134,8 +140,73 @@ impl MultiDeepChainWalkProofTrace {
     }
 }
 
+/// One genuine C1 claim group represented in the base-field circuit.
+#[derive(Clone)]
+pub struct C1LaneClaimGroupTrace {
+    pub point: Vec<ExtExpr>,
+    pub values: [ExtExpr; STATE_SIZE],
+}
+
+/// Witness allocation of the genuine extension-field ragged walk proof.
+pub struct C1MultiDeepChainWalkProofTrace {
+    pub layers: Vec<C1MultiWalkLayerProofTrace>,
+}
+
+pub struct C1MultiWalkLayerProofTrace {
+    pub round_coeffs: Vec<[ExtExpr; WALK_DEGREE]>,
+    pub next_values: Vec<[ExtExpr; STATE_SIZE]>,
+}
+
+impl C1MultiDeepChainWalkProofTrace {
+    pub fn alloc_ragged(
+        b: &mut FieldR1csBuilder,
+        native: &C1MultiDeepChainWalkProof,
+        w_logs: &[usize],
+    ) -> Self {
+        assert!(!w_logs.is_empty(), "C1 multi-walk instance count");
+        let max_w_log = *w_logs.iter().max().expect("one C1 multi-walk instance");
+        assert_eq!(native.layers.len(), N_ROUNDS, "C1 multi-walk layer count");
+        let layers = native
+            .layers
+            .iter()
+            .map(|layer| {
+                assert_eq!(
+                    layer.round_coeffs.len(),
+                    max_w_log,
+                    "C1 multi-walk round count"
+                );
+                assert_eq!(
+                    layer.next_values.len(),
+                    w_logs.len(),
+                    "C1 multi-walk next-value instance count"
+                );
+                C1MultiWalkLayerProofTrace {
+                    round_coeffs: layer
+                        .round_coeffs
+                        .iter()
+                        .map(|wire| std::array::from_fn(|i| alloc_ext_expr(b, wire[i])))
+                        .collect(),
+                    next_values: layer
+                        .next_values
+                        .iter()
+                        .map(|values| std::array::from_fn(|i| alloc_ext_expr(b, values[i])))
+                        .collect(),
+                }
+            })
+            .collect();
+        Self { layers }
+    }
+}
+
 fn alloc_expr(b: &mut FieldR1csBuilder, v: F128) -> LinExpr {
     LinExpr::from_wire(b.alloc_f128(v))
+}
+
+fn alloc_ext_expr(b: &mut FieldR1csBuilder, value: F256) -> ExtExpr {
+    ExtExpr::new(
+        LinExpr::from_wire(b.alloc_f128(value.lo)),
+        LinExpr::from_wire(b.alloc_f128(value.hi)),
+    )
 }
 
 /// x^7 on an expression: 4 multiplication rows.
@@ -195,6 +266,61 @@ fn compressed_horner(
     acc = t.add(&c1);
     let t = mul(b, &acc, r);
     t.add(&wire[0])
+}
+
+fn compressed_horner_ext(
+    b: &mut FieldR1csBuilder,
+    wire: &[ExtExpr],
+    claim: &ExtExpr,
+    challenge: &ExtExpr,
+) -> ExtExpr {
+    let mut linear = claim.clone();
+    for coefficient in &wire[1..] {
+        linear = linear.add(coefficient);
+    }
+    let mut accumulator = wire[wire.len() - 1].clone();
+    for coefficient in wire[1..wire.len() - 1].iter().rev() {
+        accumulator = mul_ext(b, &accumulator, challenge).add(coefficient);
+    }
+    accumulator = mul_ext(b, &accumulator, challenge).add(&linear);
+    mul_ext(b, &accumulator, challenge).add(&wire[0])
+}
+
+fn layer_terms_ext_trace(
+    b: &mut FieldR1csBuilder,
+    round: usize,
+    values: &[ExtExpr; STATE_SIZE],
+) -> [ExtExpr; STATE_SIZE] {
+    if is_full_round(round) {
+        std::array::from_fn(|lane| {
+            let value = values[lane].add(&ExtExpr::constant(F256::from_base(flat_round_constant(
+                lane, round,
+            ))));
+            pow7_ext(b, &value)
+        })
+    } else {
+        std::array::from_fn(|lane| {
+            if lane == 0 {
+                let value = values[0].add(&ExtExpr::constant(F256::from_base(
+                    flat_round_constant(0, round),
+                )));
+                pow7_ext(b, &value)
+            } else {
+                values[lane].clone()
+            }
+        })
+    }
+}
+
+fn eq_eval_ext_trace(b: &mut FieldR1csBuilder, left: &[ExtExpr], right: &[ExtExpr]) -> ExtExpr {
+    assert_eq!(left.len(), right.len(), "C1 equality point arity");
+    let mut product = ExtExpr::one();
+    for (left, right) in left.iter().zip(right) {
+        // xy + (1 + x)(1 + y) = 1 + x + y in characteristic two.
+        let factor = ExtExpr::one().add(left).add(right);
+        product = mul_ext(b, &product, &factor);
+    }
+    product
 }
 
 // ---------------------------------------------------------------------------
@@ -567,6 +693,462 @@ pub fn verify_ragged_multi_deep_chain_walk_trace(
         .into_iter()
         .map(|mut instance| instance.pop().expect("one terminal group per instance"))
         .collect()
+}
+
+/// Trace twin of the genuine GF(2^256) single-group ragged walk.
+///
+/// The committed Poseidon columns remain base-field columns, while every
+/// claim, Fiat-Shamir draw, sumcheck message, fold, and terminal evaluation
+/// is represented as an [`ExtExpr`]. The transcript order is identical to
+/// `deep_chain::c1::verify_ragged_deep_chain_walk`.
+pub fn verify_c1_ragged_deep_chain_walk_trace(
+    b: &mut FieldR1csBuilder,
+    ch: &mut impl FsChannelOps,
+    w_logs: &[usize],
+    out_groups: &[C1LaneClaimGroupTrace],
+    proof: &C1MultiDeepChainWalkProofTrace,
+) -> Vec<C1LaneClaimGroupTrace> {
+    assert!(!w_logs.is_empty(), "at least one C1 walk child");
+    assert_eq!(w_logs.len(), out_groups.len(), "one width per C1 child");
+    let max_w_log = *w_logs.iter().max().expect("one C1 walk child");
+    assert!(
+        out_groups
+            .iter()
+            .zip(w_logs)
+            .all(|(group, &w_log)| group.point.len() == w_log),
+        "C1 walk point arity"
+    );
+    assert_eq!(proof.layers.len(), N_ROUNDS, "C1 walk layer count");
+    assert!(proof.layers.iter().all(|layer| {
+        layer.round_coeffs.len() == max_w_log && layer.next_values.len() == out_groups.len()
+    }));
+
+    let count = |value: usize| {
+        ExtExpr::constant(F256::from_base(F128::new(
+            u64::try_from(value).expect("C1 walk count exceeds u64"),
+            0,
+        )))
+    };
+    ch.observe_label(b, b"history-deep-chain-ragged-multi-walk-c1-v1");
+    ch.observe_f256(b, &count(out_groups.len()));
+    for (&w_log, group) in w_logs.iter().zip(out_groups) {
+        ch.observe_f256(b, &count(w_log));
+        ch.observe_f256(b, &ExtExpr::one());
+        ch.observe_f256_slice(b, &group.point);
+        ch.observe_f256_slice(b, &group.values);
+    }
+
+    let mut groups = out_groups.to_vec();
+    for (layer_index, layer_proof) in proof.layers.iter().enumerate() {
+        let layer = N_ROUNDS - layer_index;
+        let round = layer - 1;
+        let alpha = ch.sample_f256(b);
+
+        let mut power = ExtExpr::one();
+        let weights = groups
+            .iter()
+            .map(|_| {
+                std::array::from_fn(|_| {
+                    power = mul_ext(b, &power, &alpha);
+                    power.clone()
+                })
+            })
+            .collect::<Vec<[ExtExpr; STATE_SIZE]>>();
+        let mds = flat_mds(is_full_round(round));
+        let columns = weights
+            .iter()
+            .map(|lane_weights| {
+                std::array::from_fn(|column| {
+                    (0..STATE_SIZE).fold(ExtExpr::zero(), |sum, lane| {
+                        sum.add(&lane_weights[lane].scale_base(mds[lane][column]))
+                    })
+                })
+            })
+            .collect::<Vec<[ExtExpr; STATE_SIZE]>>();
+
+        let mut claim = ExtExpr::zero();
+        for (group, lane_weights) in groups.iter().zip(&weights) {
+            for lane in 0..STATE_SIZE {
+                claim = claim.add(&mul_ext(b, &lane_weights[lane], &group.values[lane]));
+            }
+        }
+
+        let mut point = Vec::with_capacity(max_w_log);
+        for wire in &layer_proof.round_coeffs {
+            ch.observe_f256_slice(b, wire);
+            let challenge = ch.sample_f256(b);
+            claim = compressed_horner_ext(b, wire, &claim, &challenge);
+            point.push(challenge);
+        }
+        let flat_next = layer_proof
+            .next_values
+            .iter()
+            .flat_map(|values| values.iter().cloned())
+            .collect::<Vec<_>>();
+        ch.observe_f256_slice(b, &flat_next);
+
+        let mut expected = ExtExpr::zero();
+        for child in 0..groups.len() {
+            let terms = layer_terms_ext_trace(b, round, &layer_proof.next_values[child]);
+            let mut high_gate = ExtExpr::one();
+            for coordinate in &point[w_logs[child]..] {
+                high_gate = mul_ext(b, &high_gate, &coordinate.add(&ExtExpr::one()));
+            }
+            let low_eq = eq_eval_ext_trace(b, &groups[child].point, &point[..w_logs[child]]);
+            let aligned_eq = mul_ext(b, &low_eq, &high_gate);
+            let mut dot = ExtExpr::zero();
+            for lane in 0..STATE_SIZE {
+                dot = dot.add(&mul_ext(b, &columns[child][lane], &terms[lane]));
+            }
+            expected = expected.add(&mul_ext(b, &aligned_eq, &dot));
+        }
+        pin_eq_ext(b, &expected, &claim);
+
+        groups = layer_proof
+            .next_values
+            .iter()
+            .enumerate()
+            .map(|(child, values)| C1LaneClaimGroupTrace {
+                point: point[..w_logs[child]].to_vec(),
+                values: values.clone(),
+            })
+            .collect();
+    }
+    groups
+}
+
+// ---------------------------------------------------------------------------
+// Genuine C1 column-relation and shift verifier twins
+// ---------------------------------------------------------------------------
+
+pub struct C1ColumnRelationProofTrace {
+    pub rounds: Vec<[ExtExpr; RELATION_DEGREE]>,
+    pub final_values: Vec<ExtExpr>,
+}
+
+impl C1ColumnRelationProofTrace {
+    pub fn alloc(
+        b: &mut FieldR1csBuilder,
+        native: &C1ColumnRelationProof,
+        w_log: usize,
+        claimed_refs: usize,
+    ) -> Self {
+        assert_eq!(native.rounds.len(), w_log, "C1 relation round count");
+        assert_eq!(
+            native.final_values.len(),
+            claimed_refs,
+            "C1 relation value count"
+        );
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|wire| std::array::from_fn(|index| alloc_ext_expr(b, wire[index])))
+                .collect(),
+            final_values: native
+                .final_values
+                .iter()
+                .copied()
+                .map(|value| alloc_ext_expr(b, value))
+                .collect(),
+        }
+    }
+}
+
+pub struct C1RelationTermTrace {
+    pub coeff: ExtExpr,
+    pub factors: Vec<ColRef>,
+}
+
+fn c1_structure_lane(low: usize, high: usize) -> ExtExpr {
+    ExtExpr::constant(F256::from_base(F128::new(low as u64, high as u64)))
+}
+
+fn encode_c1_reference(reference: ColRef, lanes: &mut Vec<ExtExpr>) {
+    match reference {
+        ColRef::Committed(index) => lanes.push(c1_structure_lane(0, index)),
+        ColRef::CommittedShift(index) => lanes.push(c1_structure_lane(1, index)),
+        ColRef::Internal(index) => lanes.push(c1_structure_lane(2, index)),
+        ColRef::Fixed(index) => lanes.push(c1_structure_lane(3, index)),
+        ColRef::CommittedShift2(index) => lanes.push(c1_structure_lane(4, index)),
+        ColRef::Window {
+            col,
+            stride_log,
+            offset,
+        } => {
+            lanes.push(c1_structure_lane(5, col));
+            lanes.push(c1_structure_lane(stride_log, offset));
+        }
+    }
+}
+
+fn absorb_c1_relation_header_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    target: &ExtExpr,
+    eq_point: &[ExtExpr],
+    terms: &[C1RelationTermTrace],
+) {
+    channel.observe_label(b, b"history-deep-chain-relation-c1-v1");
+    channel.observe_f256(b, target);
+    channel.observe_f256_slice(b, eq_point);
+    let mut structure = vec![c1_structure_lane(terms.len(), 0)];
+    for term in terms {
+        structure.push(term.coeff.clone());
+        structure.push(c1_structure_lane(term.factors.len(), 0));
+        for &factor in &term.factors {
+            encode_c1_reference(factor, &mut structure);
+        }
+    }
+    channel.observe_f256_slice(b, &structure);
+}
+
+fn eq_tensor_extend_ext(
+    b: &mut FieldR1csBuilder,
+    tensor: &[ExtExpr],
+    coordinate: &ExtExpr,
+) -> Vec<ExtExpr> {
+    let high = tensor
+        .iter()
+        .map(|value| mul_ext(b, value, coordinate))
+        .collect::<Vec<_>>();
+    let mut next = Vec::with_capacity(2 * tensor.len());
+    for (value, high) in tensor.iter().zip(&high) {
+        next.push(value.add(high));
+    }
+    next.extend(high);
+    next
+}
+
+fn fixed_pattern_dot_gate_ext(
+    b: &mut FieldR1csBuilder,
+    pattern: &FixedPattern,
+    tensor: &[ExtExpr],
+    point: &[ExtExpr],
+) -> ExtExpr {
+    assert_eq!(tensor.len(), pattern.table.len(), "C1 eq tensor arity");
+    let mut layer = pattern
+        .table
+        .iter()
+        .zip(tensor)
+        .filter(|(value, _)| **value != F128::ZERO)
+        .map(|(&value, tensor)| tensor.scale_base(value))
+        .collect::<Vec<_>>();
+    if layer.is_empty() {
+        layer.push(ExtExpr::zero());
+    }
+    while layer.len() > 1 {
+        layer = layer
+            .chunks(2)
+            .map(|pair| {
+                if pair.len() == 2 {
+                    pair[0].add(&pair[1])
+                } else {
+                    pair[0].clone()
+                }
+            })
+            .collect();
+    }
+    let mut value = layer.pop().expect("non-empty C1 fixed fold");
+    if let Some((first, bits)) = &pattern.hi_gate {
+        assert_eq!(
+            point.len(),
+            first + bits.len(),
+            "C1 gated pattern point arity"
+        );
+        for (coordinate, bit) in bits.iter().enumerate() {
+            let factor = if *bit {
+                point[first + coordinate].clone()
+            } else {
+                point[first + coordinate].add(&ExtExpr::one())
+            };
+            value = mul_ext(b, &value, &factor);
+        }
+    }
+    value
+}
+
+pub fn verify_c1_column_relation_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    w_log: usize,
+    target: &ExtExpr,
+    eq_point: &[ExtExpr],
+    terms: &[C1RelationTermTrace],
+    fixed: &[FixedPattern],
+    proof: &C1ColumnRelationProofTrace,
+) -> Vec<ExtExpr> {
+    assert_eq!(eq_point.len(), w_log, "C1 relation point arity");
+    assert_eq!(proof.rounds.len(), w_log, "C1 relation round count");
+    let shape = terms
+        .iter()
+        .map(|term| {
+            assert!(term.factors.len() <= MAX_TERM_FACTORS);
+            C1RelationTerm {
+                coeff: F256::ZERO,
+                factors: term.factors.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let claimed = c1_claimed_refs(&shape);
+    assert_eq!(proof.final_values.len(), claimed.len());
+
+    absorb_c1_relation_header_trace(b, channel, target, eq_point, terms);
+    let mut claim = target.clone();
+    let mut point = Vec::with_capacity(w_log);
+    for wire in &proof.rounds {
+        channel.observe_f256_slice(b, wire);
+        let challenge = channel.sample_f256(b);
+        claim = compressed_horner_ext(b, wire, &claim, &challenge);
+        point.push(challenge);
+    }
+    channel.observe_f256_slice(b, &proof.final_values);
+
+    let mut fixed_used = Vec::new();
+    for term in terms {
+        for factor in &term.factors {
+            if let ColRef::Fixed(index) = factor {
+                if !fixed_used.contains(index) {
+                    fixed_used.push(*index);
+                }
+            }
+        }
+    }
+    fixed_used.sort_by_key(|index| fixed[*index].low_log);
+    let mut fixed_cache = vec![None; fixed.len()];
+    let mut tensor = vec![ExtExpr::one()];
+    let mut current_log = 0usize;
+    for index in fixed_used {
+        while current_log < fixed[index].low_log {
+            tensor = eq_tensor_extend_ext(b, &tensor, &point[current_log]);
+            current_log += 1;
+        }
+        fixed_cache[index] = Some(fixed_pattern_dot_gate_ext(
+            b,
+            &fixed[index],
+            &tensor,
+            &point,
+        ));
+    }
+
+    let mut relation = ExtExpr::zero();
+    for term in terms {
+        let mut product = term.coeff.clone();
+        for factor in &term.factors {
+            let value = match factor {
+                ColRef::Fixed(index) => fixed_cache[*index]
+                    .clone()
+                    .expect("pre-evaluated C1 fixed pattern"),
+                _ => {
+                    let index = claimed
+                        .iter()
+                        .position(|reference| reference == factor)
+                        .expect("claimed C1 relation reference");
+                    proof.final_values[index].clone()
+                }
+            };
+            product = mul_ext(b, &product, &value);
+        }
+        relation = relation.add(&product);
+    }
+    let equality = eq_eval_ext_trace(b, eq_point, &point);
+    let expected = mul_ext(b, &equality, &relation);
+    pin_eq_ext(b, &expected, &claim);
+    point
+}
+
+pub struct C1ShiftDischargeProofTrace {
+    pub rounds: Vec<[ExtExpr; 2]>,
+    pub final_value: ExtExpr,
+}
+
+impl C1ShiftDischargeProofTrace {
+    pub fn alloc(b: &mut FieldR1csBuilder, native: &C1ShiftDischargeProof, w_log: usize) -> Self {
+        assert_eq!(native.rounds.len(), w_log, "C1 shift round count");
+        Self {
+            rounds: native
+                .rounds
+                .iter()
+                .map(|wire| std::array::from_fn(|index| alloc_ext_expr(b, wire[index])))
+                .collect(),
+            final_value: alloc_ext_expr(b, native.final_value),
+        }
+    }
+}
+
+fn c1_shift_kernel_eval_trace(
+    b: &mut FieldR1csBuilder,
+    rho: &[ExtExpr],
+    sigma: &[ExtExpr],
+) -> ExtExpr {
+    assert_eq!(rho.len(), sigma.len(), "C1 shift point arity");
+    let mut suffix = vec![ExtExpr::one(); rho.len() + 1];
+    for coordinate in (0..rho.len()).rev() {
+        let matched = ExtExpr::one().add(&rho[coordinate]).add(&sigma[coordinate]);
+        suffix[coordinate] = mul_ext(b, &matched, &suffix[coordinate + 1]);
+    }
+    let mut result = ExtExpr::zero();
+    let mut prefix = ExtExpr::one();
+    for coordinate in 0..rho.len() {
+        let with_rho = mul_ext(b, &prefix, &rho[coordinate]);
+        let transition = mul_ext(b, &with_rho, &ExtExpr::one().add(&sigma[coordinate]));
+        result = result.add(&mul_ext(b, &transition, &suffix[coordinate + 1]));
+        let with_sigma = mul_ext(b, &prefix, &sigma[coordinate]);
+        prefix = mul_ext(b, &with_sigma, &ExtExpr::one().add(&rho[coordinate]));
+    }
+    result
+}
+
+fn c1_shift_pow2_kernel_eval_trace(
+    b: &mut FieldR1csBuilder,
+    shift_log: usize,
+    rho: &[ExtExpr],
+    sigma: &[ExtExpr],
+) -> ExtExpr {
+    assert_eq!(rho.len(), sigma.len(), "C1 shift point arity");
+    assert!(shift_log < rho.len(), "C1 shift below domain");
+    let mut low_match = ExtExpr::one();
+    for coordinate in 0..shift_log {
+        let matched = ExtExpr::one().add(&rho[coordinate]).add(&sigma[coordinate]);
+        low_match = mul_ext(b, &low_match, &matched);
+    }
+    let high = c1_shift_kernel_eval_trace(b, &rho[shift_log..], &sigma[shift_log..]);
+    mul_ext(b, &low_match, &high)
+}
+
+pub fn verify_c1_shift_discharge_trace(
+    b: &mut FieldR1csBuilder,
+    channel: &mut impl FsChannelOps,
+    w_log: usize,
+    sigma: &[ExtExpr],
+    target: &ExtExpr,
+    shift_log: usize,
+    proof: &C1ShiftDischargeProofTrace,
+) -> Vec<ExtExpr> {
+    assert_eq!(sigma.len(), w_log, "C1 shift point arity");
+    assert_eq!(proof.rounds.len(), w_log, "C1 shift round count");
+    assert!(shift_log < w_log, "C1 shift below domain");
+    channel.observe_label(b, b"history-deep-chain-shift-c1-v1");
+    channel.observe_f256(b, &c1_structure_lane(shift_log, 0));
+    channel.observe_f256(b, target);
+    channel.observe_f256_slice(b, sigma);
+
+    let mut claim = target.clone();
+    let mut point = Vec::with_capacity(w_log);
+    for wire in &proof.rounds {
+        channel.observe_f256_slice(b, wire);
+        let linear = claim.add(&wire[1]);
+        let challenge = channel.sample_f256(b);
+        let quadratic = mul_ext(b, &wire[1], &challenge);
+        let linearized = quadratic.add(&linear);
+        claim = mul_ext(b, &linearized, &challenge).add(&wire[0]);
+        point.push(challenge);
+    }
+    channel.observe_f256(b, &proof.final_value);
+    let kernel = c1_shift_pow2_kernel_eval_trace(b, shift_log, sigma, &point);
+    let expected = mul_ext(b, &kernel, &proof.final_value);
+    pin_eq_ext(b, &expected, &claim);
+    point
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,6 +1688,10 @@ mod tests {
                 hi: self.next_u64(),
             }
         }
+
+        fn f256(&mut self) -> F256 {
+            F256::new(self.f128(), self.f128())
+        }
     }
 
     fn mle_eval(col: &[F128], point: &[F128]) -> F128 {
@@ -1115,6 +1701,30 @@ mod tests {
             acc += *v * *e;
         }
         acc
+    }
+
+    fn mle_eval_ext(col: &[F128], point: &[F256]) -> F256 {
+        assert_eq!(col.len(), 1usize << point.len());
+        let mut folded = col.iter().copied().map(F256::from_base).collect::<Vec<_>>();
+        for &challenge in point {
+            folded = folded
+                .chunks_exact(2)
+                .map(|pair| pair[0] + challenge * (pair[0] + pair[1]))
+                .collect();
+        }
+        folded[0]
+    }
+
+    fn mle_eval_f256(values: &[F256], point: &[F256]) -> F256 {
+        assert_eq!(values.len(), 1usize << point.len());
+        let mut folded = values.to_vec();
+        for &challenge in point {
+            folded = folded
+                .chunks_exact(2)
+                .map(|pair| pair[0] + challenge * (pair[0] + pair[1]))
+                .collect();
+        }
+        folded[0]
     }
 
     /// Walk twin: lockstep with the native verifier, satisfiable trace,
@@ -1617,6 +2227,391 @@ mod tests {
             swapped.swap(swap_base + lane, swap_base + STATE_SIZE + lane);
         }
         assert!(!r1cs.satisfies(&swapped), "ragged instance swap survived");
+    }
+
+    /// Genuine C1 ragged walk: the recursive trace is transcript-identical to
+    /// the native GF(2^256) verifier, returns the authenticated base-column
+    /// openings, and rejects targeted proof mutations.
+    #[test]
+    fn c1_ragged_walk_twin_lockstep_rows_and_mutations() {
+        use noid_ivc_core::deep_chain::c1::{prove_ragged_deep_chain_walk, C1LaneClaimGroup};
+
+        let w_logs = [1usize, 2];
+        let max_w_log = *w_logs.iter().max().unwrap();
+        let mut rng = Rng(0xC1_A11D_CE11);
+        let instances = w_logs
+            .iter()
+            .map(|&w_log| {
+                let width = 1usize << w_log;
+                std::array::from_fn(|_| (0..width).map(|_| rng.f128()).collect::<Vec<_>>())
+            })
+            .collect::<Vec<[Vec<F128>; STATE_SIZE]>>();
+        let outputs: Vec<[Vec<F128>; STATE_SIZE]> = instances
+            .iter()
+            .map(|input| {
+                let width = input[0].len();
+                let rows = (0..width)
+                    .map(|index| {
+                        let mut state = std::array::from_fn(|lane| input[lane][index]);
+                        for round in 0..N_ROUNDS {
+                            state = apply_round(round, state);
+                        }
+                        state
+                    })
+                    .collect::<Vec<_>>();
+                std::array::from_fn(|lane| rows.iter().map(|row| row[lane]).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>();
+        let groups = outputs
+            .iter()
+            .zip(&w_logs)
+            .map(|(output, &w_log)| {
+                let point = (0..w_log).map(|_| rng.f256()).collect::<Vec<_>>();
+                let values = std::array::from_fn(|lane| mle_eval_ext(&output[lane], &point));
+                C1LaneClaimGroup { point, values }
+            })
+            .collect::<Vec<_>>();
+
+        let references = instances.iter().collect::<Vec<_>>();
+        let mut native_channel = FsLaneChallenger::new_c1(b"c1-ragged-walk-twin-test");
+        let (proof, native_terminals) =
+            prove_ragged_deep_chain_walk(&references, &groups, &mut native_channel);
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut channel = noid_ivc_core::field_circuit::FsChannelUnionRecorder::new_c1(
+            b"c1-ragged-walk-twin-test",
+        );
+        let group_traces = groups
+            .iter()
+            .map(|group| C1LaneClaimGroupTrace {
+                point: group
+                    .point
+                    .iter()
+                    .copied()
+                    .map(|value| alloc_ext_expr(&mut builder, value))
+                    .collect(),
+                values: std::array::from_fn(|lane| {
+                    alloc_ext_expr(&mut builder, group.values[lane])
+                }),
+            })
+            .collect::<Vec<_>>();
+        let verifier_start = builder.num_wires();
+        let mutation_start = builder.num_wires();
+        let proof_trace =
+            C1MultiDeepChainWalkProofTrace::alloc_ragged(&mut builder, &proof, &w_logs);
+        let mutation_end = builder.num_wires();
+        let terminals = verify_c1_ragged_deep_chain_walk_trace(
+            &mut builder,
+            &mut channel,
+            &w_logs,
+            &group_traces,
+            &proof_trace,
+        );
+        let verifier_rows = builder.num_wires() - verifier_start;
+
+        let native_post = native_channel.sample_f256();
+        let trace_post = channel.sample_f256(&mut builder);
+        assert_eq!(
+            trace_post.eval(builder.values()),
+            native_post,
+            "C1 walk twin transcript diverged"
+        );
+        let recording = channel.finish();
+        for (child, ((terminal, native), input)) in terminals
+            .iter()
+            .zip(&native_terminals)
+            .zip(&instances)
+            .enumerate()
+        {
+            assert_eq!(terminal.point.len(), w_logs[child]);
+            for (coordinate, &native_coordinate) in terminal.point.iter().zip(&native.point) {
+                assert_eq!(coordinate.eval(builder.values()), native_coordinate);
+                pin_eq_ext(
+                    &mut builder,
+                    coordinate,
+                    &ExtExpr::constant(native_coordinate),
+                );
+            }
+            for lane in 0..STATE_SIZE {
+                assert_eq!(
+                    terminal.values[lane].eval(builder.values()),
+                    native.values[lane]
+                );
+                assert_eq!(
+                    mle_eval_ext(&input[lane], &native.point),
+                    native.values[lane],
+                    "C1 terminal child {child}, lane {lane}"
+                );
+                pin_eq_ext(
+                    &mut builder,
+                    &terminal.values[lane],
+                    &ExtExpr::constant(native.values[lane]),
+                );
+            }
+        }
+
+        eprintln!(
+            "[deep-chain] genuine C1 ragged walk rows @w_logs={w_logs:?}: {verifier_rows}; \
+             transcript_perms={}, transcript_data={}, transcript_challenges={}",
+            recording.perms,
+            recording.data_wires.len(),
+            recording.challenge_wires.len(),
+        );
+        let f256_values_per_layer = max_w_log * WALK_DEGREE + instances.len() * STATE_SIZE;
+        let base_wires_per_layer = 2 * f256_values_per_layer;
+        assert_eq!(
+            mutation_end - mutation_start,
+            N_ROUNDS * base_wires_per_layer,
+            "unexpected C1 proof wire layout"
+        );
+
+        let (r1cs, witness) = builder.build();
+        assert!(
+            r1cs.satisfies(&witness),
+            "honest C1 walk twin unsatisfiable"
+        );
+
+        let coefficient_wire =
+            mutation_start + (N_ROUNDS / 2) * base_wires_per_layer + 2 * (WALK_DEGREE + 3);
+        let mut bad_coefficient = witness.clone();
+        bad_coefficient[coefficient_wire] += F128::ONE;
+        assert!(
+            !r1cs.satisfies(&bad_coefficient),
+            "C1 round-coefficient mutation survived"
+        );
+
+        let next_values_offset = 2 * max_w_log * WALK_DEGREE;
+        let next_value_wire = mutation_start
+            + (N_ROUNDS / 4) * base_wires_per_layer
+            + next_values_offset
+            + 2 * (STATE_SIZE + 1);
+        let mut bad_next_value = witness.clone();
+        bad_next_value[next_value_wire] += F128::ONE;
+        assert!(
+            !r1cs.satisfies(&bad_next_value),
+            "C1 next-value mutation survived"
+        );
+    }
+
+    /// The genuine C1 relation and shift twins replay one shared wide
+    /// transcript, match the native verifier's next challenge, and constrain
+    /// the proof-carried extension values.
+    #[test]
+    fn c1_relation_and_shift_twins_lockstep_rows_and_mutations() {
+        use noid_ivc_core::deep_chain::relations::c1::{
+            prove_column_relation, prove_shift_discharge, C1RelationTerm,
+        };
+        use noid_ivc_core::deep_chain::relations::RelationColumns;
+
+        let w_log = 3usize;
+        let width = 1usize << w_log;
+        let mut rng = Rng(0xC1_7E1A_7101);
+        let committed_a = (0..width).map(|_| rng.f128()).collect::<Vec<_>>();
+        let committed_b = (0..width).map(|_| rng.f128()).collect::<Vec<_>>();
+        let internal = (0..width).map(|_| rng.f128()).collect::<Vec<_>>();
+        let fixed = FixedPattern::new(
+            2,
+            vec![F128::ZERO, F128::ONE, F128::new(5, 0), F128::new(11, 0)],
+        );
+        let committed = vec![committed_a.as_slice(), committed_b.as_slice()];
+        let internals = vec![internal.as_slice()];
+        let fixed_patterns = vec![fixed];
+        let columns = RelationColumns {
+            committed: &committed,
+            internal: &internals,
+            fixed: &fixed_patterns,
+        };
+        let terms = vec![
+            C1RelationTerm {
+                coeff: rng.f256(),
+                factors: vec![ColRef::Committed(0), ColRef::Internal(0)],
+            },
+            C1RelationTerm {
+                coeff: rng.f256(),
+                factors: vec![ColRef::CommittedShift(1), ColRef::Fixed(0)],
+            },
+        ];
+        let fixed_column = fixed_patterns[0].materialize(width);
+        let relation_values = (0..width)
+            .map(|index| {
+                let shifted = if index == 0 {
+                    F128::ZERO
+                } else {
+                    committed_b[index - 1]
+                };
+                terms[0].coeff
+                    * F256::from_base(committed_a[index])
+                    * F256::from_base(internal[index])
+                    + terms[1].coeff
+                        * F256::from_base(shifted)
+                        * F256::from_base(fixed_column[index])
+            })
+            .collect::<Vec<_>>();
+        let eq_point = (0..w_log).map(|_| rng.f256()).collect::<Vec<_>>();
+        let target = mle_eval_f256(&relation_values, &eq_point);
+
+        let mut native = FsLaneChallenger::new_c1(b"c1-relation-shift-twin");
+        let (relation_proof, relation_point, relation_values) =
+            prove_column_relation(target, &eq_point, &terms, &columns, &mut native);
+        let references = c1_claimed_refs(&terms);
+        let shifted_index = references
+            .iter()
+            .position(|reference| *reference == ColRef::CommittedShift(1))
+            .unwrap();
+        let shifted_target = relation_values[shifted_index];
+        let (shift_proof, native_shift_point) =
+            prove_shift_discharge(&committed_b, &relation_point, shifted_target, &mut native);
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut channel =
+            noid_ivc_core::field_circuit::FsChannelUnionRecorder::new_c1(b"c1-relation-shift-twin");
+        let target_trace = alloc_ext_expr(&mut builder, target);
+        let eq_point_trace = eq_point
+            .iter()
+            .copied()
+            .map(|value| alloc_ext_expr(&mut builder, value))
+            .collect::<Vec<_>>();
+        let term_traces = terms
+            .iter()
+            .map(|term| C1RelationTermTrace {
+                coeff: ExtExpr::constant(term.coeff),
+                factors: term.factors.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mutation_start = builder.num_wires();
+        let relation_trace = C1ColumnRelationProofTrace::alloc(
+            &mut builder,
+            &relation_proof,
+            w_log,
+            references.len(),
+        );
+        let shift_trace = C1ShiftDischargeProofTrace::alloc(&mut builder, &shift_proof, w_log);
+        let mutation_end = builder.num_wires();
+        let row_start = builder.num_wires();
+        let relation_point_trace = verify_c1_column_relation_trace(
+            &mut builder,
+            &mut channel,
+            w_log,
+            &target_trace,
+            &eq_point_trace,
+            &term_traces,
+            &fixed_patterns,
+            &relation_trace,
+        );
+        let shift_point_trace = verify_c1_shift_discharge_trace(
+            &mut builder,
+            &mut channel,
+            w_log,
+            &relation_point_trace,
+            &relation_trace.final_values[shifted_index],
+            0,
+            &shift_trace,
+        );
+        let rows = builder.num_wires() - row_start;
+
+        let native_post = native.sample_f256();
+        let trace_post = channel.sample_f256(&mut builder);
+        assert_eq!(trace_post.eval(builder.values()), native_post);
+        let recording = channel.finish();
+        for (trace, native) in relation_point_trace.iter().zip(&relation_point) {
+            assert_eq!(trace.eval(builder.values()), *native);
+        }
+        for (trace, native) in shift_point_trace.iter().zip(&native_shift_point) {
+            assert_eq!(trace.eval(builder.values()), *native);
+            pin_eq_ext(&mut builder, trace, &ExtExpr::constant(*native));
+        }
+        assert_eq!(
+            shift_trace.final_value.eval(builder.values()),
+            mle_eval_ext(&committed_b, &native_shift_point)
+        );
+        eprintln!(
+            "[deep-chain] genuine C1 relation+shift rows={rows}, transcript_perms={}, \
+             transcript_data={}, transcript_challenges={}",
+            recording.perms,
+            recording.data_wires.len(),
+            recording.challenge_wires.len(),
+        );
+
+        let (r1cs, witness) = builder.build();
+        assert!(
+            r1cs.satisfies(&witness),
+            "honest C1 relation+shift twin unsatisfiable"
+        );
+        assert!(mutation_end > mutation_start);
+        let mut bad = witness.clone();
+        bad[mutation_start + 3] += F128::ONE;
+        assert!(!r1cs.satisfies(&bad), "C1 relation proof mutation survived");
+    }
+
+    /// Production-width row and transcript profile for the fused Link/Block
+    /// C1 walk. Correctness is covered by the non-ignored small twin above;
+    /// this benchmark intentionally avoids constructing all nine output tables.
+    #[test]
+    #[ignore = "production-width C1 recursive profile"]
+    fn c1_joint_b25_recursive_row_profile() {
+        use noid_ivc_core::deep_chain::c1::{prove_ragged_deep_chain_walk, C1LaneClaimGroup};
+
+        let w_logs = [14usize, 15, 17, 16, 12, 15, 16, 12, 13];
+        let mut rng = Rng(0xC1_B25_C1AC);
+        let instances = w_logs
+            .iter()
+            .map(|&w_log| {
+                let width = 1usize << w_log;
+                std::array::from_fn(|_| (0..width).map(|_| rng.f128()).collect::<Vec<_>>())
+            })
+            .collect::<Vec<[Vec<F128>; STATE_SIZE]>>();
+        let groups = w_logs
+            .iter()
+            .map(|&w_log| C1LaneClaimGroup {
+                point: (0..w_log).map(|_| rng.f256()).collect(),
+                values: std::array::from_fn(|_| rng.f256()),
+            })
+            .collect::<Vec<_>>();
+        let references = instances.iter().collect::<Vec<_>>();
+        let mut native_channel = FsLaneChallenger::new_c1(b"c1-joint-b25-recursive-profile");
+        let (proof, _) = prove_ragged_deep_chain_walk(&references, &groups, &mut native_channel);
+
+        let mut builder = FieldR1csBuilder::new();
+        let mut channel = noid_ivc_core::field_circuit::FsChannelUnionRecorder::new_c1(
+            b"c1-joint-b25-recursive-profile",
+        );
+        let group_traces = groups
+            .iter()
+            .map(|group| C1LaneClaimGroupTrace {
+                point: group
+                    .point
+                    .iter()
+                    .copied()
+                    .map(|value| alloc_ext_expr(&mut builder, value))
+                    .collect(),
+                values: std::array::from_fn(|lane| {
+                    alloc_ext_expr(&mut builder, group.values[lane])
+                }),
+            })
+            .collect::<Vec<_>>();
+        let row_start = builder.num_wires();
+        let proof_trace =
+            C1MultiDeepChainWalkProofTrace::alloc_ragged(&mut builder, &proof, &w_logs);
+        let terminals = verify_c1_ragged_deep_chain_walk_trace(
+            &mut builder,
+            &mut channel,
+            &w_logs,
+            &group_traces,
+            &proof_trace,
+        );
+        let rows = builder.num_wires() - row_start;
+        let native_post = native_channel.sample_f256();
+        let trace_post = channel.sample_f256(&mut builder);
+        assert_eq!(trace_post.eval(builder.values()), native_post);
+        let recording = channel.finish();
+        eprintln!(
+            "[deep-chain] genuine C1 joint B25 rows={rows}, transcript_perms={}, \
+             transcript_data={}, transcript_challenges={}, terminals={}",
+            recording.perms,
+            recording.data_wires.len(),
+            recording.challenge_wires.len(),
+            terminals.len(),
+        );
     }
 
     /// Fixed-pattern factors in the twin: a periodic selector gating a

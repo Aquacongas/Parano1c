@@ -20,7 +20,7 @@ type PreparedStateCommit = noid_chain::consensus::template::PreparedBlockStateCo
 type LocallyProvedStateCommit = noid_chain::consensus::template::LocallyProvedBlockCommit;
 
 enum PreparedWitness {
-    B64(noid_block::PreparedHistoryStepWitness<64>),
+    B25(noid_block::PreparedHistoryStepWitness<25>),
     B255(noid_block::PreparedHistoryStepWitness<255>),
 }
 
@@ -150,8 +150,8 @@ impl PreparedBlockAttempt {
             local_time,
         };
         let witness = match proof_class {
-            noid_chain::consensus::paged_spend::BlockProofClass::B64 => {
-                noid_block::prepare_history_step_witness::<64>(
+            noid_chain::consensus::paged_spend::BlockProofClass::B25 => {
+                noid_block::prepare_history_step_witness::<25>(
                     block,
                     context,
                     authorization_proofs,
@@ -159,7 +159,7 @@ impl PreparedBlockAttempt {
                     runtime,
                     parent_terminal.as_ref(),
                 )
-                .map(PreparedWitness::B64)
+                .map(PreparedWitness::B25)
             }
             noid_chain::consensus::paged_spend::BlockProofClass::B255 => {
                 noid_block::prepare_history_step_witness::<255>(
@@ -198,7 +198,7 @@ impl PreparedBlockAttempt {
             }};
         }
         let (block, terminal_bytes, end_accumulator) = match witness {
-            PreparedWitness::B64(witness) => finish_and_prove!(witness),
+            PreparedWitness::B25(witness) => finish_and_prove!(witness),
             PreparedWitness::B255(witness) => finish_and_prove!(witness),
         };
 

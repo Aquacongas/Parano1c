@@ -10,7 +10,7 @@
 
 use noid_core::mle::evaluate::evaluate_slice;
 use noid_core::mle::fold::fold_variable_inplace;
-use noid_core::{Block128, TowerField};
+use noid_core::{Block128, Block256, TowerField};
 
 use crate::zk_affine_code::{AffineHighPaddingRankCertificate, ZkAffineCodeError, ZkAffineLchCode};
 use crate::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
@@ -18,7 +18,12 @@ use crate::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
 pub const JOINT_SOURCE_BANK_SYMBOLS: usize = ZK_AUTH_CAPSULE_GEOMETRY.source_bank_symbols_per_leaf;
 pub const JOINT_SOURCE_COMPANION_SYMBOLS: usize =
     ZK_AUTH_CAPSULE_GEOMETRY.source_companion_symbols_per_leaf;
-pub const JOINT_SOURCE_LEAF_SYMBOLS: usize = ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_symbols;
+pub const JOINT_SOURCE_COMPANION_LANES: usize = 2 * JOINT_SOURCE_COMPANION_SYMBOLS;
+pub const JOINT_SOURCE_LOGICAL_SYMBOLS: usize = ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_symbols;
+/// Canonical wire lanes per mixed source leaf: for each of eight positions,
+/// one bank lane followed by the companion's low and high lanes.
+pub const JOINT_SOURCE_LEAF_SYMBOLS: usize =
+    JOINT_SOURCE_BANK_SYMBOLS + JOINT_SOURCE_COMPANION_LANES;
 pub const SOURCE_STANDARD_FOLDS: usize = ZK_AUTH_CAPSULE_GEOMETRY.source_standard_fold_log;
 pub const MID_STANDARD_FOLDS: usize = ZK_AUTH_CAPSULE_GEOMETRY.second_wide_fold_log;
 pub const OWNER_STATE_POINT_VARS: usize = ZK_AUTH_CAPSULE_GEOMETRY.state_vars;
@@ -36,9 +41,10 @@ pub const SOURCE_QUERY_BITS: usize = ZK_AUTH_CAPSULE_GEOMETRY.query_width_bits;
 const SOURCE_LOCAL_BITS: usize = SOURCE_STANDARD_FOLDS;
 const MID_LOCAL_BITS: usize = MID_STANDARD_FOLDS;
 
-const _: () = assert!(
-    JOINT_SOURCE_BANK_SYMBOLS + JOINT_SOURCE_COMPANION_SYMBOLS == JOINT_SOURCE_LEAF_SYMBOLS
-);
+const _: () =
+    assert!(JOINT_SOURCE_BANK_SYMBOLS + JOINT_SOURCE_COMPANION_LANES == JOINT_SOURCE_LEAF_SYMBOLS);
+const _: () = assert!(JOINT_SOURCE_LEAF_SYMBOLS == 24);
+const _: () = assert!(JOINT_SOURCE_LOGICAL_SYMBOLS == 16);
 const _: () = assert!(JOINT_SOURCE_BANK_SYMBOLS == 1 << SOURCE_STANDARD_FOLDS);
 const _: () = assert!(ZK_AUTH_CAPSULE_GEOMETRY.mid_leaf_symbols == 1 << MID_STANDARD_FOLDS);
 const _: () = assert!(OWNER_BANK_POINT_VARS - OWNER_STATE_POINT_VARS == 2);
@@ -66,14 +72,14 @@ impl From<ZkAffineCodeError> for ZkCapsuleAlgebraError {
 ///
 /// Bit numbering is LSB-first. For source bits `s[0..13]`:
 ///
-/// - source path directions are `s[0..8]`, source cap is `s[8..13]`;
+/// - source path directions are `s[0..10]`, source cap is `s[10..13]`;
 /// - after three adjacent folds, the source leaf is the mid position;
 /// - mid member bits are `s[0..4]` and mid leaf bits are `s[4..13]`;
-/// - mid path is `s[4..12]`, mid cap is `s[12..13]`.
+/// - mid path is `s[4..10]`, mid cap is `s[10..13]`.
 ///
-/// The path-direction union carries `s[0..12]`. One auxiliary cell carries
-/// `s[12]`, selecting both caps. Power-of-two depth-eight paths expose their
-/// roots from the final node rather than a spare root-copy tail.
+/// The path-direction union carries `s[0..10]`. Three shared auxiliary cells
+/// carry `s[10..13]` and select both eight-node caps. The dense paths expose
+/// both roots from their final feed-forward node expressions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZkCapsuleQueryMapping {
     pub source_leaf_index: usize,
@@ -108,18 +114,18 @@ impl ZkCapsuleQueryMapping {
     }
 }
 
-/// Interleave one bank coset and one companion coset in the mandatory
-/// adjacent layout `[bank0, companion0, ..., bank7, companion7]`.
+/// Pack one bank coset and one wide companion coset as
+/// `[bank0, companion0.lo, companion0.hi, ..., bank7, companion7.hi]`.
 pub fn interleave_joint_source_leaf(
     bank: &[Block128; JOINT_SOURCE_BANK_SYMBOLS],
-    companion: &[Block128; JOINT_SOURCE_COMPANION_SYMBOLS],
+    companion: &[Block256; JOINT_SOURCE_COMPANION_SYMBOLS],
 ) -> [Block128; JOINT_SOURCE_LEAF_SYMBOLS] {
     std::array::from_fn(|slot| {
-        let pair = slot / 2;
-        if slot & 1 == 0 {
-            bank[pair]
-        } else {
-            companion[pair]
+        let position = slot / 3;
+        match slot % 3 {
+            0 => bank[position],
+            1 => companion[position].lo,
+            _ => companion[position].hi,
         }
     })
 }
@@ -154,7 +160,7 @@ pub fn certify_source_query_hiding_rank(
 /// Materialize one adjacent joint leaf from the two equal affine codewords.
 pub fn build_joint_source_leaf(
     bank_codeword: &[Block128],
-    companion_codeword: &[Block128],
+    companion_codeword: &[Block256],
     source_leaf_index: usize,
 ) -> Result<[Block128; JOINT_SOURCE_LEAF_SYMBOLS], ZkCapsuleAlgebraError> {
     let g = ZK_AUTH_CAPSULE_GEOMETRY;
@@ -168,11 +174,35 @@ pub fn build_joint_source_leaf(
     Ok(interleave_joint_source_leaf(&bank, &companion))
 }
 
+/// Materialize the C1 committed source leaf after the invertible local LCH
+/// transform.  Bank and companion use the same transform, so the operation
+/// commutes with the later characteristic-two masking line.
+pub fn build_fold_normal_joint_source_leaf(
+    code: &ZkAffineLchCode,
+    bank_codeword: &[Block128],
+    companion_codeword: &[Block256],
+    source_leaf_index: usize,
+) -> Result<[Block128; JOINT_SOURCE_LEAF_SYMBOLS], ZkCapsuleAlgebraError> {
+    let raw = build_joint_source_leaf(bank_codeword, companion_codeword, source_leaf_index)?;
+    let bank: [Block128; JOINT_SOURCE_BANK_SYMBOLS] = std::array::from_fn(|member| raw[3 * member]);
+    let companion: [Block256; JOINT_SOURCE_COMPANION_SYMBOLS] =
+        std::array::from_fn(|member| Block256::new(raw[3 * member + 1], raw[3 * member + 2]));
+    let bank = code.fold_normalize_coset(&bank, 0, source_leaf_index)?;
+    let companion = code.fold_normalize_coset(&companion, 0, source_leaf_index)?;
+    let bank: [Block128; JOINT_SOURCE_BANK_SYMBOLS] = bank
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("source transform preserves eight symbols"));
+    let companion: [Block256; JOINT_SOURCE_COMPANION_SYMBOLS] = companion
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("source transform preserves eight symbols"));
+    Ok(interleave_joint_source_leaf(&bank, &companion))
+}
+
 /// Materialize one contiguous 16-symbol mid leaf.
-pub fn build_mid_leaf(
-    mid_codeword: &[Block128],
+pub fn build_mid_leaf<F: Copy>(
+    mid_codeword: &[F],
     mid_leaf_index: usize,
-) -> Result<[Block128; 1 << MID_STANDARD_FOLDS], ZkCapsuleAlgebraError> {
+) -> Result<[F; 1 << MID_STANDARD_FOLDS], ZkCapsuleAlgebraError> {
     let g = ZK_AUTH_CAPSULE_GEOMETRY;
     if mid_codeword.len() != 1usize << g.mid_domain_log {
         return Err(ZkCapsuleAlgebraError::MidCodewordLengthMismatch);
@@ -184,75 +214,159 @@ pub fn build_mid_leaf(
     Ok(std::array::from_fn(|member| mid_codeword[start | member]))
 }
 
+/// Materialize the C1 committed mid leaf after its invertible four-round
+/// local LCH transform.
+pub fn build_fold_normal_mid_leaf<F>(
+    code: &ZkAffineLchCode,
+    mid_codeword: &[F],
+    mid_leaf_index: usize,
+) -> Result<[F; 1 << MID_STANDARD_FOLDS], ZkCapsuleAlgebraError>
+where
+    F: TowerField + From<Block128>,
+{
+    let raw = build_mid_leaf(mid_codeword, mid_leaf_index)?;
+    Ok(code
+        .fold_normalize_coset(&raw, SOURCE_STANDARD_FOLDS, mid_leaf_index)?
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("mid transform preserves sixteen symbols")))
+}
+
 /// Apply the characteristic-two masking line to all eight adjacent pairs.
 ///
 /// `(1 - gamma) * bank + gamma * companion` is evaluated as
 /// `bank + gamma * (bank + companion)`.
-pub fn joint_source_line_fold(
+pub fn joint_source_line_fold<F>(
     joint_leaf: &[Block128; JOINT_SOURCE_LEAF_SYMBOLS],
-    gamma: Block128,
-) -> [Block128; JOINT_SOURCE_BANK_SYMBOLS] {
-    std::array::from_fn(|pair| {
-        let bank = joint_leaf[2 * pair];
-        let companion = joint_leaf[2 * pair + 1];
-        bank + gamma * (bank + companion)
+    gamma: F,
+) -> [F; JOINT_SOURCE_BANK_SYMBOLS]
+where
+    F: TowerField + From<Block128> + From<Block256>,
+{
+    std::array::from_fn(|position| {
+        let bank = joint_leaf[3 * position];
+        let companion = Block256::new(joint_leaf[3 * position + 1], joint_leaf[3 * position + 2]);
+        let bank = F::from(bank);
+        bank + gamma * (bank + F::from(companion))
     })
 }
 
 /// Fold one contiguous source coset through the selected affine LCH schedule.
 /// Challenges consume logical variables 0, 1, and 2 in that order.
-pub fn source_standard_fold3(
+pub fn source_standard_fold3<F>(
     code: &ZkAffineLchCode,
-    symbols: &[Block128; JOINT_SOURCE_BANK_SYMBOLS],
+    symbols: &[F; JOINT_SOURCE_BANK_SYMBOLS],
     source_leaf_index: usize,
-    challenges: &[Block128; SOURCE_STANDARD_FOLDS],
-) -> Result<Block128, ZkCapsuleAlgebraError> {
+    challenges: &[F; SOURCE_STANDARD_FOLDS],
+) -> Result<F, ZkCapsuleAlgebraError>
+where
+    F: TowerField + From<Block128>,
+{
     if source_leaf_index >= ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_count {
         return Err(ZkCapsuleAlgebraError::SourceLeafOutOfRange);
     }
-    Ok(code.fold_contiguous_coset(symbols, 0, source_leaf_index, challenges)?)
+    Ok(code.fold_contiguous_coset_extension(symbols, 0, source_leaf_index, challenges)?)
 }
 
 /// Apply the masking-line fold and then the three LOW-to-HIGH source folds.
-pub fn fold_joint_source_leaf(
+pub fn fold_joint_source_leaf<F>(
     code: &ZkAffineLchCode,
     joint_leaf: &[Block128; JOINT_SOURCE_LEAF_SYMBOLS],
-    gamma: Block128,
+    gamma: F,
     source_leaf_index: usize,
-    challenges: &[Block128; SOURCE_STANDARD_FOLDS],
-) -> Result<Block128, ZkCapsuleAlgebraError> {
+    challenges: &[F; SOURCE_STANDARD_FOLDS],
+) -> Result<F, ZkCapsuleAlgebraError>
+where
+    F: TowerField + From<Block128> + From<Block256>,
+{
     let virtual_masked = joint_source_line_fold(joint_leaf, gamma);
     source_standard_fold3(code, &virtual_masked, source_leaf_index, challenges)
 }
 
+/// Fold a C1 fold-normal source leaf.  All index-dependent inverse LCH
+/// butterflies were applied before commitment, leaving only the actual wide
+/// challenge products here.
+pub fn fold_normal_joint_source_leaf<F>(
+    joint_leaf: &[Block128; JOINT_SOURCE_LEAF_SYMBOLS],
+    gamma: F,
+    challenges: &[F; SOURCE_STANDARD_FOLDS],
+) -> F
+where
+    F: TowerField + From<Block128> + From<Block256>,
+{
+    let virtual_masked = joint_source_line_fold(joint_leaf, gamma);
+    evaluate_slice(&virtual_masked, challenges)
+}
+
 /// Fold one contiguous mid coset through logical variables 3..6.
-pub fn mid_standard_fold4(
+pub fn mid_standard_fold4<F>(
     code: &ZkAffineLchCode,
-    symbols: &[Block128; 1 << MID_STANDARD_FOLDS],
+    symbols: &[F; 1 << MID_STANDARD_FOLDS],
     mid_leaf_index: usize,
-    challenges: &[Block128; MID_STANDARD_FOLDS],
-) -> Result<Block128, ZkCapsuleAlgebraError> {
+    challenges: &[F; MID_STANDARD_FOLDS],
+) -> Result<F, ZkCapsuleAlgebraError>
+where
+    F: TowerField + From<Block128>,
+{
     if mid_leaf_index >= ZK_AUTH_CAPSULE_GEOMETRY.mid_leaf_count {
         return Err(ZkCapsuleAlgebraError::MidLeafOutOfRange);
     }
-    Ok(code.fold_contiguous_coset(symbols, SOURCE_STANDARD_FOLDS, mid_leaf_index, challenges)?)
+    Ok(code.fold_contiguous_coset_extension(
+        symbols,
+        SOURCE_STANDARD_FOLDS,
+        mid_leaf_index,
+        challenges,
+    )?)
+}
+
+/// Fold a C1 fold-normal mid leaf at the four actual wide challenges.
+pub fn fold_normal_mid_leaf<F>(
+    symbols: &[F; 1 << MID_STANDARD_FOLDS],
+    challenges: &[F; MID_STANDARD_FOLDS],
+) -> F
+where
+    F: TowerField,
+{
+    evaluate_slice(symbols, challenges)
+}
+
+/// Recover one raw mid-codeword member from its committed fold-normal leaf.
+/// Native verification uses the explicit inverse for clarity; the recursive
+/// trace evaluates the same selected inverse network without materializing a
+/// second committed leaf.
+pub fn fold_normal_mid_raw_member<F>(
+    code: &ZkAffineLchCode,
+    symbols: &[F; 1 << MID_STANDARD_FOLDS],
+    mid_leaf_index: usize,
+    member_index: usize,
+) -> Result<F, ZkCapsuleAlgebraError>
+where
+    F: TowerField + From<Block128>,
+{
+    if member_index >= 1 << MID_STANDARD_FOLDS {
+        return Err(ZkCapsuleAlgebraError::MidLeafOutOfRange);
+    }
+    let raw = code.fold_denormalize_coset(symbols, SOURCE_STANDARD_FOLDS, mid_leaf_index)?;
+    Ok(raw[member_index])
 }
 
 /// Re-encode the revealed 16-cell tail with the surviving prefix of the
 /// master affine transform after seven LOW-to-HIGH folds.
-pub fn encode_tail16(
+pub fn encode_tail16<F>(
     code: &ZkAffineLchCode,
-    tail: &[Block128; TAIL_SYMBOLS],
-) -> Result<Vec<Block128>, ZkCapsuleAlgebraError> {
-    Ok(code.encode_after_low_folds(tail, SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS)?)
+    tail: &[F; TAIL_SYMBOLS],
+) -> Result<Vec<F>, ZkCapsuleAlgebraError>
+where
+    F: TowerField + From<Block128>,
+{
+    Ok(code.encode_extension_after_low_folds(tail, SOURCE_STANDARD_FOLDS + MID_STANDARD_FOLDS)?)
 }
 
 /// Fold logical variable 7 locally. Adjacent cells, not the two table halves,
 /// are paired because the entire Phase-B order is LOW-to-HIGH.
-pub fn tail16_local_fold(
-    tail: &[Block128; TAIL_SYMBOLS],
-    challenge: Block128,
-) -> [Block128; FINAL_H_SYMBOLS] {
+pub fn tail16_local_fold<F: TowerField>(
+    tail: &[F; TAIL_SYMBOLS],
+    challenge: F,
+) -> [F; FINAL_H_SYMBOLS] {
     std::array::from_fn(|index| {
         let at_zero = tail[2 * index];
         let at_one = tail[2 * index + 1];
@@ -262,12 +376,12 @@ pub fn tail16_local_fold(
 
 /// Contract the three highest claim coordinates for each Boolean assignment
 /// of the eight LOW Phase-B variables. The result is the public `upper[256]`.
-pub fn contract_high3_for_each_low8(
-    bank: &[Block128; OWNER_BANK_RELATION_LEN],
-    high_point: &[Block128; PHASE_B_HIGH_VARS],
-) -> [Block128; UPPER_SYMBOLS] {
+pub fn contract_high3_for_each_low8<F: TowerField>(
+    bank: &[F; OWNER_BANK_RELATION_LEN],
+    high_point: &[F; PHASE_B_HIGH_VARS],
+) -> [F; UPPER_SYMBOLS] {
     std::array::from_fn(|low_index| {
-        let high_line: [Block128; 1 << PHASE_B_HIGH_VARS] =
+        let high_line: [F; 1 << PHASE_B_HIGH_VARS] =
             std::array::from_fn(|high_index| bank[low_index | (high_index << PHASE_B_LOW_VARS)]);
         evaluate_slice(&high_line, high_point)
     })
@@ -275,19 +389,19 @@ pub fn contract_high3_for_each_low8(
 
 /// Evaluate `upper` at either the original low claim point or the random
 /// Phase-B fold point.
-pub fn evaluate_upper_at_low8(
-    upper: &[Block128; UPPER_SYMBOLS],
-    low_point: &[Block128; PHASE_B_LOW_VARS],
-) -> Block128 {
+pub fn evaluate_upper_at_low8<F: TowerField>(
+    upper: &[F; UPPER_SYMBOLS],
+    low_point: &[F; PHASE_B_LOW_VARS],
+) -> F {
     evaluate_slice(upper, low_point)
 }
 
 /// Fold all eight LOW variables of a bank table in protocol order. The result
 /// is the 8-cell high-variable table linked to `upper(beta)`.
-pub fn fold_bank_low8(
-    bank: &[Block128; OWNER_BANK_RELATION_LEN],
-    beta_low: &[Block128; PHASE_B_LOW_VARS],
-) -> [Block128; FINAL_H_SYMBOLS] {
+pub fn fold_bank_low8<F: TowerField>(
+    bank: &[F; OWNER_BANK_RELATION_LEN],
+    beta_low: &[F; PHASE_B_LOW_VARS],
+) -> [F; FINAL_H_SYMBOLS] {
     let mut folded = bank.to_vec();
     for &challenge in beta_low {
         fold_variable_inplace(&mut folded, challenge, 0);
@@ -305,35 +419,35 @@ pub fn fold_bank_low8(
 /// never be serialized as an authorization opening claim. Protocol terminal
 /// points remain arbitrary 11-variable challenges and use
 /// [`evaluate_fundamental_slice_embedding`] instead.
-pub fn fundamental_slice_alignment_point(
-    state_point: &[Block128; OWNER_STATE_POINT_VARS],
-) -> [Block128; OWNER_BANK_POINT_VARS] {
-    let mut lifted = [Block128::ZERO; OWNER_BANK_POINT_VARS];
+pub fn fundamental_slice_alignment_point<F: TowerField>(
+    state_point: &[F; OWNER_STATE_POINT_VARS],
+) -> [F; OWNER_BANK_POINT_VARS] {
+    let mut lifted = [F::ZERO; OWNER_BANK_POINT_VARS];
     lifted[..OWNER_STATE_POINT_VARS].copy_from_slice(state_point);
     lifted
 }
 
 /// Equality-selector weight of the two high Boolean coordinates `[0, 0]`.
-pub fn eq_high_zero(high: &[Block128; 2]) -> Block128 {
-    (Block128::ONE - high[0]) * (Block128::ONE - high[1])
+pub fn eq_high_zero<F: TowerField>(high: &[F; 2]) -> F {
+    (F::ONE - high[0]) * (F::ONE - high[1])
 }
 
 /// Embed one 9-variable relation table into the high-`00` state slice of an
 /// 11-variable table, with every other high slice identically zero.
-pub fn fundamental_slice_relation_embedding(
-    relation: &[Block128; OWNER_STATE_RELATION_LEN],
-) -> [Block128; OWNER_BANK_RELATION_LEN] {
-    let mut embedded = [Block128::ZERO; OWNER_BANK_RELATION_LEN];
+pub fn fundamental_slice_relation_embedding<F: TowerField>(
+    relation: &[F; OWNER_STATE_RELATION_LEN],
+) -> [F; OWNER_BANK_RELATION_LEN] {
+    let mut embedded = [F::ZERO; OWNER_BANK_RELATION_LEN];
     embedded[..OWNER_STATE_RELATION_LEN].copy_from_slice(relation);
     embedded
 }
 
 /// Evaluate the state-slice embedding at an arbitrary 11-variable terminal
 /// point without replacing its two high challenges by zero.
-pub fn evaluate_fundamental_slice_embedding(
-    relation: &[Block128; OWNER_STATE_RELATION_LEN],
-    terminal_point: &[Block128; OWNER_BANK_POINT_VARS],
-) -> Block128 {
+pub fn evaluate_fundamental_slice_embedding<F: TowerField>(
+    relation: &[F; OWNER_STATE_RELATION_LEN],
+    terminal_point: &[F; OWNER_BANK_POINT_VARS],
+) -> F {
     let high_point = [
         terminal_point[OWNER_STATE_POINT_VARS],
         terminal_point[OWNER_STATE_POINT_VARS + 1],
@@ -409,11 +523,13 @@ mod tests {
     #[test]
     fn joint_leaf_layout_and_contiguous_positions_are_exact() {
         let bank = std::array::from_fn(|i| elem(i, 0xB4A9));
-        let companion = std::array::from_fn(|i| elem(i, 0xC09A));
+        let companion =
+            std::array::from_fn(|i| Block256::new(elem(i, 0xC09A), elem(i + 100, 0xC09B)));
         let joint = interleave_joint_source_leaf(&bank, &companion);
-        for pair in 0..JOINT_SOURCE_BANK_SYMBOLS {
-            assert_eq!(joint[2 * pair], bank[pair]);
-            assert_eq!(joint[2 * pair + 1], companion[pair]);
+        for position in 0..JOINT_SOURCE_BANK_SYMBOLS {
+            assert_eq!(joint[3 * position], bank[position]);
+            assert_eq!(joint[3 * position + 1], companion[position].lo);
+            assert_eq!(joint[3 * position + 2], companion[position].hi);
         }
 
         for leaf in [
@@ -430,10 +546,10 @@ mod tests {
         let code = ZkAffineLchCode::selected().unwrap();
         let leaves: Vec<usize> = (0..ZK_AUTH_CAPSULE_GEOMETRY.query_count()).collect();
         let certificate = certify_source_query_hiding_rank(&code, &leaves).unwrap();
-        assert_eq!(certificate.distinct_query_count, 512);
-        assert_eq!(certificate.certified_rank, 512);
+        assert_eq!(certificate.distinct_query_count, 520);
+        assert_eq!(certificate.certified_rank, 520);
 
-        let repeated = [17usize; 64];
+        let repeated = [17usize; 65];
         let certificate = certify_source_query_hiding_rank(&code, &repeated).unwrap();
         assert_eq!(certificate.distinct_query_count, 8);
         assert_eq!(certificate.certified_rank, 8);
@@ -443,22 +559,32 @@ mod tests {
     fn gamma_then_source_and_mid_folds_match_full_affine_codewords() {
         let code = ZkAffineLchCode::selected().unwrap();
         let bank = message(0xB4A9);
-        let companion = message(0xC09A);
-        let gamma = elem(3, 0x6A77A);
-        let source_challenges = std::array::from_fn(|i| elem(i, 0x503CE));
-        let mid_challenges = std::array::from_fn(|i| elem(i, 0xA11D));
+        let companion: [Block256; OWNER_BANK_RELATION_LEN] =
+            std::array::from_fn(|index| Block256::new(elem(index, 0xC09A), elem(index, 0xC09B)));
+        let gamma = Block256::new(elem(3, 0x6A77A), elem(4, 0x6A77B));
+        let source_challenges =
+            std::array::from_fn(|i| Block256::new(elem(i, 0x503CE), elem(i, 0x503CF)));
+        let mid_challenges =
+            std::array::from_fn(|i| Block256::new(elem(i, 0xA11D), elem(i, 0xA11E)));
 
         let bank_code = code.encode(&bank).unwrap();
-        let companion_code = code.encode(&companion).unwrap();
-        let virtual_message: Vec<Block128> = bank
+        let companion_code = code
+            .encode_extension_after_low_folds(&companion, 0)
+            .unwrap();
+        let virtual_message: Vec<Block256> = bank
             .iter()
             .zip(companion.iter())
-            .map(|(&b, &c)| b + gamma * (b + c))
+            .map(|(&b, &c)| {
+                let b = Block256::from(b);
+                b + gamma * (b + c)
+            })
             .collect();
-        let mut mid_code = code.encode(&virtual_message).unwrap();
+        let mut mid_code = code
+            .encode_extension_after_low_folds(&virtual_message, 0)
+            .unwrap();
         for (round, &challenge) in source_challenges.iter().enumerate() {
             mid_code = code
-                .fold_codeword_once(&mid_code, round, challenge)
+                .fold_codeword_once_extension(&mid_code, round, challenge)
                 .unwrap();
         }
 
@@ -475,12 +601,23 @@ mod tests {
                     .unwrap(),
                 mid_code[source_leaf]
             );
+            let normal = build_fold_normal_joint_source_leaf(
+                &code,
+                &bank_code,
+                &companion_code,
+                source_leaf,
+            )
+            .unwrap();
+            assert_eq!(
+                fold_normal_joint_source_leaf(&normal, gamma, &source_challenges),
+                mid_code[source_leaf]
+            );
         }
 
         let mut tail_code = mid_code.clone();
         for (inner, &challenge) in mid_challenges.iter().enumerate() {
             tail_code = code
-                .fold_codeword_once(&tail_code, SOURCE_STANDARD_FOLDS + inner, challenge)
+                .fold_codeword_once_extension(&tail_code, SOURCE_STANDARD_FOLDS + inner, challenge)
                 .unwrap();
         }
         for mid_leaf in [0, 1, 31, 255, ZK_AUTH_CAPSULE_GEOMETRY.mid_leaf_count - 1] {
@@ -489,6 +626,17 @@ mod tests {
                 mid_standard_fold4(&code, &leaf, mid_leaf, &mid_challenges).unwrap(),
                 tail_code[mid_leaf]
             );
+            let normal = build_fold_normal_mid_leaf(&code, &mid_code, mid_leaf).unwrap();
+            assert_eq!(
+                fold_normal_mid_leaf(&normal, &mid_challenges),
+                tail_code[mid_leaf]
+            );
+            for member in 0..1 << MID_STANDARD_FOLDS {
+                assert_eq!(
+                    fold_normal_mid_raw_member(&code, &normal, mid_leaf, member).unwrap(),
+                    leaf[member]
+                );
+            }
         }
     }
 
@@ -574,19 +722,22 @@ mod tests {
                 (mapping.mid_leaf_index << MID_LOCAL_BITS) | mapping.mid_member_index
             );
 
-            // Source path q0..q7; mid path q4..q11; auxiliary q12.
-            for bit in 0..8 {
+            // Dense C1 paths carry source q0..q9 and mid q4..q9.  The shared
+            // q10..q12 suffix selects both eight-node caps.
+            for bit in 0..10 {
                 assert_eq!(
                     (mapping.source_path_index >> bit) & 1,
                     (source_leaf >> bit) & 1
                 );
+            }
+            for bit in 0..6 {
                 assert_eq!(
                     (mapping.mid_path_index >> bit) & 1,
                     (source_leaf >> (bit + 4)) & 1
                 );
             }
-            assert_eq!(mapping.source_cap_index, source_leaf >> 8);
-            assert_eq!(mapping.mid_cap_index, source_leaf >> 12);
+            assert_eq!(mapping.source_cap_index, source_leaf >> 10);
+            assert_eq!(mapping.mid_cap_index, source_leaf >> 10);
         }
 
         assert_eq!(

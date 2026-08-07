@@ -27,9 +27,9 @@
 //! never share a transcript.
 
 use crate::challenger::Challenger;
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::lincheck::build_eq_table;
-use crate::pcs::QuirkyDirectClaim;
+use crate::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 
 /// Domain separator for the verification-key/class identity of a post-commit
 /// auxiliary protocol.  Context-based APIs absorb this after public IO and
@@ -198,6 +198,63 @@ pub fn bind_public_io<Ch: Challenger>(
             k_skip: 0,
             x_rest,
             value: io[c.value],
+        });
+    }
+    claims
+}
+
+/// C1 twin of [`bind_public_io`]. Public lanes remain elements of the
+/// committed F128 witness, while the binding point, equality polynomial and
+/// resulting PCS claims live in the C1 extension field.
+pub fn bind_public_io_c1<Ch: Challenger>(
+    challenger: &mut Ch,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    total_vars: usize,
+) -> Vec<C1QuirkyDirectClaim> {
+    spec.validate(total_vars);
+    assert_eq!(io.len(), spec.io_len, "envelope length must match the spec");
+
+    challenger.observe_label(b"history-public-io-c1");
+    challenger.observe_f128_slice(&spec.transcript_lanes());
+    challenger.observe_f128_slice(io);
+    let y = challenger.sample_f256_vec(spec.io_slice.log2_len);
+
+    let eq = crate::zerocheck::field_c1::build_eq_table(&y);
+    let io_value = io
+        .iter()
+        .zip(eq.iter())
+        .fold(F256::ZERO, |sum, (&value, &weight)| {
+            sum + weight.scale_base(value)
+        });
+    let prefix = |slice: &WitnessSlice| {
+        slice
+            .prefix_coords(total_vars)
+            .into_iter()
+            .map(F256::from_base)
+            .collect::<Vec<_>>()
+    };
+    let mut x_rest = y;
+    x_rest.extend(prefix(&spec.io_slice));
+    let mut claims = vec![C1QuirkyDirectClaim {
+        z_skip: F256::ZERO,
+        k_skip: 0,
+        x_rest,
+        value: io_value,
+    }];
+
+    for claim in &spec.claims {
+        let mut x_rest = io[claim.point.clone()]
+            .iter()
+            .copied()
+            .map(F256::from_base)
+            .collect::<Vec<_>>();
+        x_rest.extend(prefix(&claim.slice));
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
+            k_skip: 0,
+            x_rest,
+            value: F256::from_base(io[claim.value]),
         });
     }
     claims

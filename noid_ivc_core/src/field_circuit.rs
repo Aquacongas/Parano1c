@@ -38,12 +38,13 @@
 //!   wires + 1 pin.
 
 use crate::challenger::{
-    Challenger, FS_KIND_SCALAR, FS_KIND_SLICE, FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL,
-    FS_OP_OBSERVE, FS_OP_POW, FS_OP_SQUEEZE, FsLaneChallenger, fs_lane_iv_flat, fs_op_lane,
-    fs_pack_bytes_lanes, fs_pad_lane_flat,
+    Challenger, FS_KIND_SCALAR, FS_KIND_SLICE, FS_KIND_WIDE_SCALAR, FS_KIND_WIDE_SLICE,
+    FS_OP_BYTES, FS_OP_DOMAIN, FS_OP_LABEL, FS_OP_OBSERVE, FS_OP_POW, FS_OP_SQUEEZE,
+    FsLaneChallenger, fs_c1_lane_iv_flat, fs_lane_iv_flat, fs_op_lane, fs_pack_bytes_lanes,
+    fs_pad_lane_flat,
 };
 use crate::deep_chain::schedule::{DuplexLayout, LaneSource, flat_of_tower_u128};
-use crate::field::F128;
+use crate::field::{F128, F256};
 use crate::field_r1cs::{FieldR1cs, SparseFieldMatrix};
 use noid_core::hardware::tower_to_flat_u128;
 use noid_poseidon2b::native::permutation::{
@@ -95,6 +96,30 @@ pub enum DeferredWitnessSlotError {
     WrongBuilder,
     AlreadySealed,
 }
+
+/// Linear authority to replace one reserved free-input row after the staged
+/// relation has allocated all wires referenced by its final constraint.
+///
+/// The wire value and index never change. Only its original tautology row is
+/// replaced, exactly once, by `wire = left * right`. This lets a committed
+/// column be allocated before a self-recursive replay while still using that
+/// already-budgeted row for the replay's final source binding.
+#[must_use = "a deferred constraint row must be sealed before the builder can finish"]
+pub struct DeferredConstraintSlot {
+    builder_brand: u64,
+    wire: Wire,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeferredConstraintSlotError {
+    WrongBuilder,
+    AlreadySealed,
+    PendingWitness,
+    Unsatisfied,
+}
+
+const PENDING_WITNESS_VALUE: u8 = 1;
+const PENDING_CONSTRAINT_ROW: u8 = 2;
 
 static NEXT_BUILDER_BRAND: AtomicU64 = AtomicU64::new(1);
 
@@ -200,6 +225,89 @@ impl LinExpr {
     }
 }
 
+/// Symbolic element of the C1 challenge field GF(2^256), represented by two
+/// flat-basis GF(2^128) expressions.  The committed recursive witness remains
+/// over F128; every extension operation is lowered to base-field constraints.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtExpr {
+    pub lo: LinExpr,
+    pub hi: LinExpr,
+}
+
+impl ExtExpr {
+    pub fn new(lo: LinExpr, hi: LinExpr) -> Self {
+        Self { lo, hi }
+    }
+
+    pub fn zero() -> Self {
+        Self::constant(F256::ZERO)
+    }
+
+    pub fn one() -> Self {
+        Self::constant(F256::ONE)
+    }
+
+    pub fn constant(value: F256) -> Self {
+        Self {
+            lo: LinExpr::constant(value.lo),
+            hi: LinExpr::constant(value.hi),
+        }
+    }
+
+    pub fn from_base(value: LinExpr) -> Self {
+        Self {
+            lo: value,
+            hi: LinExpr::zero(),
+        }
+    }
+
+    pub fn add(&self, other: &Self) -> Self {
+        Self {
+            lo: self.lo.add(&other.lo),
+            hi: self.hi.add(&other.hi),
+        }
+    }
+
+    pub fn add_const(&self, value: F256) -> Self {
+        Self {
+            lo: self.lo.add_const(value.lo),
+            hi: self.hi.add_const(value.hi),
+        }
+    }
+
+    pub fn scale_base(&self, scalar: F128) -> Self {
+        Self {
+            lo: self.lo.scale(scalar),
+            hi: self.hi.scale(scalar),
+        }
+    }
+
+    /// Multiply by a build-time GF(2^256) constant using only F128-linear
+    /// recombination. No multiplication constraint is required.
+    pub fn scale_ext(&self, scalar: F256) -> Self {
+        let v0 = self.lo.scale(scalar.lo);
+        let v1 = self.hi.scale(scalar.hi);
+        let v_sum = self.lo.add(&self.hi).scale(scalar.lo + scalar.hi);
+        Self {
+            lo: v0.add(&v1.scale(F256::EXTENSION_TAU)),
+            hi: v0.add(&v_sum),
+        }
+    }
+
+    pub fn eval(&self, values: &[F128]) -> F256 {
+        F256::new(self.lo.eval(values), self.hi.eval(values))
+    }
+
+    pub fn is_const(&self) -> bool {
+        self.lo.is_const() && self.hi.is_const()
+    }
+
+    pub fn constant_value(&self) -> Option<F256> {
+        self.is_const()
+            .then_some(F256::new(self.lo.constant, self.hi.constant))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Builder
 // ---------------------------------------------------------------------------
@@ -211,15 +319,13 @@ impl LinExpr {
 pub struct FieldR1csBuilder {
     values: Vec<F128>,
     /// A/B constraint matrices in dictionary-encoded CSR-under-construction
-    /// form. Rows are filled strictly in wire order — every allocation appends
-    /// exactly one row, set once — so column and value-table indices plus one
-    /// offset per wire are appended as they are built, never a `Vec<Vec>` of
-    /// per-row heap allocations. Coefficients are interned into `value_table`
-    /// on the fly (the matrix is a protocol constant with a few hundred
-    /// distinct values), so the builder holds a `u32` index — not a 16 B
-    /// `F128` — per nonzero. At the m=24 block-bearing class the old `Vec<Vec>`
-    /// was a ~7.6 GB transient during construction; this is ~1.7 GB, and it
-    /// moves straight into `SparseFieldMatrix` at `build` with no flatten.
+    /// form. Ordinary allocations append exactly one row in wire order, never
+    /// a `Vec<Vec>` of per-row heap allocations. Coefficients are interned into
+    /// `value_table` on the fly (the matrix is a protocol constant with a few
+    /// hundred distinct values), so the builder holds a `u32` index, not a
+    /// 16-byte `F128`, per nonzero. A small explicitly deferred subset is
+    /// replaced in one ordered CSR pass at `build`; every other row moves
+    /// directly into `SparseFieldMatrix`.
     a_cols: Vec<u32>,
     a_value_indices: Vec<u32>,
     a_offsets: Vec<usize>,
@@ -245,6 +351,20 @@ pub struct FieldR1csBuilder {
     builder_brand: u64,
     deferred_witness_slots: Vec<u8>,
     pending_deferred_witness_slots: usize,
+    pending_deferred_constraint_slots: usize,
+    deferred_constraint_patches: Vec<DeferredConstraintPatch>,
+    deferred_patch_a_cols: Vec<u32>,
+    deferred_patch_a_value_indices: Vec<u32>,
+    deferred_patch_b_cols: Vec<u32>,
+    deferred_patch_b_value_indices: Vec<u32>,
+}
+
+struct DeferredConstraintPatch {
+    wire: u32,
+    a_start: usize,
+    a_end: usize,
+    b_start: usize,
+    b_end: usize,
 }
 
 impl Default for FieldR1csBuilder {
@@ -270,6 +390,12 @@ impl FieldR1csBuilder {
             builder_brand: next_builder_brand(),
             deferred_witness_slots: Vec::new(),
             pending_deferred_witness_slots: 0,
+            pending_deferred_constraint_slots: 0,
+            deferred_constraint_patches: Vec::new(),
+            deferred_patch_a_cols: Vec::new(),
+            deferred_patch_a_value_indices: Vec::new(),
+            deferred_patch_b_cols: Vec::new(),
+            deferred_patch_b_value_indices: Vec::new(),
         };
         // Wire 0: the constant-one wire, z_0 = z_0 · z_0.
         let w = b.commit_wire(F128::ONE, &[(0, F128::ONE)], &[(0, F128::ONE)]);
@@ -395,7 +521,7 @@ impl FieldR1csBuilder {
             *pending, 0,
             "fresh deferred witness wire was already pending"
         );
-        *pending = 1;
+        *pending = PENDING_WITNESS_VALUE;
         self.pending_deferred_witness_slots += 1;
         (
             wire,
@@ -420,12 +546,89 @@ impl FieldR1csBuilder {
         let Some(pending) = self.deferred_witness_slots.get_mut(slot.wire.0 as usize) else {
             return Err(DeferredWitnessSlotError::AlreadySealed);
         };
-        if *pending == 0 {
+        if *pending & PENDING_WITNESS_VALUE == 0 {
             return Err(DeferredWitnessSlotError::AlreadySealed);
         }
-        *pending = 0;
+        *pending &= !PENDING_WITNESS_VALUE;
         self.pending_deferred_witness_slots -= 1;
         self.values[slot.wire.0 as usize] = value;
+        Ok(())
+    }
+
+    /// Reserve one ordinary free-input row whose final constraint references
+    /// wires allocated later in the staged relation. The returned capability
+    /// is linear, builder-branded, and must be consumed exactly once.
+    pub fn alloc_deferred_constraint_f128(
+        &mut self,
+        value: F128,
+    ) -> (Wire, DeferredConstraintSlot) {
+        let wire = self.alloc_f128(value);
+        let pending = &mut self.deferred_witness_slots[wire.0 as usize];
+        assert_eq!(*pending, 0, "fresh deferred constraint row was pending");
+        *pending = PENDING_CONSTRAINT_ROW;
+        self.pending_deferred_constraint_slots += 1;
+        (
+            wire,
+            DeferredConstraintSlot {
+                builder_brand: self.builder_brand,
+                wire,
+            },
+        )
+    }
+
+    /// Replace a reserved tautology by `slot.wire = left * right` without
+    /// allocating another row. Future-wire references are accepted because
+    /// matrix columns are validated only after the complete witness exists.
+    pub fn seal_deferred_constraint(
+        &mut self,
+        slot: DeferredConstraintSlot,
+        left: &LinExpr,
+        right: &LinExpr,
+    ) -> Result<(), DeferredConstraintSlotError> {
+        if slot.builder_brand != self.builder_brand {
+            return Err(DeferredConstraintSlotError::WrongBuilder);
+        }
+        let Some(&pending) = self.deferred_witness_slots.get(slot.wire.0 as usize) else {
+            return Err(DeferredConstraintSlotError::AlreadySealed);
+        };
+        if pending & PENDING_CONSTRAINT_ROW == 0 {
+            return Err(DeferredConstraintSlotError::AlreadySealed);
+        }
+        if self.expression_contains_pending_deferred(left)
+            || self.expression_contains_pending_deferred(right)
+        {
+            return Err(DeferredConstraintSlotError::PendingWitness);
+        }
+        if left.eval(&self.values) * right.eval(&self.values) != self.values[slot.wire.0 as usize] {
+            return Err(DeferredConstraintSlotError::Unsatisfied);
+        }
+
+        if self.record_rows {
+            let a_start = self.deferred_patch_a_cols.len();
+            for (column, value) in Self::expr_to_row(left) {
+                let value_index = self.intern_value(value);
+                self.deferred_patch_a_cols.push(column);
+                self.deferred_patch_a_value_indices.push(value_index);
+            }
+            let a_end = self.deferred_patch_a_cols.len();
+            let b_start = self.deferred_patch_b_cols.len();
+            for (column, value) in Self::expr_to_row(right) {
+                let value_index = self.intern_value(value);
+                self.deferred_patch_b_cols.push(column);
+                self.deferred_patch_b_value_indices.push(value_index);
+            }
+            let b_end = self.deferred_patch_b_cols.len();
+            self.deferred_constraint_patches
+                .push(DeferredConstraintPatch {
+                    wire: slot.wire.0,
+                    a_start,
+                    a_end,
+                    b_start,
+                    b_end,
+                });
+        }
+        self.deferred_witness_slots[slot.wire.0 as usize] &= !PENDING_CONSTRAINT_ROW;
+        self.pending_deferred_constraint_slots -= 1;
         Ok(())
     }
 
@@ -469,18 +672,58 @@ impl FieldR1csBuilder {
         self.commit_wire(value, &a_row, &b_row)
     }
 
+    /// Three base-field multiplication constraints for one GF(2^256)
+    /// Karatsuba product. Linear recombination by the extension constant is
+    /// symbolic and adds no rows.
+    pub fn mul_f256(&mut self, x: &ExtExpr, y: &ExtExpr) -> ExtExpr {
+        let v0 = LinExpr::from_wire(self.mul(&x.lo, &y.lo));
+        let v1 = LinExpr::from_wire(self.mul(&x.hi, &y.hi));
+        let x_sum = x.lo.add(&x.hi);
+        let y_sum = y.lo.add(&y.hi);
+        let v_sum = LinExpr::from_wire(self.mul(&x_sum, &y_sum));
+        ExtExpr {
+            lo: v0.add(&v1.scale(F256::EXTENSION_TAU)),
+            hi: v0.add(&v_sum),
+        }
+    }
+
+    /// Two base-field multiplication constraints for one GF(2^256) square.
+    /// In the quadratic tower, `(a + bu)^2 = a^2 + tau*b^2 + b^2*u`, so the
+    /// cross product used by a general Karatsuba multiplication is absent.
+    pub fn square_f256(&mut self, value: &ExtExpr) -> ExtExpr {
+        let lo_square = LinExpr::from_wire(self.mul(&value.lo, &value.lo));
+        let hi_square = LinExpr::from_wire(self.mul(&value.hi, &value.hi));
+        ExtExpr {
+            lo: lo_square.add(&hi_square.scale(F256::EXTENSION_TAU)),
+            hi: hi_square,
+        }
+    }
+
+    /// One base-field multiplication for the C1 trace-one challenge map
+    /// `(lo, y) -> (lo, y^2+y+tau)`.
+    pub fn c1_challenge_from_raw(&mut self, lo: LinExpr, raw_hi: LinExpr) -> ExtExpr {
+        let square = LinExpr::from_wire(self.mul(&raw_hi, &raw_hi));
+        ExtExpr {
+            lo,
+            hi: square.add(&raw_hi).add_const(F256::EXTENSION_TAU),
+        }
+    }
+
     #[inline]
     fn expression_contains_pending_deferred(&self, expression: &LinExpr) -> bool {
         self.pending_deferred_witness_slots != 0
-            && expression
-                .terms
-                .iter()
-                .any(|(wire, _)| self.deferred_witness_slots[*wire as usize] != 0)
+            && expression.terms.iter().any(|(wire, _)| {
+                self.deferred_witness_slots[*wire as usize] & PENDING_WITNESS_VALUE != 0
+            })
     }
 
     /// Materialize an expression into a single wire (`w = expr · 1`).
     pub fn materialize(&mut self, expr: &LinExpr) -> Wire {
         self.mul(expr, &self.one())
+    }
+
+    pub fn materialize_f256(&mut self, expr: &ExtExpr) -> (Wire, Wire) {
+        (self.materialize(&expr.lo), self.materialize(&expr.hi))
     }
 
     /// Assert `expr == expected` (one wire, self-cancelling row:
@@ -496,6 +739,104 @@ impl FieldR1csBuilder {
         self.commit_wire(F128::ZERO, &a_row, &[(0, F128::ONE)]);
     }
 
+    pub fn pin_f256(&mut self, expr: &ExtExpr, expected: F256) {
+        self.pin_f128(&expr.lo, expected.lo);
+        self.pin_f128(&expr.hi, expected.hi);
+    }
+
+    fn apply_deferred_constraint_patches(&mut self) {
+        assert_eq!(
+            self.pending_deferred_constraint_slots, 0,
+            "cannot build with unsealed deferred constraint rows"
+        );
+        if !self.record_rows {
+            assert!(self.deferred_constraint_patches.is_empty());
+            return;
+        }
+        if self.deferred_constraint_patches.is_empty() {
+            return;
+        }
+
+        self.deferred_constraint_patches
+            .sort_unstable_by_key(|patch| patch.wire);
+        assert!(
+            self.deferred_constraint_patches
+                .windows(2)
+                .all(|pair| pair[0].wire != pair[1].wire),
+            "deferred constraint row patched twice"
+        );
+
+        let old_a_cols = std::mem::take(&mut self.a_cols);
+        let old_a_values = std::mem::take(&mut self.a_value_indices);
+        let old_a_offsets = std::mem::take(&mut self.a_offsets);
+        let old_b_cols = std::mem::take(&mut self.b_cols);
+        let old_b_values = std::mem::take(&mut self.b_value_indices);
+        let old_b_offsets = std::mem::take(&mut self.b_offsets);
+        let patch_a_cols = std::mem::take(&mut self.deferred_patch_a_cols);
+        let patch_a_values = std::mem::take(&mut self.deferred_patch_a_value_indices);
+        let patch_b_cols = std::mem::take(&mut self.deferred_patch_b_cols);
+        let patch_b_values = std::mem::take(&mut self.deferred_patch_b_value_indices);
+
+        let mut new_a_cols = Vec::with_capacity(
+            old_a_cols.len() + patch_a_cols.len() - self.deferred_constraint_patches.len(),
+        );
+        let mut new_a_values = Vec::with_capacity(new_a_cols.capacity());
+        let mut new_a_offsets = Vec::with_capacity(self.values.len() + 1);
+        let mut new_b_cols = Vec::with_capacity(
+            old_b_cols.len() + patch_b_cols.len() - self.deferred_constraint_patches.len(),
+        );
+        let mut new_b_values = Vec::with_capacity(new_b_cols.capacity());
+        let mut new_b_offsets = Vec::with_capacity(self.values.len() + 1);
+        new_a_offsets.push(0);
+        new_b_offsets.push(0);
+
+        let mut patch_index = 0usize;
+        for row in 0..self.values.len() {
+            let patch = self
+                .deferred_constraint_patches
+                .get(patch_index)
+                .filter(|patch| patch.wire as usize == row);
+            if let Some(patch) = patch {
+                let old_a = old_a_offsets[row]..old_a_offsets[row + 1];
+                let old_b = old_b_offsets[row]..old_b_offsets[row + 1];
+                assert_eq!(&old_a_cols[old_a.clone()], &[row as u32]);
+                assert_eq!(old_a.len(), 1);
+                assert_eq!(
+                    self.value_table[old_a_values[old_a.start] as usize],
+                    F128::ONE
+                );
+                assert_eq!(&old_b_cols[old_b.clone()], &[0]);
+                assert_eq!(old_b.len(), 1);
+                assert_eq!(
+                    self.value_table[old_b_values[old_b.start] as usize],
+                    F128::ONE
+                );
+                new_a_cols.extend_from_slice(&patch_a_cols[patch.a_start..patch.a_end]);
+                new_a_values.extend_from_slice(&patch_a_values[patch.a_start..patch.a_end]);
+                new_b_cols.extend_from_slice(&patch_b_cols[patch.b_start..patch.b_end]);
+                new_b_values.extend_from_slice(&patch_b_values[patch.b_start..patch.b_end]);
+                patch_index += 1;
+            } else {
+                let a = old_a_offsets[row]..old_a_offsets[row + 1];
+                let b = old_b_offsets[row]..old_b_offsets[row + 1];
+                new_a_cols.extend_from_slice(&old_a_cols[a.clone()]);
+                new_a_values.extend_from_slice(&old_a_values[a]);
+                new_b_cols.extend_from_slice(&old_b_cols[b.clone()]);
+                new_b_values.extend_from_slice(&old_b_values[b]);
+            }
+            new_a_offsets.push(new_a_cols.len());
+            new_b_offsets.push(new_b_cols.len());
+        }
+        assert_eq!(patch_index, self.deferred_constraint_patches.len());
+        self.a_cols = new_a_cols;
+        self.a_value_indices = new_a_values;
+        self.a_offsets = new_a_offsets;
+        self.b_cols = new_b_cols;
+        self.b_value_indices = new_b_values;
+        self.b_offsets = new_b_offsets;
+        self.deferred_constraint_patches.clear();
+    }
+
     /// Finish: pad to the next power of two (≥ 2^7 — the zerocheck needs
     /// `m ≥ K_SKIP + 1` and the lincheck `k_skip ≤ k_log`), emit a
     /// single-block `FieldR1cs` (`m = k_log`, `n_outer = 1`) and the witness.
@@ -508,6 +849,10 @@ impl FieldR1csBuilder {
             self.pending_deferred_witness_slots == 0,
             "cannot build with unsealed deferred witness slots"
         );
+        assert_eq!(
+            self.pending_deferred_constraint_slots, 0,
+            "cannot build with unsealed deferred constraint rows"
+        );
         let n_wires = self.values.len();
         let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
         let mut values = self.values;
@@ -515,7 +860,7 @@ impl FieldR1csBuilder {
         (n_wires, values)
     }
 
-    pub fn build(self) -> (FieldR1cs, Vec<F128>) {
+    pub fn build(mut self) -> (FieldR1cs, Vec<F128>) {
         assert!(
             self.record_rows,
             "build() on a witness-only builder would emit an empty matrix; \
@@ -525,6 +870,7 @@ impl FieldR1csBuilder {
             self.pending_deferred_witness_slots == 0,
             "cannot build with unsealed deferred witness slots"
         );
+        self.apply_deferred_constraint_patches();
         let n_wires = self.values.len();
         let k_log = n_wires.next_power_of_two().trailing_zeros().max(7) as usize;
         let k = 1usize << k_log;
@@ -734,12 +1080,26 @@ pub struct FsChannelTrace {
     buffered: Option<LinExpr>,
     pending: Option<LinExpr>,
     perms: usize,
+    c1: bool,
 }
 
 impl FsChannelTrace {
     /// Mirror of `FsLaneChallenger::new(domain)`.
     pub fn new(b: &mut FieldR1csBuilder, domain: &[u8]) -> Self {
-        let [iv0, iv1] = fs_lane_iv_flat();
+        Self::with_profile(b, domain, fs_lane_iv_flat(), false)
+    }
+
+    /// Mirror of `FsLaneChallenger::new_c1(domain)`.
+    pub fn new_c1(b: &mut FieldR1csBuilder, domain: &[u8]) -> Self {
+        Self::with_profile(b, domain, fs_c1_lane_iv_flat(), true)
+    }
+
+    fn with_profile(
+        b: &mut FieldR1csBuilder,
+        domain: &[u8],
+        [iv0, iv1]: [F128; 2],
+        c1: bool,
+    ) -> Self {
         let mut t = Self {
             state: [
                 LinExpr::zero(),
@@ -750,6 +1110,7 @@ impl FsChannelTrace {
             buffered: None,
             pending: None,
             perms: 0,
+            c1,
         };
         t.absorb_lane(
             b,
@@ -840,6 +1201,38 @@ impl FsChannelTrace {
         }
     }
 
+    pub fn observe_f256(&mut self, b: &mut FieldR1csBuilder, value: &ExtExpr) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChannelTrace::new_c1"
+        );
+        self.absorb_lane(
+            b,
+            LinExpr::constant(fs_op_lane(FS_OP_OBSERVE, FS_KIND_WIDE_SCALAR, 0)),
+        );
+        self.absorb_lane(b, value.lo.clone());
+        self.absorb_lane(b, value.hi.clone());
+    }
+
+    pub fn observe_f256_slice(&mut self, b: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChannelTrace::new_c1"
+        );
+        self.absorb_lane(
+            b,
+            LinExpr::constant(fs_op_lane(
+                FS_OP_OBSERVE,
+                FS_KIND_WIDE_SLICE,
+                values.len() as u64,
+            )),
+        );
+        for value in values {
+            self.absorb_lane(b, value.lo.clone());
+            self.absorb_lane(b, value.hi.clone());
+        }
+    }
+
     /// Constant byte observation (statement digests, roots known at build
     /// time). Witness-carried byte data must be observed as lane expressions
     /// via [`Self::observe_lanes`] with the same header.
@@ -879,6 +1272,38 @@ impl FsChannelTrace {
         (0..n).map(|_| self.squeeze_lane(b)).collect()
     }
 
+    pub fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChannelTrace::new_c1"
+        );
+        self.absorb_lane(
+            b,
+            LinExpr::constant(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SCALAR, 0)),
+        );
+        let lo = self.squeeze_lane(b);
+        let raw_hi = self.squeeze_lane(b);
+        b.c1_challenge_from_raw(lo, raw_hi)
+    }
+
+    pub fn sample_f256_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        assert!(
+            self.c1,
+            "wide transcript operation requires FsChannelTrace::new_c1"
+        );
+        self.absorb_lane(
+            b,
+            LinExpr::constant(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SLICE, n as u64)),
+        );
+        (0..n)
+            .map(|_| {
+                let lo = self.squeeze_lane(b);
+                let raw_hi = self.squeeze_lane(b);
+                b.c1_challenge_from_raw(lo, raw_hi)
+            })
+            .collect()
+    }
+
     /// In-trace mirror of `FsLaneChallenger::verify_pow` (GRIND-BY-SQUEEZE):
     /// absorb the `[FS_OP_POW header, nonce]` pair with the ordinary lane
     /// discipline, sample one scalar challenge and prove its top `bits`
@@ -915,11 +1340,27 @@ pub trait FsChannelOps {
     fn observe_label(&mut self, b: &mut FieldR1csBuilder, label: &[u8]);
     fn observe_f128(&mut self, b: &mut FieldR1csBuilder, value: &LinExpr);
     fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]);
+    fn observe_f256(&mut self, b: &mut FieldR1csBuilder, value: &ExtExpr) {
+        self.observe_f128(b, &value.lo);
+        self.observe_f128(b, &value.hi);
+    }
+    fn observe_f256_slice(&mut self, b: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        for value in values {
+            self.observe_f256(b, value);
+        }
+    }
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr;
     /// One SLICE-kind squeeze header followed by `n` challenge reads — the
     /// native `sample_f128_vec` discipline (NOT `n` scalar samples, whose
     /// per-sample headers would diverge from the native transcript).
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr>;
+    fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
+        let lanes = self.sample_f128_vec(b, 2);
+        b.c1_challenge_from_raw(lanes[0].clone(), lanes[1].clone())
+    }
+    fn sample_f256_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        (0..n).map(|_| self.sample_f256(b)).collect()
+    }
     /// Grind-by-squeeze pow mirror: absorb the `[FS_OP_POW header, nonce]`
     /// pair, sample one scalar challenge and pin its top `bits` flat bits
     /// to zero (`FsLaneChallenger::verify_pow` lockstep).
@@ -942,11 +1383,23 @@ impl<C: FsChannelOps + ?Sized> FsChannelOps for &mut C {
     fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
         (**self).observe_f128_slice(b, values);
     }
+    fn observe_f256(&mut self, b: &mut FieldR1csBuilder, value: &ExtExpr) {
+        (**self).observe_f256(b, value);
+    }
+    fn observe_f256_slice(&mut self, b: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        (**self).observe_f256_slice(b, values);
+    }
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
         (**self).sample_f128(b)
     }
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
         (**self).sample_f128_vec(b, n)
+    }
+    fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
+        (**self).sample_f256(b)
+    }
+    fn sample_f256_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        (**self).sample_f256_vec(b, n)
     }
     fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
         (**self).verify_pow(b, nonce, bits);
@@ -969,11 +1422,23 @@ impl FsChannelOps for FsChannelTrace {
     fn observe_f128_slice(&mut self, b: &mut FieldR1csBuilder, values: &[LinExpr]) {
         FsChannelTrace::observe_f128_slice(self, b, values);
     }
+    fn observe_f256(&mut self, b: &mut FieldR1csBuilder, value: &ExtExpr) {
+        FsChannelTrace::observe_f256(self, b, value);
+    }
+    fn observe_f256_slice(&mut self, b: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        FsChannelTrace::observe_f256_slice(self, b, values);
+    }
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
         FsChannelTrace::sample_f128(self, b)
     }
     fn sample_f128_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<LinExpr> {
         FsChannelTrace::sample_f128_vec(self, b, n)
+    }
+    fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
+        FsChannelTrace::sample_f256(self, b)
+    }
+    fn sample_f256_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        FsChannelTrace::sample_f256_vec(self, b, n)
     }
     fn verify_pow(&mut self, b: &mut FieldR1csBuilder, nonce: &LinExpr, bits: u32) {
         FsChannelTrace::verify_pow_trace(self, b, nonce, bits);
@@ -1044,7 +1509,14 @@ pub struct LayoutRecordingChallenger {
 
 impl LayoutRecordingChallenger {
     pub fn new(domain: &[u8], layout: DuplexLayout) -> Self {
-        let inner = FsLaneChallenger::new(domain);
+        Self::with_inner(domain, layout, FsLaneChallenger::new(domain))
+    }
+
+    pub fn new_c1(domain: &[u8], layout: DuplexLayout) -> Self {
+        Self::with_inner(domain, layout, FsLaneChallenger::new_c1(domain))
+    }
+
+    fn with_inner(domain: &[u8], layout: DuplexLayout, inner: FsLaneChallenger) -> Self {
         let mut recorder = Self {
             inner,
             data_flat: Vec::with_capacity(layout.n_data),
@@ -1209,6 +1681,26 @@ impl Challenger for LayoutRecordingChallenger {
         self.inner.observe_f128_slice(values);
     }
 
+    fn observe_f256(&mut self, value: F256) {
+        self.record_absorb(fs_op_lane(FS_OP_OBSERVE, FS_KIND_WIDE_SCALAR, 0));
+        self.record_absorb(value.lo);
+        self.record_absorb(value.hi);
+        self.inner.observe_f256(value);
+    }
+
+    fn observe_f256_slice(&mut self, values: &[F256]) {
+        self.record_absorb(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_WIDE_SLICE,
+            values.len() as u64,
+        ));
+        for value in values {
+            self.record_absorb(value.lo);
+            self.record_absorb(value.hi);
+        }
+        self.inner.observe_f256_slice(values);
+    }
+
     fn observe_bytes(&mut self, bytes: &[u8]) {
         self.record_absorb(fs_op_lane(FS_OP_BYTES, 0, bytes.len() as u64));
         for lane in fs_pack_bytes_lanes(bytes) {
@@ -1231,6 +1723,27 @@ impl Challenger for LayoutRecordingChallenger {
             self.record_squeeze(Some(value));
         }
         values
+    }
+
+    fn sample_f256(&mut self) -> F256 {
+        self.record_absorb(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SCALAR, 0));
+        let (challenge, raw) = self.inner.sample_f256_with_raw();
+        self.record_squeeze(Some(raw[0]));
+        self.record_squeeze(Some(raw[1]));
+        challenge
+    }
+
+    fn sample_f256_vec(&mut self, n: usize) -> Vec<F256> {
+        self.record_absorb(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SLICE, n as u64));
+        let draws = self.inner.sample_f256_vec_with_raw(n);
+        draws
+            .into_iter()
+            .map(|(challenge, raw)| {
+                self.record_squeeze(Some(raw[0]));
+                self.record_squeeze(Some(raw[1]));
+                challenge
+            })
+            .collect()
     }
 
     fn grind_pow(&mut self, bits: u32) -> u64 {
@@ -1283,13 +1796,23 @@ pub struct FsChannelUnionRecorder {
     data_flat: Vec<F128>,
     challenge_wires: Vec<LinExpr>,
     perms: usize,
+    c1: bool,
 }
 
 impl FsChannelUnionRecorder {
     /// Mirror of `FsChannelTrace::new(domain)`: LANECHAL capacity IV, then
     /// the domain-op header and label lanes (all protocol constants).
     pub fn new(domain: &[u8]) -> Self {
-        let [iv0, iv1] = fs_lane_iv_flat();
+        Self::with_profile(domain, fs_lane_iv_flat(), false)
+    }
+
+    /// C1 recorder using the wide transcript capacity domain and canonical
+    /// extension-field frames.
+    pub fn new_c1(domain: &[u8]) -> Self {
+        Self::with_profile(domain, fs_c1_lane_iv_flat(), true)
+    }
+
+    fn with_profile(domain: &[u8], [iv0, iv1]: [F128; 2], c1: bool) -> Self {
         let mut t = Self {
             state: [F128::ZERO, F128::ZERO, iv0, iv1],
             buffered: None,
@@ -1300,6 +1823,7 @@ impl FsChannelUnionRecorder {
             data_flat: Vec::new(),
             challenge_wires: Vec::new(),
             perms: 0,
+            c1,
         };
         t.absorb_const(fs_op_lane(FS_OP_DOMAIN, 0, domain.len() as u64));
         for lane in fs_pack_bytes_lanes(domain) {
@@ -1311,6 +1835,10 @@ impl FsChannelUnionRecorder {
     /// The capacity IV the discharge seeds the duplex columns with.
     pub fn capacity_iv_flat() -> [F128; 2] {
         fs_lane_iv_flat()
+    }
+
+    pub fn capacity_iv_flat_c1() -> [F128; 2] {
+        fs_c1_lane_iv_flat()
     }
 
     fn flat_bits(v: F128) -> u128 {
@@ -1420,6 +1948,26 @@ impl FsChannelOps for FsChannelUnionRecorder {
         }
     }
 
+    fn observe_f256(&mut self, b: &mut FieldR1csBuilder, value: &ExtExpr) {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(FS_OP_OBSERVE, FS_KIND_WIDE_SCALAR, 0));
+        self.absorb_expr(b, &value.lo);
+        self.absorb_expr(b, &value.hi);
+    }
+
+    fn observe_f256_slice(&mut self, b: &mut FieldR1csBuilder, values: &[ExtExpr]) {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(
+            FS_OP_OBSERVE,
+            FS_KIND_WIDE_SLICE,
+            values.len() as u64,
+        ));
+        for value in values {
+            self.absorb_expr(b, &value.lo);
+            self.absorb_expr(b, &value.hi);
+        }
+    }
+
     fn sample_f128(&mut self, b: &mut FieldR1csBuilder) -> LinExpr {
         self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_SCALAR, 0));
         self.close_absorb();
@@ -1442,6 +1990,36 @@ impl FsChannelOps for FsChannelUnionRecorder {
                 let w = LinExpr::from_wire(b.alloc_f128(v));
                 self.challenge_wires.push(w.clone());
                 w
+            })
+            .collect()
+    }
+
+    fn sample_f256(&mut self, b: &mut FieldR1csBuilder) -> ExtExpr {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SCALAR, 0));
+        self.close_absorb();
+        self.ops
+            .push(crate::deep_chain::schedule::TranscriptOp::Squeeze(2));
+        let lo = LinExpr::from_wire(b.alloc_f128(self.squeeze_native()));
+        let raw_hi = LinExpr::from_wire(b.alloc_f128(self.squeeze_native()));
+        self.challenge_wires.push(lo.clone());
+        self.challenge_wires.push(raw_hi.clone());
+        b.c1_challenge_from_raw(lo, raw_hi)
+    }
+
+    fn sample_f256_vec(&mut self, b: &mut FieldR1csBuilder, n: usize) -> Vec<ExtExpr> {
+        assert!(self.c1, "wide transcript operation requires new_c1");
+        self.absorb_const(fs_op_lane(FS_OP_SQUEEZE, FS_KIND_WIDE_SLICE, n as u64));
+        self.close_absorb();
+        self.ops
+            .push(crate::deep_chain::schedule::TranscriptOp::Squeeze(2 * n));
+        (0..n)
+            .map(|_| {
+                let lo = LinExpr::from_wire(b.alloc_f128(self.squeeze_native()));
+                let raw_hi = LinExpr::from_wire(b.alloc_f128(self.squeeze_native()));
+                self.challenge_wires.push(lo.clone());
+                self.challenge_wires.push(raw_hi.clone());
+                b.c1_challenge_from_raw(lo, raw_hi)
             })
             .collect()
     }
@@ -1689,6 +2267,57 @@ mod tests {
         assert_eq!(witness[wire.0 as usize], F128::ONE);
     }
 
+    #[test]
+    fn deferred_constraint_reuses_reserved_row_with_future_wires() {
+        let arm0_value = F128 { lo: 7, hi: 11 };
+        let arm1_value = F128 { lo: 13, hi: 17 };
+
+        let mut builder = FieldR1csBuilder::new();
+        let (cell_wire, slot) = builder.alloc_deferred_constraint_f128(arm1_value);
+        let arm0 = LinExpr::from_wire(builder.alloc_f128(arm0_value));
+        let arm1 = LinExpr::from_wire(builder.alloc_f128(arm1_value));
+        let selector = LinExpr::from_wire(builder.alloc_bool(true));
+        let product = LinExpr::from_wire(builder.mul(&selector, &arm0.add(&arm1)));
+        let one = builder.one();
+        builder
+            .seal_deferred_constraint(slot, &arm0.add(&product), &one)
+            .expect("selected future-wire equality seals reserved row");
+        let useful_rows = builder.num_wires();
+        let (matrix, witness) = builder.build();
+        assert_eq!(useful_rows, 6, "row reuse allocated an extra pin");
+        assert!(matrix.satisfies(&witness));
+
+        let mut bad_cell = witness.clone();
+        bad_cell[cell_wire.0 as usize] += F128::ONE;
+        assert!(!matrix.satisfies(&bad_cell));
+        let mut bad_arm = witness.clone();
+        bad_arm[arm1.terms[0].0 as usize] += F128::ONE;
+        assert!(!matrix.satisfies(&bad_arm));
+    }
+
+    #[test]
+    fn deferred_constraint_gates_a_unique_source_in_one_new_row() {
+        let value = F128 { lo: 19, hi: 23 };
+        let mut builder = FieldR1csBuilder::new();
+        let (cell_wire, slot) = builder.alloc_deferred_constraint_f128(value);
+        let cell = LinExpr::from_wire(cell_wire);
+        let source = LinExpr::from_wire(builder.alloc_f128(value));
+        let gate = LinExpr::from_wire(builder.alloc_bool(true));
+        let product = LinExpr::from_wire(builder.mul(&gate, &source.add(&cell)));
+        let one = builder.one();
+        builder
+            .seal_deferred_constraint(slot, &cell.add(&product), &one)
+            .expect("gated source equality seals reserved row");
+        let useful_rows = builder.num_wires();
+        let (matrix, witness) = builder.build();
+        assert_eq!(useful_rows, 5, "unique binding allocated an extra pin");
+        assert!(matrix.satisfies(&witness));
+
+        let mut bad_source = witness.clone();
+        bad_source[source.terms[0].0 as usize] += F128::ONE;
+        assert!(!matrix.satisfies(&bad_source));
+    }
+
     fn drive_mixed_gadgets(b: &mut FieldR1csBuilder) {
         let mut rng = Rng::new(0xF00D);
         let xs: Vec<LinExpr> = (0..8)
@@ -1886,6 +2515,83 @@ mod tests {
     }
 
     #[test]
+    fn c1_layout_and_union_recorders_bind_raw_wide_sponge_lanes() {
+        use crate::deep_chain::schedule::{build_duplex_columns, compile_duplex};
+
+        let domain = b"c1-layout-native-lockstep";
+        let values = [
+            F256::new(F128::new(0x11, 0x12), F128::new(0x13, 0x14)),
+            F256::new(F128::new(0x21, 0x22), F128::new(0x23, 0x24)),
+            F256::new(F128::new(0x31, 0x32), F128::new(0x33, 0x34)),
+        ];
+        let mut b = FieldR1csBuilder::new();
+        let expressions = values.map(|value| {
+            ExtExpr::new(
+                LinExpr::from_wire(b.alloc_f128(value.lo)),
+                LinExpr::from_wire(b.alloc_f128(value.hi)),
+            )
+        });
+
+        let mut trace = FsChannelUnionRecorder::new_c1(domain);
+        trace.observe_label(&mut b, b"wide-stage");
+        trace.observe_f256(&mut b, &expressions[0]);
+        trace.observe_f256_slice(&mut b, &expressions[1..]);
+        let trace_scalar = trace.sample_f256(&mut b);
+        let trace_wide = trace.sample_f256_vec(&mut b, 4);
+        let trace_raw = trace.sample_f128_vec(&mut b, 3);
+        let recorded = trace.finish();
+        let layout = compile_duplex(&recorded.ops);
+
+        let mut native = LayoutRecordingChallenger::new_c1(domain, layout.clone());
+        native.observe_label(b"wide-stage");
+        native.observe_f256(values[0]);
+        native.observe_f256_slice(&values[1..]);
+        let native_scalar = native.sample_f256();
+        let native_wide = native.sample_f256_vec(4);
+        let native_raw = native.sample_f128_vec(3);
+        let captured = native
+            .finish()
+            .expect("C1 native call stream matches its frozen wide layout");
+
+        assert_eq!(trace_scalar.eval(b.values()), native_scalar);
+        assert!(!native_scalar.is_in_base_subfield());
+        for (trace_value, native_value) in trace_wide.iter().zip(&native_wide) {
+            assert_eq!(trace_value.eval(b.values()), *native_value);
+            assert!(!native_value.is_in_base_subfield());
+        }
+        for (trace_value, native_value) in trace_raw.iter().zip(&native_raw) {
+            assert_eq!(trace_value.eval(b.values()), *native_value);
+        }
+        assert_eq!(captured.layout, layout);
+        assert_eq!(captured.data_flat, recorded.data_flat);
+        assert_eq!(captured.post_state, recorded.post_state);
+        assert_eq!(captured.perms, recorded.perms);
+
+        // The committed duplex carries the raw low/high sponge lanes. The
+        // trace-one map is constrained after those lanes are bound, so no
+        // transformed extension coordinate is mistaken for a sponge output.
+        assert_eq!(captured.challenges.len(), recorded.challenge_wires.len());
+        for (captured_value, trace_wire) in
+            captured.challenges.iter().zip(&recorded.challenge_wires)
+        {
+            assert_eq!(*captured_value, Some(trace_wire.eval(b.values())));
+        }
+        let block_log = layout.slots.len().next_power_of_two().trailing_zeros() as usize;
+        let columns = build_duplex_columns(
+            &layout,
+            FsChannelUnionRecorder::capacity_iv_flat_c1(),
+            &recorded.data_flat,
+            block_log,
+        );
+        for (column_value, trace_wire) in columns.challenges.iter().zip(&recorded.challenge_wires) {
+            assert_eq!(*column_value, trace_wire.eval(b.values()));
+        }
+
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
+    }
+
+    #[test]
     fn layout_recording_challenger_rejects_layout_drift() {
         use crate::challenger::Challenger;
         use crate::deep_chain::schedule::compile_duplex;
@@ -1974,6 +2680,110 @@ mod tests {
         // Corrupt the public wire → unsat.
         z[pub_w.0 as usize] += F128::ONE;
         assert!(!r1cs.satisfies(&z));
+    }
+
+    #[test]
+    fn f256_gadget_matches_native_and_costs_three_constraints() {
+        let mut rng = Rng::new(0xC1_F256);
+        for _ in 0..32 {
+            let x = F256::new(rng.f128(), rng.f128());
+            let y = F256::new(rng.f128(), rng.f128());
+            let mut b = FieldR1csBuilder::new();
+            let x_expr = ExtExpr::new(
+                LinExpr::from_wire(b.alloc_f128(x.lo)),
+                LinExpr::from_wire(b.alloc_f128(x.hi)),
+            );
+            let y_expr = ExtExpr::new(
+                LinExpr::from_wire(b.alloc_f128(y.lo)),
+                LinExpr::from_wire(b.alloc_f128(y.hi)),
+            );
+
+            let before = b.num_wires();
+            let product = b.mul_f256(&x_expr, &y_expr);
+            assert_eq!(
+                b.num_wires() - before,
+                3,
+                "one extension product must use exactly three base products"
+            );
+            assert_eq!(product.eval(b.values()), x * y);
+            b.pin_f256(&product, x * y);
+
+            let (r1cs, witness) = b.build();
+            assert!(r1cs.satisfies(&witness));
+        }
+    }
+
+    #[test]
+    fn f256_square_matches_native_and_costs_two_constraints() {
+        let mut rng = Rng::new(0xC1_5A_E);
+        for _ in 0..32 {
+            let value = F256::new(rng.f128(), rng.f128());
+            let mut b = FieldR1csBuilder::new();
+            let expression = ExtExpr::new(
+                LinExpr::from_wire(b.alloc_f128(value.lo)),
+                LinExpr::from_wire(b.alloc_f128(value.hi)),
+            );
+
+            let before = b.num_wires();
+            let square = b.square_f256(&expression);
+            assert_eq!(b.num_wires() - before, 2);
+            assert_eq!(square.eval(b.values()), value * value);
+            b.pin_f256(&square, value * value);
+
+            let (r1cs, witness) = b.build();
+            assert!(r1cs.satisfies(&witness));
+        }
+    }
+
+    #[test]
+    fn c1_channel_trace_locksteps_native_wide_operations() {
+        let domain = b"c1-trace-lockstep";
+        let values = [
+            F256::new(F128::new(1, 2), F128::new(3, 4)),
+            F256::new(F128::new(5, 6), F128::new(7, 8)),
+            F256::new(F128::new(9, 10), F128::new(11, 12)),
+        ];
+
+        let mut b = FieldR1csBuilder::new();
+        let expressions = values.map(|value| {
+            ExtExpr::new(
+                LinExpr::from_wire(b.alloc_f128(value.lo)),
+                LinExpr::from_wire(b.alloc_f128(value.hi)),
+            )
+        });
+        let mut trace = FsChannelTrace::new_c1(&mut b, domain);
+        let mut native = FsLaneChallenger::new_c1(domain);
+
+        trace.observe_label(&mut b, b"wide-algebra");
+        native.observe_label(b"wide-algebra");
+        trace.observe_f256(&mut b, &expressions[0]);
+        native.observe_f256(values[0]);
+        trace.observe_f256_slice(&mut b, &expressions[1..]);
+        native.observe_f256_slice(&values[1..]);
+
+        let trace_scalar = trace.sample_f256(&mut b);
+        let native_scalar = native.sample_f256();
+        assert_eq!(trace_scalar.eval(b.values()), native_scalar);
+        assert!(!native_scalar.is_in_base_subfield());
+
+        let trace_wide = trace.sample_f256_vec(&mut b, 7);
+        let native_wide = native.sample_f256_vec(7);
+        for (trace_value, native_value) in trace_wide.iter().zip(&native_wide) {
+            assert_eq!(trace_value.eval(b.values()), *native_value);
+            assert!(!native_value.is_in_base_subfield());
+        }
+
+        // Raw base-field draws remain part of the C1 transcript for query
+        // indices and grinding. They must stay in the same sponge schedule.
+        let trace_raw = trace.sample_f128_vec(&mut b, 23);
+        let native_raw = native.sample_f128_vec(23);
+        for (trace_value, native_value) in trace_raw.iter().zip(&native_raw) {
+            assert_eq!(trace_value.eval(b.values()), *native_value);
+        }
+        assert_eq!(trace.perms(), native.perms());
+
+        let (r1cs, witness) = b.build();
+        assert!(r1cs.satisfies(&witness));
     }
 
     /// pow7 == native S-box through the φ map, and costs exactly 4 wires.

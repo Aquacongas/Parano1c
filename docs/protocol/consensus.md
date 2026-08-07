@@ -30,8 +30,11 @@ For a child block to extend a parent, all of the following must hold:
 13. the supplied `HistoryStep` terminal verifies and binds the nonce-free
     semantic header.
 
-The block and terminal are accepted as one bundle. A valid block without its
-matching terminal is not an accepted consensus object.
+Direct candidate admission accepts the block and matching terminal as one
+bundle. Authenticated catch-up may first verify the terminal of an exact
+descendant suffix tip and then import the linked bodies covered by that
+recursion. Every body still satisfies the native rules above. No candidate is
+accepted from block bytes and proof of work alone.
 
 ## Fork choice
 
@@ -58,9 +61,10 @@ boundary from height and reject deeper alternatives.
 
 ## Difficulty
 
-The target block interval is 15 seconds. ASERT adjusts the target using
-six-block reference epochs and a 90-second half-life. The target is encoded as
-a 256-bit little-endian integer.
+The target interval between accepted blocks is 15 seconds. Proof preparation,
+nonce search and propagation share that interval. ASERT adjusts the target
+using six-block reference epochs and a 90-second half-life. The target is
+encoded as a 256-bit little-endian integer.
 
 Validation derives the one exact target from canonical header history. Miners
 do not choose among a range of acceptable difficulties.

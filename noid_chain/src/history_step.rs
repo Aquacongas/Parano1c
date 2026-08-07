@@ -8,7 +8,7 @@
 
 use core::fmt;
 
-pub const HISTORY_STEP_TERMINAL_VERSION: u8 = 2;
+pub const HISTORY_STEP_TERMINAL_VERSION: u8 = 4;
 pub const HISTORY_STEP_TERMINAL_BINDING_BYTES: usize = 1 + 8 + 32 + 1;
 pub const HISTORY_STEP_TIER_SLOT_COUNT: u8 = 4;
 /// One class per current tier: every class shares one frozen outer shape,

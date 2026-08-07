@@ -40,8 +40,8 @@ pub fn view(app: &App, compact: bool) -> Element<'_, Message> {
     };
 
     let mut page = column![controls].spacing(10);
-    let matrix_error = match (&app.matrix_b64, &app.matrix_b255) {
-        (MatrixCacheState::Failed(error), _) => Some(format!("B64: {error}")),
+    let matrix_error = match (&app.matrix_b25, &app.matrix_b255) {
+        (MatrixCacheState::Failed(error), _) => Some(format!("B25: {error}")),
         (_, MatrixCacheState::Failed(error)) => Some(format!("B255: {error}")),
         _ => None,
     };
@@ -288,15 +288,15 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
     };
 
     let mining_enabled = app.snapshot.mining.enabled;
-    let b64_ready = app.matrix_b64 == MatrixCacheState::Ready;
+    let b25_ready = app.matrix_b25 == MatrixCacheState::Ready;
     let label = if app.node_action_in_flight {
         "RESTARTING…"
     } else if mining_enabled {
         "STOP MINING"
-    } else if matches!(app.matrix_b64, MatrixCacheState::Failed(_)) {
+    } else if matches!(app.matrix_b25, MatrixCacheState::Failed(_)) {
         "RETRY MATRIX PREPARATION"
-    } else if !b64_ready {
-        "PREPARING B64 MATRIX…"
+    } else if !b25_ready {
+        "PREPARING B25 MATRIX…"
     } else {
         "START MINING"
     };
@@ -319,9 +319,9 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
         )
     });
     if !app.node_action_in_flight && app.backend_state != BackendState::Offline {
-        if !mining_enabled && matches!(app.matrix_b64, MatrixCacheState::Failed(_)) {
+        if !mining_enabled && matches!(app.matrix_b25, MatrixCacheState::Failed(_)) {
             toggle = toggle.on_press(Message::PrepareMatrices);
-        } else if mining_enabled || b64_ready {
+        } else if mining_enabled || b25_ready {
             toggle = toggle.on_press(Message::SetMining(!mining_enabled));
         }
     }

@@ -41,19 +41,22 @@ use noid_fri_binius::zk_capsule_algebra::{
     TAIL_SYMBOLS,
 };
 
-use super::zk_affine_fold::{fold_joint_source_leaf_trace, mid_standard_fold4_trace};
+use super::zk_affine_fold::{
+    fold_normal_joint_source_leaf_trace, fold_normal_mid_leaf_trace,
+    select_fold_normal_mid_raw_member_trace,
+};
 use super::zk_affine_tail::{
     select_affine_tail16_trace, ZK_AFFINE_TAIL_LEN, ZK_AFFINE_TAIL_QUERY_BITS,
     ZK_AFFINE_TAIL_SELECTOR_ROWS,
 };
-use super::{mul, pin_eq, FieldR1csBuilder, LinExpr};
+use super::{pin_eq_ext, ExtExpr, FieldR1csBuilder, LinExpr};
 
-pub const ZK_PHASE_B_SOURCE_FOLD_ROWS: usize = 22;
-pub const ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS: usize = (1 << MID_STANDARD_FOLDS) - 1;
-pub const ZK_PHASE_B_SOURCE_SPLICE_PIN_ROWS: usize = 1;
-pub const ZK_PHASE_B_MID_FOLD_ROWS: usize = 30;
+pub const ZK_PHASE_B_SOURCE_FOLD_ROWS: usize = 45;
+pub const ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS: usize = 2 * ((1 << MID_STANDARD_FOLDS) - 1);
+pub const ZK_PHASE_B_SOURCE_SPLICE_PIN_ROWS: usize = 2;
+pub const ZK_PHASE_B_MID_FOLD_ROWS: usize = 45;
 pub const ZK_PHASE_B_TAIL_SELECTOR_ROWS: usize = ZK_AFFINE_TAIL_SELECTOR_ROWS;
-pub const ZK_PHASE_B_MID_SPLICE_PIN_ROWS: usize = 1;
+pub const ZK_PHASE_B_MID_SPLICE_PIN_ROWS: usize = 2;
 
 /// Exact incremental row count of one complete disconnected query algebra.
 pub const ZK_PHASE_B_QUERY_TRACE_ROWS: usize = ZK_PHASE_B_SOURCE_FOLD_ROWS
@@ -69,10 +72,9 @@ pub const ZK_PHASE_B_PREVIOUS_ACTIVE_QUERY_ROWS: usize = 49;
 pub const ZK_PHASE_B_QUERY_ACTIVE_EQUIVALENT_DELTA_ROWS: usize =
     ZK_PHASE_B_QUERY_TRACE_ROWS - ZK_PHASE_B_PREVIOUS_ACTIVE_QUERY_ROWS;
 
-const MID_MEMBER_QUERY_BITS: usize = MID_STANDARD_FOLDS;
-const MID_LEAF_QUERY_BIT_OFFSET: usize = MID_MEMBER_QUERY_BITS;
+const MID_LEAF_QUERY_BIT_OFFSET: usize = MID_STANDARD_FOLDS;
 
-const _: () = assert!(JOINT_SOURCE_LEAF_SYMBOLS == 16);
+const _: () = assert!(JOINT_SOURCE_LEAF_SYMBOLS == 24);
 const _: () = assert!(SOURCE_QUERY_BITS == 13);
 const _: () = assert!(SOURCE_STANDARD_FOLDS == 3);
 const _: () = assert!(MID_STANDARD_FOLDS == 4);
@@ -80,9 +82,9 @@ const _: () = assert!(TAIL_SYMBOLS == 16);
 const _: () = assert!(ZK_AFFINE_TAIL_LEN == TAIL_SYMBOLS);
 const _: () = assert!(SOURCE_QUERY_BITS - MID_LEAF_QUERY_BIT_OFFSET == 9);
 const _: () = assert!(ZK_AFFINE_TAIL_QUERY_BITS == 9);
-const _: () = assert!(ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS == 15);
-const _: () = assert!(ZK_PHASE_B_QUERY_TRACE_ROWS == 84);
-const _: () = assert!(ZK_PHASE_B_QUERY_ACTIVE_EQUIVALENT_DELTA_ROWS == 35);
+const _: () = assert!(ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS == 30);
+const _: () = assert!(ZK_PHASE_B_QUERY_TRACE_ROWS == 154);
+const _: () = assert!(ZK_PHASE_B_QUERY_ACTIVE_EQUIVALENT_DELTA_ROWS == 105);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZkPhaseBQueryDynamicInput {
@@ -119,26 +121,26 @@ pub struct ZkPhaseBQueryTraceInput {
     /// Authenticated adjacent layout `[B0, C0, ..., B7, C7]`.
     pub joint_source_leaf: [LinExpr; JOINT_SOURCE_LEAF_SYMBOLS],
     /// Authenticated contiguous mid codeword leaf.
-    pub mid_leaf: [LinExpr; 1 << MID_STANDARD_FOLDS],
+    pub mid_leaf: [ExtExpr; 1 << MID_STANDARD_FOLDS],
     /// Revealed common coefficient tail after seven LOW-to-HIGH folds.
-    pub tail: [LinExpr; TAIL_SYMBOLS],
-    pub gamma: LinExpr,
+    pub tail: [ExtExpr; TAIL_SYMBOLS],
+    pub gamma: ExtExpr,
     /// Challenges for logical variables `0..3`, LOW-to-HIGH.
-    pub source_challenges: [LinExpr; SOURCE_STANDARD_FOLDS],
+    pub source_challenges: [ExtExpr; SOURCE_STANDARD_FOLDS],
     /// Challenges for logical variables `3..7`, LOW-to-HIGH.
-    pub mid_challenges: [LinExpr; MID_STANDARD_FOLDS],
+    pub mid_challenges: [ExtExpr; MID_STANDARD_FOLDS],
 }
 
 #[derive(Clone, Debug)]
 pub struct ZkPhaseBQueryTraceOutput {
     /// Result of the joint source line and the first three affine folds.
-    pub source_folded: LinExpr,
+    pub source_folded: ExtExpr,
     /// Mid-leaf member selected by the shared `q0..q3` aliases.
-    pub selected_mid_member: LinExpr,
+    pub selected_mid_member: ExtExpr,
     /// Result of the next four affine folds.
-    pub mid_folded: LinExpr,
+    pub mid_folded: ExtExpr,
     /// Encoded-tail cell selected by the shared `q4..q12` aliases.
-    pub selected_tail_cell: LinExpr,
+    pub selected_tail_cell: ExtExpr,
 }
 
 fn selected_code() -> Result<&'static ZkAffineLchCode, ZkAffineCodeError> {
@@ -151,6 +153,18 @@ fn selected_code() -> Result<&'static ZkAffineLchCode, ZkAffineCodeError> {
 
 fn check_dynamic(
     expression: &LinExpr,
+    input: ZkPhaseBQueryDynamicInput,
+    index: usize,
+) -> Result<(), ZkPhaseBQueryTraceError> {
+    if expression.is_const() {
+        Err(ZkPhaseBQueryTraceError::DynamicInputIsConstant { input, index })
+    } else {
+        Ok(())
+    }
+}
+
+fn check_dynamic_ext(
+    expression: &ExtExpr,
     input: ZkPhaseBQueryDynamicInput,
     index: usize,
 ) -> Result<(), ZkPhaseBQueryTraceError> {
@@ -175,44 +189,23 @@ fn preflight_dynamic_inputs(
         )?;
     }
     for (index, expression) in input.mid_leaf.iter().enumerate() {
-        check_dynamic(expression, ZkPhaseBQueryDynamicInput::MidLeaf, index)?;
+        check_dynamic_ext(expression, ZkPhaseBQueryDynamicInput::MidLeaf, index)?;
     }
     for (index, expression) in input.tail.iter().enumerate() {
-        check_dynamic(expression, ZkPhaseBQueryDynamicInput::Tail, index)?;
+        check_dynamic_ext(expression, ZkPhaseBQueryDynamicInput::Tail, index)?;
     }
-    check_dynamic(&input.gamma, ZkPhaseBQueryDynamicInput::Gamma, 0)?;
+    check_dynamic_ext(&input.gamma, ZkPhaseBQueryDynamicInput::Gamma, 0)?;
     for (index, expression) in input.source_challenges.iter().enumerate() {
-        check_dynamic(
+        check_dynamic_ext(
             expression,
             ZkPhaseBQueryDynamicInput::SourceChallenge,
             index,
         )?;
     }
     for (index, expression) in input.mid_challenges.iter().enumerate() {
-        check_dynamic(expression, ZkPhaseBQueryDynamicInput::MidChallenge, index)?;
+        check_dynamic_ext(expression, ZkPhaseBQueryDynamicInput::MidChallenge, index)?;
     }
     Ok(())
-}
-
-/// Evaluate a dynamic 16-cell table at four LSB-first query coordinates.
-///
-/// For Boolean query bits this is exactly a 16-way member mux.  Written as
-/// four adjacent multilinear folds, it has the fixed `8 + 4 + 2 + 1 = 15`
-/// multiplication-row shape and also remains the table's MLE off-cube.
-fn select_mid_member_trace(
-    b: &mut FieldR1csBuilder,
-    mid_leaf: &[LinExpr; 1 << MID_STANDARD_FOLDS],
-    member_bits: &[LinExpr; MID_MEMBER_QUERY_BITS],
-) -> LinExpr {
-    let mut current = mid_leaf.to_vec();
-    for bit in member_bits {
-        current = current
-            .chunks_exact(2)
-            .map(|pair| pair[0].add(&mul(b, bit, &pair[0].add(&pair[1]))))
-            .collect();
-    }
-    debug_assert_eq!(current.len(), 1);
-    current.pop().expect("four folds leave one selected member")
 }
 
 /// Verify the complete algebraic linkage of one selected Phase-B query.
@@ -228,37 +221,28 @@ pub fn verify_zk_phase_b_query_trace(
     let code = selected_code()?;
     let trace_start = b.num_wires();
 
-    let source_folded = fold_joint_source_leaf_trace(
+    let source_folded = fold_normal_joint_source_leaf_trace(
         b,
-        code,
         &input.joint_source_leaf,
         &input.gamma,
-        &input.query_bits,
         &input.source_challenges,
-    )?;
+    );
     debug_assert_eq!(b.num_wires() - trace_start, ZK_PHASE_B_SOURCE_FOLD_ROWS);
 
-    let member_bits: [LinExpr; MID_MEMBER_QUERY_BITS] =
-        std::array::from_fn(|bit| input.query_bits[bit].clone());
-    let selected_mid_member = select_mid_member_trace(b, &input.mid_leaf, &member_bits);
+    let selected_mid_member =
+        select_fold_normal_mid_raw_member_trace(b, code, &input.mid_leaf, &input.query_bits)?;
     debug_assert_eq!(
         b.num_wires() - trace_start,
         ZK_PHASE_B_SOURCE_FOLD_ROWS + ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS
     );
-    pin_eq(b, &source_folded, &selected_mid_member);
+    pin_eq_ext(b, &source_folded, &selected_mid_member);
 
-    let mid_folded = mid_standard_fold4_trace(
-        b,
-        code,
-        &input.mid_leaf,
-        &input.query_bits,
-        &input.mid_challenges,
-    )?;
+    let mid_folded = fold_normal_mid_leaf_trace(b, &input.mid_leaf, &input.mid_challenges);
 
     let tail_query_bits: [LinExpr; ZK_AFFINE_TAIL_QUERY_BITS] =
         std::array::from_fn(|bit| input.query_bits[MID_LEAF_QUERY_BIT_OFFSET + bit].clone());
     let selected_tail_cell = select_affine_tail16_trace(b, &input.tail, &tail_query_bits);
-    pin_eq(b, &mid_folded, &selected_tail_cell);
+    pin_eq_ext(b, &mid_folded, &selected_tail_cell);
 
     debug_assert_eq!(b.num_wires() - trace_start, ZK_PHASE_B_QUERY_TRACE_ROWS);
     Ok(ZkPhaseBQueryTraceOutput {
@@ -272,37 +256,39 @@ pub fn verify_zk_phase_b_query_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acceptance::trace::{alloc_block, flat_of, test_support::tower_value, F128};
+    use crate::acceptance::trace::{
+        alloc_block, alloc_block256, const_block256, flat_of, test_support::tower_value_ext, F128,
+    };
     use noid_core::mle::fold::fold_variable_inplace;
-    use noid_core::{Block128, TowerField};
+    use noid_core::{Block128, Block256, TowerField};
     use noid_fri_binius::zk_affine_code::AFFINE_CODE_MESSAGE_LEN;
     use noid_fri_binius::zk_capsule::ZK_AUTH_CAPSULE_GEOMETRY;
     use noid_fri_binius::zk_capsule_algebra::{
-        build_joint_source_leaf, build_mid_leaf, encode_tail16, fold_joint_source_leaf,
-        mid_standard_fold4,
+        build_fold_normal_joint_source_leaf, build_fold_normal_mid_leaf, encode_tail16,
+        fold_normal_joint_source_leaf, fold_normal_mid_leaf,
     };
     use noid_ivc_core::field_r1cs::FieldR1cs;
 
     const DYNAMIC_INPUT_ROWS: usize = SOURCE_QUERY_BITS
         + JOINT_SOURCE_LEAF_SYMBOLS
-        + (1 << MID_STANDARD_FOLDS)
-        + TAIL_SYMBOLS
-        + 1
-        + SOURCE_STANDARD_FOLDS
-        + MID_STANDARD_FOLDS;
+        + 2 * ((1 << MID_STANDARD_FOLDS)
+            + TAIL_SYMBOLS
+            + 1
+            + SOURCE_STANDARD_FOLDS
+            + MID_STANDARD_FOLDS);
     const FIXTURE_USEFUL_ROWS: usize = 1 + DYNAMIC_INPUT_ROWS + ZK_PHASE_B_QUERY_TRACE_ROWS;
 
     #[derive(Clone)]
     struct NativeCase {
         query: usize,
         joint_source_leaf: [Block128; JOINT_SOURCE_LEAF_SYMBOLS],
-        mid_leaf: [Block128; 1 << MID_STANDARD_FOLDS],
-        tail: [Block128; TAIL_SYMBOLS],
-        gamma: Block128,
-        source_challenges: [Block128; SOURCE_STANDARD_FOLDS],
-        mid_challenges: [Block128; MID_STANDARD_FOLDS],
-        source_folded: Block128,
-        mid_folded: Block128,
+        mid_leaf: [Block256; 1 << MID_STANDARD_FOLDS],
+        tail: [Block256; TAIL_SYMBOLS],
+        gamma: Block256,
+        source_challenges: [Block256; SOURCE_STANDARD_FOLDS],
+        mid_challenges: [Block256; MID_STANDARD_FOLDS],
+        source_folded: Block256,
+        mid_folded: Block256,
     }
 
     fn elem(index: usize, domain: u128, salt: u128) -> Block128 {
@@ -319,36 +305,54 @@ mod tests {
         std::array::from_fn(|index| elem(index, domain, salt))
     }
 
+    fn ext_elem(index: usize, domain: u128, salt: u128) -> Block256 {
+        Block256::new(
+            elem(index, domain, salt),
+            elem(index + 109, domain ^ 0xC1_256, salt.rotate_left(41)),
+        )
+    }
+
+    fn ext_message(domain: u128, salt: u128) -> [Block256; AFFINE_CODE_MESSAGE_LEN] {
+        std::array::from_fn(|index| ext_elem(index, domain, salt))
+    }
+
     fn native_case(salt: u128, query: usize) -> NativeCase {
         assert!(query < ZK_AUTH_CAPSULE_GEOMETRY.source_leaf_count);
         let code = ZkAffineLchCode::selected().expect("selected affine code");
         let bank = message(0xB4A9, salt ^ 0x11);
-        let companion = message(0xC09A, salt ^ 0x22);
-        let mut gamma = elem(17, 0x6A77A, salt ^ 0x33);
-        if gamma == Block128::ZERO || gamma == Block128::ONE {
-            gamma += Block128::from(2u128);
+        let companion = ext_message(0xC09A, salt ^ 0x22);
+        let mut gamma = ext_elem(17, 0x6A77A, salt ^ 0x33);
+        if gamma == Block256::ZERO || gamma == Block256::ONE {
+            gamma += Block256::from(2u128);
         }
-        let source_challenges = std::array::from_fn(|round| elem(round + 31, 0x503CE, salt ^ 0x44));
-        let mid_challenges = std::array::from_fn(|round| elem(round + 47, 0xA11D, salt ^ 0x55));
+        let source_challenges =
+            std::array::from_fn(|round| ext_elem(round + 31, 0x503CE, salt ^ 0x44));
+        let mid_challenges = std::array::from_fn(|round| ext_elem(round + 47, 0xA11D, salt ^ 0x55));
 
         let bank_code = code.encode(&bank).expect("bank encoding");
-        let companion_code = code.encode(&companion).expect("companion encoding");
+        let companion_code = code
+            .encode_extension_after_low_folds(&companion, 0)
+            .expect("companion encoding");
         let virtual_message = bank
             .iter()
             .zip(companion.iter())
-            .map(|(&bank, &companion)| bank + gamma * (bank + companion))
+            .map(|(&bank, &companion)| {
+                Block256::from(bank) + gamma * (Block256::from(bank) + companion)
+            })
             .collect::<Vec<_>>();
 
-        let mut mid_code = code.encode(&virtual_message).expect("mixed encoding");
+        let mut mid_code = code
+            .encode_extension_after_low_folds(&virtual_message, 0)
+            .expect("mixed encoding");
         for (round, &challenge) in source_challenges.iter().enumerate() {
             mid_code = code
-                .fold_codeword_once(&mid_code, round, challenge)
+                .fold_codeword_once_extension(&mid_code, round, challenge)
                 .expect("source codeword fold");
         }
         let mut tail_code = mid_code.clone();
         for (round, &challenge) in mid_challenges.iter().enumerate() {
             tail_code = code
-                .fold_codeword_once(&tail_code, SOURCE_STANDARD_FOLDS + round, challenge)
+                .fold_codeword_once_extension(&tail_code, SOURCE_STANDARD_FOLDS + round, challenge)
                 .expect("mid codeword fold");
         }
 
@@ -356,7 +360,7 @@ mod tests {
         for challenge in source_challenges.iter().chain(mid_challenges.iter()) {
             fold_variable_inplace(&mut tail_coefficients, *challenge, 0);
         }
-        let tail: [Block128; TAIL_SYMBOLS] = tail_coefficients
+        let tail: [Block256; TAIL_SYMBOLS] = tail_coefficients
             .try_into()
             .expect("seven message folds leave sixteen coefficients");
         assert_eq!(
@@ -366,15 +370,15 @@ mod tests {
         );
 
         let joint_source_leaf =
-            build_joint_source_leaf(&bank_code, &companion_code, query).expect("joint source leaf");
-        let mid_leaf_index = query >> MID_MEMBER_QUERY_BITS;
-        let mid_leaf = build_mid_leaf(&mid_code, mid_leaf_index).expect("mid leaf");
+            build_fold_normal_joint_source_leaf(&code, &bank_code, &companion_code, query)
+                .expect("fold-normal joint source leaf");
+        let mid_leaf_index = query >> MID_STANDARD_FOLDS;
+        let mid_leaf = build_fold_normal_mid_leaf(&code, &mid_code, mid_leaf_index)
+            .expect("fold-normal mid leaf");
         let source_folded =
-            fold_joint_source_leaf(&code, &joint_source_leaf, gamma, query, &source_challenges)
-                .expect("native source fold");
-        let mid_folded = mid_standard_fold4(&code, &mid_leaf, mid_leaf_index, &mid_challenges)
-            .expect("native mid fold");
-        assert_eq!(source_folded, mid_leaf[query & 0xf]);
+            fold_normal_joint_source_leaf(&joint_source_leaf, gamma, &source_challenges);
+        let mid_folded = fold_normal_mid_leaf(&mid_leaf, &mid_challenges);
+        assert_eq!(source_folded, mid_code[query]);
         assert_eq!(mid_folded, tail_code[mid_leaf_index]);
 
         NativeCase {
@@ -405,13 +409,15 @@ mod tests {
             joint_source_leaf: std::array::from_fn(|index| {
                 alloc_block(b, case.joint_source_leaf[index])
             }),
-            mid_leaf: std::array::from_fn(|index| alloc_block(b, case.mid_leaf[index])),
-            tail: std::array::from_fn(|index| alloc_block(b, case.tail[index])),
-            gamma: alloc_block(b, case.gamma),
+            mid_leaf: std::array::from_fn(|index| alloc_block256(b, case.mid_leaf[index])),
+            tail: std::array::from_fn(|index| alloc_block256(b, case.tail[index])),
+            gamma: alloc_block256(b, case.gamma),
             source_challenges: std::array::from_fn(|index| {
-                alloc_block(b, case.source_challenges[index])
+                alloc_block256(b, case.source_challenges[index])
             }),
-            mid_challenges: std::array::from_fn(|index| alloc_block(b, case.mid_challenges[index])),
+            mid_challenges: std::array::from_fn(|index| {
+                alloc_block256(b, case.mid_challenges[index])
+            }),
         }
     }
 
@@ -419,10 +425,10 @@ mod tests {
         r1cs: FieldR1cs,
         witness: Vec<F128>,
         trace_rows: usize,
-        source_folded: Block128,
-        selected_mid_member: Block128,
-        mid_folded: Block128,
-        selected_tail_cell: Block128,
+        source_folded: Block256,
+        selected_mid_member: Block256,
+        mid_folded: Block256,
+        selected_tail_cell: Block256,
         query_wires: [usize; SOURCE_QUERY_BITS],
         source_challenge_wires: [usize; SOURCE_STANDARD_FOLDS],
         mid_challenge_wires: [usize; MID_STANDARD_FOLDS],
@@ -434,16 +440,16 @@ mod tests {
         assert_eq!(b.num_wires(), 1 + DYNAMIC_INPUT_ROWS, "input ledger");
         let query_wires = std::array::from_fn(|index| input_wire(&input.query_bits[index]));
         let source_challenge_wires =
-            std::array::from_fn(|index| input_wire(&input.source_challenges[index]));
+            std::array::from_fn(|index| input_wire(&input.source_challenges[index].lo));
         let mid_challenge_wires =
-            std::array::from_fn(|index| input_wire(&input.mid_challenges[index]));
+            std::array::from_fn(|index| input_wire(&input.mid_challenges[index].lo));
         let before = b.num_wires();
         let output = verify_zk_phase_b_query_trace(&mut b, &input)?;
         let trace_rows = b.num_wires() - before;
-        let source_folded = tower_value(&b, &output.source_folded);
-        let selected_mid_member = tower_value(&b, &output.selected_mid_member);
-        let mid_folded = tower_value(&b, &output.mid_folded);
-        let selected_tail_cell = tower_value(&b, &output.selected_tail_cell);
+        let source_folded = tower_value_ext(&b, &output.source_folded);
+        let selected_mid_member = tower_value_ext(&b, &output.selected_mid_member);
+        let mid_folded = tower_value_ext(&b, &output.mid_folded);
+        let selected_tail_cell = tower_value_ext(&b, &output.selected_tail_cell);
         let (r1cs, witness) = b.build();
         Ok(BuiltCase {
             r1cs,
@@ -491,11 +497,11 @@ mod tests {
         assert_rejected(&source, "joint-source splice tamper");
 
         let mut mid = honest.clone();
-        mid.mid_leaf[(honest.query & 0xf) ^ 1] += Block128::ONE;
+        mid.mid_leaf[(honest.query & 0xf) ^ 1] += Block256::ONE;
         assert_rejected(&mid, "mid-leaf splice tamper");
 
         let mut tail = honest;
-        tail.tail[7] += Block128::ONE;
+        tail.tail[7] += Block256::ONE;
         assert_rejected(&tail, "tail splice tamper");
     }
 
@@ -524,14 +530,14 @@ mod tests {
         assert!(left.r1cs.satisfies(&left.witness));
         assert!(right.r1cs.satisfies(&right.witness));
 
-        assert_eq!(ZK_PHASE_B_SOURCE_FOLD_ROWS, 22);
-        assert_eq!(ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS, 15);
-        assert_eq!(ZK_PHASE_B_SOURCE_SPLICE_PIN_ROWS, 1);
-        assert_eq!(ZK_PHASE_B_MID_FOLD_ROWS, 30);
-        assert_eq!(ZK_PHASE_B_TAIL_SELECTOR_ROWS, 15);
-        assert_eq!(ZK_PHASE_B_MID_SPLICE_PIN_ROWS, 1);
-        assert_eq!(ZK_PHASE_B_QUERY_TRACE_ROWS, 84);
-        assert_eq!(ZK_PHASE_B_QUERY_ACTIVE_EQUIVALENT_DELTA_ROWS, 35);
+        assert_eq!(ZK_PHASE_B_SOURCE_FOLD_ROWS, 45);
+        assert_eq!(ZK_PHASE_B_MID_MEMBER_SELECTOR_ROWS, 30);
+        assert_eq!(ZK_PHASE_B_SOURCE_SPLICE_PIN_ROWS, 2);
+        assert_eq!(ZK_PHASE_B_MID_FOLD_ROWS, 45);
+        assert_eq!(ZK_PHASE_B_TAIL_SELECTOR_ROWS, 30);
+        assert_eq!(ZK_PHASE_B_MID_SPLICE_PIN_ROWS, 2);
+        assert_eq!(ZK_PHASE_B_QUERY_TRACE_ROWS, 154);
+        assert_eq!(ZK_PHASE_B_QUERY_ACTIVE_EQUIVALENT_DELTA_ROWS, 105);
         assert_eq!(left.trace_rows, ZK_PHASE_B_QUERY_TRACE_ROWS);
         assert_eq!(right.trace_rows, ZK_PHASE_B_QUERY_TRACE_ROWS);
         assert_eq!(left.r1cs.useful_rows, FIXTURE_USEFUL_ROWS);
@@ -562,7 +568,7 @@ mod tests {
 
         input.query_bits[4] =
             alloc_block(&mut b, Block128::from(((native.query >> 4) & 1) as u128));
-        input.mid_challenges[3] = LinExpr::constant(flat_of(native.mid_challenges[3]));
+        input.mid_challenges[3] = const_block256(native.mid_challenges[3]);
         let before = b.num_wires();
         assert!(matches!(
             verify_zk_phase_b_query_trace(&mut b, &input),

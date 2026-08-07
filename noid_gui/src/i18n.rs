@@ -312,13 +312,13 @@ fn translate_localized(language: Language, source: &str) -> String {
             Language::English => source.to_owned(),
         };
     }
-    if source.starts_with("B64 ") && source.contains(" · B255 ") {
+    if source.starts_with("B25 ") && source.contains(" · B255 ") {
         let mut parts = source.splitn(2, " · B255 ");
-        let b64 = parts.next().unwrap_or_default().trim_start_matches("B64 ");
+        let b25 = parts.next().unwrap_or_default().trim_start_matches("B25 ");
         let b255 = parts.next().unwrap_or_default();
         return format!(
-            "B64 {} · B255 {}",
-            translate_localized(language, b64),
+            "B25 {} · B255 {}",
+            translate_localized(language, b25),
             translate_localized(language, b255)
         );
     }
@@ -865,7 +865,7 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         // Mining and block details.
         "MATRIX CACHE" => ("КЭШ МАТРИЦ", "矩阵缓存"),
         "RETRY MATRIX PREPARATION" => ("ПОВТОРИТЬ ПОДГОТОВКУ МАТРИЦ", "重试矩阵准备"),
-        "PREPARING B64 MATRIX…" => ("ПОДГОТОВКА МАТРИЦЫ B64…", "正在准备 B64 矩阵…"),
+        "PREPARING B25 MATRIX…" => ("ПОДГОТОВКА МАТРИЦЫ B25…", "正在准备 B25 矩阵…"),
         "NODE ERROR" => ("ОШИБКА УЗЛА", "节点错误"),
         "INTERNAL MINER" => ("ВСТРОЕННЫЙ МАЙНЕР", "内置矿工"),
         "MINER" => ("МАЙНЕР", "矿工"),

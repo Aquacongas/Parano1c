@@ -3,32 +3,29 @@
 
 //! Post-commit proof authority for committed recursive-region columns.
 //!
-//! V1 contains recording-free vertical slices for Walk-A wallet/meta unions,
-//! the six committed columns of one duplex union (`A0,A1,C0..C3`), and the
-//! nine committed columns of one Walk-B Merkle union
-//! (`C0..C3,E0,E1,SIB0,SIB1,D`). Recording regions are intentionally
-//! excluded: their post-root transcript dependency needs a separate versioned
-//! design. Each slice's Fiat--Shamir
-//! replay must run on the SAME challenger as the enclosing FieldR1cs proof,
-//! through the `*_and_post_commit` callbacks, after that challenger has
-//! absorbed the outer witness commitment.  The sidecar then contributes its
-//! terminal column evaluations to the outer PCS-v1 batch.
+//! Production HistoryStep uses one joint C1 transcript for its three Link and
+//! six Block regions. Every algebraic challenge and proof message is in
+//! GF(2^256). The nine region prefixes share one ragged deep-chain walk, Block
+//! completes on its derived child channel, and Link completes only after the
+//! child terminal is absorbed back into the outer FieldR1cs post-commit
+//! channel. The resulting terminal evaluations are appended to the same outer
+//! PCS batch.
 //!
-//! The serialized proof contains only algebraic proof authority.  It never
+//! The serialized proof contains only algebraic proof authority. It never
 //! carries a prover-authored list of pending openings: the verifier derives
 //! every [`QuirkyDirectClaim`] from the canonical VK column slices and the
 //! replayed relation endpoints.
 
 use noid_ivc_core::challenger::Challenger;
+use noid_ivc_core::deep_chain::c1::C1LaneClaimGroup;
 use noid_ivc_core::deep_chain::ff_merkle::{ff_merkle_fixed_patterns, FfMerklePathFamily};
 use noid_ivc_core::deep_chain::relations::FixedPattern;
 use noid_ivc_core::deep_chain::schedule::{
     duplex_family_refs, duplex_fixed_patterns, merkle_fixed_patterns, DuplexFamilyRefs,
     DuplexLayout, LaneSource, MerklePathFamily,
 };
-use noid_ivc_core::deep_chain::LaneClaimGroup;
-use noid_ivc_core::field::F128;
-use noid_ivc_core::pcs::QuirkyDirectClaim;
+use noid_ivc_core::field::{F128, F256};
+use noid_ivc_core::pcs::{C1QuirkyDirectClaim, QuirkyDirectClaim};
 use noid_ivc_core::public_io::WitnessSlice;
 use noid_poseidon2b::native::poseidon2b_hash_byte_slices;
 
@@ -36,24 +33,27 @@ use crate::acceptance::trace::paired_merkle_update::{
     paired_merkle_update_fixed_patterns, PAIRED_UPDATE_STRIDE,
 };
 use crate::acceptance::trace::region_source_binding::{
-    common_period_ones, common_period_pattern, prove_duplex_union_walk_prefix_with_challenger,
-    prove_duplex_union_walk_suffix_with_challenger, prove_duplex_union_with_challenger,
-    prove_merkle_union_walk_prefix_with_challenger, prove_merkle_union_walk_suffix_with_challenger,
-    prove_merkle_union_with_challenger, verify_duplex_union_walk_prefix_with_challenger,
-    verify_duplex_union_walk_suffix_with_challenger, verify_duplex_union_with_challenger,
-    verify_merkle_union_walk_prefix_with_challenger,
-    verify_merkle_union_walk_suffix_with_challenger, verify_merkle_union_with_challenger,
-    DuplexColumnClaim, DuplexUnion, DuplexUnionProof, DuplexUnionProverWalkPrefix,
-    DuplexUnionVerifierWalkPrefix, DuplexUnionWalkDeferredProof, MerkleColumnClaim,
-    MerkleProtocolFamily, MerkleUnionProof, MerkleUnionProverWalkPrefix,
-    MerkleUnionVerifierWalkPrefix, MerkleUnionWalkDeferredProof,
+    common_period_ones, common_period_pattern, prove_duplex_union_with_challenger,
+    prove_merkle_union_with_challenger, verify_duplex_union_with_challenger,
+    verify_merkle_union_with_challenger, DuplexColumnClaim, DuplexUnion, DuplexUnionProof,
+    MerkleColumnClaim, MerkleProtocolFamily, MerkleUnionProof,
+};
+use crate::acceptance::trace::region_source_binding_c1::{
+    prove_c1_duplex_walk_prefix, prove_c1_duplex_walk_suffix, prove_c1_merkle_walk_prefix,
+    prove_c1_merkle_walk_suffix, verify_c1_duplex_walk_prefix, verify_c1_duplex_walk_suffix,
+    verify_c1_merkle_walk_prefix, verify_c1_merkle_walk_suffix, C1DuplexColumnClaim,
+    C1DuplexProverWalkPrefix, C1DuplexUnionWalkDeferredProof, C1DuplexVerifierWalkPrefix,
+    C1MerkleColumnClaim, C1MerkleProverWalkPrefix, C1MerkleUnionWalkDeferredProof,
+    C1MerkleVerifierWalkPrefix,
 };
 
 mod block;
 pub use block::*;
 mod bounded_decode;
 mod canonical_codec;
+mod joint_c1;
 pub use bounded_decode::*;
+pub(crate) use joint_c1::*;
 mod link;
 pub use link::*;
 mod merkle_trace;
@@ -69,8 +69,14 @@ pub use walk_a::*;
 
 pub const DUPLEX_REGION_SIDECAR_VERSION: u8 = 1;
 pub const DUPLEX_REGION_COMMITTED_COLUMNS: usize = 6;
-pub const MERKLE_REGION_SIDECAR_VERSION: u8 = 1;
+pub const MERKLE_REGION_SIDECAR_VERSION: u8 = 2;
 pub const MERKLE_REGION_COMMITTED_COLUMNS: usize = 9;
+/// Number of Link claim groups in the production joint C1 History walk.
+pub const JOINT_C1_LINK_GROUPS: usize = 3;
+/// Number of Block claim groups in the production joint C1 History walk.
+pub const JOINT_C1_BLOCK_GROUPS: usize = 6;
+/// Total claim groups sharing each joint C1 deep-chain batching challenge.
+pub const JOINT_C1_GROUPS: usize = JOINT_C1_LINK_GROUPS + JOINT_C1_BLOCK_GROUPS;
 pub const MAX_MERKLE_PATTERN_LOG: usize = 20;
 const MAX_MERKLE_FAMILIES: usize = 64;
 const MAX_MERKLE_FIXED_CELLS: usize = 1 << 22;
@@ -273,6 +279,19 @@ impl DuplexRegionVk {
         }
         Ok(())
     }
+
+    /// Per-proof C1 witness gate for a key authenticated by `new` or
+    /// `from_union`. The immutable layout and fixed bank are constructor
+    /// invariants; only the enclosing witness width varies between proofs.
+    fn validate_certified_c1_in_witness(
+        &self,
+        total_vars: usize,
+    ) -> Result<(), RegionSidecarError> {
+        if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        Ok(())
+    }
 }
 
 /// Prover-only inputs not carried by the sidecar proof: layer-0 and layer-66
@@ -282,73 +301,6 @@ pub struct DuplexRegionProverPlan<'a> {
     vk: &'a DuplexRegionVk,
     s0: &'a [Vec<F128>; 4],
     s_out: &'a [Vec<F128>; 4],
-}
-
-pub(crate) struct DuplexRegionProverWalkContinuation<'a, 'z> {
-    vk: &'a DuplexRegionVk,
-    total_vars: usize,
-    committed: [&'z [F128]; DUPLEX_REGION_COMMITTED_COLUMNS],
-    s0: &'a [Vec<F128>; 4],
-    prefix: DuplexUnionProverWalkPrefix,
-}
-
-impl DuplexRegionProverWalkContinuation<'_, '_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
-        self.s0
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<(DuplexRegionWalkDeferredProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
-        let (authority, terminal_claims) = prove_duplex_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &[],
-            &self.committed,
-            self.prefix,
-            terminal,
-            challenger,
-        );
-        let claims = resolve_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
-        Ok((DuplexRegionWalkDeferredProof::new(authority), claims))
-    }
-}
-
-pub(crate) struct DuplexRegionVerifierWalkContinuation<'a> {
-    vk: &'a DuplexRegionVk,
-    total_vars: usize,
-    prefix: DuplexUnionVerifierWalkPrefix<'a>,
-}
-
-impl DuplexRegionVerifierWalkContinuation<'_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-        let terminal_claims = verify_duplex_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &[],
-            self.prefix,
-            terminal,
-            challenger,
-        )
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-        resolve_terminal_claims(self.vk, self.total_vars, terminal_claims)
-    }
 }
 
 impl<'a> DuplexRegionProverPlan<'a> {
@@ -367,33 +319,13 @@ impl<'a> DuplexRegionProverPlan<'a> {
         Ok(Self { vk, s0, s_out })
     }
 
-    pub(crate) fn prove_walk_deferred_prefix<'z, Ch: Challenger>(
-        &self,
-        z: &'z [F128],
-        challenger: &mut Ch,
-    ) -> Result<DuplexRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
-        let total_vars = witness_log(z)?;
-        self.vk.validate_in_witness(total_vars)?;
-        let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
-            let slice = self.vk.slices[column];
-            &z[slice.start()..slice.start() + slice.len()]
-        });
-        bind_vk(challenger, self.vk);
-        let prefix = prove_duplex_union_walk_prefix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.vk.refs,
-            &committed,
-            self.s_out,
-            challenger,
-        );
-        Ok(DuplexRegionProverWalkContinuation {
-            vk: self.vk,
-            total_vars,
-            committed,
-            s0: self.s0,
-            prefix,
-        })
+    fn new_certified_c1(
+        vk: &'a DuplexRegionVk,
+        s0: &'a [Vec<F128>; 4],
+        s_out: &'a [Vec<F128>; 4],
+    ) -> Result<Self, RegionSidecarError> {
+        validate_c1_endpoint_lengths(vk.w_log, s0, s_out)?;
+        Ok(Self { vk, s0, s_out })
     }
 
     /// Run inside `prove_field_with_public_io_and_post_commit` on its passed
@@ -433,6 +365,105 @@ impl<'a> DuplexRegionProverPlan<'a> {
     }
 }
 
+pub(crate) struct C1DuplexRegionProverWalkContinuation<'a, 'z> {
+    vk: &'a DuplexRegionVk,
+    total_vars: usize,
+    committed: [&'z [F128]; DUPLEX_REGION_COMMITTED_COLUMNS],
+    s0: &'a [Vec<F128>; 4],
+    prefix: C1DuplexProverWalkPrefix,
+}
+
+impl C1DuplexRegionProverWalkContinuation<'_, '_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
+        self.s0
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<(C1DuplexRegionWalkDeferredProof, Vec<C1QuirkyDirectClaim>), RegionSidecarError>
+    {
+        let (authority, terminal_claims) = prove_c1_duplex_walk_suffix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.vk.refs,
+            &[],
+            &self.committed,
+            self.prefix,
+            terminal,
+            challenger,
+        );
+        let claims = resolve_c1_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
+        Ok((C1DuplexRegionWalkDeferredProof::new(authority), claims))
+    }
+}
+
+pub(crate) struct C1DuplexRegionVerifierWalkContinuation<'a> {
+    vk: &'a DuplexRegionVk,
+    total_vars: usize,
+    prefix: C1DuplexVerifierWalkPrefix<'a>,
+}
+
+impl C1DuplexRegionVerifierWalkContinuation<'_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let terminal_claims = verify_c1_duplex_walk_suffix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.vk.refs,
+            &[],
+            self.prefix,
+            terminal,
+            challenger,
+        )
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+        resolve_c1_terminal_claims(self.vk, self.total_vars, terminal_claims)
+    }
+}
+
+impl<'a> DuplexRegionProverPlan<'a> {
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1DuplexRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        let total_vars = witness_log(z)?;
+        self.vk.validate_certified_c1_in_witness(total_vars)?;
+        let committed: [&[F128]; DUPLEX_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
+            let slice = self.vk.slices[column];
+            &z[slice.start()..slice.start() + slice.len()]
+        });
+        bind_vk(challenger, self.vk);
+        let prefix = prove_c1_duplex_walk_prefix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.vk.refs,
+            &committed,
+            self.s_out,
+            challenger,
+        );
+        Ok(C1DuplexRegionProverWalkContinuation {
+            vk: self.vk,
+            total_vars,
+            committed,
+            s0: self.s0,
+            prefix,
+        })
+    }
+}
+
 /// Serializable duplex proof authority.  There is no pending-descriptor field:
 /// terminal PCS claims exist only as verifier replay output.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -447,16 +478,14 @@ impl DuplexRegionSidecarProof {
     }
 }
 
-/// Serializable duplex-region authority whose walk is provided and verified
-/// by an enclosing protocol.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct DuplexRegionWalkDeferredProof {
+pub(crate) struct C1DuplexRegionWalkDeferredProof {
     version: u8,
-    authority: DuplexUnionWalkDeferredProof,
+    authority: C1DuplexUnionWalkDeferredProof,
 }
 
-impl DuplexRegionWalkDeferredProof {
-    pub(crate) fn new(authority: DuplexUnionWalkDeferredProof) -> Self {
+impl C1DuplexRegionWalkDeferredProof {
+    pub(crate) fn new(authority: C1DuplexUnionWalkDeferredProof) -> Self {
         Self {
             version: DUPLEX_REGION_SIDECAR_VERSION,
             authority,
@@ -467,31 +496,44 @@ impl DuplexRegionWalkDeferredProof {
         self.version
     }
 
-    pub(crate) fn authority(&self) -> &DuplexUnionWalkDeferredProof {
+    pub(crate) fn authority(&self) -> &C1DuplexUnionWalkDeferredProof {
         &self.authority
     }
 }
 
-pub(crate) fn verify_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
+pub(crate) fn verify_c1_duplex_region_walk_deferred_prefix<'a, Ch: Challenger>(
     vk: &'a DuplexRegionVk,
     total_vars: usize,
-    proof: &'a DuplexRegionWalkDeferredProof,
+    proof: &'a C1DuplexRegionWalkDeferredProof,
     challenger: &mut Ch,
-) -> Result<DuplexRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+) -> Result<C1DuplexRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
     vk.validate_in_witness(total_vars)?;
-    if proof.version() != DUPLEX_REGION_SIDECAR_VERSION {
+    let validate_micros = total_started.elapsed().as_micros();
+    if proof.version != DUPLEX_REGION_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
     bind_vk(challenger, vk);
-    let prefix = verify_duplex_union_walk_prefix_with_challenger(
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+    let prefix_started = std::time::Instant::now();
+    let prefix = verify_c1_duplex_walk_prefix(
         vk.w_log,
         &vk.fixed,
         &vk.refs,
-        proof.authority().as_ref(),
+        proof.authority.as_ref(),
         challenger,
     )
     .map_err(|_| RegionSidecarError::InvalidProof)?;
-    Ok(DuplexRegionVerifierWalkContinuation {
+    if timing {
+        eprintln!(
+            "[duplex-c1 prefix] w_log={} validate_us={validate_micros} bind_us={bind_micros} proof_us={} total_us={}",
+            vk.w_log,
+            prefix_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1DuplexRegionVerifierWalkContinuation {
         vk,
         total_vars,
         prefix,
@@ -538,6 +580,18 @@ pub enum MerkleRegionFamily {
         n_paths: usize,
         iv: [F128; 2],
     },
+    /// Feed-forward paths whose active nodes occupy a fixed caller-selected
+    /// stride. This represents disjoint packed families such as the selected
+    /// authorization layout's `10 + 6` nodes inside each 16-slot query tile.
+    /// No root-copy padding slot is enabled; the final feed-forward root is
+    /// linked from the last active node by the caller's composite-root trace.
+    FeedForwardStrided {
+        offset: usize,
+        depth: usize,
+        n_paths: usize,
+        stride: usize,
+        iv: [F128; 2],
+    },
     TwoPermutation {
         offset: usize,
         depth: usize,
@@ -554,7 +608,7 @@ pub enum MerkleRegionFamily {
 impl MerkleRegionFamily {
     fn fixed_len(self) -> usize {
         match self {
-            Self::FeedForward { .. } => 6,
+            Self::FeedForward { .. } | Self::FeedForwardStrided { .. } => 6,
             Self::TwoPermutation { .. } => 9,
             Self::PairedUpdate { .. } => 12,
         }
@@ -562,7 +616,9 @@ impl MerkleRegionFamily {
 
     fn protocol(self, fixed_base: usize) -> MerkleProtocolFamily {
         match self {
-            Self::FeedForward { .. } => MerkleProtocolFamily::feed_forward(fixed_base),
+            Self::FeedForward { .. } | Self::FeedForwardStrided { .. } => {
+                MerkleProtocolFamily::feed_forward(fixed_base)
+            }
             Self::TwoPermutation { .. } => MerkleProtocolFamily::two_permutation(fixed_base),
             Self::PairedUpdate { .. } => MerkleProtocolFamily::paired_update(fixed_base),
         }
@@ -573,6 +629,7 @@ impl MerkleRegionFamily {
             Self::FeedForward { .. } => 0,
             Self::TwoPermutation { .. } => 1,
             Self::PairedUpdate { .. } => 2,
+            Self::FeedForwardStrided { .. } => 3,
         }
     }
 
@@ -586,6 +643,19 @@ impl MerkleRegionFamily {
             } => {
                 let stride = depth.checked_next_power_of_two()?;
                 Some((offset, n_paths.checked_mul(stride)?))
+            }
+            Self::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                ..
+            } => {
+                if depth == 0 || n_paths == 0 || stride < depth {
+                    return None;
+                }
+                let span = (n_paths - 1).checked_mul(stride)?.checked_add(depth)?;
+                Some((offset, span))
             }
             Self::TwoPermutation {
                 offset,
@@ -605,6 +675,35 @@ impl MerkleRegionFamily {
 
     fn canonical_fixed(self, block_log: usize) -> Option<Vec<FixedPattern>> {
         let (offset, active_slots) = self.geometry()?;
+        if let Self::FeedForwardStrided {
+            depth,
+            n_paths,
+            stride,
+            iv,
+            ..
+        } = self
+        {
+            let family = FfMerklePathFamily { depth, n_paths: 1 };
+            let block = 1usize.checked_shl(block_log as u32)?;
+            let mut fixed = ff_merkle_fixed_patterns(&family, iv)
+                .into_iter()
+                .map(|pattern| {
+                    let mut table = vec![F128::ZERO; block];
+                    for path in 0..n_paths {
+                        let start = offset + path * stride;
+                        table[start..start + depth].copy_from_slice(&pattern.table[..depth]);
+                    }
+                    FixedPattern::new(block_log, table)
+                })
+                .collect::<Vec<_>>();
+            let mut region = vec![F128::ZERO; block];
+            for path in 0..n_paths {
+                let start = offset + path * stride;
+                region[start..start + depth].fill(F128::ONE);
+            }
+            fixed.push(FixedPattern::new(block_log, region));
+            return Some(fixed);
+        }
         let mut fixed = match self {
             Self::FeedForward {
                 depth, n_paths, iv, ..
@@ -632,6 +731,7 @@ impl MerkleRegionFamily {
                 .into_iter()
                 .map(|pattern| common_period_pattern(&pattern.table, offset, n_updates, block_log))
                 .collect::<Vec<_>>(),
+            Self::FeedForwardStrided { .. } => unreachable!("handled above"),
         };
         fixed.push(common_period_ones(offset, active_slots, block_log));
         Some(fixed)
@@ -655,6 +755,21 @@ impl MerkleRegionFamily {
                 push_usize(bytes, offset);
                 push_usize(bytes, depth);
                 push_usize(bytes, n_paths);
+                for value in iv {
+                    push_f128(bytes, value);
+                }
+            }
+            Self::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                iv,
+            } => {
+                push_usize(bytes, offset);
+                push_usize(bytes, depth);
+                push_usize(bytes, n_paths);
+                push_usize(bytes, stride);
                 for value in iv {
                     push_f128(bytes, value);
                 }
@@ -829,6 +944,19 @@ impl MerkleRegionVk {
         }
         Ok(())
     }
+
+    /// Witness-width gate for the per-proof C1 path. `MerkleRegionVk` has no
+    /// public raw-field constructor: `new` authenticates the complete fixed
+    /// bank and layout before this value can exist.
+    fn validate_certified_c1_in_witness(
+        &self,
+        total_vars: usize,
+    ) -> Result<(), RegionSidecarError> {
+        if self.slices.iter().any(|slice| !slice.fits(total_vars)) {
+            return Err(RegionSidecarError::BadSlice);
+        }
+        Ok(())
+    }
 }
 
 /// Prover-only Walk-B endpoints.  The committed columns are read exclusively
@@ -837,73 +965,6 @@ pub struct MerkleRegionProverPlan<'a> {
     vk: &'a MerkleRegionVk,
     s0: &'a [Vec<F128>; 4],
     s_out: &'a [Vec<F128>; 4],
-}
-
-pub(crate) struct MerkleRegionProverWalkContinuation<'a, 'z> {
-    vk: &'a MerkleRegionVk,
-    total_vars: usize,
-    committed: [&'z [F128]; MERKLE_REGION_COMMITTED_COLUMNS],
-    families: Vec<MerkleProtocolFamily>,
-    s0: &'a [Vec<F128>; 4],
-    prefix: MerkleUnionProverWalkPrefix,
-}
-
-impl MerkleRegionProverWalkContinuation<'_, '_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
-        self.s0
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<(MerkleRegionWalkDeferredProof, Vec<QuirkyDirectClaim>), RegionSidecarError> {
-        let (authority, terminal_claims) = prove_merkle_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.families,
-            &self.committed,
-            self.prefix,
-            terminal,
-            challenger,
-        );
-        let claims = resolve_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
-        Ok((MerkleRegionWalkDeferredProof::new(authority), claims))
-    }
-}
-
-pub(crate) struct MerkleRegionVerifierWalkContinuation<'a> {
-    vk: &'a MerkleRegionVk,
-    total_vars: usize,
-    families: Vec<MerkleProtocolFamily>,
-    prefix: MerkleUnionVerifierWalkPrefix<'a>,
-}
-
-impl MerkleRegionVerifierWalkContinuation<'_> {
-    pub(crate) fn group(&self) -> &LaneClaimGroup {
-        self.prefix.walk_group()
-    }
-
-    pub(crate) fn finish<Ch: Challenger>(
-        self,
-        terminal: &LaneClaimGroup,
-        challenger: &mut Ch,
-    ) -> Result<Vec<QuirkyDirectClaim>, RegionSidecarError> {
-        let terminal_claims = verify_merkle_union_walk_suffix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &self.families,
-            self.prefix,
-            terminal,
-            challenger,
-        )
-        .map_err(|_| RegionSidecarError::InvalidProof)?;
-        resolve_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims)
-    }
 }
 
 impl<'a> MerkleRegionProverPlan<'a> {
@@ -920,38 +981,6 @@ impl<'a> MerkleRegionProverPlan<'a> {
             return Err(RegionSidecarError::BadWalkColumns);
         }
         Ok(Self { vk, s0, s_out })
-    }
-
-    pub(crate) fn prove_walk_deferred_prefix<'z, Ch: Challenger>(
-        &self,
-        z: &'z [F128],
-        challenger: &mut Ch,
-    ) -> Result<MerkleRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
-        let total_vars = witness_log(z)?;
-        self.vk.validate_in_witness(total_vars)?;
-        let committed: [&[F128]; MERKLE_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
-            let slice = self.vk.slices[column];
-            &z[slice.start()..slice.start() + slice.len()]
-        });
-        let families = self.vk.protocol_families();
-        bind_merkle_vk(challenger, self.vk);
-        let prefix = prove_merkle_union_walk_prefix_with_challenger(
-            self.vk.w_log,
-            &self.vk.fixed,
-            &[0, 1, 2, 3],
-            &families,
-            &committed,
-            self.s_out,
-            challenger,
-        );
-        Ok(MerkleRegionProverWalkContinuation {
-            vk: self.vk,
-            total_vars,
-            committed,
-            families,
-            s0: self.s0,
-            prefix,
-        })
     }
 
     /// Must run inside the enclosing FieldR1cs post-commit callback, using its
@@ -990,6 +1019,117 @@ impl<'a> MerkleRegionProverPlan<'a> {
     }
 }
 
+pub(crate) struct C1MerkleRegionProverWalkContinuation<'a, 'z> {
+    vk: &'a MerkleRegionVk,
+    total_vars: usize,
+    committed: [&'z [F128]; MERKLE_REGION_COMMITTED_COLUMNS],
+    families: Vec<MerkleProtocolFamily>,
+    s0: &'a [Vec<F128>; 4],
+    prefix: C1MerkleProverWalkPrefix,
+}
+
+impl C1MerkleRegionProverWalkContinuation<'_, '_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn s0(&self) -> &[Vec<F128>; 4] {
+        self.s0
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<(C1MerkleRegionWalkDeferredProof, Vec<C1QuirkyDirectClaim>), RegionSidecarError>
+    {
+        let (authority, terminal_claims) = prove_c1_merkle_walk_suffix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.families,
+            &self.committed,
+            self.prefix,
+            terminal,
+            challenger,
+        );
+        let claims = resolve_c1_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims)?;
+        Ok((C1MerkleRegionWalkDeferredProof::new(authority), claims))
+    }
+}
+
+pub(crate) struct C1MerkleRegionVerifierWalkContinuation<'a> {
+    vk: &'a MerkleRegionVk,
+    total_vars: usize,
+    families: Vec<MerkleProtocolFamily>,
+    prefix: C1MerkleVerifierWalkPrefix<'a>,
+}
+
+impl C1MerkleRegionVerifierWalkContinuation<'_> {
+    pub(crate) fn group(&self) -> &C1LaneClaimGroup {
+        self.prefix.walk_group()
+    }
+
+    pub(crate) fn finish<Ch: Challenger>(
+        self,
+        terminal: &C1LaneClaimGroup,
+        challenger: &mut Ch,
+    ) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+        let terminal_claims = verify_c1_merkle_walk_suffix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &self.families,
+            self.prefix,
+            terminal,
+            challenger,
+        )
+        .map_err(|_| RegionSidecarError::InvalidProof)?;
+        resolve_c1_merkle_terminal_claims(self.vk, self.total_vars, terminal_claims)
+    }
+}
+
+impl<'a> MerkleRegionProverPlan<'a> {
+    fn new_certified_c1(
+        vk: &'a MerkleRegionVk,
+        s0: &'a [Vec<F128>; 4],
+        s_out: &'a [Vec<F128>; 4],
+    ) -> Result<Self, RegionSidecarError> {
+        validate_c1_endpoint_lengths(vk.w_log, s0, s_out)?;
+        Ok(Self { vk, s0, s_out })
+    }
+
+    pub(crate) fn prove_c1_walk_deferred_prefix<'z, Ch: Challenger>(
+        &self,
+        z: &'z [F128],
+        challenger: &mut Ch,
+    ) -> Result<C1MerkleRegionProverWalkContinuation<'a, 'z>, RegionSidecarError> {
+        let total_vars = witness_log(z)?;
+        self.vk.validate_certified_c1_in_witness(total_vars)?;
+        let committed: [&[F128]; MERKLE_REGION_COMMITTED_COLUMNS] = std::array::from_fn(|column| {
+            let slice = self.vk.slices[column];
+            &z[slice.start()..slice.start() + slice.len()]
+        });
+        let families = self.vk.protocol_families();
+        bind_merkle_vk(challenger, self.vk);
+        let prefix = prove_c1_merkle_walk_prefix(
+            self.vk.w_log,
+            &self.vk.fixed,
+            &[0, 1, 2, 3],
+            &families,
+            &committed,
+            self.s_out,
+            challenger,
+        );
+        Ok(C1MerkleRegionProverWalkContinuation {
+            vk: self.vk,
+            total_vars,
+            committed,
+            families,
+            s0: self.s0,
+            prefix,
+        })
+    }
+}
+
 /// Serializable Walk-B authority without prover-authored PCS descriptors.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MerkleRegionSidecarProof {
@@ -1001,60 +1141,16 @@ impl MerkleRegionSidecarProof {
     pub fn byte_len(&self) -> usize {
         bincode::serialized_size(self).expect("merkle sidecar serialized length") as usize
     }
-
-    #[cfg(test)]
-    pub(in crate::region_sidecar) fn into_walk_deferred_parts(
-        self,
-        w_log: usize,
-    ) -> (
-        MerkleRegionWalkDeferredProof,
-        noid_ivc_core::deep_chain::DeepChainWalkProof,
-    ) {
-        let MerkleUnionProof {
-            mut zero,
-            mut zero_shifts,
-            mut selection,
-            mut walk,
-            mut substitution,
-            mut shifts,
-        } = self.authority;
-        for relation in [&mut zero, &mut selection, &mut substitution] {
-            relation.rounds.resize(
-                w_log,
-                [F128::ZERO; noid_ivc_core::deep_chain::relations::RELATION_DEGREE],
-            );
-        }
-        for shift in zero_shifts.iter_mut().chain(&mut shifts) {
-            shift.rounds.resize(w_log, [F128::ZERO; 2]);
-        }
-        for layer in &mut walk.layers {
-            layer
-                .round_coeffs
-                .resize(w_log, [F128::ZERO; noid_ivc_core::deep_chain::WALK_DEGREE]);
-        }
-        (
-            MerkleRegionWalkDeferredProof::new(MerkleUnionWalkDeferredProof {
-                zero,
-                zero_shifts,
-                selection,
-                substitution,
-                shifts,
-            }),
-            walk,
-        )
-    }
 }
 
-/// Serializable Walk-B region authority whose walk is owned by an enclosing
-/// protocol.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MerkleRegionWalkDeferredProof {
+pub(crate) struct C1MerkleRegionWalkDeferredProof {
     version: u8,
-    authority: MerkleUnionWalkDeferredProof,
+    authority: C1MerkleUnionWalkDeferredProof,
 }
 
-impl MerkleRegionWalkDeferredProof {
-    pub(crate) fn new(authority: MerkleUnionWalkDeferredProof) -> Self {
+impl C1MerkleRegionWalkDeferredProof {
+    pub(crate) fn new(authority: C1MerkleUnionWalkDeferredProof) -> Self {
         Self {
             version: MERKLE_REGION_SIDECAR_VERSION,
             authority,
@@ -1065,33 +1161,46 @@ impl MerkleRegionWalkDeferredProof {
         self.version
     }
 
-    pub(crate) fn authority(&self) -> &MerkleUnionWalkDeferredProof {
+    pub(crate) fn authority(&self) -> &C1MerkleUnionWalkDeferredProof {
         &self.authority
     }
 }
 
-pub(crate) fn verify_merkle_region_walk_deferred_prefix<'a, Ch: Challenger>(
+pub(crate) fn verify_c1_merkle_region_walk_deferred_prefix<'a, Ch: Challenger>(
     vk: &'a MerkleRegionVk,
     total_vars: usize,
-    proof: &'a MerkleRegionWalkDeferredProof,
+    proof: &'a C1MerkleRegionWalkDeferredProof,
     challenger: &mut Ch,
-) -> Result<MerkleRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
-    vk.validate_in_witness(total_vars)?;
-    if proof.version() != MERKLE_REGION_SIDECAR_VERSION {
+) -> Result<C1MerkleRegionVerifierWalkContinuation<'a>, RegionSidecarError> {
+    let timing = std::env::var_os("NOIDH_C1_VERIFY_TIMING").is_some();
+    let total_started = std::time::Instant::now();
+    vk.validate_certified_c1_in_witness(total_vars)?;
+    let validate_micros = total_started.elapsed().as_micros();
+    if proof.version != MERKLE_REGION_SIDECAR_VERSION {
         return Err(RegionSidecarError::UnsupportedVersion);
     }
     let families = vk.protocol_families();
     bind_merkle_vk(challenger, vk);
-    let prefix = verify_merkle_union_walk_prefix_with_challenger(
+    let bind_micros = total_started.elapsed().as_micros() - validate_micros;
+    let prefix_started = std::time::Instant::now();
+    let prefix = verify_c1_merkle_walk_prefix(
         vk.w_log,
         &vk.fixed,
         &[0, 1, 2, 3],
         &families,
-        proof.authority().as_ref(),
+        proof.authority.as_ref(),
         challenger,
     )
     .map_err(|_| RegionSidecarError::InvalidProof)?;
-    Ok(MerkleRegionVerifierWalkContinuation {
+    if timing {
+        eprintln!(
+            "[merkle-c1 prefix] w_log={} validate_us={validate_micros} bind_us={bind_micros} proof_us={} total_us={}",
+            vk.w_log,
+            prefix_started.elapsed().as_micros(),
+            total_started.elapsed().as_micros(),
+        );
+    }
+    Ok(C1MerkleRegionVerifierWalkContinuation {
         vk,
         total_vars,
         families,
@@ -1121,7 +1230,12 @@ pub fn verify_merkle_region_sidecar<Ch: Challenger>(
         &proof.authority,
         challenger,
     )
-    .map_err(|_| RegionSidecarError::InvalidProof)?;
+    .map_err(|error| {
+        if std::env::var_os("NOID_HISTORY_STEP_AUX_DEBUG").is_some() {
+            eprintln!("[merkle-sidecar verify] complete proof: {error:?}");
+        }
+        RegionSidecarError::InvalidProof
+    })?;
     resolve_merkle_terminal_claims(vk, total_vars, terminal)
 }
 
@@ -1133,10 +1247,12 @@ fn validate_merkle_family_geometry(
         return Err(RegionSidecarError::BadVk);
     }
     let block = 1usize << block_log;
-    let mut ranges = Vec::with_capacity(families.len());
+    let mut ranges = Vec::new();
+    let mut previous_offset = None;
     for family in families {
         let nonempty = match family {
             MerkleRegionFamily::FeedForward { depth, n_paths, .. }
+            | MerkleRegionFamily::FeedForwardStrided { depth, n_paths, .. }
             | MerkleRegionFamily::TwoPermutation { depth, n_paths, .. } => {
                 *depth > 0 && *n_paths > 0
             }
@@ -1144,11 +1260,37 @@ fn validate_merkle_family_geometry(
         };
         let (offset, len) = family.geometry().ok_or(RegionSidecarError::BadVk)?;
         let end = offset.checked_add(len).ok_or(RegionSidecarError::BadVk)?;
-        if !nonempty || len == 0 || end > block {
+        if !nonempty
+            || len == 0
+            || end > block
+            || previous_offset.is_some_and(|previous| offset < previous)
+        {
             return Err(RegionSidecarError::UnsupportedVkShape);
         }
-        ranges.push((offset, end));
+        previous_offset = Some(offset);
+        match *family {
+            MerkleRegionFamily::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths,
+                stride,
+                ..
+            } => {
+                for path in 0..n_paths {
+                    let start = offset
+                        .checked_add(path.checked_mul(stride).ok_or(RegionSidecarError::BadVk)?)
+                        .ok_or(RegionSidecarError::BadVk)?;
+                    let end = start.checked_add(depth).ok_or(RegionSidecarError::BadVk)?;
+                    if end > block {
+                        return Err(RegionSidecarError::UnsupportedVkShape);
+                    }
+                    ranges.push((start, end));
+                }
+            }
+            _ => ranges.push((offset, end)),
+        }
     }
+    ranges.sort_unstable();
     if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
         return Err(RegionSidecarError::UnsupportedVkShape);
     }
@@ -1270,6 +1412,37 @@ fn resolve_merkle_terminal_claims(
     Ok(claims)
 }
 
+fn resolve_c1_merkle_terminal_claims(
+    vk: &MerkleRegionVk,
+    total_vars: usize,
+    terminal: Vec<C1MerkleColumnClaim>,
+) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+    let mut claims = Vec::with_capacity(terminal.len());
+    for claim in terminal {
+        let slice = *vk
+            .slices
+            .get(claim.column)
+            .ok_or(RegionSidecarError::InvalidProof)?;
+        if claim.point.len() != slice.log2_len {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let mut x_rest = claim.point;
+        x_rest.extend(
+            slice
+                .prefix_coords(total_vars)
+                .into_iter()
+                .map(F256::from_base),
+        );
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
+            k_skip: 0,
+            x_rest,
+            value: claim.value,
+        });
+    }
+    Ok(claims)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegionSidecarError {
     BadVk,
@@ -1373,11 +1546,59 @@ fn resolve_terminal_claims(
     Ok(claims)
 }
 
+fn resolve_c1_terminal_claims(
+    vk: &DuplexRegionVk,
+    total_vars: usize,
+    terminal: Vec<C1DuplexColumnClaim>,
+) -> Result<Vec<C1QuirkyDirectClaim>, RegionSidecarError> {
+    let mut claims = Vec::with_capacity(terminal.len());
+    for claim in terminal {
+        let slice = *vk
+            .slices
+            .get(claim.column)
+            .ok_or(RegionSidecarError::InvalidProof)?;
+        if claim.point.len() != slice.log2_len {
+            return Err(RegionSidecarError::InvalidProof);
+        }
+        let mut x_rest = claim.point;
+        x_rest.extend(
+            slice
+                .prefix_coords(total_vars)
+                .into_iter()
+                .map(F256::from_base),
+        );
+        claims.push(C1QuirkyDirectClaim {
+            z_skip: F256::ZERO,
+            k_skip: 0,
+            x_rest,
+            value: claim.value,
+        });
+    }
+    Ok(claims)
+}
+
 fn witness_log(z: &[F128]) -> Result<usize, RegionSidecarError> {
     if z.is_empty() || !z.len().is_power_of_two() {
         return Err(RegionSidecarError::WitnessShape);
     }
     Ok(z.len().trailing_zeros() as usize)
+}
+
+fn validate_c1_endpoint_lengths(
+    w_log: usize,
+    s0: &[Vec<F128>; 4],
+    s_out: &[Vec<F128>; 4],
+) -> Result<(), RegionSidecarError> {
+    if w_log >= usize::BITS as usize {
+        return Err(RegionSidecarError::BadWalkColumns);
+    }
+    let expected = 1usize << w_log;
+    if s0.iter().any(|column| column.len() != expected)
+        || s_out.iter().any(|column| column.len() != expected)
+    {
+        return Err(RegionSidecarError::BadWalkColumns);
+    }
+    Ok(())
 }
 
 fn push_usize(out: &mut Vec<u8>, value: usize) {
@@ -1410,6 +1631,9 @@ mod tests {
         build_duplex_union, build_duplex_union_with_recordings, RecordingSpec,
     };
     use noid_ivc_core::challenger::{Challenger, FsLaneChallenger};
+    use noid_ivc_core::deep_chain::ff_merkle::{
+        build_ff_merkle_path_columns, FfMerklePathFamily, FfMerklePathWitness,
+    };
     use noid_ivc_core::deep_chain::relations::{
         prove_column_relation, verify_column_relation, RelationColumns,
     };
@@ -1417,7 +1641,6 @@ mod tests {
         build_merkle_path_columns, carry_selection_terms, compile_duplex, MerklePathWitness,
         TranscriptOp,
     };
-    use noid_ivc_core::deep_chain::{prove_deep_chain_walk, verify_deep_chain_walk};
     use noid_ivc_core::field_circuit::FieldR1csBuilder;
     use noid_ivc_core::lincheck::build_eq_table;
     use noid_ivc_core::pcs::{self, PcsParams};
@@ -1428,6 +1651,31 @@ mod tests {
     use noid_ivc_prover::field_prover::prove_field_with_public_io_and_post_commit;
 
     const OUTER_DOMAIN: &[u8] = b"duplex-region-sidecar-field-e2e-v1";
+
+    #[test]
+    fn certified_c1_endpoint_gate_checks_both_boundaries() {
+        let s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; 8]);
+        let s_out = s0.clone();
+        assert_eq!(validate_c1_endpoint_lengths(3, &s0, &s_out), Ok(()));
+
+        let mut short_s0 = s0.clone();
+        short_s0[1].pop();
+        assert_eq!(
+            validate_c1_endpoint_lengths(3, &short_s0, &s_out),
+            Err(RegionSidecarError::BadWalkColumns)
+        );
+
+        let mut long_s_out = s_out.clone();
+        long_s_out[2].push(F128::ZERO);
+        assert_eq!(
+            validate_c1_endpoint_lengths(3, &s0, &long_s_out),
+            Err(RegionSidecarError::BadWalkColumns)
+        );
+        assert_eq!(
+            validate_c1_endpoint_lengths(usize::BITS as usize, &s0, &s_out),
+            Err(RegionSidecarError::BadWalkColumns)
+        );
+    }
 
     fn params(m: usize) -> PcsParams {
         PcsParams {
@@ -1466,77 +1714,6 @@ mod tests {
         let (proof, _) = plan.prove(&z, &mut challenger).unwrap();
         let encoded = bincode::serialize(&proof).unwrap();
         (vk, z.len().trailing_zeros() as usize, proof, encoded)
-    }
-
-    #[test]
-    fn duplex_walk_deferred_plan_and_verifier_match_single_walk_authority() {
-        let layout = compile_duplex(&[
-            TranscriptOp::Absorb(vec![None, None, None]),
-            TranscriptOp::Squeeze(3),
-        ]);
-        let union = build_duplex_union(
-            &layout,
-            [F128::new(0xAB, 0xCD), F128::new(0xEF, 0x12)],
-            &[vec![F128::new(3, 0), F128::new(5, 0), F128::new(7, 0)]],
-        );
-        let column_len = 1usize << union.w_log;
-        let mut z =
-            vec![F128::ZERO; (DUPLEX_REGION_COMMITTED_COLUMNS * column_len).next_power_of_two()];
-        for (column, values) in union.committed.iter().enumerate() {
-            z[column * column_len..(column + 1) * column_len].copy_from_slice(values);
-        }
-        let slices = std::array::from_fn(|index| WitnessSlice {
-            log2_len: union.w_log,
-            index,
-        });
-        let vk = DuplexRegionVk::from_union([0xD5; 32], slices, &union).unwrap();
-        let plan = DuplexRegionProverPlan::new(&vk, &union.s0, &union.s_out).unwrap();
-        let domain = b"duplex-walk-deferred-parity-v1";
-
-        let mut single_ch = FsLaneChallenger::new(domain);
-        let (single, single_claims) = plan.prove(&z, &mut single_ch).unwrap();
-        let single_next = single_ch.sample_f128();
-
-        let mut phased_ch = FsLaneChallenger::new(domain);
-        let continuation = plan.prove_walk_deferred_prefix(&z, &mut phased_ch).unwrap();
-        let groups = [continuation.group().clone()];
-        let (walk, terminal) = prove_deep_chain_walk(continuation.s0(), &groups, &mut phased_ch);
-        let (deferred, phased_claims) = continuation.finish(&terminal, &mut phased_ch).unwrap();
-        let phased_next = phased_ch.sample_f128();
-
-        assert_eq!(single.authority.selection, deferred.authority.selection);
-        assert_eq!(single.authority.walk, walk);
-        assert_eq!(
-            single.authority.substitution,
-            deferred.authority.substitution
-        );
-        assert_eq!(single.authority.shifts, deferred.authority.shifts);
-        let claim_tuples = |claims: &[QuirkyDirectClaim]| {
-            claims
-                .iter()
-                .map(|claim| {
-                    (
-                        claim.z_skip,
-                        claim.k_skip,
-                        claim.x_rest.clone(),
-                        claim.value,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(claim_tuples(&single_claims), claim_tuples(&phased_claims));
-        assert_eq!(single_next, phased_next, "phased prover transcript drift");
-
-        let total_vars = z.len().trailing_zeros() as usize;
-        let mut verifier_ch = FsLaneChallenger::new(domain);
-        let verification =
-            verify_duplex_region_walk_deferred_prefix(&vk, total_vars, &deferred, &mut verifier_ch)
-                .unwrap();
-        let groups = [verification.group().clone()];
-        let terminal = verify_deep_chain_walk(vk.w_log, &groups, &walk, &mut verifier_ch).unwrap();
-        let verifier_claims = verification.finish(&terminal, &mut verifier_ch).unwrap();
-        assert_eq!(claim_tuples(&verifier_claims), claim_tuples(&phased_claims));
-        assert_eq!(verifier_ch.sample_f128(), phased_next);
     }
 
     #[test]
@@ -1875,6 +2052,309 @@ mod tests {
             block_log,
             families,
         )
+    }
+
+    #[test]
+    fn strided_feed_forward_ten_plus_six_matches_dense_wallet_layout_end_to_end() {
+        const W_LOG: usize = 5;
+        const BLOCK_LOG: usize = 5;
+        const N_PATHS: usize = 2;
+        const DESTINATION_STRIDE: usize = 16;
+        const SOURCE_DEPTH: usize = 10;
+        const MID_DEPTH: usize = 6;
+
+        let iv = [F128::new(0x1357, 0x2468), F128::new(0x3579, 0x468a)];
+        let paths = |depth: usize, salt: u64| {
+            (0..N_PATHS)
+                .map(|path| FfMerklePathWitness {
+                    entry: [
+                        F128::new(salt + path as u64 + 1, salt + 0x100 + path as u64),
+                        F128::new(salt + path as u64 + 3, salt + 0x200 + path as u64),
+                    ],
+                    siblings: (0..depth)
+                        .map(|level| {
+                            [
+                                F128::new(
+                                    salt + 0x300 + (path * depth + level) as u64,
+                                    salt + 0x400 + level as u64,
+                                ),
+                                F128::new(
+                                    salt + 0x500 + (path * depth + level) as u64,
+                                    salt + 0x600 + level as u64,
+                                ),
+                            ]
+                        })
+                        .collect(),
+                    directions: (0..depth)
+                        .map(|level| (path + level + salt as usize) & 1 == 1)
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let source_family = FfMerklePathFamily {
+            depth: SOURCE_DEPTH,
+            n_paths: N_PATHS,
+        };
+        let mid_family = FfMerklePathFamily {
+            depth: MID_DEPTH,
+            n_paths: N_PATHS,
+        };
+        let source =
+            build_ff_merkle_path_columns(&source_family, iv, &paths(SOURCE_DEPTH, 0x1000), W_LOG);
+        let mid = build_ff_merkle_path_columns(&mid_family, iv, &paths(MID_DEPTH, 0x2000), 4);
+
+        let column_len = 1usize << W_LOG;
+        let mut committed: [Vec<F128>; MERKLE_REGION_COMMITTED_COLUMNS] =
+            std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s_out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut place = |columns: &noid_ivc_core::deep_chain::ff_merkle::FfMerklePathColumns,
+                         depth: usize,
+                         source_stride: usize,
+                         destination_offset: usize| {
+            for path in 0..N_PATHS {
+                for level in 0..depth {
+                    let from = path * source_stride + level;
+                    let to = path * DESTINATION_STRIDE + destination_offset + level;
+                    for lane in 0..2 {
+                        committed[4 + lane][to] = columns.cr[lane][from];
+                        committed[6 + lane][to] = columns.sib[lane][from];
+                    }
+                    committed[8][to] = columns.d[from];
+                    for lane in 0..4 {
+                        committed[lane][to] = columns.c[lane][from];
+                        s0[lane][to] = columns.s0[lane][from];
+                        s_out[lane][to] = columns.s_out[lane][from];
+                    }
+                }
+            }
+        };
+        place(&source, SOURCE_DEPTH, source_family.stride(), 0);
+        place(&mid, MID_DEPTH, mid_family.stride(), SOURCE_DEPTH);
+
+        let mut z =
+            vec![F128::ZERO; (MERKLE_REGION_COMMITTED_COLUMNS * column_len).next_power_of_two()];
+        for (column, values) in committed.iter().enumerate() {
+            z[column * column_len..(column + 1) * column_len].copy_from_slice(values);
+        }
+        let slices = std::array::from_fn(|index| WitnessSlice {
+            log2_len: W_LOG,
+            index,
+        });
+        let purpose = [0xA6; 32];
+        let families = vec![
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: 0,
+                depth: SOURCE_DEPTH,
+                n_paths: N_PATHS,
+                stride: DESTINATION_STRIDE,
+                iv,
+            },
+            MerkleRegionFamily::FeedForwardStrided {
+                offset: SOURCE_DEPTH,
+                depth: MID_DEPTH,
+                n_paths: N_PATHS,
+                stride: DESTINATION_STRIDE,
+                iv,
+            },
+        ];
+        let vk = MerkleRegionVk::new(purpose, W_LOG, slices, BLOCK_LOG, families).unwrap();
+        assert_eq!(vk.fixed().len(), 12);
+        for slot in 0..column_len {
+            let local = slot % DESTINATION_STRIDE;
+            assert_eq!(
+                vk.fixed()[5].table[slot],
+                if local < SOURCE_DEPTH {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            );
+            assert_eq!(
+                vk.fixed()[11].table[slot],
+                if local >= SOURCE_DEPTH {
+                    F128::ONE
+                } else {
+                    F128::ZERO
+                }
+            );
+        }
+
+        let plan = MerkleRegionProverPlan::new(&vk, &s0, &s_out).unwrap();
+        let mut prover = FsLaneChallenger::new(b"strided-wallet-b-10-plus-6-v1");
+        let (proof, claims) = plan.prove(&z, &mut prover).unwrap();
+        let prover_next = prover.sample_f128();
+        let mut verifier = FsLaneChallenger::new(b"strided-wallet-b-10-plus-6-v1");
+        let replay = verify_merkle_region_sidecar(
+            &vk,
+            z.len().trailing_zeros() as usize,
+            &proof,
+            &mut verifier,
+        )
+        .unwrap();
+        let claim_tuples = |claims: &[QuirkyDirectClaim]| {
+            claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.z_skip,
+                        claim.k_skip,
+                        claim.x_rest.clone(),
+                        claim.value,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claim_tuples(&claims), claim_tuples(&replay));
+        assert_eq!(prover_next, verifier.sample_f128());
+
+        let old_eight_plus_eight = MerkleRegionVk::new(
+            purpose,
+            W_LOG,
+            slices,
+            BLOCK_LOG,
+            vec![
+                MerkleRegionFamily::FeedForwardStrided {
+                    offset: 0,
+                    depth: 8,
+                    n_paths: N_PATHS,
+                    stride: DESTINATION_STRIDE,
+                    iv,
+                },
+                MerkleRegionFamily::FeedForwardStrided {
+                    offset: 8,
+                    depth: 8,
+                    n_paths: N_PATHS,
+                    stride: DESTINATION_STRIDE,
+                    iv,
+                },
+            ],
+        )
+        .unwrap();
+        let mut wrong_verifier = FsLaneChallenger::new(b"strided-wallet-b-10-plus-6-v1");
+        assert!(
+            verify_merkle_region_sidecar(
+                &old_eight_plus_eight,
+                z.len().trailing_zeros() as usize,
+                &proof,
+                &mut wrong_verifier,
+            )
+            .is_err(),
+            "the selected 10+6 authority replayed under the retired 8+8 key"
+        );
+    }
+
+    #[test]
+    fn family_major_feed_forward_paths_fill_the_dyadic_domain_end_to_end() {
+        const W_LOG: usize = 8;
+        const DEPTHS: [usize; 4] = [21, 17, 13, 9];
+        const PATH_COUNTS: [usize; 4] = [5, 5, 3, 3];
+
+        let iv = [F128::new(0x1357, 0x2468), F128::new(0x3579, 0x468a)];
+        let column_len = 1usize << W_LOG;
+        let mut committed: [Vec<F128>; MERKLE_REGION_COMMITTED_COLUMNS] =
+            std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s0: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut s_out: [Vec<F128>; 4] = std::array::from_fn(|_| vec![F128::ZERO; column_len]);
+        let mut families = Vec::with_capacity(DEPTHS.len());
+        let mut offset = 0usize;
+
+        for (family_index, (depth, path_count)) in DEPTHS.into_iter().zip(PATH_COUNTS).enumerate() {
+            let source_family = FfMerklePathFamily {
+                depth,
+                n_paths: path_count,
+            };
+            let source_stride = source_family.stride();
+            let source_slots = (path_count * source_stride).next_power_of_two();
+            let witnesses = (0..path_count)
+                .map(|path| {
+                    let salt = ((family_index + 1) * 0x1000 + path * 0x100) as u64;
+                    FfMerklePathWitness {
+                        entry: [F128::new(salt + 1, salt + 2), F128::new(salt + 3, salt + 4)],
+                        siblings: (0..depth)
+                            .map(|level| {
+                                [
+                                    F128::new(salt + 0x10 + level as u64, salt + 0x20),
+                                    F128::new(salt + 0x30 + level as u64, salt + 0x40),
+                                ]
+                            })
+                            .collect(),
+                        directions: (0..depth)
+                            .map(|level| (path + level + family_index) & 1 == 1)
+                            .collect(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let source = build_ff_merkle_path_columns(
+                &source_family,
+                iv,
+                &witnesses,
+                source_slots.trailing_zeros() as usize,
+            );
+            for path in 0..path_count {
+                for level in 0..depth {
+                    let from = path * source_stride + level;
+                    let to = offset + path * depth + level;
+                    for lane in 0..2 {
+                        committed[4 + lane][to] = source.cr[lane][from];
+                        committed[6 + lane][to] = source.sib[lane][from];
+                    }
+                    committed[8][to] = source.d[from];
+                    for lane in 0..4 {
+                        committed[lane][to] = source.c[lane][from];
+                        s0[lane][to] = source.s0[lane][from];
+                        s_out[lane][to] = source.s_out[lane][from];
+                    }
+                }
+            }
+            families.push(MerkleRegionFamily::FeedForwardStrided {
+                offset,
+                depth,
+                n_paths: path_count,
+                stride: depth,
+                iv,
+            });
+            offset += path_count * depth;
+        }
+        assert_eq!(offset, column_len, "families cover the dyadic domain");
+
+        let mut z =
+            vec![F128::ZERO; (MERKLE_REGION_COMMITTED_COLUMNS * column_len).next_power_of_two()];
+        for (column, values) in committed.iter().enumerate() {
+            z[column * column_len..(column + 1) * column_len].copy_from_slice(values);
+        }
+        let slices = std::array::from_fn(|index| WitnessSlice {
+            log2_len: W_LOG,
+            index,
+        });
+        let vk = MerkleRegionVk::new([0xA7; 32], W_LOG, slices, W_LOG, families).unwrap();
+        let plan = MerkleRegionProverPlan::new(&vk, &s0, &s_out).unwrap();
+        let mut prover = FsLaneChallenger::new(b"family-major-feed-forward-v1");
+        let (proof, claims) = plan.prove(&z, &mut prover).unwrap();
+        let prover_next = prover.sample_f128();
+        let mut verifier = FsLaneChallenger::new(b"family-major-feed-forward-v1");
+        let replay = verify_merkle_region_sidecar(
+            &vk,
+            z.len().trailing_zeros() as usize,
+            &proof,
+            &mut verifier,
+        )
+        .unwrap();
+        let claim_tuples = |claims: &[QuirkyDirectClaim]| {
+            claims
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.z_skip,
+                        claim.k_skip,
+                        claim.x_rest.clone(),
+                        claim.value,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(claim_tuples(&claims), claim_tuples(&replay));
+        assert_eq!(prover_next, verifier.sample_f128());
     }
 
     pub(super) fn merkle_decode_fixture_with_purpose(
