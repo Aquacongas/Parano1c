@@ -217,6 +217,7 @@ release_tool_executable() {
 release_build_pack_tools() {
   local include_generator=${1:-0}
   local build_args=(--bin noid_pack_pins)
+  local tool_rustflags='-C target-cpu=native'
 
   release_require_command cargo
   release_require_command rustc
@@ -225,6 +226,13 @@ release_build_pack_tools() {
   if [[ $include_generator == 1 ]]; then
     build_args+=(--bin noid_matrix_gen)
   fi
+  case "$(rustc -vV | sed -n 's/^host: //p' | tr -d '\r')" in
+    *-windows-*)
+      # Pack authentication assembles a complete launch witness. Reserve the
+      # same bounded stack on Windows that proof workers receive at runtime.
+      tool_rustflags+=' -C link-arg=/STACK:67108864'
+      ;;
+  esac
 
   printf '\n==> Building release pack tools\n'
   (
@@ -233,7 +241,7 @@ release_build_pack_tools() {
     unset NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
     unset NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
     export CARGO_TARGET_DIR="$RELEASE_TOOL_TARGET_DIR"
-    export RUSTFLAGS='-C target-cpu=native'
+    export RUSTFLAGS="$tool_rustflags"
     cd "$RELEASE_ROOT_DIR" || exit 1
     cargo build --locked --release -p bench_prover "${build_args[@]}"
   )
