@@ -44,6 +44,25 @@ The Category 1 result also states the coherent response-cost premise used to
 translate oracle queries into logical gates and circuit depth. These conditions
 are part of the theorem, not omitted implementation notes.
 
+The certificate also instantiates published algebraic cryptanalysis
+of Poseidon2b. The wide tensor round skips in ePrint 2026/306 do not apply to
+the production width-four permutation. Appendix A does apply to the MDS
+two-to-one feed-forward compression used by production Merkle trees. For the
+source-linked `GF(2^128)`, `t=4`, `x^7`, `RF=8`, `RP=58` instance, Theorem 5.1
+gives
+
+```text
+round skip                 (1, [1, 7])
+ideal-degree upper bound   7^73
+log2(d_I^2) dedicated algebraic projection   409.873818620410
+```
+
+The final value is the paper's classical dedicated-attack projection with
+`omega=2`, derived from an ideal-degree upper bound. The fixed-Poseidon2b QROM
+delta remains the separate premise stated by the end-to-end theorem. The exact
+correspondence and its scope are included in [the Category 1
+proof](docs/category-one.md#current-poseidon2b-cryptanalysis).
+
 The complete derivations are in:
 
 - [Block–Tiwari FS-FRI security](docs/block-tiwari.md);
@@ -116,6 +135,7 @@ soundness game. It does not claim that NIST reviewed or certified Parano1d.
 | Sequential QROM lifting and adaptive all-root composition | Chiesa, Manohar and Spooner together with FRACTAL, specialized in [`docs/category-one.md`](docs/category-one.md) |
 | Parallel compressed-oracle transition and collision bounds | Chung, Fehr, Huang and Liao, specialized to typed production responses in the Category 1 document |
 | Category 1 reference resources | NIST Section 4.A.5, evaluated at every stated `MAXDEPTH` point |
+| Current classical Poseidon2b cryptanalysis | Merz and Rodríguez García, specialized to the production permutation and compression mode in [`src/poseidon2b_cryptanalysis.rs`](src/poseidon2b_cryptanalysis.rs) |
 | Production correspondence and numerical conclusions | source-linked Rust parameters, exact rational arithmetic and release regression tests in this crate |
 
 ## Reproduce
@@ -145,6 +165,7 @@ cargo test --release --locked -p noid_soundness
 | [`src/parameters.rs`](src/parameters.rs) | read and cross-check production parameters |
 | [`src/local.rs`](src/local.rs) | wallet and History generalized RBR bounds |
 | [`src/block_tiwari.rs`](src/block_tiwari.rs) | exact classical-ROM expected-work optimizer |
+| [`src/poseidon2b_cryptanalysis.rs`](src/poseidon2b_cryptanalysis.rs) | production correspondence for published Poseidon2b algebraic attacks |
 | [`src/qrom.rs`](src/qrom.rs) | sequential ideal-QROM all-root bound |
 | [`src/resource.rs`](src/resource.rs) | depth-aware Category 1 resource calculation |
 | [`src/exact.rs`](src/exact.rs) | arbitrary-size rational arithmetic and directed decimals |
