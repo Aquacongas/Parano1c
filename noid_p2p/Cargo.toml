@@ -14,7 +14,6 @@ libp2p       = { version = "0.54", features = [
     "gossipsub", "request-response", "cbor", "identify",
     "ping", "macros", "kad", "mdns",
     # NAT traversal
-    "autonat",   # detect NAT status
     "relay",     # circuit relay v2 (client + server modes)
     "dcutr",     # direct connection upgrade through relay (hole punching)
 ] }

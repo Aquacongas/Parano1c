@@ -62,6 +62,20 @@ pub struct FinalizedSnapshotTail {
     armed: bool,
 }
 
+#[derive(Debug)]
+pub enum SnapshotTailFinalizeError {
+    Terminal(String),
+    Local(String),
+}
+
+impl std::fmt::Display for SnapshotTailFinalizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Terminal(error) | Self::Local(error) => formatter.write_str(error),
+        }
+    }
+}
+
 pub struct SnapshotTailReader {
     reader: BufReader<File>,
     next_height: u64,
@@ -212,25 +226,37 @@ impl SnapshotTailStaging {
         mut self,
         terminal_bytes: Vec<u8>,
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    ) -> Result<FinalizedSnapshotTail, String> {
-        let tip_header = self
-            .tip_header
-            .ok_or_else(|| "snapshot tail cannot finalize without a block body".to_string())?;
+    ) -> Result<FinalizedSnapshotTail, SnapshotTailFinalizeError> {
+        let tip_header = self.tip_header.ok_or_else(|| {
+            SnapshotTailFinalizeError::Local(
+                "snapshot tail cannot finalize without a block body".to_string(),
+            )
+        })?;
         if terminal_bytes.len() < HISTORY_STEP_TERMINAL_BINDING_BYTES
             || terminal_bytes.len() > MAX_HISTORY_STEP_TERMINAL_BYTES
         {
-            return Err("snapshot tail terminal length is outside bounds".to_string());
+            return Err(SnapshotTailFinalizeError::Terminal(
+                "snapshot tail terminal length is outside bounds".to_string(),
+            ));
         }
-        let metadata = HistoryStepTerminalMetadata::decode_prefix(&terminal_bytes)
-            .map_err(|error| format!("snapshot tail terminal metadata: {error}"))?;
+        let metadata =
+            HistoryStepTerminalMetadata::decode_prefix(&terminal_bytes).map_err(|error| {
+                SnapshotTailFinalizeError::Terminal(format!(
+                    "snapshot tail terminal metadata: {error}"
+                ))
+            })?;
         if metadata.terminal_height() != tip_header.height
             || metadata.terminal_hash() != noid_chain::block_header::semantic_header_id(&tip_header)
         {
-            return Err("snapshot tail terminal does not bind its sealed tip".to_string());
+            return Err(SnapshotTailFinalizeError::Terminal(
+                "snapshot tail terminal does not bind its sealed tip".to_string(),
+            ));
         }
         File::open(&self.path)
             .and_then(|file| file.sync_all())
-            .map_err(|error| format!("finalize snapshot tail: {error}"))?;
+            .map_err(|error| {
+                SnapshotTailFinalizeError::Local(format!("finalize snapshot tail: {error}"))
+            })?;
         self.armed = false;
         Ok(FinalizedSnapshotTail {
             path: self.path.clone(),

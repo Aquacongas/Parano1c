@@ -86,17 +86,26 @@ impl request_response::Codec for HeaderSyncCodec {
         let count = u16::from_le_bytes(header[4..6].try_into().expect("fixed count"));
         validate_count(count)?;
 
-        // The attacker-controlled count has now passed its hard cap.  Only at
-        // this point may the outer and per-header vectors be reserved.
+        // The attacker-controlled count has now passed its hard cap. Read the
+        // fixed-size payload in one bounded operation so a large batch does
+        // not become thousands of tiny async reads on the multiplexed stream.
         let count = usize::from(count);
+        let payload_len = count
+            .checked_mul(BLOCK_HEADER_WIRE_SIZE)
+            .ok_or_else(|| invalid_data("header batch payload length overflow"))?;
+        let mut payload = Vec::new();
+        payload.try_reserve_exact(payload_len).map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
+        })?;
+        payload.resize(payload_len, 0);
+        io.read_exact(&mut payload).await?;
+
         let mut headers = Vec::new();
         headers.try_reserve_exact(count).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
         })?;
-        for _ in 0..count {
-            let mut encoded = vec![0u8; BLOCK_HEADER_WIRE_SIZE];
-            io.read_exact(&mut encoded).await?;
-            headers.push(encoded);
+        for encoded in payload.chunks_exact(BLOCK_HEADER_WIRE_SIZE) {
+            headers.push(encoded.to_vec());
         }
         ensure_eof(io).await?;
         Ok(GetHeadersResponse { headers })
@@ -141,14 +150,25 @@ impl request_response::Codec for HeaderSyncCodec {
             ));
         }
 
-        let mut header = [0u8; RESPONSE_HEADER_BYTES];
-        header[..4].copy_from_slice(&RESPONSE_MAGIC);
-        header[4..6].copy_from_slice(&count.to_le_bytes());
-        io.write_all(&header).await?;
+        let payload_len = response
+            .headers
+            .len()
+            .checked_mul(BLOCK_HEADER_WIRE_SIZE)
+            .and_then(|len| len.checked_add(RESPONSE_HEADER_BYTES))
+            .ok_or_else(|| invalid_data("header batch payload length overflow"))?;
+        let mut encoded_response = Vec::new();
+        encoded_response
+            .try_reserve_exact(payload_len)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
+            })?;
+        encoded_response.extend_from_slice(&RESPONSE_MAGIC);
+        encoded_response.extend_from_slice(&count.to_le_bytes());
+        encoded_response.extend_from_slice(&[0, 0]);
         for encoded in response.headers {
-            io.write_all(&encoded).await?;
+            encoded_response.extend_from_slice(&encoded);
         }
-        Ok(())
+        io.write_all(&encoded_response).await
     }
 }
 

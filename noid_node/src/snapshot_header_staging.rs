@@ -830,6 +830,76 @@ fn validate_next_header(
     })
 }
 
+/// Validate one bounded in-memory extension before its block bodies can steer
+/// sync or fork choice. This is the same native header relation used by deep
+/// snapshot staging, anchored at an exact canonical header record, but without
+/// creating a durable candidate file for a recent suffix.
+pub fn validate_bounded_header_extension(
+    store: &MdbxStore,
+    ancestor_height: u64,
+    headers: &[BlockHeader],
+    local_time: u64,
+) -> Result<[u8; 32]> {
+    if headers.is_empty() {
+        return Err(SnapshotHeaderStagingError::InvalidCandidate {
+            height: ancestor_height,
+            reason: "empty header extension".into(),
+        });
+    }
+    if headers.len() > MAX_STAGED_HEADER_BATCH {
+        return Err(SnapshotHeaderStagingError::InvalidCandidate {
+            height: ancestor_height.saturating_add(1),
+            reason: format!(
+                "extension has {} headers, maximum is {MAX_STAGED_HEADER_BATCH}",
+                headers.len()
+            ),
+        });
+    }
+
+    let base = CanonicalHeaderBoundary::load(store, ancestor_height)?;
+    let max_window = consensus_window_len();
+    let start = ancestor_height.saturating_sub(max_window as u64 - 1);
+    let mut window = VecDeque::with_capacity(max_window);
+    for height in start..=ancestor_height {
+        let header = store.get_header(height).map_err(store_error)?.ok_or(
+            SnapshotHeaderStagingError::CanonicalConflict {
+                height,
+                reason: "canonical consensus-window header is missing".into(),
+            },
+        )?;
+        window.push_back(header);
+    }
+
+    let mut expected_height =
+        ancestor_height
+            .checked_add(1)
+            .ok_or(SnapshotHeaderStagingError::Format(
+                "candidate height overflow",
+            ))?;
+    let mut cumulative_chainwork = base.cumulative_chainwork;
+    for header in headers {
+        validate_next_header(header, expected_height, &window)?;
+        noid_chain::consensus::validate_future_drift(header.timestamp, local_time).map_err(
+            |error| SnapshotHeaderStagingError::InvalidCandidate {
+                height: header.height,
+                reason: error.to_string(),
+            },
+        )?;
+        cumulative_chainwork = add_work(
+            &cumulative_chainwork,
+            &block_work(&header.difficulty_target),
+        );
+        push_window(&mut window, *header);
+        expected_height =
+            expected_height
+                .checked_add(1)
+                .ok_or(SnapshotHeaderStagingError::Format(
+                    "candidate height overflow",
+                ))?;
+    }
+    Ok(cumulative_chainwork)
+}
+
 fn finalized_active_counts_for_parent(
     parent_height: u64,
     window: &VecDeque<BlockHeader>,

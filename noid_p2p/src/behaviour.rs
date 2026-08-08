@@ -29,8 +29,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
-    swarm::NetworkBehaviour, StreamProtocol,
+    dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response, swarm::NetworkBehaviour,
+    StreamProtocol,
 };
 use libp2p_connection_limits as connection_limits;
 use noid_chain::consensus::wire_limits::GOSSIP_MAX_TRANSMIT_BYTES;
@@ -47,10 +47,25 @@ use crate::state_segment_codec::StateSegmentCodec;
 
 /// All P2P behaviours composed via the derive macro.
 ///
-/// Field order matters: libp2p polls in struct order.
-/// gossipsub and request_response are polled first for lower latency.
+/// Field order matters. Connection limits must reject an endpoint before any
+/// stateful behaviour records its ConnectionId. The remaining behaviours keep
+/// latency-sensitive gossip and request-response near the front.
 #[derive(NetworkBehaviour)]
 pub struct NodeBehaviour {
+    /// Hard connection limits — evaluated before every stateful behaviour.
+    ///
+    /// Limits (production defaults, tunable via config):
+    ///   128 established inbound  — matches Substrate's default
+    ///    64 established outbound — we initiate fewer than we accept
+    ///    64 pending inbound      — cap half-open handshakes
+    ///    32 pending outbound     — cap simultaneous dial attempts
+    ///     2 established per peer — direct plus relay during path upgrade
+    ///
+    /// Inbound network-group admission keeps 32 slots reserved for
+    /// underrepresented prefixes, while allowing shared CGNAT/VPN exits to
+    /// use the unreserved pool.
+    pub connection_limits: connection_limits::Behaviour,
+
     /// Block and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
@@ -86,19 +101,10 @@ pub struct NodeBehaviour {
     /// Liveness probing.
     pub ping: ping::Behaviour,
 
-    /// AutoNAT — probes whether this node is reachable from the internet.
-    ///
-    /// Periodically asks connected peers to dial us back.  If all probes
-    /// fail, the node is behind NAT and should activate the relay client
-    /// to make itself reachable.
-    pub autonat: autonat::Behaviour,
-
     /// Circuit relay client — routes traffic through relay nodes when
     /// direct connections are not possible (NAT, firewall).
     ///
-    /// When AutoNAT confirms NAT, the node makes a reservation at one of
-    /// its connected peers that supports the relay server protocol.
-    /// Other peers can then reach us via:
+    /// A relay reservation can make the node reachable via:
     ///   /ip4/<relay>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
     pub relay_client: relay::client::Behaviour,
 
@@ -109,28 +115,13 @@ pub struct NodeBehaviour {
     /// On success the relay connection is replaced by a direct connection.
     pub dcutr: dcutr::Behaviour,
 
-    /// Hard connection limits — enforced by the swarm before any other
-    /// behaviour sees the connection.  Prevents file-descriptor exhaustion
-    /// and connection-flood DoS.
-    ///
-    /// Limits (production defaults, tunable via config):
-    ///   128 established inbound  — matches Substrate's default
-    ///    64 established outbound — we initiate fewer than we accept
-    ///    64 pending inbound      — cap half-open handshakes
-    ///    32 pending outbound     — cap simultaneous dial attempts
-    ///     2 established per peer — direct plus relay during path upgrade
-    ///
-    /// Inbound network-group admission keeps 32 slots reserved for
-    /// underrepresented prefixes, while allowing shared CGNAT/VPN exits to
-    /// use the unreserved pool.
-    pub connection_limits: connection_limits::Behaviour,
-
     /// State manifest sync — step 1: request chain metadata + active segment IDs.
     /// Tiny response (~few KB), establishes what needs downloading.
     pub state_manifest_sync: request_response::Behaviour<StateManifestCodec>,
 
     /// State segment sync — step 2: request individual segments (~3 MB each).
-    /// Downloaded in parallel after manifest is received.
+    /// The node keeps one network request in flight and overlaps transfer with
+    /// bounded disk authentication.
     pub state_segment_sync: request_response::Behaviour<StateSegmentCodec>,
 
     /// Mempool sync — exchange pending TXs on peer connect.
@@ -309,7 +300,8 @@ impl NodeBehaviour {
         );
 
         // Segment: each response is ~3 MB; 60s per segment is generous.
-        // 16 concurrent streams lets us pipeline downloads aggressively.
+        // The server cap bounds aggregate inbound work from concurrent peers;
+        // one snapshot client uses a single transfer lane.
         let state_segment_sync = request_response::Behaviour::new(
             [(
                 // v3 additionally echoes the exact snapshot boundary in every
@@ -402,24 +394,8 @@ impl NodeBehaviour {
         let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(30)));
 
         // ----------------------------------------------------------------
-        // NAT traversal: AutoNAT + DCUtR
+        // NAT traversal: relay client + DCUtR
         // ----------------------------------------------------------------
-        //
-        // AutoNAT probes our reachability every 90s by asking peers to
-        // dial us back.  Result is logged so operators know if their node
-        // is publicly reachable.
-        let autonat = autonat::Behaviour::new(
-            key.public().to_peer_id(),
-            autonat::Config {
-                boot_delay: Duration::from_secs(30),
-                refresh_interval: Duration::from_secs(90),
-                retry_interval: Duration::from_secs(30),
-                // 3 confirmations before declaring public/private.
-                confidence_max: 3,
-                ..Default::default()
-            },
-        );
-
         // DCUtR: coordinates simultaneous dial attempts between two NAT'd
         // nodes connected through a relay, upgrading to a direct connection.
         let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
@@ -445,6 +421,7 @@ impl NodeBehaviour {
         );
 
         Ok(Self {
+            connection_limits,
             gossipsub,
             chain_sync,
             block_sync,
@@ -453,10 +430,8 @@ impl NodeBehaviour {
             mdns,
             identify,
             ping,
-            autonat,
             relay_client,
             dcutr,
-            connection_limits,
             state_manifest_sync,
             state_segment_sync,
             mempool_sync,

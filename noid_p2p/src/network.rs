@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use libp2p::{
-    autonat, dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent,
-    Multiaddr, PeerId,
+    dcutr, gossipsub, identify, kad, mdns, relay, request_response, swarm::SwarmEvent, Multiaddr,
+    PeerId,
 };
 use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, RwLock, Semaphore};
@@ -53,6 +53,11 @@ struct PendingStateSegmentResponse {
 struct PendingBlockResponse {
     channel: request_response::ResponseChannel<GetRecentBlockResponse>,
     response: GetRecentBlockResponse,
+}
+
+struct PendingHeaderResponse {
+    channel: request_response::ResponseChannel<GetHeadersResponse>,
+    response: GetHeadersResponse,
 }
 
 struct PendingHistoryStepTerminalResponse {
@@ -109,8 +114,17 @@ const MAX_OUTBOUND_BLOCK_BODY_BATCH_RESERVATION: usize =
 const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
 const MAX_PENDING_HEADER_REQUESTS: usize = 64;
+const MAX_PENDING_STATE_MANIFEST_REQUESTS: usize = 16;
 const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
 const MAX_PENDING_HISTORY_STEP_REQUESTS: usize = 8;
+/// The request-response transport timeout starts only after substream open.
+/// These complete-local deadlines also cover time queued before that point.
+const SMALL_SYNC_PENDING_DEADLINE: Duration = Duration::from_secs(35);
+const STATE_SEGMENT_PENDING_DEADLINE: Duration = Duration::from_secs(65);
+/// libp2p starts its request timeout only after an outbound substream opens.
+/// Bound the complete local lifetime as well, including time spent waiting in
+/// the stream-capacity queue.
+const HISTORY_STEP_PENDING_DEADLINE: Duration = Duration::from_secs(65);
 /// In a small network, direct-push to every connected peer so an edge wallet
 /// cannot depend on an already-formed gossipsub mesh to reach the miner.
 const TX_DIRECT_SMALL_NETWORK_MAX_PEERS: usize = 8;
@@ -164,6 +178,187 @@ struct AutomaticPeerCandidate {
     last_seen: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SyncPath {
+    peer: PeerId,
+    direct: bool,
+    dialer: bool,
+    identified: bool,
+    closing: bool,
+}
+
+/// Mirrors every connection visible to request-response and exposes only
+/// peers for which arbitrary per-peer connection selection is safe.
+///
+/// libp2p request-response distributes requests across every established
+/// connection for one PeerId. A second direct connection must therefore be
+/// collapsed before the node issues another sync request. Relay and direct
+/// paths may coexist during a DCUtR upgrade.
+#[derive(Default)]
+struct PeerSyncPaths {
+    paths: std::collections::HashMap<libp2p::swarm::ConnectionId, SyncPath>,
+    announced: std::collections::HashSet<PeerId>,
+}
+
+impl PeerSyncPaths {
+    fn insert(
+        &mut self,
+        connection_id: libp2p::swarm::ConnectionId,
+        peer: PeerId,
+        direct: bool,
+        dialer: bool,
+    ) {
+        let previous = self.paths.insert(
+            connection_id,
+            SyncPath {
+                peer,
+                direct,
+                dialer,
+                identified: false,
+                closing: false,
+            },
+        );
+        debug_assert!(previous.is_none(), "libp2p connection IDs are unique");
+    }
+
+    /// Select one canonical direct path and return exact connections to close.
+    fn canonicalize_direct(
+        &mut self,
+        local: PeerId,
+        peer: PeerId,
+        new_connection: libp2p::swarm::ConnectionId,
+    ) -> Vec<libp2p::swarm::ConnectionId> {
+        let Some(new_path) = self.paths.get(&new_connection).copied() else {
+            return Vec::new();
+        };
+        if !new_path.direct || new_path.closing {
+            return Vec::new();
+        }
+
+        let existing = self
+            .paths
+            .iter()
+            .filter_map(|(connection_id, path)| {
+                (*connection_id != new_connection
+                    && path.peer == peer
+                    && path.direct
+                    && !path.closing)
+                    .then_some((*connection_id, *path))
+            })
+            .collect::<Vec<_>>();
+        if existing.is_empty() {
+            return Vec::new();
+        }
+
+        let has_dialer = new_path.dialer || existing.iter().any(|(_, path)| path.dialer);
+        let has_listener = !new_path.dialer || existing.iter().any(|(_, path)| !path.dialer);
+        let losers = if has_dialer && has_listener {
+            // Opposite-direction cross-dials must retain the same physical
+            // path at both endpoints even if Identify completes in a different
+            // order. PeerId ordering makes that choice independent of local
+            // ConnectionIds, arrival order and handshake speed.
+            let prefer_dialer = local.to_bytes() < peer.to_bytes();
+            if new_path.dialer == prefer_dialer {
+                existing
+                    .iter()
+                    .filter_map(|(connection_id, path)| {
+                        (path.dialer != prefer_dialer).then_some(*connection_id)
+                    })
+                    .collect()
+            } else if existing
+                .iter()
+                .any(|(_, path)| path.dialer == prefer_dialer)
+            {
+                vec![new_connection]
+            } else {
+                Vec::new()
+            }
+        } else if existing.iter().any(|(_, path)| path.identified) {
+            // For same-direction duplicates, preserve an already usable path.
+            // This is the common cached-peer plus unresolved-DNS case.
+            vec![new_connection]
+        } else if has_dialer {
+            // Repeated outbound DNS dials have one owner. Keep the path that
+            // was already established and close the new duplicate.
+            vec![new_connection]
+        } else {
+            // Repeated inbound paths are resolved by their remote dialer.
+            // Until its close arrives, two direct paths keep this peer
+            // non-dispatchable.
+            Vec::new()
+        };
+
+        for connection_id in &losers {
+            if let Some(path) = self.paths.get_mut(connection_id) {
+                path.closing = true;
+            }
+        }
+        losers
+    }
+
+    fn mark_identified(&mut self, connection_id: libp2p::swarm::ConnectionId) {
+        if let Some(path) = self.paths.get_mut(&connection_id) {
+            path.identified = true;
+        }
+    }
+
+    fn mark_closing(&mut self, connection_id: libp2p::swarm::ConnectionId) {
+        if let Some(path) = self.paths.get_mut(&connection_id) {
+            path.closing = true;
+        }
+    }
+
+    fn is_closing(&self, connection_id: libp2p::swarm::ConnectionId) -> bool {
+        self.paths
+            .get(&connection_id)
+            .is_some_and(|path| path.closing)
+    }
+
+    fn remove(&mut self, connection_id: libp2p::swarm::ConnectionId) -> Option<PeerId> {
+        self.paths.remove(&connection_id).map(|path| path.peer)
+    }
+
+    fn has_identified_path(&self, peer: PeerId) -> bool {
+        self.paths
+            .values()
+            .any(|path| path.peer == peer && path.identified && !path.closing)
+    }
+
+    fn is_dispatchable(&self, peer: PeerId) -> bool {
+        let paths = self
+            .paths
+            .values()
+            .filter(|path| path.peer == peer)
+            .collect::<Vec<_>>();
+        if paths.is_empty() || paths.iter().any(|path| !path.identified || path.closing) {
+            return false;
+        }
+        paths.iter().filter(|path| path.direct).count() <= 1
+    }
+
+    fn try_mark_announced(&mut self, peer: PeerId) -> bool {
+        self.is_dispatchable(peer) && self.announced.insert(peer)
+    }
+
+    fn is_announced(&self, peer: PeerId) -> bool {
+        self.announced.contains(&peer)
+    }
+
+    fn clear_announced(&mut self, peer: PeerId) {
+        self.announced.remove(&peer);
+    }
+
+    fn dispatchable_peer_count(&self) -> usize {
+        self.paths
+            .values()
+            .map(|path| path.peer)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .filter(|peer| self.is_dispatchable(*peer))
+            .count()
+    }
+}
+
 #[derive(Clone, Debug)]
 enum PendingAutomaticDial {
     Bootstrap(Multiaddr),
@@ -191,7 +386,7 @@ struct AutomaticPeerState {
     bootstrap: std::collections::HashMap<Multiaddr, BootstrapCandidate>,
     peers: std::collections::HashMap<PeerId, AutomaticPeerCandidate>,
     pending: std::collections::HashMap<libp2p::swarm::ConnectionId, PendingAutomaticDial>,
-    /// Every outbound transport, including short Kademlia/AutoNAT sessions.
+    /// Every outbound transport, including short Kademlia sessions.
     /// These are useful for DNS classification and duplicate suppression but
     /// do not count toward the maintained neighbour target by themselves.
     outbound_connections: std::collections::HashMap<libp2p::swarm::ConnectionId, PeerId>,
@@ -681,6 +876,8 @@ struct PendingRetainedBlockRequest {
     height: u64,
     count: u16,
     payload_kind: RecentBlockPayloadKind,
+    issued_at: Instant,
+    notify_node: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -689,6 +886,17 @@ struct PendingStateSegmentRequest {
     segment_id: u16,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
+    issued_at: Instant,
+    notify_node: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingStateManifestRequest {
+    generation: u64,
+    peer: PeerId,
+    requester_height: u64,
+    issued_at: Instant,
+    notify_node: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -697,6 +905,8 @@ struct PendingHeaderRequest {
     start_height: u64,
     count: u16,
     kind: HeaderRequestKind,
+    issued_at: Instant,
+    notify_node: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -705,22 +915,36 @@ enum HeaderRequestKind {
     Snapshot { generation: u64, token: u64 },
 }
 
-fn header_request_survives_snapshot_generation(
-    kind: HeaderRequestKind,
-    active_generation: u64,
-) -> bool {
-    !matches!(
-        kind,
-        HeaderRequestKind::Snapshot { generation, .. } if generation != active_generation
-    )
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PendingHistoryStepTerminalRequest {
     token: u64,
     peer: PeerId,
     height: u64,
     block_hash: [u8; 32],
+    issued_at: Instant,
+    notify_node: bool,
+}
+
+/// Make room for a new logical terminal race without disturbing newer races.
+/// A race may own more than one transport request because exact requests to
+/// different peers share one node-local token. If the bounded table is full,
+/// retire the complete oldest race; delayed responses then become unknown and
+/// inert in the normal response-correlation path.
+fn admit_history_step_terminal_race<K: std::hash::Hash + Eq + Clone>(
+    pending: &mut BoundedPendingRequests<K, PendingHistoryStepTerminalRequest>,
+) -> Vec<(K, PendingHistoryStepTerminalRequest)> {
+    if pending.has_capacity() {
+        return Vec::new();
+    }
+    let Some(oldest) = pending
+        .entries
+        .values()
+        .min_by_key(|request| request.issued_at)
+        .map(|request| request.token)
+    else {
+        return Vec::new();
+    };
+    pending.take_where_entries(|request| request.token == oldest)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -839,14 +1063,21 @@ impl<K: std::hash::Hash + Eq, V> BoundedPendingRequests<K, V> {
 }
 
 impl<K: std::hash::Hash + Eq + Clone, V> BoundedPendingRequests<K, V> {
-    fn take_where(&mut self, mut matches: impl FnMut(&V) -> bool) -> Vec<V> {
+    fn take_where_entries(&mut self, mut matches: impl FnMut(&V) -> bool) -> Vec<(K, V)> {
         let ids = self
             .entries
             .iter()
             .filter_map(|(id, pending)| matches(pending).then_some(id.clone()))
             .collect::<Vec<_>>();
         ids.into_iter()
-            .filter_map(|id| self.entries.remove(&id))
+            .filter_map(|id| self.entries.remove(&id).map(|pending| (id, pending)))
+            .collect()
+    }
+
+    fn take_where(&mut self, matches: impl FnMut(&V) -> bool) -> Vec<V> {
+        self.take_where_entries(matches)
+            .into_iter()
+            .map(|(_, pending)| pending)
             .collect()
     }
 }
@@ -1119,7 +1350,8 @@ pub enum NetworkCommand {
     },
     /// Fetch one exactly correlated header range for snapshot disk staging.
     ///
-    /// Unlike `FetchHeaders`, two ranges from the same peer may be in flight.
+    /// Unlike `FetchHeaders`, this request belongs to the exact snapshot
+    /// generation and single bounded transfer lane.
     /// `generation`, the node-local `token`, `start_height`, and `count` are
     /// returned unchanged so the node can reject stale or out-of-order
     /// responses without confusing them with reorg/tip probes.
@@ -1133,7 +1365,12 @@ pub enum NetworkCommand {
     },
     /// Request the state manifest from a peer (step 1 of snapshot sync).
     /// Returns metadata + active segment IDs. Emits `NetworkEvent::StateManifest`.
-    RequestStateManifest { peer: PeerId, requester_height: u64 },
+    RequestStateManifest {
+        /// Node-local snapshot generation. It is never sent on the wire.
+        generation: u64,
+        peer: PeerId,
+        requester_height: u64,
+    },
     /// Request a single state segment from a peer (step 2, one per segment).
     /// Emits `NetworkEvent::StateSegment`.
     RequestStateSegment {
@@ -1150,6 +1387,10 @@ pub enum NetworkCommand {
         height: u64,
         block_hash: [u8; 32],
     },
+    /// Retire node notifications for one completed terminal race. Transport
+    /// correlation remains until response, failure, or the local deadline so
+    /// a pre-substream stall can still be detected and flushed.
+    CancelHistoryStepTerminalRace { token: u64 },
     /// Request a peer's mempool contents (all pending TxIntent bytes).
     /// Triggered on peer connect so late-joining nodes receive existing TXs.
     /// Emits `NetworkEvent::MempoolSyncResponse` when the response arrives.
@@ -1242,11 +1483,21 @@ pub enum NetworkEvent {
         from: PeerId,
         start_height: u64,
         count: u16,
+        kind: RequestFailureKind,
     },
     /// State manifest received from a peer (step 1 of snapshot sync).
     StateManifest {
+        generation: u64,
         from: PeerId,
+        requester_height: u64,
         manifest: Box<crate::protocol::GetStateManifestResponse>,
+    },
+    /// Transport failed for one exactly correlated state-manifest request.
+    StateManifestRequestFailed {
+        generation: u64,
+        from: PeerId,
+        requester_height: u64,
+        kind: RequestFailureKind,
     },
     /// One state segment received from a peer (step 2).
     StateSegment {
@@ -1297,8 +1548,6 @@ pub enum NetworkEvent {
     PeerConnected(PeerId),
     /// A peer disconnected.
     PeerDisconnected(PeerId),
-    /// A peer-owned sync request failed while the connection may remain live.
-    PeerRequestFailed(PeerId),
 }
 
 /// Receive side for node-facing P2P events.
@@ -1514,6 +1763,7 @@ impl P2PNetwork {
         let _ = self
             .cmd_tx
             .send(NetworkCommand::RequestStateManifest {
+                generation: 0,
                 peer,
                 requester_height: 0,
             })
@@ -1681,29 +1931,32 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut mempool_sync_retries: std::collections::HashMap<PeerId, MempoolSyncRetry> =
         std::collections::HashMap::new();
-    let mut snapshot_manifest_last_request: std::collections::HashMap<PeerId, Instant> =
-        std::collections::HashMap::new();
     let mut snapshot_segment_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
         std::collections::HashMap::new();
     let mut pending_retained_block_requests =
         BoundedPendingRequests::new(MAX_PENDING_RETAINED_BLOCK_REQUESTS);
     let mut pending_header_requests = BoundedPendingRequests::new(MAX_PENDING_HEADER_REQUESTS);
+    let mut pending_state_manifest_requests =
+        BoundedPendingRequests::new(MAX_PENDING_STATE_MANIFEST_REQUESTS);
     let mut pending_state_segment_requests =
         BoundedPendingRequests::new(MAX_PENDING_STATE_SEGMENT_REQUESTS);
     let mut pending_history_step_requests =
         BoundedPendingRequests::new(MAX_PENDING_HISTORY_STEP_REQUESTS);
     let mut peer_diversity = PeerDiversity::default();
+    let mut sync_paths = PeerSyncPaths::default();
 
     // One waiting response of each kind is sufficient: the request-response
     // behaviour owns the next response while its codec writes it. Byte permits
     // retained by both stages are the process-wide RAM bound.
     let (block_response_tx, mut block_response_rx) = mpsc::channel::<PendingBlockResponse>(1);
+    let (header_response_tx, mut header_response_rx) = mpsc::channel::<PendingHeaderResponse>(1);
     let (history_step_response_tx, mut history_step_response_rx) =
         mpsc::channel::<PendingHistoryStepTerminalResponse>(1);
     let (segment_response_tx, mut segment_response_rx) =
         mpsc::channel::<PendingStateSegmentResponse>(1);
     let (mempool_response_tx, mut mempool_response_rx) = mpsc::channel::<PendingMempoolResponse>(1);
     let block_response_prepare_semaphore = Arc::new(Semaphore::new(2));
+    let header_response_prepare_semaphore = Arc::new(Semaphore::new(2));
     let history_step_response_prepare_semaphore = Arc::new(Semaphore::new(4));
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
     let mempool_response_prepare_semaphore = Arc::new(Semaphore::new(1));
@@ -1750,7 +2003,10 @@ async fn run_swarm(
     loop {
         // Drain all pending commands first (priority: outgoing blocks must propagate
         // immediately without waiting for swarm event processing).
-        while let Ok(cmd) = cmd_rx.try_recv() {
+        for _ in 0..32 {
+            let Ok(cmd) = cmd_rx.try_recv() else {
+                break;
+            };
             handle_network_command(
                 &mut swarm,
                 cmd,
@@ -1760,9 +2016,11 @@ async fn run_swarm(
                 &required_event_tx,
                 &mut pending_retained_block_requests,
                 &mut pending_header_requests,
+                &mut pending_state_manifest_requests,
                 &mut pending_state_segment_requests,
                 &mut pending_history_step_requests,
                 &mut automatic_peers,
+                &sync_paths,
             )
             .await;
         }
@@ -1780,6 +2038,8 @@ async fn run_swarm(
                     &topics,
                     &block_response_tx,
                     &block_response_prepare_semaphore,
+                    &header_response_tx,
+                    &header_response_prepare_semaphore,
                     &history_step_response_tx,
                     &history_step_response_prepare_semaphore,
                     &segment_response_tx,
@@ -1793,14 +2053,15 @@ async fn run_swarm(
                     &mut tx_gossip_rate,
                     &mut mempool_sync_last_request,
                     &mut mempool_sync_retries,
-                    &mut snapshot_manifest_last_request,
                     &mut snapshot_segment_rate,
                     &mut pending_retained_block_requests,
                     &mut pending_header_requests,
+                    &mut pending_state_manifest_requests,
                     &mut pending_state_segment_requests,
                     &mut pending_history_step_requests,
                     &mut automatic_peers,
                     &mut peer_diversity,
+                    &mut sync_paths,
                     &mut successful_peer_cache,
                 )
                 .await;
@@ -1811,6 +2072,15 @@ async fn run_swarm(
                     let _ = swarm
                         .behaviour_mut()
                         .block_sync
+                        .send_response(prepared.channel, prepared.response);
+                }
+            }
+
+            prepared = header_response_rx.recv() => {
+                if let Some(prepared) = prepared {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .chain_sync
                         .send_response(prepared.channel, prepared.response);
                 }
             }
@@ -1935,9 +2205,11 @@ async fn run_swarm(
                         &required_event_tx,
                         &mut pending_retained_block_requests,
                         &mut pending_header_requests,
+                        &mut pending_state_manifest_requests,
                         &mut pending_state_segment_requests,
                         &mut pending_history_step_requests,
                         &mut automatic_peers,
+                        &sync_paths,
                     )
                     .await,
                     None => break, // cmd_tx dropped
@@ -1959,6 +2231,198 @@ async fn run_swarm(
             }
 
             _ = automatic_peer_timer.tick() => {
+                let now = Instant::now();
+                let mut wedged_sync_peers = std::collections::HashSet::new();
+
+                let expired_blocks = pending_retained_block_requests.take_where_entries(
+                    |request| {
+                        now.saturating_duration_since(request.issued_at)
+                            >= SMALL_SYNC_PENDING_DEADLINE
+                    },
+                );
+                for (request_id, request) in expired_blocks {
+                    let transport_stuck = swarm
+                        .behaviour()
+                        .block_sync
+                        .is_pending_outbound(&request.peer, &request_id);
+                    if transport_stuck {
+                        tracing::warn!(
+                            protocol = "block",
+                            peer = %request.peer,
+                            height = request.height,
+                            count = request.count,
+                            payload = ?request.payload_kind,
+                            active = request.notify_node,
+                            "sync request exceeded its complete local deadline"
+                        );
+                        wedged_sync_peers.insert(request.peer);
+                    }
+                    if request.notify_node {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::RecentBlockRequestFailed {
+                                from: request.peer,
+                                height: request.height,
+                                payload_kind: request.payload_kind,
+                            })
+                            .await;
+                    }
+                }
+
+                let expired_headers = pending_header_requests.take_where_entries(|request| {
+                    now.saturating_duration_since(request.issued_at)
+                        >= SMALL_SYNC_PENDING_DEADLINE
+                });
+                for (request_id, request) in expired_headers {
+                    let transport_stuck = swarm
+                        .behaviour()
+                        .chain_sync
+                        .is_pending_outbound(&request.peer, &request_id);
+                    if transport_stuck {
+                        tracing::warn!(
+                            protocol = "headers",
+                            peer = %request.peer,
+                            start_height = request.start_height,
+                            count = request.count,
+                            kind = ?request.kind,
+                            active = request.notify_node,
+                            "sync request exceeded its complete local deadline"
+                        );
+                        wedged_sync_peers.insert(request.peer);
+                    }
+                    if request.notify_node {
+                        match request.kind {
+                            HeaderRequestKind::General => {
+                                let _ = required_event_tx
+                                    .send(NetworkEvent::HeadersRequestFailed {
+                                        from: request.peer,
+                                        start_height: request.start_height,
+                                        count: request.count,
+                                    })
+                                    .await;
+                            }
+                            HeaderRequestKind::Snapshot { generation, token } => {
+                                let _ = required_event_tx
+                                    .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                                        generation,
+                                        token,
+                                        from: request.peer,
+                                        start_height: request.start_height,
+                                        count: request.count,
+                                        kind: RequestFailureKind::Timeout,
+                                    })
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                let expired_manifests = pending_state_manifest_requests.take_where_entries(
+                    |request| {
+                        now.saturating_duration_since(request.issued_at)
+                            >= SMALL_SYNC_PENDING_DEADLINE
+                    },
+                );
+                for (request_id, request) in expired_manifests {
+                    let transport_stuck = swarm
+                        .behaviour()
+                        .state_manifest_sync
+                        .is_pending_outbound(&request.peer, &request_id);
+                    if transport_stuck {
+                        tracing::warn!(
+                            protocol = "manifest",
+                            peer = %request.peer,
+                            generation = request.generation,
+                            requester_height = request.requester_height,
+                            active = request.notify_node,
+                            "sync request exceeded its complete local deadline"
+                        );
+                        wedged_sync_peers.insert(request.peer);
+                    }
+                    if request.notify_node {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::StateManifestRequestFailed {
+                                generation: request.generation,
+                                from: request.peer,
+                                requester_height: request.requester_height,
+                                kind: RequestFailureKind::Timeout,
+                            })
+                            .await;
+                    }
+                }
+
+                let expired_segments = pending_state_segment_requests.take_where_entries(
+                    |request| {
+                        now.saturating_duration_since(request.issued_at)
+                            >= STATE_SEGMENT_PENDING_DEADLINE
+                    },
+                );
+                for (request_id, request) in expired_segments {
+                    let transport_stuck = swarm
+                        .behaviour()
+                        .state_segment_sync
+                        .is_pending_outbound(&request.peer, &request_id);
+                    if transport_stuck {
+                        tracing::warn!(
+                            protocol = "segment",
+                            peer = %request.peer,
+                            segment = request.segment_id,
+                            snapshot_height = request.expected_tip_height,
+                            active = request.notify_node,
+                            "sync request exceeded its complete local deadline"
+                        );
+                        wedged_sync_peers.insert(request.peer);
+                    }
+                    if request.notify_node {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::StateSegmentRequestFailed {
+                                from: request.peer,
+                                segment_id: request.segment_id,
+                                expected_tip_height: request.expected_tip_height,
+                                expected_tip_hash: request.expected_tip_hash,
+                            })
+                            .await;
+                    }
+                }
+
+                let expired_terminals = pending_history_step_requests.take_where_entries(
+                    |request| {
+                        now.saturating_duration_since(request.issued_at)
+                            >= HISTORY_STEP_PENDING_DEADLINE
+                    },
+                );
+                for (request_id, request) in expired_terminals {
+                    if swarm
+                        .behaviour()
+                        .history_step_sync
+                        .is_pending_outbound(&request.peer, &request_id)
+                    {
+                        wedged_sync_peers.insert(request.peer);
+                    }
+                    tracing::warn!(
+                        token = request.token,
+                        peer = %request.peer,
+                        height = request.height,
+                        "HistoryStep terminal request exceeded its complete local deadline"
+                    );
+                    if request.notify_node {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                                token: request.token,
+                                from: request.peer,
+                                height: request.height,
+                                block_hash: request.block_hash,
+                                kind: RequestFailureKind::Timeout,
+                            })
+                            .await;
+                    }
+                }
+                for peer in wedged_sync_peers {
+                    tracing::warn!(
+                        peer = %peer,
+                        "closing connection to flush a sync request stuck before its transport timeout"
+                    );
+                    let _ = swarm.disconnect_peer_id(peer);
+                }
                 maintain_automatic_outbound(
                     &mut swarm,
                     &mut automatic_peers,
@@ -2008,7 +2472,8 @@ async fn run_swarm(
                 let retry_peers: Vec<_> = mempool_sync_retries
                     .iter()
                     .filter(|(peer, retry)| {
-                        mempool_now >= retry.next_attempt && swarm.is_connected(peer)
+                        mempool_now >= retry.next_attempt
+                            && sync_paths.is_dispatchable(**peer)
                     })
                     .map(|(peer, retry)| (*peer, retry.failures))
                     .collect();
@@ -2427,6 +2892,10 @@ async fn handle_network_command(
         request_response::OutboundRequestId,
         PendingHeaderRequest,
     >,
+    pending_state_manifest_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingStateManifestRequest,
+    >,
     pending_state_segment_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingStateSegmentRequest,
@@ -2436,6 +2905,7 @@ async fn handle_network_command(
         PendingHistoryStepTerminalRequest,
     >,
     automatic_peers: &mut AutomaticPeerState,
+    sync_paths: &PeerSyncPaths,
 ) {
     match cmd {
         NetworkCommand::AnnounceBlock { bundle } => {
@@ -2461,7 +2931,11 @@ async fn handle_network_command(
                 tracing::debug!(err = %error, "gossipsub: transaction publish");
             }
 
-            let mut connected: Vec<_> = swarm.connected_peers().copied().collect();
+            let mut connected: Vec<_> = swarm
+                .connected_peers()
+                .copied()
+                .filter(|peer| sync_paths.is_dispatchable(*peer))
+                .collect();
             let direct_limit = direct_tx_relay_limit(connected.len());
             if direct_limit > 0 {
                 connected.shuffle(&mut rand::thread_rng());
@@ -2491,7 +2965,7 @@ async fn handle_network_command(
             tracing::debug!("initial synchronization complete — bootstrap peers are releasable");
         }
         NetworkCommand::PeerCount { reply } => {
-            let count = swarm.connected_peers().count();
+            let count = sync_paths.dispatchable_peer_count();
             let _ = reply.send(count);
         }
         NetworkCommand::SyncBlocksFrom {
@@ -2506,6 +2980,26 @@ async fn handle_network_command(
             // request queue after every applied response.
             const SYNC_WINDOW: u64 = 1;
             for h in from_height..(from_height + (count as u64).min(SYNC_WINDOW)) {
+                if !sync_paths.is_dispatchable(peer) {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::RecentBlockRequestFailed {
+                            from: peer,
+                            height: h,
+                            payload_kind: RecentBlockPayloadKind::Complete,
+                        })
+                        .await;
+                    break;
+                }
+                pending_retained_block_requests.retain(|_, pending| {
+                    if pending.peer == peer
+                        && pending.height == h
+                        && pending.count == 1
+                        && pending.payload_kind == RecentBlockPayloadKind::Complete
+                    {
+                        pending.notify_node = false;
+                    }
+                    true
+                });
                 if !pending_retained_block_requests.has_capacity() {
                     tracing::warn!(
                         peer = %peer,
@@ -2537,12 +3031,34 @@ async fn handle_network_command(
                         height: h,
                         count: 1,
                         payload_kind: RecentBlockPayloadKind::Complete,
+                        issued_at: Instant::now(),
+                        notify_node: true,
                     },
                 );
                 debug_assert!(inserted, "fresh block-sync request ID must be unique");
             }
         }
         NetworkCommand::RequestBlock { peer, height } => {
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockRequestFailed {
+                        from: peer,
+                        height,
+                        payload_kind: RecentBlockPayloadKind::Complete,
+                    })
+                    .await;
+                return;
+            }
+            pending_retained_block_requests.retain(|_, pending| {
+                if pending.peer == peer
+                    && pending.height == height
+                    && pending.count == 1
+                    && pending.payload_kind == RecentBlockPayloadKind::Complete
+                {
+                    pending.notify_node = false;
+                }
+                true
+            });
             if !pending_retained_block_requests.has_capacity() {
                 tracing::warn!(
                     peer = %peer,
@@ -2574,6 +3090,8 @@ async fn handle_network_command(
                     height,
                     count: 1,
                     payload_kind: RecentBlockPayloadKind::Complete,
+                    issued_at: Instant::now(),
+                    notify_node: true,
                 },
             );
             debug_assert!(inserted, "fresh block-sync request ID must be unique");
@@ -2599,6 +3117,26 @@ async fn handle_network_command(
                     .await;
                 return;
             }
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockRequestFailed {
+                        from: peer,
+                        height,
+                        payload_kind: RecentBlockPayloadKind::BlockBody,
+                    })
+                    .await;
+                return;
+            }
+            pending_retained_block_requests.retain(|_, pending| {
+                if pending.peer == peer
+                    && pending.height == height
+                    && pending.count == count
+                    && pending.payload_kind == RecentBlockPayloadKind::BlockBody
+                {
+                    pending.notify_node = false;
+                }
+                true
+            });
             if !pending_retained_block_requests.has_capacity() {
                 tracing::warn!(
                     peer = %peer,
@@ -2631,19 +3169,71 @@ async fn handle_network_command(
                     height,
                     count,
                     payload_kind: RecentBlockPayloadKind::BlockBody,
+                    issued_at: Instant::now(),
+                    notify_node: true,
                 },
             );
             debug_assert!(inserted, "fresh block-sync request ID must be unique");
         }
         NetworkCommand::RequestStateManifest {
+            generation,
             peer,
             requester_height,
         } => {
-            let _ = swarm.behaviour_mut().state_manifest_sync.send_request(
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateManifestRequestFailed {
+                        generation,
+                        from: peer,
+                        requester_height,
+                        kind: RequestFailureKind::ConnectionClosed,
+                    })
+                    .await;
+                return;
+            }
+            // Exact generation correlation makes superseded responses inert.
+            // Keep their transport IDs until completion or local expiry so a
+            // request stuck before substream negotiation can still be flushed.
+            pending_state_manifest_requests.retain(|_, pending| {
+                if pending.peer == peer {
+                    pending.notify_node = false;
+                }
+                true
+            });
+            if !pending_state_manifest_requests.has_capacity() {
+                tracing::warn!(
+                    generation,
+                    peer = %peer,
+                    requester_height,
+                    limit = MAX_PENDING_STATE_MANIFEST_REQUESTS,
+                    "state-manifest request correlation table full"
+                );
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateManifestRequestFailed {
+                        generation,
+                        from: peer,
+                        requester_height,
+                        kind: RequestFailureKind::Io,
+                    })
+                    .await;
+                return;
+            }
+            let request_id = swarm.behaviour_mut().state_manifest_sync.send_request(
                 &peer,
                 crate::protocol::GetStateManifestRequest { requester_height },
             );
-            tracing::debug!(peer = %peer, requester_height, "requesting state manifest");
+            let inserted = pending_state_manifest_requests.try_insert(
+                request_id,
+                PendingStateManifestRequest {
+                    generation,
+                    peer,
+                    requester_height,
+                    issued_at: Instant::now(),
+                    notify_node: true,
+                },
+            );
+            debug_assert!(inserted, "fresh manifest request ID must be unique");
+            tracing::debug!(generation, peer = %peer, requester_height, "requesting state manifest");
         }
         NetworkCommand::RequestStateSegment {
             peer,
@@ -2651,14 +3241,28 @@ async fn handle_network_command(
             expected_tip_height,
             expected_tip_hash,
         } => {
-            // The node owns exactly one active snapshot session. Retire request
-            // IDs from superseded sessions immediately instead of retaining
-            // them for the 60-second libp2p timeout. A delayed response for a
-            // retired ID is consequently unknown and inert.
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateSegmentRequestFailed {
+                        from: peer,
+                        segment_id,
+                        expected_tip_height,
+                        expected_tip_hash,
+                    })
+                    .await;
+                return;
+            }
+            // Exact peer, segment and tip correlation makes superseded
+            // responses inert. Retain old transport IDs until completion or
+            // local expiry so pre-substream stalls remain observable.
             pending_state_segment_requests.retain(|_, pending| {
-                pending.peer == peer
+                let same_session = pending.peer == peer
                     && pending.expected_tip_height == expected_tip_height
-                    && pending.expected_tip_hash == expected_tip_hash
+                    && pending.expected_tip_hash == expected_tip_hash;
+                if !same_session || pending.segment_id == segment_id {
+                    pending.notify_node = false;
+                }
+                true
             });
             if !pending_state_segment_requests.has_capacity() {
                 tracing::warn!(
@@ -2692,6 +3296,8 @@ async fn handle_network_command(
                     segment_id,
                     expected_tip_height,
                     expected_tip_hash,
+                    issued_at: Instant::now(),
+                    notify_node: true,
                 },
             );
             debug_assert!(inserted, "fresh segment-sync request ID must be unique");
@@ -2703,10 +3309,57 @@ async fn handle_network_command(
             height,
             block_hash,
         } => {
-            // The node owns one snapshot state machine. Both requests in one
-            // exact-boundary hedge share a token; a newer logical token
-            // supersedes every older transport.
-            pending_history_step_requests.retain(|_, pending| pending.token == token);
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                        token,
+                        from: peer,
+                        height,
+                        block_hash,
+                        kind: RequestFailureKind::ConnectionClosed,
+                    })
+                    .await;
+                return;
+            }
+            // Boundary, bridge-tip and recent-suffix terminals are independent
+            // logical races and may all be useful concurrently. Never retire
+            // one merely because another token was issued.
+            let retired = admit_history_step_terminal_race(pending_history_step_requests);
+            let mut wedged_retired_peers = std::collections::HashSet::new();
+            for (request_id, request) in retired {
+                if swarm
+                    .behaviour()
+                    .history_step_sync
+                    .is_pending_outbound(&request.peer, &request_id)
+                {
+                    wedged_retired_peers.insert(request.peer);
+                }
+                tracing::warn!(
+                    retired_token = request.token,
+                    token,
+                    peer = %request.peer,
+                    height = request.height,
+                    "retired oldest HistoryStep terminal race at correlation capacity"
+                );
+                if request.notify_node {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                            token: request.token,
+                            from: request.peer,
+                            height: request.height,
+                            block_hash: request.block_hash,
+                            kind: RequestFailureKind::Timeout,
+                        })
+                        .await;
+                }
+            }
+            for retired_peer in wedged_retired_peers {
+                tracing::warn!(
+                    peer = %retired_peer,
+                    "closing connection to flush an evicted HistoryStep terminal race"
+                );
+                let _ = swarm.disconnect_peer_id(retired_peer);
+            }
             if !pending_history_step_requests.has_capacity() {
                 tracing::warn!(
                     token,
@@ -2737,10 +3390,27 @@ async fn handle_network_command(
                     peer,
                     height,
                     block_hash,
+                    issued_at: Instant::now(),
+                    notify_node: true,
                 },
             );
             debug_assert!(inserted, "fresh HistoryStep request ID must be unique");
             tracing::debug!(token, peer = %peer, height, "requesting HistoryStep terminal for snapshot verification");
+        }
+        NetworkCommand::CancelHistoryStepTerminalRace { token } => {
+            let mut retired = 0usize;
+            pending_history_step_requests.retain(|_, request| {
+                if request.token == token {
+                    request.notify_node = false;
+                    retired += 1;
+                }
+                true
+            });
+            tracing::debug!(
+                token,
+                requests = retired,
+                "retired node notification for HistoryStep terminal race"
+            );
         }
         NetworkCommand::FetchHeaders {
             peer,
@@ -2752,11 +3422,24 @@ async fn handle_network_command(
                     .try_into()
                     .expect("header batch cap fits u16"),
             );
-            // Node-side fetch state is per peer. Retire an older request from
-            // the same peer before issuing its replacement so a delayed stream
-            // cannot consume correlation capacity or reset a newer session.
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::HeadersRequestFailed {
+                        from: peer,
+                        start_height,
+                        count,
+                    })
+                    .await;
+                return;
+            }
+            // Exact range correlation makes superseded responses inert. Keep
+            // their transport IDs until completion or local expiry so a
+            // request stuck before substream negotiation can be flushed.
             pending_header_requests.retain(|_, pending| {
-                pending.peer != peer || pending.kind != HeaderRequestKind::General
+                if pending.peer == peer && pending.kind == HeaderRequestKind::General {
+                    pending.notify_node = false;
+                }
+                true
             });
             if !pending_header_requests.has_capacity() {
                 let _ = required_event_tx
@@ -2782,6 +3465,8 @@ async fn handle_network_command(
                     start_height,
                     count,
                     kind: HeaderRequestKind::General,
+                    issued_at: Instant::now(),
+                    notify_node: true,
                 },
             );
             debug_assert!(inserted, "fresh header request ID must be unique");
@@ -2798,15 +3483,27 @@ async fn handle_network_command(
                     .try_into()
                     .expect("header batch cap fits u16"),
             );
-            // The node owns a single snapshot-header FSM. Once it advances to
-            // a new generation, delayed requests from every older generation
-            // are inert and must not consume the bounded correlation table.
-            // Keep both current-window requests, their one bounded hedge, and
-            // unrelated general probes. The node accepts the first valid
-            // response from either attempt and correlation tokens make the
-            // later duplicate inert.
+            if !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                        generation,
+                        token,
+                        from: peer,
+                        start_height,
+                        count,
+                        kind: RequestFailureKind::ConnectionClosed,
+                    })
+                    .await;
+                return;
+            }
+            // Generation, token and exact range correlation make superseded
+            // responses inert. Retain old transport IDs until completion or
+            // local expiry so pre-substream stalls remain observable.
             pending_header_requests.retain(|_, pending| {
-                header_request_survives_snapshot_generation(pending.kind, generation)
+                if matches!(pending.kind, HeaderRequestKind::Snapshot { .. }) {
+                    pending.notify_node = false;
+                }
+                true
             });
             if !pending_header_requests.has_capacity() {
                 let _ = required_event_tx
@@ -2816,6 +3513,7 @@ async fn handle_network_command(
                         from: peer,
                         start_height,
                         count,
+                        kind: RequestFailureKind::Io,
                     })
                     .await;
                 return;
@@ -2834,11 +3532,18 @@ async fn handle_network_command(
                     start_height,
                     count,
                     kind: HeaderRequestKind::Snapshot { generation, token },
+                    issued_at: Instant::now(),
+                    notify_node: true,
                 },
             );
             debug_assert!(inserted, "fresh snapshot header request ID must be unique");
         }
         NetworkCommand::RequestMempoolSync { peer } => {
+            if !sync_paths.is_dispatchable(peer) {
+                let local = *swarm.local_peer_id();
+                let _ = schedule_mempool_sync_retry(mempool_sync_retries, local, peer);
+                return;
+            }
             const MEMPOOL_SYNC_REQUEST_COOLDOWN: Duration = Duration::from_secs(30);
             let now = Instant::now();
             if let Some(last) = mempool_sync_last_request.get(&peer) {
@@ -2869,6 +3574,8 @@ async fn handle_swarm_event(
     topics: &NetworkTopics,
     block_response_tx: &mpsc::Sender<PendingBlockResponse>,
     block_response_prepare_semaphore: &Arc<Semaphore>,
+    header_response_tx: &mpsc::Sender<PendingHeaderResponse>,
+    header_response_prepare_semaphore: &Arc<Semaphore>,
     history_step_response_tx: &mpsc::Sender<PendingHistoryStepTerminalResponse>,
     history_step_response_prepare_semaphore: &Arc<Semaphore>,
     segment_response_tx: &mpsc::Sender<PendingStateSegmentResponse>,
@@ -2882,7 +3589,6 @@ async fn handle_swarm_event(
     tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     mempool_sync_retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
-    snapshot_manifest_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     snapshot_segment_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     pending_retained_block_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
@@ -2891,6 +3597,10 @@ async fn handle_swarm_event(
     pending_header_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingHeaderRequest,
+    >,
+    pending_state_manifest_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingStateManifestRequest,
     >,
     pending_state_segment_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
@@ -2902,31 +3612,36 @@ async fn handle_swarm_event(
     >,
     automatic_peers: &mut AutomaticPeerState,
     peer_diversity: &mut PeerDiversity,
+    sync_paths: &mut PeerSyncPaths,
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
 ) {
     macro_rules! fail_retained_request {
         ($pending:expr) => {{
             let pending = $pending;
-            let _ = required_event_tx
-                .send(NetworkEvent::RecentBlockRequestFailed {
-                    from: pending.peer,
-                    height: pending.height,
-                    payload_kind: pending.payload_kind,
-                })
-                .await;
+            if pending.notify_node {
+                let _ = required_event_tx
+                    .send(NetworkEvent::RecentBlockRequestFailed {
+                        from: pending.peer,
+                        height: pending.height,
+                        payload_kind: pending.payload_kind,
+                    })
+                    .await;
+            }
         }};
     }
     macro_rules! fail_state_segment_request {
         ($pending:expr) => {{
             let pending = $pending;
-            let _ = required_event_tx
-                .send(NetworkEvent::StateSegmentRequestFailed {
-                    from: pending.peer,
-                    segment_id: pending.segment_id,
-                    expected_tip_height: pending.expected_tip_height,
-                    expected_tip_hash: pending.expected_tip_hash,
-                })
-                .await;
+            if pending.notify_node {
+                let _ = required_event_tx
+                    .send(NetworkEvent::StateSegmentRequestFailed {
+                        from: pending.peer,
+                        segment_id: pending.segment_id,
+                        expected_tip_height: pending.expected_tip_height,
+                        expected_tip_hash: pending.expected_tip_hash,
+                    })
+                    .await;
+            }
         }};
     }
 
@@ -3023,6 +3738,12 @@ async fn handle_swarm_event(
             info,
             ..
         })) => {
+            // A duplicate or policy-rejected endpoint remains visible to
+            // request-response until its exact ConnectionClosed event. Do not
+            // promote it while the close is in flight.
+            if sync_paths.is_closing(connection_id) {
+                return;
+            }
             // A Noise/libp2p endpoint is not yet a usable ParanO(1)d peer.
             // Require the current network's exact header protocol before this
             // connection can satisfy bootstrap fanout or the ordinary peer
@@ -3033,6 +3754,7 @@ async fn handle_swarm_event(
                 .iter()
                 .any(|protocol| protocol.as_ref() == required_protocol)
             {
+                sync_paths.mark_closing(connection_id);
                 let _ = swarm.close_connection(connection_id);
                 swarm.behaviour_mut().kad.remove_peer(&peer_id);
                 tracing::debug!(
@@ -3080,6 +3802,7 @@ async fn handle_swarm_event(
                         peer_id,
                         addr,
                     ) {
+                        sync_paths.mark_closing(connection_id);
                         let _ = swarm.close_connection(connection_id);
                         swarm.behaviour_mut().kad.remove_peer(&peer_id);
                         tracing::debug!(
@@ -3098,6 +3821,13 @@ async fn handle_swarm_event(
                 routable_addrs.iter().cloned(),
             );
             automatic_peers.note_identified(connection_id, peer_id);
+            sync_paths.mark_identified(connection_id);
+            if sync_paths.try_mark_announced(peer_id) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::PeerConnected(peer_id))
+                    .await;
+                tracing::debug!(peer = %peer_id, "peer sync protocols ready");
+            }
             if automatic_peers.is_outbound(peer_id) {
                 for addr in routable_addrs {
                     successful_peer_cache.record_success(peer_id, addr);
@@ -3240,30 +3970,6 @@ async fn handle_swarm_event(
             _ => {}
         },
 
-        // --- AutoNAT: log the latest reachability sample ---
-        SwarmEvent::Behaviour(NodeBehaviourEvent::Autonat(autonat::Event::StatusChanged {
-            old,
-            new,
-        })) => match &new {
-            autonat::NatStatus::Public(addr) => {
-                tracing::info!(addr = %addr, "autonat: node is publicly reachable");
-            }
-            autonat::NatStatus::Private => {
-                // AutoNAT v1 reports the result of a dial-back sample. A
-                // single failed sample is not a stable NAT classification:
-                // another connected probe server can immediately confirm the
-                // same public address. Keep the sample visible without
-                // presenting it as an operator fault.
-                tracing::info!(
-                    prev = ?old,
-                    "autonat: latest dial-back probe did not confirm public reachability"
-                );
-            }
-            autonat::NatStatus::Unknown => {
-                tracing::debug!(prev = ?old, "autonat: NAT status unknown (probing)");
-            }
-        },
-
         // --- Relay client: reservation / circuit events ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::RelayClient(ev)) => match ev {
             relay::client::Event::ReservationReqAccepted { relay_peer_id, .. } => {
@@ -3316,6 +4022,10 @@ async fn handle_swarm_event(
                 );
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded header response");
+                return;
+            }
             if pending.peer != peer {
                 match pending.kind {
                     HeaderRequestKind::General => {
@@ -3335,6 +4045,7 @@ async fn handle_swarm_event(
                                 from: pending.peer,
                                 start_height: pending.start_height,
                                 count: pending.count,
+                                kind: RequestFailureKind::InvalidResponse,
                             })
                             .await;
                     }
@@ -3363,6 +4074,7 @@ async fn handle_swarm_event(
                                     from: pending.peer,
                                     start_height: pending.start_height,
                                     count: pending.count,
+                                    kind: RequestFailureKind::InvalidResponse,
                                 })
                                 .await;
                         }
@@ -3401,6 +4113,7 @@ async fn handle_swarm_event(
                 error,
             },
         )) => {
+            let kind = RequestFailureKind::from(&error);
             let Some(pending) = pending_header_requests.remove(&request_id) else {
                 tracing::debug!(
                     peer = %peer,
@@ -3409,6 +4122,10 @@ async fn handle_swarm_event(
                 );
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded header request failure");
+                return;
+            }
             tracing::debug!(
                 peer = %peer,
                 request_id = %request_id,
@@ -3433,6 +4150,7 @@ async fn handle_swarm_event(
                             from: pending.peer,
                             start_height: pending.start_height,
                             count: pending.count,
+                            kind,
                         })
                         .await;
                 }
@@ -3455,29 +4173,57 @@ async fn handle_swarm_event(
                     .try_into()
                     .expect("header batch cap fits u16"),
             );
-            let headers = match chain_store.get_headers(request.start_height, count) {
-                Ok(headers) => headers
-                    .into_iter()
-                    .map(|header| {
-                        let mut encoded = Vec::with_capacity(noid_chain::BLOCK_HEADER_WIRE_SIZE);
-                        header.encode(&mut encoded);
-                        encoded
+            let start_height = request.start_height;
+            let store = chain_store.clone();
+            let preparation_admission = header_response_prepare_semaphore.clone();
+            let completion = header_response_tx.clone();
+            tokio::spawn(async move {
+                let Ok(preparation_permit) = preparation_admission.acquire_owned().await else {
+                    return;
+                };
+                let _preparation_permit = preparation_permit;
+                let loaded = tokio::task::spawn_blocking(move || {
+                    match store.get_headers(start_height, count) {
+                        Ok(headers) => headers
+                            .into_iter()
+                            .map(|header| {
+                                let mut encoded =
+                                    Vec::with_capacity(noid_chain::BLOCK_HEADER_WIRE_SIZE);
+                                header.encode(&mut encoded);
+                                encoded
+                            })
+                            .collect(),
+                        Err(error) => {
+                            tracing::warn!(
+                                start_height,
+                                count,
+                                err = %error,
+                                "canonical header range read failed"
+                            );
+                            Vec::new()
+                        }
+                    }
+                })
+                .await;
+                let headers = match loaded {
+                    Ok(headers) => headers,
+                    Err(error) => {
+                        tracing::warn!(
+                            start_height,
+                            count,
+                            err = %error,
+                            "header response storage worker failed"
+                        );
+                        Vec::new()
+                    }
+                };
+                let _ = completion
+                    .send(PendingHeaderResponse {
+                        channel,
+                        response: GetHeadersResponse { headers },
                     })
-                    .collect(),
-                Err(error) => {
-                    tracing::warn!(
-                        start_height = request.start_height,
-                        count,
-                        err = %error,
-                        "canonical header range read failed"
-                    );
-                    Vec::new()
-                }
-            };
-            let _ = swarm
-                .behaviour_mut()
-                .chain_sync
-                .send_response(channel, GetHeadersResponse { headers });
+                    .await;
+            });
         }
 
         // --- Block pull: client received block + proof ---
@@ -3500,6 +4246,10 @@ async fn handle_swarm_event(
                 );
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded retained-block response");
+                return;
+            }
             if !retained_block_response_matches_pending(
                 pending,
                 peer,
@@ -3616,20 +4366,11 @@ async fn handle_swarm_event(
             },
         )) => {
             // Reserve the consensus upper bound before the first MDBX value is
-            // copied into a Vec. The task waits off the swarm loop so the
-            // current response can continue being polled/written and release
-            // its permit. The permit then follows the response into the codec.
-            let Ok(preparation_permit) =
-                block_response_prepare_semaphore.clone().try_acquire_owned()
-            else {
-                tracing::debug!(
-                    height = request.height,
-                    "block response preparation saturated"
-                );
-                // Dropping the response channel reports a transient outbound
-                // failure; it must not masquerade as a durable pruned block.
-                return;
-            };
+            // copied into a Vec. Waiting happens off the swarm loop. The
+            // request-response stream cap bounds the waiter count, so a busy
+            // disk worker delays this exact response instead of manufacturing
+            // a transport failure that makes the client repeat the range.
+            let preparation_admission = block_response_prepare_semaphore.clone();
             let store = chain_store.clone();
             let budget = outbound_response_budget.clone();
             let completion = block_response_tx.clone();
@@ -3653,6 +4394,9 @@ async fn handle_swarm_event(
                 }
             });
             tokio::spawn(async move {
+                let Ok(preparation_permit) = preparation_admission.acquire_owned().await else {
+                    return;
+                };
                 let _preparation_permit = preparation_permit;
                 let Ok(Some(outbound_memory_permit)) = budget.acquire(response_reservation).await
                 else {
@@ -3742,18 +4486,11 @@ async fn handle_swarm_event(
                 height = request.height,
                 "received HistoryStep terminal request"
             );
-            let Ok(preparation_permit) = history_step_response_prepare_semaphore
-                .clone()
-                .try_acquire_owned()
-            else {
-                tracing::warn!(
-                    %peer,
-                    ?request_id,
-                    height = request.height,
-                    "HistoryStep response preparation saturated"
-                );
-                return;
-            };
+            // The protocol admits at most four concurrent terminal streams.
+            // Queue those streams behind the four storage workers off the
+            // swarm loop rather than dropping an exact, immutable terminal
+            // request and forcing a second near-megabyte transfer.
+            let preparation_admission = history_step_response_prepare_semaphore.clone();
             let store = chain_store.clone();
             let budget = outbound_response_budget.clone();
             let completion = history_step_response_tx.clone();
@@ -3773,6 +4510,9 @@ async fn handle_swarm_event(
                 Some(generation.clone())
             });
             tokio::spawn(async move {
+                let Ok(preparation_permit) = preparation_admission.acquire_owned().await else {
+                    return;
+                };
                 let _preparation_permit = preparation_permit;
                 let Ok(Some(outbound_memory_permit)) = budget
                     .acquire(MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES)
@@ -3845,6 +4585,15 @@ async fn handle_swarm_event(
                 );
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(
+                    token = pending.token,
+                    peer = %peer,
+                    request_id = %request_id,
+                    "discarding response for a completed HistoryStep terminal race"
+                );
+                return;
+            }
             if pending.peer != peer
                 || pending.height != response.height
                 || pending.block_hash != response.block_hash
@@ -3922,20 +4671,6 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
-            const MANIFEST_REQUEST_COOLDOWN: Duration = Duration::from_secs(10);
-            let now = Instant::now();
-            if snapshot_manifest_last_request
-                .get(&peer)
-                .is_some_and(|last| now.duration_since(*last) < MANIFEST_REQUEST_COOLDOWN)
-            {
-                tracing::debug!(peer = %peer, "snapshot manifest request suppressed by cooldown");
-                let _ = swarm
-                    .behaviour_mut()
-                    .state_manifest_sync
-                    .send_response(channel, GetStateManifestResponse::default());
-                return;
-            }
-            snapshot_manifest_last_request.insert(peer, now);
             prune_snapshot_export_leases(snapshot_export_leases);
             prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             let response = 'ready_manifest: {
@@ -4010,10 +4745,44 @@ async fn handle_swarm_event(
         // --- State sync: manifest client (step 1 response) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
             request_response::Event::Message {
-                message: request_response::Message::Response { response, .. },
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
                 peer,
             },
         )) => {
+            let Some(pending) = pending_state_manifest_requests.remove(&request_id) else {
+                tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale state-manifest response");
+                return;
+            };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded state-manifest response");
+                return;
+            }
+            macro_rules! reject_manifest_response {
+                ($failed_peer:expr) => {{
+                    let _ = required_event_tx
+                        .send(NetworkEvent::StateManifestRequestFailed {
+                            generation: pending.generation,
+                            from: $failed_peer,
+                            requester_height: pending.requester_height,
+                            kind: RequestFailureKind::InvalidResponse,
+                        })
+                        .await;
+                    return;
+                }};
+            }
+            if pending.peer != peer {
+                tracing::debug!(
+                    peer = %peer,
+                    requested_peer = %pending.peer,
+                    request_id = %request_id,
+                    "ignoring mismatched state-manifest response"
+                );
+                reject_manifest_response!(pending.peer);
+            }
             if response.tip_height > 0 {
                 if response.bridge_tip_height < response.tip_height
                     || response
@@ -4029,17 +4798,17 @@ async fn handle_swarm_event(
                         bridge_tip = response.bridge_tip_height,
                         "manifest: immutable bridge geometry is invalid"
                     );
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 if response.segment_ids.len() != response.segment_roots.len()
                     || response.segment_ids.len() != response.segment_lengths.len()
                 {
                     tracing::warn!(from = %peer, "manifest: descriptor vector length mismatch, dropping");
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 if !response.segment_ids.windows(2).all(|w| w[0] < w[1]) {
                     tracing::warn!(from = %peer, "manifest: segment IDs are not strictly sorted, dropping");
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 let segment_span = response.log_slots.saturating_sub(response.eff_log as u32);
                 let max_possible_segments = 1usize.checked_shl(segment_span).unwrap_or(usize::MAX);
@@ -4052,7 +4821,7 @@ async fn handle_swarm_event(
                         eff_log = response.eff_log,
                         "manifest: impossible segment count, dropping"
                     );
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 if response.segment_ids.len() > MAX_SNAPSHOT_MANIFEST_SEGMENTS {
                     tracing::warn!(
@@ -4061,13 +4830,13 @@ async fn handle_swarm_event(
                         max_segments = MAX_SNAPSHOT_MANIFEST_SEGMENTS,
                         "manifest: too many segment IDs, dropping"
                     );
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 let Some(maximum_segment_bytes) =
                     max_encoded_segment_len_for_eff_log(response.eff_log)
                 else {
                     tracing::warn!(from = %peer, eff_log = response.eff_log, "manifest: invalid effective segment log, dropping");
-                    return;
+                    reject_manifest_response!(peer);
                 };
                 if maximum_segment_bytes > MAX_SEGMENT_BYTES {
                     tracing::warn!(
@@ -4077,7 +4846,7 @@ async fn handle_swarm_event(
                         max_segment = MAX_SEGMENT_BYTES,
                         "manifest: segment encoding exceeds per-segment cap, dropping"
                     );
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 let mut declared_live_count = 0u64;
                 for &encoded_len in &response.segment_lengths {
@@ -4085,21 +4854,21 @@ async fn handle_swarm_event(
                         encoded_segment_live_count_from_len(response.eff_log, encoded_len as usize)
                     else {
                         tracing::warn!(from = %peer, encoded_len, "manifest: non-canonical sparse segment length, dropping");
-                        return;
+                        reject_manifest_response!(peer);
                     };
                     if live_count == 0 {
                         tracing::warn!(from = %peer, "manifest: empty segment descriptor, dropping");
-                        return;
+                        reject_manifest_response!(peer);
                     }
                     let Some(next) = declared_live_count.checked_add(u64::from(live_count)) else {
                         tracing::warn!(from = %peer, "manifest: live-entry count overflow, dropping");
-                        return;
+                        reject_manifest_response!(peer);
                     };
                     declared_live_count = next;
                 }
                 if declared_live_count != response.active_slot_count {
                     tracing::warn!(from = %peer, declared_live_count, active_slot_count = response.active_slot_count, "manifest: sparse lengths disagree with active count, dropping");
-                    return;
+                    reject_manifest_response!(peer);
                 }
                 tracing::info!(
                     from = %peer,
@@ -4109,7 +4878,9 @@ async fn handle_swarm_event(
                 );
                 let _ = required_event_tx
                     .send(NetworkEvent::StateManifest {
+                        generation: pending.generation,
                         from: peer,
+                        requester_height: pending.requester_height,
                         manifest: Box::new(response),
                     })
                     .await;
@@ -4121,7 +4892,9 @@ async fn handle_swarm_event(
                 tracing::debug!(from = %peer, "received empty state manifest");
                 let _ = required_event_tx
                     .send(NetworkEvent::StateManifest {
+                        generation: pending.generation,
                         from: peer,
+                        requester_height: pending.requester_height,
                         manifest: Box::new(response),
                     })
                     .await;
@@ -4191,13 +4964,6 @@ async fn handle_swarm_event(
                     .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             };
-            let Ok(permit) = segment_encode_semaphore.clone().try_acquire_owned() else {
-                let _ = swarm
-                    .behaviour_mut()
-                    .state_segment_sync
-                    .send_response(channel, unavailable_state_segment_response(&request));
-                return;
-            };
             let effective_log = export.manifest().effective_log_segment_size;
             let declared_len = descriptor.encoded_len as usize;
             if declared_len > MAX_SEGMENT_BYTES
@@ -4219,7 +4985,14 @@ async fn handle_swarm_event(
             let requested_tip_hash = request.expected_tip_hash;
             let completion = segment_response_tx.clone();
             let budget = outbound_response_budget.clone();
+            let encode_admission = Arc::clone(segment_encode_semaphore);
             tokio::spawn(async move {
+                // Stream concurrency and the request rate cap already bound the
+                // waiter count. Queue behind the two disk encoders instead of
+                // lying that an immutable advertised segment is unavailable.
+                let Ok(permit) = encode_admission.acquire_owned().await else {
+                    return;
+                };
                 let Ok(Some(outbound_memory_permit)) = budget.acquire(declared_len).await else {
                     return;
                 };
@@ -4293,6 +5066,10 @@ async fn handle_swarm_event(
                 );
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded state-segment response");
+                return;
+            }
             if !state_segment_response_matches_pending(pending, peer, &response) {
                 tracing::warn!(
                     peer = %peer,
@@ -4515,15 +5292,18 @@ async fn handle_swarm_event(
             peer_id,
             connection_id,
             endpoint,
-            num_established,
             ..
         } => {
+            let dialer = endpoint.is_dialer();
+            let direct = !endpoint.is_relayed();
+            sync_paths.insert(connection_id, peer_id, direct, dialer);
             if let Err(reason) = peer_diversity.try_admit(
                 connection_id,
                 peer_id,
                 endpoint.get_remote_address(),
-                endpoint.is_dialer(),
+                dialer,
             ) {
+                sync_paths.mark_closing(connection_id);
                 automatic_peers.note_dial_failed(connection_id);
                 let _ = swarm.close_connection(connection_id);
                 // `BucketInserts::OnConnected` may have admitted the peer just
@@ -4538,20 +5318,20 @@ async fn handle_swarm_event(
                 );
                 return;
             }
-            automatic_peers.note_connection_established(
-                connection_id,
-                peer_id,
-                endpoint.is_dialer(),
-            );
-            // Only emit PeerConnected on the FIRST connection to a peer.
-            // Multiple connections to the same peer are common (simultaneous dials,
-            // mDNS re-discovery, relay + direct). Emitting for each one causes
-            if num_established.get() == 1 {
-                let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected(peer_id))
-                    .await;
-                tracing::debug!(peer = %peer_id, "peer connected");
+            automatic_peers.note_connection_established(connection_id, peer_id, dialer);
+            let duplicate_losers =
+                sync_paths.canonicalize_direct(*swarm.local_peer_id(), peer_id, connection_id);
+            for loser in &duplicate_losers {
+                let _ = swarm.close_connection(*loser);
             }
+            tracing::debug!(
+                peer = %peer_id,
+                ?connection_id,
+                dialer,
+                direct,
+                duplicate_losers = ?duplicate_losers,
+                "peer transport connected; awaiting Identify"
+            );
         }
         SwarmEvent::ConnectionClosed {
             peer_id,
@@ -4560,16 +5340,23 @@ async fn handle_swarm_event(
             cause,
             ..
         } => {
-            if !peer_diversity.remove(connection_id) {
+            let removed_sync_path = sync_paths.remove(connection_id);
+            if peer_diversity.remove(connection_id) {
+                automatic_peers.note_connection_closed(connection_id);
+            } else {
                 tracing::debug!(
                     peer = %peer_id,
                     "diversity-rejected connection closed"
                 );
-                return;
             }
-            automatic_peers.note_connection_closed(connection_id);
-            // Only emit PeerDisconnected when the LAST connection to a peer closes.
-            if num_established == 0 {
+            debug_assert!(
+                removed_sync_path.is_none_or(|path_peer| path_peer == peer_id),
+                "ConnectionClosed peer must match the tracked sync path"
+            );
+            let sync_peer_became_unready =
+                sync_paths.is_announced(peer_id) && !sync_paths.has_identified_path(peer_id);
+            if sync_peer_became_unready {
+                sync_paths.clear_announced(peer_id);
                 // Deliver exact request failures before the generic
                 // disconnect event. This deterministic ordering lets the node
                 // retain or fail over its disk staging without racing the
@@ -4582,6 +5369,9 @@ async fn handle_swarm_event(
                 let failed_headers =
                     pending_header_requests.take_where(|pending| pending.peer == peer_id);
                 for pending in failed_headers {
+                    if !pending.notify_node {
+                        continue;
+                    }
                     match pending.kind {
                         HeaderRequestKind::General => {
                             let _ = required_event_tx
@@ -4600,6 +5390,7 @@ async fn handle_swarm_event(
                                     from: pending.peer,
                                     start_height: pending.start_height,
                                     count: pending.count,
+                                    kind: RequestFailureKind::ConnectionClosed,
                                 })
                                 .await;
                         }
@@ -4613,25 +5404,48 @@ async fn handle_swarm_event(
                 let failed_terminals =
                     pending_history_step_requests.take_where(|pending| pending.peer == peer_id);
                 for pending in failed_terminals {
-                    let _ = required_event_tx
-                        .send(NetworkEvent::HistoryStepTerminalRequestFailed {
-                            token: pending.token,
-                            from: pending.peer,
-                            height: pending.height,
-                            block_hash: pending.block_hash,
-                            kind: RequestFailureKind::ConnectionClosed,
-                        })
-                        .await;
+                    if pending.notify_node {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                                token: pending.token,
+                                from: pending.peer,
+                                height: pending.height,
+                                block_hash: pending.block_hash,
+                                kind: RequestFailureKind::ConnectionClosed,
+                            })
+                            .await;
+                    }
+                }
+                let failed_manifests =
+                    pending_state_manifest_requests.take_where(|pending| pending.peer == peer_id);
+                for pending in failed_manifests {
+                    if pending.notify_node {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::StateManifestRequestFailed {
+                                generation: pending.generation,
+                                from: pending.peer,
+                                requester_height: pending.requester_height,
+                                kind: RequestFailureKind::ConnectionClosed,
+                            })
+                            .await;
+                    }
                 }
                 let _ = required_event_tx
                     .send(NetworkEvent::PeerDisconnected(peer_id))
                     .await;
-                tracing::debug!(peer = %peer_id, cause = ?cause, "peer disconnected");
+                tracing::debug!(peer = %peer_id, cause = ?cause, "peer lost its last sync-ready connection");
+            }
+            if sync_paths.try_mark_announced(peer_id) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::PeerConnected(peer_id))
+                    .await;
+                tracing::debug!(peer = %peer_id, "peer sync protocols ready after duplicate path closed");
+            }
+            if num_established == 0 {
                 block_event_rate.remove(&peer_id);
                 tx_gossip_rate.remove(&peer_id);
                 mempool_sync_last_request.remove(&peer_id);
                 mempool_sync_retries.remove(&peer_id);
-                snapshot_manifest_last_request.remove(&peer_id);
                 snapshot_segment_rate.remove(&peer_id);
                 snapshot_export_leases.remove(&peer_id);
                 prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
@@ -4664,6 +5478,10 @@ async fn handle_swarm_event(
                 tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale block-sync failure");
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded block-sync failure");
+                return;
+            }
             if pending.peer != peer {
                 tracing::debug!(
                     peer = %peer,
@@ -4686,10 +5504,39 @@ async fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateManifestSync(
-            request_response::Event::OutboundFailure { peer, error, .. },
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
         )) => {
+            let kind = RequestFailureKind::from(&error);
             tracing::debug!(peer = %peer, err = %error, "manifest sync request failed");
-            let _ = gossip_event_tx.send(NetworkEvent::PeerRequestFailed(peer));
+            let Some(pending) = pending_state_manifest_requests.remove(&request_id) else {
+                tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale state-manifest failure");
+                return;
+            };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded state-manifest failure");
+                return;
+            }
+            if pending.peer != peer {
+                tracing::debug!(
+                    peer = %peer,
+                    requested_peer = %pending.peer,
+                    request_id = %request_id,
+                    "ignoring mismatched state-manifest failure"
+                );
+                return;
+            }
+            let _ = required_event_tx
+                .send(NetworkEvent::StateManifestRequestFailed {
+                    generation: pending.generation,
+                    from: peer,
+                    requester_height: pending.requester_height,
+                    kind,
+                })
+                .await;
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::StateSegmentSync(
@@ -4704,6 +5551,10 @@ async fn handle_swarm_event(
                 tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale segment-sync failure");
                 return;
             };
+            if !pending.notify_node {
+                tracing::debug!(peer = %peer, request_id = %request_id, "discarding superseded state-segment failure");
+                return;
+            }
             if pending.peer != peer {
                 tracing::debug!(
                     peer = %peer,
@@ -4748,15 +5599,17 @@ async fn handle_swarm_event(
                 );
                 return;
             }
-            let _ = required_event_tx
-                .send(NetworkEvent::HistoryStepTerminalRequestFailed {
-                    token: pending.token,
-                    from: peer,
-                    height: pending.height,
-                    block_hash: pending.block_hash,
-                    kind,
-                })
-                .await;
+            if pending.notify_node {
+                let _ = required_event_tx
+                    .send(NetworkEvent::HistoryStepTerminalRequestFailed {
+                        token: pending.token,
+                        from: peer,
+                        height: pending.height,
+                        block_hash: pending.block_hash,
+                        kind,
+                    })
+                    .await;
+            }
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
@@ -4797,6 +5650,125 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    fn ordered_peer_ids() -> (PeerId, PeerId) {
+        let first = PeerId::random();
+        let second = PeerId::random();
+        if first.to_bytes() < second.to_bytes() {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    #[test]
+    fn identified_direct_path_wins_over_a_late_dns_duplicate() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let established = libp2p::swarm::ConnectionId::new_unchecked(10_001);
+        let duplicate = libp2p::swarm::ConnectionId::new_unchecked(10_002);
+        let mut paths = PeerSyncPaths::default();
+
+        paths.insert(established, peer, true, true);
+        paths.mark_identified(established);
+        assert!(paths.is_dispatchable(peer));
+        assert!(paths.try_mark_announced(peer));
+
+        paths.insert(duplicate, peer, true, true);
+        assert_eq!(
+            paths.canonicalize_direct(local, peer, duplicate),
+            vec![duplicate]
+        );
+        assert!(paths.is_closing(duplicate));
+        assert!(!paths.is_dispatchable(peer));
+
+        assert_eq!(paths.remove(duplicate), Some(peer));
+        assert!(paths.is_dispatchable(peer));
+        assert!(!paths.try_mark_announced(peer));
+    }
+
+    #[test]
+    fn opposite_cross_dials_keep_the_same_physical_path() {
+        let (lower, higher) = ordered_peer_ids();
+        let lower_inbound = libp2p::swarm::ConnectionId::new_unchecked(10_101);
+        let lower_outbound = libp2p::swarm::ConnectionId::new_unchecked(10_102);
+        let mut lower_paths = PeerSyncPaths::default();
+        lower_paths.insert(lower_inbound, higher, true, false);
+        lower_paths.mark_identified(lower_inbound);
+        lower_paths.insert(lower_outbound, higher, true, true);
+        assert_eq!(
+            lower_paths.canonicalize_direct(lower, higher, lower_outbound),
+            vec![lower_inbound],
+            "the lower PeerId keeps its outbound half"
+        );
+
+        let higher_outbound = libp2p::swarm::ConnectionId::new_unchecked(10_201);
+        let higher_inbound = libp2p::swarm::ConnectionId::new_unchecked(10_202);
+        let mut higher_paths = PeerSyncPaths::default();
+        higher_paths.insert(higher_outbound, lower, true, true);
+        higher_paths.mark_identified(higher_outbound);
+        higher_paths.insert(higher_inbound, lower, true, false);
+        assert_eq!(
+            higher_paths.canonicalize_direct(higher, lower, higher_inbound),
+            vec![higher_outbound],
+            "the higher PeerId keeps the matching inbound half"
+        );
+    }
+
+    #[test]
+    fn repeated_outbound_dns_dial_keeps_the_established_path() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let first = libp2p::swarm::ConnectionId::new_unchecked(10_301);
+        let duplicate = libp2p::swarm::ConnectionId::new_unchecked(10_302);
+        let mut paths = PeerSyncPaths::default();
+
+        paths.insert(first, peer, true, true);
+        paths.insert(duplicate, peer, true, true);
+        assert_eq!(
+            paths.canonicalize_direct(local, peer, duplicate),
+            vec![duplicate]
+        );
+        assert!(!paths.is_closing(first));
+        assert!(paths.is_closing(duplicate));
+    }
+
+    #[test]
+    fn inbound_duplicates_block_dispatch_until_the_remote_dialer_closes_one() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let first = libp2p::swarm::ConnectionId::new_unchecked(10_401);
+        let duplicate = libp2p::swarm::ConnectionId::new_unchecked(10_402);
+        let mut paths = PeerSyncPaths::default();
+
+        paths.insert(first, peer, true, false);
+        paths.insert(duplicate, peer, true, false);
+        assert!(
+            paths.canonicalize_direct(local, peer, duplicate).is_empty(),
+            "the listener cannot choose between remote-owned duplicate dials"
+        );
+        paths.mark_identified(first);
+        paths.mark_identified(duplicate);
+        assert!(!paths.is_dispatchable(peer));
+
+        assert_eq!(paths.remove(duplicate), Some(peer));
+        assert!(paths.is_dispatchable(peer));
+    }
+
+    #[test]
+    fn identified_direct_and_relay_paths_can_coexist() {
+        let peer = PeerId::random();
+        let direct = libp2p::swarm::ConnectionId::new_unchecked(10_501);
+        let relay = libp2p::swarm::ConnectionId::new_unchecked(10_502);
+        let mut paths = PeerSyncPaths::default();
+
+        paths.insert(direct, peer, true, true);
+        paths.insert(relay, peer, false, true);
+        paths.mark_identified(direct);
+        paths.mark_identified(relay);
+        assert!(paths.is_dispatchable(peer));
+        assert_eq!(paths.dispatchable_peer_count(), 1);
+    }
 
     fn accepted_bundle(height: u64, recursive_payload_bytes: usize) -> AcceptedBlockBundle {
         let mut header = noid_chain::consensus::genesis::genesis_header();
@@ -5221,6 +6193,8 @@ mod tests {
             height: 77,
             count: 1,
             payload_kind: RecentBlockPayloadKind::Complete,
+            issued_at: Instant::now(),
+            notify_node: true,
         };
         assert!(retained_block_response_matches_pending(
             pending, peer, 77, 1
@@ -5244,6 +6218,8 @@ mod tests {
                 height: 78,
                 count: 2,
                 payload_kind: RecentBlockPayloadKind::BlockBody,
+                issued_at: Instant::now(),
+                notify_node: true,
             }
         ));
         assert!(!registry.try_insert(
@@ -5253,6 +6229,8 @@ mod tests {
                 height: 79,
                 count: 1,
                 payload_kind: RecentBlockPayloadKind::Complete,
+                issued_at: Instant::now(),
+                notify_node: true,
             }
         ));
         assert_eq!(registry.len(), 2);
@@ -5272,6 +6250,8 @@ mod tests {
                 height: 79,
                 count: 1,
                 payload_kind: RecentBlockPayloadKind::Complete,
+                issued_at: Instant::now(),
+                notify_node: true,
             }
         ));
         registry.retain(|_, entry| entry.peer != peer);
@@ -5286,6 +6266,8 @@ mod tests {
             segment_id: 7,
             expected_tip_height: 144,
             expected_tip_hash: [0xA5; 32],
+            issued_at: Instant::now(),
+            notify_node: true,
         };
         let response = GetStateSegmentResponse {
             segment_id: 7,
@@ -5314,23 +6296,6 @@ mod tests {
             &response
         ));
 
-        let mut registry = BoundedPendingRequests::new(2);
-        assert!(registry.try_insert(1u64, old));
-        assert!(registry.try_insert(
-            2,
-            PendingStateSegmentRequest {
-                segment_id: 8,
-                ..old
-            }
-        ));
-        registry.retain(|_, pending| {
-            pending.peer == new_session.peer
-                && pending.expected_tip_height == new_session.expected_tip_height
-                && pending.expected_tip_hash == new_session.expected_tip_hash
-        });
-        assert_eq!(registry.len(), 0, "new snapshot session retires old IDs");
-        assert!(registry.try_insert(3, new_session));
-
         let request = GetStateSegmentRequest {
             segment_id: 9,
             expected_tip_height: 200,
@@ -5343,8 +6308,40 @@ mod tests {
     }
 
     #[test]
-    fn new_snapshot_header_generation_retires_only_stale_snapshot_requests() {
+    fn distinct_history_step_terminal_races_coexist_and_evict_only_the_oldest() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let issued_at = Instant::now();
+        let request = |token, peer, height| PendingHistoryStepTerminalRequest {
+            token,
+            peer,
+            height,
+            block_hash: [height as u8; 32],
+            issued_at: issued_at + Duration::from_millis(token),
+            notify_node: true,
+        };
+        let mut registry = BoundedPendingRequests::new(4);
+        assert!(registry.try_insert(1u64, request(10, first_peer, 100)));
+        assert!(registry.try_insert(2u64, request(10, second_peer, 100)));
+        assert!(registry.try_insert(3u64, request(11, first_peer, 118)));
+        assert!(registry.try_insert(4u64, request(11, second_peer, 118)));
+
+        let retired = admit_history_step_terminal_race(&mut registry);
+        assert_eq!(retired.len(), 2);
+        assert!(retired.iter().all(|(_, pending)| pending.token == 10));
+        assert_eq!(registry.len(), 2);
+        assert!(registry.entries.values().all(|pending| pending.token == 11));
+        assert!(registry.try_insert(5u64, request(12, first_peer, 119)));
+        assert!(admit_history_step_terminal_race(&mut registry).is_empty());
+    }
+
+    #[test]
+    fn superseded_snapshot_header_transport_is_retained_until_expiry() {
         let peer = PeerId::random();
+        let now = Instant::now();
+        let expired_at = now
+            .checked_sub(SMALL_SYNC_PENDING_DEADLINE)
+            .expect("process monotonic clock exceeds request deadline");
         let mut registry = BoundedPendingRequests::new(4);
         assert!(registry.try_insert(
             1u64,
@@ -5356,6 +6353,8 @@ mod tests {
                     generation: 7,
                     token: 11,
                 },
+                issued_at: expired_at,
+                notify_node: false,
             }
         ));
         assert!(registry.try_insert(
@@ -5368,6 +6367,8 @@ mod tests {
                     generation: 8,
                     token: 12,
                 },
+                issued_at: now,
+                notify_node: true,
             }
         ));
         assert!(registry.try_insert(
@@ -5377,15 +6378,19 @@ mod tests {
                 start_height: 99,
                 count: 20,
                 kind: HeaderRequestKind::General,
+                issued_at: now,
+                notify_node: true,
             }
         ));
 
-        registry.retain(|_, pending| header_request_survives_snapshot_generation(pending.kind, 8));
+        assert_eq!(registry.len(), 3);
+        let expired = registry.take_where_entries(|pending| {
+            now.saturating_duration_since(pending.issued_at) >= SMALL_SYNC_PENDING_DEADLINE
+        });
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, 1);
         assert_eq!(registry.len(), 2);
-        assert!(
-            registry.remove(&1).is_none(),
-            "delayed old-generation response is inert"
-        );
+        assert!(registry.remove(&1).is_none());
         assert!(registry.remove(&2).is_some());
         assert!(
             registry.remove(&3).is_some(),
