@@ -11,7 +11,9 @@
 //! master secret from a user-chosen file (photo, document, etc.) instead of
 //! generating random bytes.
 
-use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 

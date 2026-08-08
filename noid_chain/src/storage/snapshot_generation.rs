@@ -40,7 +40,7 @@ use crate::exact_state_hash::{slot_leaf_hash, state_node_hash, zero_slot_roots, 
 use crate::fri_state::{SlotValue, LOG_SEGMENT_SIZE};
 use crate::state::StreamingSparseRoot;
 use crate::storage::mdbx_store::MdbxHistoricalReadSnapshot;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::storage::serial::encoded_segment_len_for_live_count;
 use crate::storage::serial::{
     decode_sparse_segment, encode_sparse_segment_entries, encoded_segment_live_count_from_len,
@@ -1548,13 +1548,16 @@ mod tests {
     use super::*;
 
     use noid_core::Block128;
+    #[cfg(unix)]
     use noid_poseidon2b::primitives::Address;
+    #[cfg(unix)]
     use noid_tx::{
         output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS,
     };
 
     use crate::consensus::genesis::genesis_header;
     use crate::consensus::params::coinbase_creation_id;
+    #[cfg(unix)]
     use crate::storage::{ConsensusMeta, FinalizedCheckpoint};
 
     #[test]

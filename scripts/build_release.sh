@@ -234,9 +234,13 @@ CURRENT_STAGE='format check'
 printf '\n==> Checking formatting\n'
 cargo fmt --all -- --check
 
-CURRENT_STAGE='workspace check'
-printf '\n==> Checking the release workspace for %s\n' "$HOST_TRIPLE"
-cargo check --locked --release --workspace --all-targets --target "$HOST_TRIPLE"
+if [[ $SKIP_TESTS == 1 ]]; then
+  printf '\n==> Skipping repeated workspace check; source gates must already be green\n'
+else
+  CURRENT_STAGE='workspace check'
+  printf '\n==> Checking the release workspace for %s\n' "$HOST_TRIPLE"
+  cargo check --locked --release --workspace --all-targets --target "$HOST_TRIPLE"
+fi
 
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'

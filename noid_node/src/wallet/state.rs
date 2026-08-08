@@ -730,13 +730,16 @@ fn persist_owner_only_atomically(path: &Path, bytes: &[u8], label: &str) -> Resu
     sync_directory(parent, label)
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        std::fs::File::open(path)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|error| format!("sync {label}: {error}"))?;
-    }
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("sync {label}: {error}"))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path, _label: &str) -> Result<(), String> {
     Ok(())
 }
 
