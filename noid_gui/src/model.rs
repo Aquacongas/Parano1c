@@ -1004,6 +1004,50 @@ pub fn format_compact_count(value: u64) -> String {
     }
 }
 
+/// Formats the ASERT multiplier for the fixed-width status panels.
+///
+/// Values below one thousand retain the existing two-decimal display. Larger
+/// values use short decimal units, then scientific notation beyond trillions.
+pub fn format_compact_difficulty(value: f64) -> String {
+    if !value.is_finite() || value < 0.0 {
+        return "—".into();
+    }
+
+    const UNITS: [&str; 5] = ["", "K", "M", "B", "T"];
+    let mut scaled = value;
+    let mut unit = 0usize;
+    while scaled >= 1_000.0 && unit + 1 < UNITS.len() {
+        scaled /= 1_000.0;
+        unit += 1;
+    }
+
+    let mut rounded = (scaled * 100.0).round() / 100.0;
+    if rounded >= 1_000.0 && unit + 1 < UNITS.len() {
+        rounded /= 1_000.0;
+        unit += 1;
+    }
+
+    if unit == UNITS.len() - 1 && rounded >= 1_000.0 {
+        let exponent = value.log10().floor() as i32;
+        let mantissa = value / 10.0_f64.powi(exponent);
+        return format!("{}e{exponent}", compact_decimal(mantissa));
+    }
+
+    if unit == 0 {
+        format!("{rounded:.2}")
+    } else {
+        format!("{}{}", compact_decimal(rounded), UNITS[unit])
+    }
+}
+
+fn compact_decimal(value: f64) -> String {
+    let formatted = format!("{value:.2}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
 /// Compact whole-network monetary value with at most two decimal places.
 ///
 /// The caller supplies μNOID; the returned text deliberately omits the final
@@ -1048,9 +1092,10 @@ pub fn format_compact_micronoid(value: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        display_pow_target, format_compact_count, format_compact_micronoid, format_creation_origin,
-        format_expected_pow_hashes, format_hashrate, format_micronoid_trimmed,
-        format_pow_work_change, AppSnapshot, SensitiveString,
+        display_pow_target, format_compact_count, format_compact_difficulty,
+        format_compact_micronoid, format_creation_origin, format_expected_pow_hashes,
+        format_hashrate, format_micronoid_trimmed, format_pow_work_change, AppSnapshot,
+        SensitiveString,
     };
 
     #[test]
@@ -1119,6 +1164,19 @@ mod tests {
         assert_eq!(format_compact_count(999_995), "1M");
         assert_eq!(format_compact_count(1_276_944), "1.28M");
         assert_eq!(format_compact_count(4_294_967_296), "4.29B");
+    }
+
+    #[test]
+    fn compacts_difficulty_without_changing_small_values() {
+        assert_eq!(format_compact_difficulty(93.718), "93.72");
+        assert_eq!(format_compact_difficulty(999.99), "999.99");
+        assert_eq!(format_compact_difficulty(1_000.0), "1K");
+        assert_eq!(format_compact_difficulty(12_345.0), "12.35K");
+        assert_eq!(format_compact_difficulty(999_995.0), "1M");
+        assert_eq!(format_compact_difficulty(1_250_000.0), "1.25M");
+        assert_eq!(format_compact_difficulty(1_000_000_000.0), "1B");
+        assert_eq!(format_compact_difficulty(1.0e15), "1e15");
+        assert_eq!(format_compact_difficulty(f64::INFINITY), "—");
     }
 
     #[test]

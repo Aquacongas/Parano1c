@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=ParanO(1)d
+Name=Parano1d
 Comment=Private proof-native wallet
 Exec=/usr/lib/parano1d/parano1d-gui
 Icon=org.parano1d.wallet

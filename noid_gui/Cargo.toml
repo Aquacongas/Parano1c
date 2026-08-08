@@ -3,7 +3,7 @@ name = "noid_gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Native ParanO(1)d wallet application"
+description = "Native Parano1d wallet application"
 
 [features]
 default = []

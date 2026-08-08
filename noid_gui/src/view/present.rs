@@ -10,8 +10,9 @@ use crate::app::{Action, AddressOperation, App, Message};
 use crate::backend::{ConsolidationPlan, ConsolidationSubmission, PaymentSubmission};
 use crate::i18n::{address_label, text, text_input};
 use crate::model::{
-    format_compact_count, format_compact_micronoid, format_creation_origin, format_hashrate,
-    format_micronoid, format_micronoid_trimmed, AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
+    format_compact_count, format_compact_difficulty, format_compact_micronoid,
+    format_creation_origin, format_hashrate, format_micronoid, format_micronoid_trimmed,
+    AddressSnapshot, UtxoSnapshot, UTXO_PAGE_SIZE,
 };
 use crate::theme::{self, ButtonKind};
 use crate::widgets::{ProofForge, StateField};
@@ -406,7 +407,7 @@ fn difficulty_telemetry(difficulty: f64) -> Element<'static, Message> {
                 .size(14)
                 .color(theme::DIM)
                 .wrapping(iced::widget::text::Wrapping::None),
-            text(format!("{difficulty:.2}"))
+            text(format_compact_difficulty(difficulty))
                 .size(14)
                 .color(theme::WARNING)
                 .wrapping(iced::widget::text::Wrapping::None),

@@ -11,7 +11,7 @@ usage() {
   cat <<'EOF'
 Usage: package_macos_gui.sh BIN_DIR OUTPUT_DIR VERSION PLATFORM
 
-Build a native ParanO(1)d .app and compressed DMG.
+Build a native Parano1d .app and compressed DMG.
 PLATFORM must be macos-aarch64 or macos-x86_64.
 EOF
 }
@@ -131,7 +131,7 @@ cp -R "$APP" "$DMG_ROOT/Parano1d.app"
 ln -s /Applications "$DMG_ROOT/Applications"
 ARTIFACT="$OUTPUT_DIR/parano1d-gui-v${VERSION}-${PLATFORM}.dmg"
 hdiutil create \
-  -volname "ParanO(1)d" \
+  -volname "Parano1d" \
   -srcfolder "$DMG_ROOT" \
   -format UDZO \
   -ov \

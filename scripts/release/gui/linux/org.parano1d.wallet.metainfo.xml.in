@@ -3,11 +3,11 @@
   <id>org.parano1d.wallet</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>Apache-2.0</project_license>
-  <name>ParanO(1)d</name>
+  <name>Parano1d</name>
   <summary>Private proof-native wallet</summary>
   <description>
     <p>
-      ParanO(1)d is a native wallet for the NOID network. It supervises its
+      Parano1d is a native wallet for the NOID network. It supervises its
       bundled full node locally, so the wallet can be used without a terminal
       or a separately managed daemon.
     </p>

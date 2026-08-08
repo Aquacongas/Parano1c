@@ -53,7 +53,7 @@ fn handle_process_command() -> bool {
     }
 
     if argument == "--version" || argument == "-V" {
-        println!("ParanO(1)d {}", env!("CARGO_PKG_VERSION"));
+        println!("Parano1d {}", env!("CARGO_PKG_VERSION"));
         return true;
     }
     if argument != "--release-self-check" {
@@ -64,7 +64,7 @@ fn handle_process_command() -> bool {
     match node {
         Some(node) if node.is_file() => {
             println!(
-                "ParanO(1)d {} release self-check OK",
+                "Parano1d {} release self-check OK",
                 env!("CARGO_PKG_VERSION")
             );
             true
@@ -86,7 +86,7 @@ fn main() -> iced::Result {
     }
 
     iced::application(app::App::new, app::App::update, app::App::view)
-        .title("ParanO(1)d")
+        .title("Parano1d")
         .theme(app_theme)
         .subscription(app::App::subscription)
         .font(include_bytes!("../assets/fonts/NotoSansMono-Regular.ttf").as_slice())

@@ -16,8 +16,8 @@ fn main() {
     let mut resource = winresource::WindowsResource::new();
     resource
         .set_icon(icon.to_str().expect("Windows icon path is UTF-8"))
-        .set("FileDescription", "ParanO(1)d Wallet")
-        .set("ProductName", "ParanO(1)d")
+        .set("FileDescription", "Parano1d Wallet")
+        .set("ProductName", "Parano1d")
         .set("ProductVersion", &version)
         .set("FileVersion", &version)
         .set("InternalName", "Parano1d")
@@ -49,5 +49,5 @@ fn main() {
         );
     resource
         .compile()
-        .expect("compile ParanO(1)d Windows resources");
+        .expect("compile Parano1d Windows resources");
 }

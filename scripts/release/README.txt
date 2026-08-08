@@ -1,5 +1,5 @@
-ParanO(1)d Native Release
-=========================
+Parano1d Native Release
+=======================
 
 Each GitHub release contains two independent product lines.
 
@@ -9,7 +9,7 @@ GUI Wallet packages (ordinary users):
   Windows: parano1d-gui-vVERSION-windows-x86_64-setup.exe
   macOS:   parano1d-gui-vVERSION-macos-ARCH.dmg
 
-The GUI package exposes only the ParanO(1)d wallet application. Its full node
+The GUI package exposes only the Parano1d wallet application. Its full node
 is bundled as a private application component and is supervised by the wallet.
 The user does not need to start a daemon or use a terminal.
 
@@ -64,13 +64,13 @@ from a terminal:
 
   sudo apt install ./parano1d-gui-vVERSION-linux-ARCH.deb
 
-Launch ParanO(1)d from the desktop application menu. Removing the package does
+Launch Parano1d from the desktop application menu. Removing the package does
 not remove wallet data from the user's home directory.
 
 GUI Wallet — Windows
 --------------------
 
-Run the downloaded setup.exe and launch ParanO(1)d from the Start menu. The
+Run the downloaded setup.exe and launch Parano1d from the Start menu. The
 installer is per-user and does not require administrator privileges by
 default.
 

@@ -13,8 +13,9 @@ use crate::app::{
 use crate::i18n::translate;
 use crate::i18n::{address_label, text, text_input};
 use crate::model::{
-    display_pow_target, format_creation_origin, format_expected_pow_hashes, format_pow_work_change,
-    BlockDetailsSnapshot, BlockTransactionSnapshot, MatrixCacheState, MinedBlockSnapshot,
+    display_pow_target, format_compact_difficulty, format_creation_origin,
+    format_expected_pow_hashes, format_pow_work_change, BlockDetailsSnapshot,
+    BlockTransactionSnapshot, MatrixCacheState, MinedBlockSnapshot,
 };
 use crate::theme::{self, ButtonKind};
 
@@ -151,7 +152,7 @@ fn miner_status(app: &App) -> iced::widget::Container<'_, Message> {
         row![
             container(mining_detail(
                 "DIFFICULTY",
-                format!("{:.2}×", network.difficulty),
+                format!("{}×", format_compact_difficulty(network.difficulty)),
                 theme::PROOF,
             ))
             .width(Length::FillPortion(1)),

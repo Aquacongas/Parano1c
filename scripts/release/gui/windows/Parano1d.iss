@@ -25,15 +25,15 @@
 
 [Setup]
 AppId={{8EAD67A1-91AB-497A-81A5-8A73CF4A6F31}
-AppName=ParanO(1)d
+AppName=Parano1d
 AppVersion={#MyAppVersion}
-AppVerName=ParanO(1)d {#MyAppVersion}
+AppVerName=Parano1d {#MyAppVersion}
 AppPublisher=Paranoid Zero
 AppPublisherURL=https://parano1d.org/
 AppSupportURL=https://github.com/ignotusnemo/parano1d/issues
 AppUpdatesURL=https://github.com/ignotusnemo/parano1d/releases
 DefaultDirName={localappdata}\Programs\Parano1d
-DefaultGroupName=ParanO(1)d
+DefaultGroupName=Parano1d
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
 PrivilegesRequired=lowest
@@ -53,8 +53,8 @@ RestartApplications=no
 SetupLogging=yes
 VersionInfoVersion={#NumericVersion}
 VersionInfoCompany=Paranoid Zero
-VersionInfoDescription=ParanO(1)d Wallet Installer
-VersionInfoProductName=ParanO(1)d
+VersionInfoDescription=Parano1d Wallet Installer
+VersionInfoProductName=Parano1d
 VersionInfoProductVersion={#MyAppVersion}
 
 [Languages]
@@ -72,8 +72,8 @@ Source: "{#LicenseFile}"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: igno
 Source: "{#NoticeFile}"; DestDir: "{app}"; DestName: "NOTICE.txt"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\ParanO(1)d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\ParanO(1)d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\Parano1d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\Parano1d"; Filename: "{app}\Parano1d.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\Parano1d.exe"; Description: "{cm:LaunchProgram,ParanO(1)d}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Parano1d.exe"; Description: "{cm:LaunchProgram,Parano1d}"; Flags: nowait postinstall skipifsilent
