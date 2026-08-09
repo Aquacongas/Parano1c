@@ -17,7 +17,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use noid_chain::block_header::BlockHeader;
-use noid_chain::consensus::header::validate_header_timeless;
+use noid_chain::consensus::header::validate_header_timeless_prehashed_parent;
 use noid_chain::consensus::params::{
     EPOCH_LENGTH, EXPANSION_HEADER_LOOKBACK, EXPANSION_WINDOW, MEDIAN_TIME_BLOCKS, TX_EPOCH_BLOCKS,
 };
@@ -365,8 +365,9 @@ impl SnapshotHeaderStaging {
         }
         self.base.validate_against(store)?;
 
-        // First pass: consensus validation only.  The bounded window makes a
-        // bad later header unable to partially commit an otherwise valid batch.
+        // Validate and derive every record before writing. The bounded working
+        // set makes a bad later header unable to partially commit an otherwise
+        // valid batch, while each semantic block id is computed only once.
         let tip = self.tip_record()?;
         let mut expected_height =
             tip.header
@@ -375,11 +376,22 @@ impl SnapshotHeaderStaging {
                 .ok_or(SnapshotHeaderStagingError::Format(
                     "candidate height overflow",
                 ))?;
-        let mut chainwork = tip.cumulative_chainwork;
+        let mut previous_hash = tip.block_hash;
+        let mut previous_work = tip.cumulative_chainwork;
         let mut window = self.load_consensus_window(store, tip.header.height)?;
+        let mut records = Vec::with_capacity(headers.len());
         for header in headers {
-            validate_next_header(header, expected_height, &window)?;
-            chainwork = add_work(&chainwork, &block_work(&header.difficulty_target));
+            validate_next_header(header, expected_height, previous_hash, &window)?;
+            let block_hash = hash_block_header(header);
+            let cumulative_chainwork =
+                add_work(&previous_work, &block_work(&header.difficulty_target));
+            records.push(StagedHeaderRecord {
+                header: *header,
+                block_hash,
+                cumulative_chainwork,
+            });
+            previous_hash = block_hash;
+            previous_work = cumulative_chainwork;
             push_window(&mut window, *header);
             expected_height =
                 expected_height
@@ -389,7 +401,7 @@ impl SnapshotHeaderStaging {
                     ))?;
         }
 
-        // Second pass: fixed-size sequential records and one durability point.
+        // Write fixed-size sequential records with one durability point.
         let original_len = FILE_HEADER_SIZE
             .checked_add(self.count.checked_mul(RECORD_SIZE as u64).ok_or(
                 SnapshotHeaderStagingError::Format("staging file length overflow"),
@@ -397,18 +409,10 @@ impl SnapshotHeaderStaging {
             .ok_or(SnapshotHeaderStagingError::Format(
                 "staging file length overflow",
             ))?;
-        let mut previous_work = tip.cumulative_chainwork;
         let write_result = (|| -> io::Result<()> {
             self.file.seek(SeekFrom::Start(original_len))?;
-            for header in headers {
-                let work = add_work(&previous_work, &block_work(&header.difficulty_target));
-                let record = StagedHeaderRecord {
-                    header: *header,
-                    block_hash: hash_block_header(header),
-                    cumulative_chainwork: work,
-                };
-                write_record(&mut self.file, &record)?;
-                previous_work = work;
+            for record in &records {
+                write_record(&mut self.file, record)?;
             }
             self.file.sync_data()
         })();
@@ -490,18 +494,8 @@ impl SnapshotHeaderStaging {
         let boundary =
             self.exact_boundary(store, expected_height, expected_hash, expected_chainwork)?;
 
-        // Validate every record, re-derive the exact boundary, then replace
-        // the writable descriptor with a read-only O_NOFOLLOW descriptor for
-        // the same inode.
-        self.revalidate_complete_file(store)?;
-        let revalidated = self.exact_boundary(
-            store,
-            boundary.tip_header.height,
-            boundary.tip_hash,
-            boundary.cumulative_chainwork,
-        )?;
-        ensure_exact_header_boundary(&boundary, &revalidated)?;
-
+        // Replace the writable descriptor with a read-only O_NOFOLLOW
+        // descriptor for the same inode before the authoritative full pass.
         let writable_identity = StagingFileIdentity::capture(&self.file)?;
         let expected_len = staged_file_len(self.count)?;
         if writable_identity.len != expected_len {
@@ -520,7 +514,7 @@ impl SnapshotHeaderStaging {
         }
         self.file = read_only;
 
-        // Revalidate through the descriptor that atomic installation will use.
+        // Validate through the descriptor that atomic installation will use.
         // This closes the path-reopen interval and drops the last writable
         // descriptor owned by the node before installable typestate exists.
         self.revalidate_complete_file(store)?;
@@ -640,12 +634,14 @@ impl SnapshotHeaderStaging {
             });
         }
         let mut window = self.load_canonical_window(store)?;
+        let mut previous_hash = self.base.block_hash;
         let mut previous_work = self.base.cumulative_chainwork;
         let mut expected_height = self.base.header.height + 1;
         for index in 0..self.count {
             let record = self.read_record(index)?;
-            validate_next_header(&record.header, expected_height, &window)?;
-            if hash_block_header(&record.header) != record.block_hash {
+            validate_next_header(&record.header, expected_height, previous_hash, &window)?;
+            let block_hash = hash_block_header(&record.header);
+            if block_hash != record.block_hash {
                 return Err(SnapshotHeaderStagingError::InvalidCandidate {
                     height: expected_height,
                     reason: "record hash does not match header".into(),
@@ -661,6 +657,7 @@ impl SnapshotHeaderStaging {
                     reason: "record does not contain exact cumulative chainwork".into(),
                 });
             }
+            previous_hash = block_hash;
             previous_work = expected_work;
             push_window(&mut window, record.header);
             expected_height =
@@ -785,6 +782,7 @@ fn ensure_exact_header_boundary(
 fn validate_next_header(
     header: &BlockHeader,
     expected_height: u64,
+    parent_id: [u8; 32],
     window: &VecDeque<BlockHeader>,
 ) -> Result<()> {
     if header.height != expected_height {
@@ -815,9 +813,10 @@ fn validate_next_header(
             height: header.height,
             reason: format!("ASERT anchor h={anchor_height} is outside the validated window"),
         })?;
-    validate_header_timeless(
+    validate_header_timeless_prehashed_parent(
         header,
         parent,
+        parent_id,
         &prev_timestamps[..timestamp_len],
         &finalized_active_counts[..expansion_len],
         anchor_height,
@@ -877,8 +876,9 @@ pub fn validate_bounded_header_extension(
                 "candidate height overflow",
             ))?;
     let mut cumulative_chainwork = base.cumulative_chainwork;
+    let mut previous_hash = base.block_hash;
     for header in headers {
-        validate_next_header(header, expected_height, &window)?;
+        validate_next_header(header, expected_height, previous_hash, &window)?;
         noid_chain::consensus::validate_future_drift(header.timestamp, local_time).map_err(
             |error| SnapshotHeaderStagingError::InvalidCandidate {
                 height: header.height,
@@ -889,6 +889,7 @@ pub fn validate_bounded_header_extension(
             &cumulative_chainwork,
             &block_work(&header.difficulty_target),
         );
+        previous_hash = hash_block_header(header);
         push_window(&mut window, *header);
         expected_height =
             expected_height

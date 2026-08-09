@@ -49,6 +49,7 @@ pub fn validate_header(
     validate_header_inner(
         header,
         parent,
+        block_id(parent),
         prev_timestamps,
         finalized_active_counts,
         Some(local_time),
@@ -79,6 +80,7 @@ pub fn validate_header_template(
     validate_header_inner(
         header,
         parent,
+        block_id(parent),
         prev_timestamps,
         finalized_active_counts,
         Some(local_time),
@@ -105,6 +107,40 @@ pub fn validate_header_timeless(
     validate_header_inner(
         header,
         parent,
+        block_id(parent),
+        prev_timestamps,
+        finalized_active_counts,
+        None,
+        anchor_height,
+        anchor_timestamp,
+        anchor_target,
+        true,
+    )
+}
+
+/// Validate deterministic historical header rules using an already computed
+/// semantic block id for the exact `parent` value.
+///
+/// This is consensus-equivalent to [`validate_header_timeless`]. It exists for
+/// bounded sequential validation, where the current header id becomes the
+/// next header's parent id and hashing the same parent again is unnecessary.
+/// The caller must derive `parent_id` from the supplied `parent` or obtain it
+/// from an authenticated canonical boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_header_timeless_prehashed_parent(
+    header: &BlockHeader,
+    parent: &BlockHeader,
+    parent_id: [u8; 32],
+    prev_timestamps: &[u64],
+    finalized_active_counts: &[u64],
+    anchor_height: u64,
+    anchor_timestamp: u64,
+    anchor_target: &[u8; 32],
+) -> Result<(), ConsensusError> {
+    validate_header_inner(
+        header,
+        parent,
+        parent_id,
         prev_timestamps,
         finalized_active_counts,
         None,
@@ -119,6 +155,7 @@ pub fn validate_header_timeless(
 fn validate_header_inner(
     header: &BlockHeader,
     parent: &BlockHeader,
+    expected_parent_hash: [u8; 32],
     prev_timestamps: &[u64],
     finalized_active_counts: &[u64],
     local_time: Option<u64>,
@@ -128,7 +165,6 @@ fn validate_header_inner(
     check_pow: bool,
 ) -> Result<(), ConsensusError> {
     // 1. Parent hash linkage.
-    let expected_parent_hash = block_id(parent);
     if header.prev_block_hash != expected_parent_hash {
         return Err(ConsensusError::BadParentHash);
     }
@@ -287,6 +323,48 @@ mod tests {
             &genesis.difficulty_target,
         );
         assert_eq!(result, Err(ConsensusError::BadParentHash));
+    }
+
+    #[test]
+    fn prehashed_parent_validation_matches_standard_validation() {
+        let genesis = make_header(0, 1_000_000, None);
+        let mut h1 = make_header(1, 1_000_000 + BLOCK_TIME, Some(&genesis));
+        mine(&mut h1);
+        let parent_id = block_id(&genesis);
+        let standard = validate_header_timeless(
+            &h1,
+            &genesis,
+            &[genesis.timestamp],
+            &[],
+            0,
+            genesis.timestamp,
+            &genesis.difficulty_target,
+        );
+        let prehashed = validate_header_timeless_prehashed_parent(
+            &h1,
+            &genesis,
+            parent_id,
+            &[genesis.timestamp],
+            &[],
+            0,
+            genesis.timestamp,
+            &genesis.difficulty_target,
+        );
+        assert_eq!(prehashed, standard);
+
+        assert_eq!(
+            validate_header_timeless_prehashed_parent(
+                &h1,
+                &genesis,
+                [0xAB; 32],
+                &[genesis.timestamp],
+                &[],
+                0,
+                genesis.timestamp,
+                &genesis.difficulty_target,
+            ),
+            Err(ConsensusError::BadParentHash)
+        );
     }
 
     #[test]

@@ -1933,7 +1933,6 @@ impl MdbxStore {
         {
             if record.header.height != expected_height
                 || record.header.prev_block_hash != previous.hash
-                || crate::block_header::block_id(&record.header) != record.hash
             {
                 return Err(StoreError::Decode(
                     "staged snapshot headers are not an exact contiguous chain",
