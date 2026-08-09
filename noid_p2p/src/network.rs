@@ -3748,7 +3748,7 @@ async fn handle_swarm_event(
             // Require the current network's exact header protocol before this
             // connection can satisfy bootstrap fanout or the ordinary peer
             // target. Old releases are intentionally not wire-compatible.
-            let required_protocol = format!("{}/sync/headers/2", topics.protocol_id);
+            let required_protocol = format!("{}/sync/headers/3", topics.protocol_id);
             if !info
                 .protocols
                 .iter()

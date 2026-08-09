@@ -28,6 +28,7 @@ anyhow     = { workspace = true }
 async-trait = "0.1"
 libc = "0.2"
 rand = "0.8"
+zstd = "0.13"
 
 [dev-dependencies]
 tokio = { workspace = true }

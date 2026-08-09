@@ -250,9 +250,9 @@ impl NodeBehaviour {
         // This ensures mainnet and testnet sync protocols are fully isolated.
         let chain_sync = request_response::Behaviour::new(
             [(
-                // v2 validates the header count before reserving the batch and
-                // carries only exact canonical 212-byte headers.
-                StreamProtocol::try_from_owned(format!("{}/sync/headers/2", protocol_id))?,
+                // v3 carries one bounded zstd frame whose decompressed bytes
+                // are the exact canonical 212-byte header stream.
+                StreamProtocol::try_from_owned(format!("{}/sync/headers/3", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

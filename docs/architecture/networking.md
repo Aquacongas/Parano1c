@@ -69,8 +69,10 @@ Typed exchanges serve:
 - recent mempool inventory and missing intents.
 
 Direct catch-up requests ask for at most 512 headers at a time. Snapshot
-header staging uses batches of up to 4,096 headers; the fixed framing still
-keeps each response below 0.83 MiB at the canonical 212-byte header size.
+header staging uses batches of up to 4,096 headers. Each batch is compressed
+with zstd. Both the compressed input and decompressed output have strict size
+limits; the output is at most 0.83 MiB of canonical 212-byte headers. Decoded
+headers enter the existing validation and storage path unchanged.
 Snapshot State is transferred as a manifest followed by individually
 authenticated segments rather than as one unbounded message.
 
