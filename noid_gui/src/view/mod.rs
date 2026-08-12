@@ -459,9 +459,16 @@ fn wallet_setup_raw<'a>(app: &'a App, compact: bool) -> Element<'a, Message> {
         app.imported_master_secret.as_str(),
     )
     .on_input(|value| Message::ImportSecretChanged(crate::model::SensitiveString::new(value)))
+    .width(Length::Fill)
     .size(14)
     .padding([12, 13])
     .style(theme::text_input);
+    let mut paste = button(text("PASTE").size(13))
+        .padding([12, 13])
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if !app.secret_action_in_flight {
+        paste = paste.on_press(Message::PasteImportSecret);
+    }
     let mut import = button(text(if app.secret_action_in_flight {
         "RESTORING WALLET…"
     } else {
@@ -478,7 +485,7 @@ fn wallet_setup_raw<'a>(app: &'a App, compact: bool) -> Element<'a, Message> {
         text("The key restores the same deterministic address sequence.")
             .size(13)
             .color(theme::MUTED),
-        input,
+        row![input, paste].spacing(8).align_y(Alignment::Center),
         Space::new().height(Length::Fill),
         import,
     ]
@@ -1317,9 +1324,16 @@ fn secret_raw_import_control(app: &App, busy: bool) -> Element<'_, Message> {
         app.imported_master_secret.as_str(),
     )
     .on_input(|value| Message::ImportSecretChanged(crate::model::SensitiveString::new(value)))
+    .width(Length::Fill)
     .size(14)
     .padding([11, 12])
     .style(theme::text_input);
+    let mut paste = button(text("PASTE").size(13))
+        .padding([11, 12])
+        .style(|_, status| theme::button(ButtonKind::Secondary, status));
+    if !busy {
+        paste = paste.on_press(Message::PasteImportSecret);
+    }
     let mut confirm = button(text(if busy {
         "IMPORTING WALLET…"
     } else {
@@ -1334,7 +1348,7 @@ fn secret_raw_import_control(app: &App, busy: bool) -> Element<'_, Message> {
     column![
         secret_control_header("IMPORT KEY", theme::CYAN, busy),
         replacement_warning(),
-        input,
+        row![input, paste].spacing(8).align_y(Alignment::Center),
         Space::new().height(Length::Fill),
         confirm,
     ]

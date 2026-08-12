@@ -68,6 +68,23 @@ pub fn extend_header_chain_anchor(
     header: &BlockHeader,
     cumulative_chainwork: Digest,
 ) -> Result<HeaderChainAnchor, HeaderChainAnchorError> {
+    extend_header_chain_anchor_prehashed(
+        previous,
+        header,
+        hash_block_header(header),
+        cumulative_chainwork,
+    )
+}
+
+/// Extend an anchor with the block id produced by the authoritative native
+/// header pass. This avoids re-running the same hash while streaming a sealed
+/// snapshot header archive into durable storage.
+pub(crate) fn extend_header_chain_anchor_prehashed(
+    previous: &HeaderChainAnchor,
+    header: &BlockHeader,
+    block_id: Digest,
+    cumulative_chainwork: Digest,
+) -> Result<HeaderChainAnchor, HeaderChainAnchorError> {
     let expected = previous.height.saturating_add(1);
     if header.height != expected {
         return Err(HeaderChainAnchorError::NonContiguous {
@@ -81,7 +98,6 @@ pub fn extend_header_chain_anchor(
         });
     }
 
-    let block_id = hash_block_header(header);
     Ok(HeaderChainAnchor {
         height: header.height,
         block_id,

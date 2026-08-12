@@ -290,6 +290,8 @@ pub enum Message {
     PhotoScanTick,
     PhotoImportFinished(Result<String, String>),
     ImportSecretChanged(SensitiveString),
+    PasteImportSecret,
+    ImportSecretClipboardLoaded(Option<SensitiveString>),
     ConfirmImportSecret,
     BeginGenerateSecret,
     ConfirmGenerateSecret,
@@ -1840,6 +1842,40 @@ impl App {
                     self.settings_error = None;
                 }
             }
+            Message::PasteImportSecret => {
+                if self.settings_applying
+                    || self.secret_action_in_flight
+                    || self.photo_scan_active
+                    || !self.raw_secret_import_open()
+                {
+                    return Task::none();
+                }
+                return iced::clipboard::read().map(|contents| {
+                    Message::ImportSecretClipboardLoaded(contents.map(|contents| {
+                        SensitiveString::new(
+                            contents
+                                .chars()
+                                .filter(|character| !character.is_ascii_whitespace())
+                                .collect(),
+                        )
+                    }))
+                });
+            }
+            Message::ImportSecretClipboardLoaded(secret) => {
+                if self.settings_applying
+                    || self.secret_action_in_flight
+                    || self.photo_scan_active
+                    || !self.raw_secret_import_open()
+                {
+                    return Task::none();
+                }
+                if let Some(secret) = secret {
+                    self.imported_master_secret = secret;
+                    self.settings_error = None;
+                } else {
+                    self.settings_error = Some("Clipboard does not contain text.".into());
+                }
+            }
             Message::ConfirmImportSecret => {
                 if self.settings_applying || self.secret_action_in_flight || self.photo_scan_active
                 {
@@ -2213,6 +2249,15 @@ impl App {
             digits += 1;
         }
         digits == 64
+    }
+
+    fn raw_secret_import_open(&self) -> bool {
+        if self.wallet_setup_required {
+            self.wallet_setup_mode == WalletSetupMode::Raw
+        } else {
+            self.secret_dialog == Some(SecretDialog::Import)
+                && self.secret_import_mode == SecretImportMode::Raw
+        }
     }
 
     fn settings_draft(&self) -> NodeSettingsSnapshot {

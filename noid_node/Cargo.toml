@@ -46,6 +46,7 @@ thiserror          = { workspace = true }
 clap    = { version = "4", features = ["derive", "env"] }
 toml    = "0.8"
 hex     = "0.4"
+blake3  = "1"
 
 # Networking
 libp2p  = { version = "0.54", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }

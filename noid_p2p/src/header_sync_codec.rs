@@ -16,7 +16,7 @@ use std::io;
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use noid_chain::BLOCK_HEADER_WIRE_SIZE;
+use noid_chain::{BlockHeader, BLOCK_HEADER_WIRE_SIZE};
 
 use crate::protocol::{GetHeadersRequest, GetHeadersResponse};
 
@@ -120,7 +120,10 @@ impl request_response::Codec for HeaderSyncCodec {
             io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
         })?;
         for encoded in payload.chunks_exact(BLOCK_HEADER_WIRE_SIZE) {
-            headers.push(encoded.to_vec());
+            headers.push(
+                BlockHeader::from_bytes(encoded)
+                    .map_err(|_| invalid_data("header decode failed"))?,
+            );
         }
         Ok(GetHeadersResponse { headers })
     }
@@ -154,23 +157,13 @@ impl request_response::Codec for HeaderSyncCodec {
         let count = u16::try_from(response.headers.len())
             .map_err(|_| invalid_data("header batch count does not fit u16"))?;
         validate_count(count)?;
-        if response
-            .headers
-            .iter()
-            .any(|encoded| encoded.len() != BLOCK_HEADER_WIRE_SIZE)
-        {
-            return Err(invalid_data(
-                "header batch contains a noncanonical header length",
-            ));
-        }
-
         let canonical_len = canonical_payload_len(count)?;
         let mut canonical = Vec::new();
         canonical.try_reserve_exact(canonical_len).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
         })?;
-        for encoded in response.headers {
-            canonical.extend_from_slice(&encoded);
+        for header in response.headers {
+            canonical.extend_from_slice(&header.to_bytes());
         }
         let compressed =
             zstd::bulk::compress(&canonical, HEADER_COMPRESSION_LEVEL).map_err(|error| {
@@ -287,6 +280,15 @@ mod tests {
         zstd::bulk::compress(payload, HEADER_COMPRESSION_LEVEL).unwrap()
     }
 
+    fn fixture_header(height: u64, marker: u8) -> BlockHeader {
+        let mut header = noid_chain::consensus::genesis::genesis_header();
+        header.height = height;
+        header.state_root = [marker; 32];
+        header.tx_root = [marker.wrapping_add(1); 32];
+        header.nonce = u128::from(marker);
+        header
+    }
+
     fn framed_response(count: u16, canonical: &[u8]) -> Vec<u8> {
         let compressed = compress(canonical);
         let mut encoded = response_header(count, compressed.len());
@@ -338,10 +340,7 @@ mod tests {
     #[tokio::test]
     async fn response_round_trip_restores_exact_canonical_headers() {
         let response = GetHeadersResponse {
-            headers: vec![
-                vec![0x11; BLOCK_HEADER_WIRE_SIZE],
-                vec![0x22; BLOCK_HEADER_WIRE_SIZE],
-            ],
+            headers: vec![fixture_header(1, 0x11), fixture_header(2, 0x22)],
         };
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
@@ -360,19 +359,19 @@ mod tests {
             .read_response(&protocol(), &mut wire)
             .await
             .unwrap();
-        assert_eq!(decoded.headers[0], vec![0x11; BLOCK_HEADER_WIRE_SIZE]);
-        assert_eq!(decoded.headers[1], vec![0x22; BLOCK_HEADER_WIRE_SIZE]);
+        assert_eq!(decoded.headers[0], fixture_header(1, 0x11));
+        assert_eq!(decoded.headers[1], fixture_header(2, 0x22));
     }
 
     #[tokio::test]
-    async fn writer_rejects_noncanonical_header_before_partial_output() {
+    async fn writer_rejects_oversized_batch_before_partial_output() {
         let mut wire = Cursor::new(Vec::new());
         let error = HeaderSyncCodec
             .write_response(
                 &protocol(),
                 &mut wire,
                 GetHeadersResponse {
-                    headers: vec![vec![0; BLOCK_HEADER_WIRE_SIZE - 1]],
+                    headers: vec![fixture_header(1, 1); MAX_HEADERS_PER_BATCH + 1],
                 },
             )
             .await
@@ -426,18 +425,8 @@ mod tests {
 
     #[tokio::test]
     async fn maximum_batch_round_trip_stays_exact_and_bounded() {
-        let mut state = 0xD1B5_4A32_D192_ED03u64;
         let headers = (0..MAX_HEADERS_PER_BATCH)
-            .map(|_| {
-                (0..BLOCK_HEADER_WIRE_SIZE)
-                    .map(|_| {
-                        state ^= state << 13;
-                        state ^= state >> 7;
-                        state ^= state << 17;
-                        state as u8
-                    })
-                    .collect::<Vec<_>>()
-            })
+            .map(|height| fixture_header(height as u64, height as u8))
             .collect::<Vec<_>>();
         let expected = headers.clone();
         let mut wire = Cursor::new(Vec::new());

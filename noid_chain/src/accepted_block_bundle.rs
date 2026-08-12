@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Canonical pre-launch wire container for one complete accepted block candidate.
+//! Canonical wire container for one complete accepted block candidate.
 //!
 //! A semantic [`Block`] intentionally excludes recursive proof bytes because
 //! including them in the header would make the block id circular.  Network and

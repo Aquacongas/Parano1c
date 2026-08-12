@@ -1700,10 +1700,12 @@ enum SnapshotHeaderNextAction {
     RequestTerminal,
 }
 
-const SNAPSHOT_HEADER_REQUEST_WINDOW: usize = 1;
-/// Use the codec's allocation-bounded response cap directly.  Keeping one
-/// request in flight still bounds peer memory, while a cold sync no longer
-/// pays a new request-response round trip for every legacy 512-header slice.
+/// Consecutive, non-overlapping ranges requested from one selected peer. They
+/// may arrive out of order, but only the exact next height enters native
+/// validation. This hides request/response latency without racing sources.
+const SNAPSHOT_HEADER_REQUEST_WINDOW: usize = 4;
+/// Use the codec's allocation-bounded response cap directly. The bounded
+/// ordered window avoids paying one request-response round trip per range.
 const SNAPSHOT_HEADER_BATCH: u64 = MAX_STAGED_HEADER_BATCH as u64;
 /// A timeout on a slow path reduces only the failed range. Successful paths
 /// retain the full bulk batch, while a VPN or constrained relay can make
@@ -1783,9 +1785,10 @@ impl SnapshotHeaderPipeline {
         self.next_request_token
     }
 
-    fn refill_plan(&mut self) -> Vec<SnapshotHeaderRequestPlan> {
+    fn refill_plan(&mut self, locally_staging: bool) -> Vec<SnapshotHeaderRequestPlan> {
         let mut plan = Vec::with_capacity(SNAPSHOT_HEADER_REQUEST_WINDOW);
-        while self.outstanding.len() + self.ready.len() < SNAPSHOT_HEADER_REQUEST_WINDOW
+        let reserved = usize::from(locally_staging);
+        while self.outstanding.len() + self.ready.len() + reserved < SNAPSHOT_HEADER_REQUEST_WINDOW
             && self.next_request_height <= self.target_height
         {
             let start_height = self.next_request_height;
@@ -1959,17 +1962,25 @@ impl SnapshotHeaderPipeline {
             (request.count, request.attempted_peers, request.primary.peer)
         };
 
+        // Every later range was scheduled from the failed prefix. Retire it
+        // deterministically and rebuild from this exact height. Earlier ranges
+        // remain useful and are still consumed in order.
+        self.outstanding
+            .retain(|range_start, _| *range_start < start_height);
+        self.ready
+            .retain(|range_start, _| *range_start < start_height);
+
         if matches!(kind, noid_p2p::RequestFailureKind::Timeout)
             && retry_count > SNAPSHOT_HEADER_MIN_BATCH
         {
             retry_count = (retry_count / 2).max(SNAPSHOT_HEADER_MIN_BATCH);
             self.batch_cap = self.batch_cap.min(retry_count);
-            self.next_request_height = start_height.saturating_add(u64::from(retry_count));
             attempted_peers.clear();
             if peers.len() > 1 {
                 attempted_peers.insert(failed_peer);
             }
         }
+        self.next_request_height = start_height.saturating_add(u64::from(retry_count));
         let alternate = self.rotating_peer(peers, &attempted_peers)?;
         Some(self.restart_range(start_height, alternate, retry_count, attempted_peers))
     }
@@ -1984,11 +1995,13 @@ impl SnapshotHeaderPipeline {
         if self.next_request_height < start_height.saturating_add(u64::from(count)) {
             return None;
         }
-        // One later network range may have overlapped local validation of this
-        // batch. It is based on the rejected prefix, so retire its correlation
-        // token and rebuild the pipeline from this exact height.
-        self.outstanding.clear();
-        self.ready.clear();
+        // Later ranges may have overlapped local validation of this batch. They
+        // are based on the rejected prefix, so retire their correlation tokens
+        // and rebuild the ordered pipeline from this exact height.
+        self.outstanding
+            .retain(|range_start, _| *range_start < start_height);
+        self.ready
+            .retain(|range_start, _| *range_start < start_height);
         self.next_request_height = start_height.saturating_add(u64::from(count));
         let alternate = self.rotating_peer(peers, &attempted_peers)?;
         Some(self.restart_range(start_height, alternate, count, attempted_peers))
@@ -2726,10 +2739,10 @@ mod tests {
         unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
         validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
         MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        SnapshotHeaderPipeline, SnapshotHeaderRequestPlan, SnapshotSegmentResponseAdmission,
-        TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        SnapshotHeaderPipeline, SnapshotSegmentResponseAdmission, TerminalRequestRace,
+        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MINING_PEER_QUORUM, SNAPSHOT_HEADER_BATCH,
-        STATE_MANIFEST_RESPONSE_TIMEOUT,
+        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
     };
 
     #[test]
@@ -3008,7 +3021,7 @@ mod tests {
         let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
         assert_eq!(
             retention, 18,
-            "pre-launch retained full-block window is 18 blocks"
+            "consensus retained full-block window is 18 blocks"
         );
         let local_height = 100;
 
@@ -3046,20 +3059,26 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_header_pipeline_uses_one_bulk_lane() {
+    fn snapshot_header_pipeline_uses_one_ordered_same_peer_window() {
         let peer = libp2p::PeerId::random();
-        let target = SNAPSHOT_HEADER_BATCH * 2;
+        let target = SNAPSHOT_HEADER_BATCH * 5;
         let mut pipeline = SnapshotHeaderPipeline::new(7, peer, 1, target);
+        let initial = pipeline.refill_plan(false);
+        assert_eq!(initial.len(), SNAPSHOT_HEADER_REQUEST_WINDOW);
+        assert!(initial.iter().all(|request| request.peer == peer));
         assert_eq!(
-            pipeline.refill_plan(),
-            vec![SnapshotHeaderRequestPlan {
-                peer,
-                token: 1,
-                start_height: 1,
-                count: SNAPSHOT_HEADER_BATCH as u16,
-            }]
+            initial
+                .iter()
+                .map(|request| request.start_height)
+                .collect::<Vec<_>>(),
+            vec![
+                1,
+                SNAPSHOT_HEADER_BATCH + 1,
+                SNAPSHOT_HEADER_BATCH * 2 + 1,
+                SNAPSHOT_HEADER_BATCH * 3 + 1,
+            ]
         );
-        assert!(pipeline.refill_plan().is_empty());
+        assert!(pipeline.refill_plan(false).is_empty());
 
         let headers = |start: u64, count: u16| {
             (start..start + u64::from(count))
@@ -3070,10 +3089,23 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+        // A later response may arrive first, but it cannot advance the
+        // authoritative staging height.
         pipeline
             .accept(
                 7,
-                1,
+                initial[1].token,
+                peer,
+                SNAPSHOT_HEADER_BATCH + 1,
+                SNAPSHOT_HEADER_BATCH as u16,
+                headers(SNAPSHOT_HEADER_BATCH + 1, SNAPSHOT_HEADER_BATCH as u16),
+            )
+            .unwrap();
+        assert!(pipeline.take_ready(1).is_none());
+        pipeline
+            .accept(
+                7,
+                initial[0].token,
                 peer,
                 1,
                 SNAPSHOT_HEADER_BATCH as u16,
@@ -3084,34 +3116,11 @@ mod tests {
             pipeline.take_ready(1).unwrap().headers.len(),
             SNAPSHOT_HEADER_BATCH as usize
         );
-        assert_eq!(
-            pipeline.refill_plan(),
-            vec![SnapshotHeaderRequestPlan {
-                peer,
-                token: 2,
-                start_height: SNAPSHOT_HEADER_BATCH + 1,
-                count: SNAPSHOT_HEADER_BATCH as u16,
-            }]
-        );
-        pipeline
-            .accept(
-                7,
-                2,
-                peer,
-                SNAPSHOT_HEADER_BATCH + 1,
-                SNAPSHOT_HEADER_BATCH as u16,
-                headers(SNAPSHOT_HEADER_BATCH + 1, SNAPSHOT_HEADER_BATCH as u16),
-            )
-            .unwrap();
-        assert_eq!(
-            pipeline
-                .take_ready(SNAPSHOT_HEADER_BATCH + 1)
-                .unwrap()
-                .headers
-                .len(),
-            SNAPSHOT_HEADER_BATCH as usize
-        );
-        assert!(pipeline.is_drained());
+        assert!(pipeline.refill_plan(true).is_empty());
+        assert!(pipeline.take_ready(SNAPSHOT_HEADER_BATCH + 1).is_some());
+        let refill = pipeline.refill_plan(true);
+        assert_eq!(refill.len(), 1);
+        assert_eq!(refill[0].start_height, SNAPSHOT_HEADER_BATCH * 4 + 1);
     }
 
     #[test]
@@ -3120,31 +3129,42 @@ mod tests {
         let alternate = libp2p::PeerId::random();
         let peers = std::collections::HashSet::from([peer, alternate]);
         let mut pipeline = SnapshotHeaderPipeline::new(7, peer, 1, SNAPSHOT_HEADER_BATCH * 3);
-        let initial = pipeline.refill_plan();
-        assert_eq!(initial.len(), 1);
+        let initial = pipeline.refill_plan(false);
+        assert_eq!(initial.len(), 3);
+        let failed = initial[1];
         let retry = pipeline
             .failure_plan(
                 peer,
-                1,
+                failed.start_height,
                 SNAPSHOT_HEADER_BATCH as u16,
-                initial[0].token,
+                failed.token,
                 noid_p2p::RequestFailureKind::Io,
                 &peers,
             )
             .expect("failed exact range must be retried");
         assert_eq!(
             (retry.peer, retry.start_height, retry.count),
-            (alternate, 1, SNAPSHOT_HEADER_BATCH as u16)
+            (
+                alternate,
+                SNAPSHOT_HEADER_BATCH + 1,
+                SNAPSHOT_HEADER_BATCH as u16
+            )
         );
-        assert!(!pipeline.matches_outstanding(
+        assert!(pipeline.matches_outstanding(
             peer,
             1,
             SNAPSHOT_HEADER_BATCH as u16,
             initial[0].token
         ));
+        assert!(!pipeline.matches_outstanding(
+            peer,
+            SNAPSHOT_HEADER_BATCH * 2 + 1,
+            SNAPSHOT_HEADER_BATCH as u16,
+            initial[2].token
+        ));
         assert!(pipeline.matches_outstanding(
             alternate,
-            1,
+            SNAPSHOT_HEADER_BATCH + 1,
             SNAPSHOT_HEADER_BATCH as u16,
             retry.token
         ));
@@ -3155,7 +3175,7 @@ mod tests {
         let peer = libp2p::PeerId::random();
         let peers = std::collections::HashSet::from([peer]);
         let mut pipeline = SnapshotHeaderPipeline::new(9, peer, 1, SNAPSHOT_HEADER_BATCH * 2);
-        let initial = pipeline.refill_plan().pop().unwrap();
+        let initial = pipeline.refill_plan(false).remove(0);
         let retry = pipeline
             .failure_plan(
                 peer,
@@ -3178,7 +3198,7 @@ mod tests {
         let third = libp2p::PeerId::random();
         let peers = std::collections::HashSet::from([first, second, third]);
         let mut pipeline = SnapshotHeaderPipeline::new(11, first, 1, SNAPSHOT_HEADER_BATCH);
-        let initial = pipeline.refill_plan().pop().unwrap();
+        let initial = pipeline.refill_plan(false).pop().unwrap();
         let retry_one = pipeline
             .failure_plan(
                 first,
@@ -3216,8 +3236,8 @@ mod tests {
     fn delayed_snapshot_header_generation_is_inert() {
         let current_peer = libp2p::PeerId::random();
         let mut pipeline = SnapshotHeaderPipeline::new(8, current_peer, 1, 5_000);
-        let plan = pipeline.refill_plan();
-        assert_eq!(plan.len(), 1);
+        let plan = pipeline.refill_plan(false);
+        assert_eq!(plan.len(), 2);
         assert_eq!(
             (plan[0].start_height, plan[0].count),
             (1, SNAPSHOT_HEADER_BATCH as u16)
@@ -4073,11 +4093,11 @@ async fn handle_p2p_events(
             let terminal_height = manifest.tip_height;
             let terminal_hash = manifest.tip_hash;
 
-            // The manifest fixes a bounded immutable generation. Network
-            // payloads from its owner are fetched through one bulk lane. Local
-            // validation and disk staging may overlap the next transfer, but
-            // terminals, state and bridge bodies never compete with headers on
-            // the same connection.
+            // The manifest fixes a bounded immutable generation. Consecutive
+            // ranges come from one selected peer through a bounded ordered
+            // window. Local validation and disk staging overlap later ranges,
+            // while terminals, state and bridge bodies do not compete with the
+            // header phase on the same connection.
             let bridge_is_empty = snapshot_bridge_requires_tail(
                 manifest.tip_height,
                 manifest.bridge_tip_height,
@@ -6687,7 +6707,7 @@ async fn handle_p2p_events(
                     reset_sync_state!();
                     continue;
                 }
-                let refill = pipeline.refill_plan();
+                let refill = pipeline.refill_plan(true);
                 for request in refill {
                     let _ = p2p_cmd
                         .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
@@ -8518,7 +8538,7 @@ async fn handle_p2p_events(
                             reset_sync_state!();
                             continue;
                         }
-                        let refill = pipeline.refill_plan();
+                        let refill = pipeline.refill_plan(true);
                         for request in refill {
                             let _ = p2p_cmd
                                 .send(noid_p2p::NetworkCommand::FetchSnapshotHeaders {
@@ -8534,7 +8554,7 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    let refill = pipeline.refill_plan();
+                    let refill = pipeline.refill_plan(false);
                     pending_snapshot_header_sync = Some(sync);
                     for request in refill {
                         let _ = p2p_cmd

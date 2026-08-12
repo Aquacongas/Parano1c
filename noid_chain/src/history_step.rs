@@ -4,7 +4,7 @@
 //! Canonical chain-level metadata prefix for HistoryStep terminals.
 //!
 //! The recursive layer owns and verifies the proof envelope after this prefix.
-//! Chain, storage and transport share this exact pre-launch codec.
+//! Chain, storage and transport share this exact canonical codec.
 
 use core::fmt;
 

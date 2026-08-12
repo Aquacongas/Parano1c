@@ -1256,41 +1256,43 @@ fn decode_stored_accepted_block_bundle(
     }
 }
 
-/// Decode one fixed-framed batch as a single contiguous chain fragment.
-/// A malformed entry invalidates the complete response; silently shortening a
-/// hostile batch would make its transport identity ambiguous to the sync FSM.
-fn decode_linked_header_batch(
-    encoded_headers: Vec<Vec<u8>>,
-) -> Result<Vec<noid_chain::block_header::BlockHeader>, &'static str> {
-    if encoded_headers.len() > crate::header_sync_codec::MAX_HEADERS_PER_BATCH {
+/// Check the cheap structural shape of one already allocation-bounded decoded
+/// batch. Parent hashes, PoW, ASERT and the remaining consensus rules are
+/// checked once by the authoritative node-side header path.
+fn validate_header_batch_shape(
+    headers: &[noid_chain::block_header::BlockHeader],
+) -> Result<(), &'static str> {
+    if headers.len() > crate::header_sync_codec::MAX_HEADERS_PER_BATCH {
         return Err("header count exceeds cap");
     }
-    let mut decoded: Vec<noid_chain::block_header::BlockHeader> = Vec::new();
-    decoded
-        .try_reserve_exact(encoded_headers.len())
-        .map_err(|_| "header batch allocation failed")?;
-    for encoded in encoded_headers {
-        if encoded.len() != noid_chain::BLOCK_HEADER_WIRE_SIZE {
-            return Err("noncanonical header length");
+    for pair in headers.windows(2) {
+        let [parent, header] = pair else {
+            unreachable!("windows(2) always has two entries")
+        };
+        if header.height
+            != parent
+                .height
+                .checked_add(1)
+                .ok_or("header height overflow")?
+        {
+            return Err("header batch is not height-contiguous");
         }
-        let header = noid_chain::block_header::BlockHeader::from_bytes(&encoded)
-            .map_err(|_| "header decode failed")?;
-        if let Some(parent) = decoded.last() {
-            if header.height
-                != parent
-                    .height
-                    .checked_add(1)
-                    .ok_or("header height overflow")?
-            {
-                return Err("header batch is not height-contiguous");
-            }
-            if header.prev_block_hash != noid_chain::hash_block_header(parent) {
-                return Err("header batch is not hash-linked");
-            }
-        }
-        decoded.push(header);
     }
-    Ok(decoded)
+    Ok(())
+}
+
+fn snapshot_header_request_is_superseded(
+    pending: &PendingHeaderRequest,
+    generation: u64,
+    start_height: u64,
+) -> bool {
+    matches!(
+        pending.kind,
+        HeaderRequestKind::Snapshot {
+            generation: pending_generation,
+            ..
+        } if pending_generation != generation || pending.start_height == start_height
+    )
 }
 
 fn accepted_block_bundle_wire_len(bundle: &AcceptedBlockBundle) -> usize {
@@ -3496,11 +3498,13 @@ async fn handle_network_command(
                     .await;
                 return;
             }
-            // Generation, token and exact range correlation make superseded
-            // responses inert. Retain old transport IDs until completion or
-            // local expiry so pre-substream stalls remain observable.
+            // Keep distinct ranges in the same generation live: the node uses
+            // a bounded ordered window against one selected peer. Only an old
+            // generation or a replacement of this exact start height is
+            // superseded. Transport IDs remain until completion or local
+            // expiry so pre-substream stalls stay observable.
             pending_header_requests.retain(|_, pending| {
-                if matches!(pending.kind, HeaderRequestKind::Snapshot { .. }) {
+                if snapshot_header_request_is_superseded(pending, generation, start_height) {
                     pending.notify_node = false;
                 }
                 true
@@ -4052,42 +4056,40 @@ async fn handle_swarm_event(
                 }
                 return;
             }
-            let decoded = match decode_linked_header_batch(response.headers) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
-                    match pending.kind {
-                        HeaderRequestKind::General => {
-                            let _ = required_event_tx
-                                .send(NetworkEvent::HeadersRequestFailed {
-                                    from: pending.peer,
-                                    start_height: pending.start_height,
-                                    count: pending.count,
-                                })
-                                .await;
-                        }
-                        HeaderRequestKind::Snapshot { generation, token } => {
-                            let _ = required_event_tx
-                                .send(NetworkEvent::SnapshotHeadersRequestFailed {
-                                    generation,
-                                    token,
-                                    from: pending.peer,
-                                    start_height: pending.start_height,
-                                    count: pending.count,
-                                    kind: RequestFailureKind::InvalidResponse,
-                                })
-                                .await;
-                        }
+            let headers = response.headers;
+            if let Err(error) = validate_header_batch_shape(&headers) {
+                tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
+                match pending.kind {
+                    HeaderRequestKind::General => {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::HeadersRequestFailed {
+                                from: pending.peer,
+                                start_height: pending.start_height,
+                                count: pending.count,
+                            })
+                            .await;
                     }
-                    return;
+                    HeaderRequestKind::Snapshot { generation, token } => {
+                        let _ = required_event_tx
+                            .send(NetworkEvent::SnapshotHeadersRequestFailed {
+                                generation,
+                                token,
+                                from: pending.peer,
+                                start_height: pending.start_height,
+                                count: pending.count,
+                                kind: RequestFailureKind::InvalidResponse,
+                            })
+                            .await;
+                    }
                 }
-            };
+                return;
+            }
             match pending.kind {
                 HeaderRequestKind::General => {
                     let _ = required_event_tx
                         .send(NetworkEvent::HeadersBatch {
                             from: peer,
-                            headers: decoded,
+                            headers,
                         })
                         .await;
                 }
@@ -4099,7 +4101,7 @@ async fn handle_swarm_event(
                             from: peer,
                             start_height: pending.start_height,
                             requested_count: pending.count,
-                            headers: decoded,
+                            headers,
                         })
                         .await;
                 }
@@ -4184,15 +4186,7 @@ async fn handle_swarm_event(
                 let _preparation_permit = preparation_permit;
                 let loaded = tokio::task::spawn_blocking(move || {
                     match store.get_headers(start_height, count) {
-                        Ok(headers) => headers
-                            .into_iter()
-                            .map(|header| {
-                                let mut encoded =
-                                    Vec::with_capacity(noid_chain::BLOCK_HEADER_WIRE_SIZE);
-                                header.encode(&mut encoded);
-                                encoded
-                            })
-                            .collect(),
+                        Ok(headers) => headers,
                         Err(error) => {
                             tracing::warn!(
                                 start_height,
@@ -6399,40 +6393,56 @@ mod tests {
     }
 
     #[test]
-    fn header_batch_rejects_partial_decode_noncontiguity_and_broken_links() {
+    fn snapshot_header_window_keeps_distinct_ranges_in_one_generation_live() {
+        let peer = PeerId::random();
+        let request = |generation, start_height| PendingHeaderRequest {
+            peer,
+            start_height,
+            count: 512,
+            kind: HeaderRequestKind::Snapshot {
+                generation,
+                token: start_height,
+            },
+            issued_at: Instant::now(),
+            notify_node: true,
+        };
+
+        let first = request(9, 1);
+        let second = request(9, 513);
+        let old = request(8, 1025);
+        assert!(snapshot_header_request_is_superseded(&first, 9, 1));
+        assert!(!snapshot_header_request_is_superseded(&first, 9, 513));
+        assert!(!snapshot_header_request_is_superseded(&second, 9, 1));
+        assert!(snapshot_header_request_is_superseded(&old, 9, 1));
+
+        let general = PendingHeaderRequest {
+            kind: HeaderRequestKind::General,
+            ..first
+        };
+        assert!(!snapshot_header_request_is_superseded(&general, 9, 1));
+    }
+
+    #[test]
+    fn header_batch_shape_rejects_noncontiguity_without_rehashing_links() {
         let mut first = noid_chain::consensus::genesis::genesis_header();
         first.height = 77;
         let mut second = first;
         second.height = 78;
         second.prev_block_hash = noid_chain::hash_block_header(&first);
-        let valid =
-            decode_linked_header_batch(vec![first.to_bytes().to_vec(), second.to_bytes().to_vec()])
-                .unwrap();
-        assert_eq!(valid.len(), 2);
+        assert_eq!(validate_header_batch_shape(&[first, second]), Ok(()));
 
         let mut skipped = second;
         skipped.height = 79;
         assert_eq!(
-            decode_linked_header_batch(vec![
-                first.to_bytes().to_vec(),
-                skipped.to_bytes().to_vec(),
-            ]),
+            validate_header_batch_shape(&[first, skipped]),
             Err("header batch is not height-contiguous")
         );
 
+        // Parent-link hashing belongs to the single authoritative consensus
+        // pass in snapshot staging, not the transport-shape layer.
         let mut wrong_parent = second;
         wrong_parent.prev_block_hash[0] ^= 1;
-        assert_eq!(
-            decode_linked_header_batch(vec![
-                first.to_bytes().to_vec(),
-                wrong_parent.to_bytes().to_vec(),
-            ]),
-            Err("header batch is not hash-linked")
-        );
-        assert_eq!(
-            decode_linked_header_batch(vec![vec![0; noid_chain::BLOCK_HEADER_WIRE_SIZE - 1]]),
-            Err("noncanonical header length")
-        );
+        assert_eq!(validate_header_batch_shape(&[first, wrong_parent]), Ok(()));
     }
 
     #[test]

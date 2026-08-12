@@ -25,8 +25,8 @@ use crate::consensus::params::{RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPT
 use crate::exact_state_hash::slot_leaf_hash;
 use crate::fri_state::SlotValue;
 use crate::header_anchor::{
-    compute_header_chain_anchor, extend_header_chain_anchor, HeaderChainAnchor,
-    HeaderChainAnchorError,
+    compute_header_chain_anchor, extend_header_chain_anchor, extend_header_chain_anchor_prehashed,
+    HeaderChainAnchor, HeaderChainAnchorError,
 };
 use crate::segmented_state::SegmentColumns;
 use crate::state::{ChainState, StreamingSparseRoot};
@@ -1947,24 +1947,20 @@ impl MdbxStore {
                     "staged snapshot header cumulative chainwork mismatch",
                 ));
             }
-            let anchor = extend_header_chain_anchor(
+            let anchor = extend_header_chain_anchor_prehashed(
                 &previous_anchor,
                 &record.header,
+                record.hash,
                 record.cumulative_chainwork,
             )?;
-            if anchor.block_id != record.hash {
-                return Err(StoreError::Decode(
-                    "staged snapshot header anchor hash mismatch",
-                ));
-            }
 
             let height_key = u64_key(record.header.height);
-            let stored_header_raw: Option<Vec<u8>> = txn.get(&header_tbl, &height_key)?;
-            let stored_height_raw: Option<Vec<u8>> =
-                txn.get(&hash_to_height_tbl, record.hash.as_slice())?;
-            let stored_work_raw: Option<Vec<u8>> = txn.get(&work_tbl, &height_key)?;
-            let stored_anchor_raw: Option<Vec<u8>> = txn.get(&anchor_tbl, &height_key)?;
             if record.header.height <= current_tip_height {
+                let stored_header_raw: Option<Vec<u8>> = txn.get(&header_tbl, &height_key)?;
+                let stored_height_raw: Option<Vec<u8>> =
+                    txn.get(&hash_to_height_tbl, record.hash.as_slice())?;
+                let stored_work_raw: Option<Vec<u8>> = txn.get(&work_tbl, &height_key)?;
+                let stored_anchor_raw: Option<Vec<u8>> = txn.get(&anchor_tbl, &height_key)?;
                 if stored_header_raw.as_deref().and_then(decode_header) != Some(record.header)
                     || stored_height_raw.as_deref().and_then(u64_from_key)
                         != Some(record.header.height)
@@ -1990,38 +1986,29 @@ impl MdbxStore {
                     matched_current_tip = true;
                 }
             } else {
-                if stored_header_raw.is_some()
-                    || stored_height_raw.is_some()
-                    || stored_work_raw.is_some()
-                    || stored_anchor_raw.is_some()
-                {
-                    return Err(StoreError::Decode(
-                        "unaccepted staged snapshot suffix already has canonical records",
-                    ));
-                }
                 txn.put(
                     &header_tbl,
                     height_key,
                     encode_header(&record.header),
-                    WriteFlags::empty(),
+                    WriteFlags::NO_OVERWRITE,
                 )?;
                 txn.put(
                     &hash_to_height_tbl,
                     record.hash.as_slice(),
                     height_key,
-                    WriteFlags::empty(),
+                    WriteFlags::NO_OVERWRITE,
                 )?;
                 txn.put(
                     &work_tbl,
                     height_key,
                     encode_chain_work(&record.cumulative_chainwork),
-                    WriteFlags::empty(),
+                    WriteFlags::NO_OVERWRITE,
                 )?;
                 txn.put(
                     &anchor_tbl,
                     height_key,
                     encode_header_chain_anchor(&anchor),
-                    WriteFlags::empty(),
+                    WriteFlags::NO_OVERWRITE,
                 )?;
             }
 

@@ -228,6 +228,7 @@ pub struct SnapshotHeaderStaging {
     base: CanonicalHeaderBoundary,
     count: u64,
     poisoned: bool,
+    content_hasher: blake3::Hasher,
 }
 
 impl SnapshotHeaderStaging {
@@ -274,6 +275,7 @@ impl SnapshotHeaderStaging {
             base,
             count: 0,
             poisoned: false,
+            content_hasher: initial_content_hasher(&base),
         })
     }
 
@@ -312,6 +314,7 @@ impl SnapshotHeaderStaging {
             base,
             count,
             poisoned: false,
+            content_hasher: initial_content_hasher(&base),
         };
         staging.revalidate_complete_file(store)?;
         Ok(staging)
@@ -363,8 +366,6 @@ impl SnapshotHeaderStaging {
                 ),
             });
         }
-        self.base.validate_against(store)?;
-
         // Validate and derive every record before writing. The bounded working
         // set makes a bad later header unable to partially commit an otherwise
         // valid batch, while each semantic block id is computed only once.
@@ -401,7 +402,9 @@ impl SnapshotHeaderStaging {
                     ))?;
         }
 
-        // Write fixed-size sequential records with one durability point.
+        // Write fixed-size sequential records. The staging file is disposable:
+        // durability is established once when the complete candidate is
+        // sealed, rather than forcing an fsync after every network range.
         let original_len = FILE_HEADER_SIZE
             .checked_add(self.count.checked_mul(RECORD_SIZE as u64).ok_or(
                 SnapshotHeaderStagingError::Format("staging file length overflow"),
@@ -414,13 +417,16 @@ impl SnapshotHeaderStaging {
             for record in &records {
                 write_record(&mut self.file, record)?;
             }
-            self.file.sync_data()
+            Ok(())
         })();
         if let Err(error) = write_result {
             self.poisoned = true;
             let _ = self.file.set_len(original_len);
             let _ = self.file.sync_all();
             return Err(SnapshotHeaderStagingError::Io(error));
+        }
+        for record in &records {
+            self.content_hasher.update(&encode_record(record));
         }
         self.count = self.count.checked_add(headers.len() as u64).ok_or(
             SnapshotHeaderStagingError::Format("staged header count overflow"),
@@ -491,11 +497,12 @@ impl SnapshotHeaderStaging {
         expected_hash: [u8; 32],
         expected_chainwork: [u8; 32],
     ) -> Result<ValidatedSnapshotHeaderStaging> {
-        let boundary =
-            self.exact_boundary(store, expected_height, expected_hash, expected_chainwork)?;
-
-        // Replace the writable descriptor with a read-only O_NOFOLLOW
-        // descriptor for the same inode before the authoritative full pass.
+        // Establish the candidate's single durability point, then replace the
+        // writable descriptor with a read-only O_NOFOLLOW descriptor for the
+        // same inode. Consensus rules were already checked exactly once while
+        // appending. The atomic installer streams the file through the expected
+        // digest and cannot commit any bytes which differ from that pass.
+        self.file.sync_data()?;
         let writable_identity = StagingFileIdentity::capture(&self.file)?;
         let expected_len = staged_file_len(self.count)?;
         if writable_identity.len != expected_len {
@@ -513,18 +520,9 @@ impl SnapshotHeaderStaging {
             ));
         }
         self.file = read_only;
-
-        // Validate through the descriptor that atomic installation will use.
-        // This closes the path-reopen interval and drops the last writable
-        // descriptor owned by the node before installable typestate exists.
-        self.revalidate_complete_file(store)?;
-        let sealed_boundary = self.exact_boundary(
-            store,
-            boundary.tip_header.height,
-            boundary.tip_hash,
-            boundary.cumulative_chainwork,
-        )?;
-        ensure_exact_header_boundary(&boundary, &sealed_boundary)?;
+        let expected_digest = *self.content_hasher.finalize().as_bytes();
+        let boundary =
+            self.exact_boundary(store, expected_height, expected_hash, expected_chainwork)?;
         let sealed_identity = StagingFileIdentity::capture(&self.file)?;
         if sealed_identity != read_only_identity {
             return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
@@ -558,8 +556,12 @@ impl SnapshotHeaderStaging {
             staging: self,
             boundary,
             file_identity: sealed_identity,
+            expected_digest,
             recent_headers,
             next_install_index: 0,
+            install_hasher: blake3::Hasher::new(),
+            install_started: false,
+            install_complete: false,
         })
     }
 
@@ -583,16 +585,7 @@ impl SnapshotHeaderStaging {
     }
 
     fn read_record(&mut self, index: u64) -> Result<StagedHeaderRecord> {
-        if index >= self.count {
-            return Err(SnapshotHeaderStagingError::Format(
-                "record index is beyond staged suffix",
-            ));
-        }
-        let offset = record_offset(index)?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        let mut bytes = [0u8; RECORD_SIZE];
-        self.file.read_exact(&mut bytes)?;
-        decode_record(&bytes)
+        decode_record(&self.read_record_bytes(index)?)
     }
 
     fn load_consensus_window(
@@ -633,12 +626,14 @@ impl SnapshotHeaderStaging {
                 reason: "staging file base header changed".into(),
             });
         }
+        let mut content_hasher = initial_content_hasher(&self.base);
         let mut window = self.load_canonical_window(store)?;
         let mut previous_hash = self.base.block_hash;
         let mut previous_work = self.base.cumulative_chainwork;
         let mut expected_height = self.base.header.height + 1;
         for index in 0..self.count {
-            let record = self.read_record(index)?;
+            let encoded = self.read_record_bytes(index)?;
+            let record = decode_record(&encoded)?;
             validate_next_header(&record.header, expected_height, previous_hash, &window)?;
             let block_hash = hash_block_header(&record.header);
             if block_hash != record.block_hash {
@@ -660,6 +655,7 @@ impl SnapshotHeaderStaging {
             previous_hash = block_hash;
             previous_work = expected_work;
             push_window(&mut window, record.header);
+            content_hasher.update(&encoded);
             expected_height =
                 expected_height
                     .checked_add(1)
@@ -667,7 +663,20 @@ impl SnapshotHeaderStaging {
                         "candidate height overflow",
                     ))?;
         }
+        self.content_hasher = content_hasher;
         Ok(())
+    }
+
+    fn read_record_bytes(&mut self, index: u64) -> Result<[u8; RECORD_SIZE]> {
+        if index >= self.count {
+            return Err(SnapshotHeaderStagingError::Format(
+                "record index is beyond staged suffix",
+            ));
+        }
+        self.file.seek(SeekFrom::Start(record_offset(index)?))?;
+        let mut bytes = [0u8; RECORD_SIZE];
+        self.file.read_exact(&mut bytes)?;
+        Ok(bytes)
     }
 
     fn load_canonical_window(&self, store: &MdbxStore) -> Result<VecDeque<BlockHeader>> {
@@ -698,8 +707,12 @@ pub struct ValidatedSnapshotHeaderStaging {
     staging: SnapshotHeaderStaging,
     boundary: SnapshotHeaderBoundary,
     file_identity: StagingFileIdentity,
+    expected_digest: [u8; 32],
     recent_headers: Vec<BlockHeader>,
     next_install_index: u64,
+    install_hasher: blake3::Hasher,
+    install_started: bool,
+    install_complete: bool,
 }
 
 impl ValidatedSnapshotHeaderStaging {
@@ -744,39 +757,51 @@ impl SnapshotHeaderInstallSource for ValidatedSnapshotHeaderStaging {
     }
 
     fn next_record(&mut self) -> std::result::Result<Option<VerifiedHeaderBatchRecord>, String> {
-        self.assert_file_unchanged_before_read()
-            .map_err(|error| error.to_string())?;
+        if !self.install_started {
+            self.assert_file_unchanged_before_read()
+                .map_err(|error| error.to_string())?;
+            self.staging
+                .file
+                .seek(SeekFrom::Start(0))
+                .map_err(|error| error.to_string())?;
+            let mut file_header = [0u8; FILE_HEADER_SIZE as usize];
+            self.staging
+                .file
+                .read_exact(&mut file_header)
+                .map_err(|error| error.to_string())?;
+            self.install_hasher.update(&file_header);
+            self.install_started = true;
+        }
         if self.next_install_index == self.staging.count {
+            if !self.install_complete {
+                self.assert_file_unchanged_before_read()
+                    .map_err(|error| error.to_string())?;
+                if self.install_hasher.finalize().as_bytes() != &self.expected_digest {
+                    return Err(
+                        "snapshot header staging content changed during atomic install".into(),
+                    );
+                }
+                self.install_complete = true;
+            }
             return Ok(None);
         }
         if self.next_install_index > self.staging.count {
             return Err("snapshot header staging stream advanced beyond its sealed suffix".into());
         }
-        let record = self
-            .staging
-            .read_record(self.next_install_index)
+        let mut encoded = [0u8; RECORD_SIZE];
+        self.staging
+            .file
+            .read_exact(&mut encoded)
             .map_err(|error| error.to_string())?;
+        let record = decode_record(&encoded).map_err(|error| error.to_string())?;
+        self.install_hasher.update(&encoded);
         self.next_install_index += 1;
-        self.assert_file_unchanged_before_read()
-            .map_err(|error| error.to_string())?;
         Ok(Some(VerifiedHeaderBatchRecord {
             header: record.header,
             hash: record.block_hash,
             cumulative_chainwork: record.cumulative_chainwork,
         }))
     }
-}
-
-fn ensure_exact_header_boundary(
-    validated: &SnapshotHeaderBoundary,
-    current: &SnapshotHeaderBoundary,
-) -> Result<()> {
-    if validated != current {
-        return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
-            "tip header/hash/work or transaction-epoch header changed",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_next_header(
@@ -955,12 +980,24 @@ fn push_window(window: &mut VecDeque<BlockHeader>, header: BlockHeader) {
 }
 
 fn write_file_header(file: &mut File, base: &CanonicalHeaderBoundary) -> io::Result<()> {
-    file.write_all(&FILE_MAGIC)?;
-    file.write_all(&FILE_VERSION.to_le_bytes())?;
-    file.write_all(&(RECORD_SIZE as u32).to_le_bytes())?;
-    file.write_all(&base.header.height.to_le_bytes())?;
-    file.write_all(&base.block_hash)?;
-    file.write_all(&base.cumulative_chainwork)
+    file.write_all(&encode_file_header(base))
+}
+
+fn encode_file_header(base: &CanonicalHeaderBoundary) -> [u8; FILE_HEADER_SIZE as usize] {
+    let mut encoded = [0u8; FILE_HEADER_SIZE as usize];
+    encoded[..8].copy_from_slice(&FILE_MAGIC);
+    encoded[8..12].copy_from_slice(&FILE_VERSION.to_le_bytes());
+    encoded[12..16].copy_from_slice(&(RECORD_SIZE as u32).to_le_bytes());
+    encoded[16..24].copy_from_slice(&base.header.height.to_le_bytes());
+    encoded[24..56].copy_from_slice(&base.block_hash);
+    encoded[56..88].copy_from_slice(&base.cumulative_chainwork);
+    encoded
+}
+
+fn initial_content_hasher(base: &CanonicalHeaderBoundary) -> blake3::Hasher {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&encode_file_header(base));
+    hasher
 }
 
 #[derive(Clone, Copy)]
@@ -1000,9 +1037,16 @@ fn read_file_header(file: &mut File) -> Result<EncodedBase> {
 }
 
 fn write_record(file: &mut File, record: &StagedHeaderRecord) -> io::Result<()> {
-    file.write_all(&record.header.to_bytes())?;
-    file.write_all(&record.block_hash)?;
-    file.write_all(&record.cumulative_chainwork)
+    file.write_all(&encode_record(record))
+}
+
+fn encode_record(record: &StagedHeaderRecord) -> [u8; RECORD_SIZE] {
+    let mut encoded = [0u8; RECORD_SIZE];
+    encoded[..BLOCK_HEADER_WIRE_SIZE].copy_from_slice(&record.header.to_bytes());
+    encoded[BLOCK_HEADER_WIRE_SIZE..BLOCK_HEADER_WIRE_SIZE + 32]
+        .copy_from_slice(&record.block_hash);
+    encoded[BLOCK_HEADER_WIRE_SIZE + 32..].copy_from_slice(&record.cumulative_chainwork);
+    encoded
 }
 
 fn decode_record(bytes: &[u8; RECORD_SIZE]) -> Result<StagedHeaderRecord> {
@@ -1176,7 +1220,7 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    nonce: 241_876,
+                    nonce: 605_382,
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
@@ -1233,7 +1277,7 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        .into_block(1_288_230)
+        .into_block(115_409)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a
@@ -1346,6 +1390,7 @@ mod tests {
         let streamed = validated.next_record().unwrap().unwrap();
         assert_eq!(streamed.header, changed_header);
         assert_ne!(streamed, validated.target_record());
+        assert!(validated.next_record().is_err());
         assert!(store.get_header(1).unwrap().is_none());
         assert!(store.get_chain_work(1).unwrap().is_none());
     }

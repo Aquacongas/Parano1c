@@ -50,10 +50,11 @@ pub struct GetHeadersRequest {
     pub count: u16, // wire cap: MAX_HEADERS_PER_BATCH; callers may request smaller batches
 }
 
-/// Response: canonical serialized BlockHeader bytes, 212 bytes each.
+/// Response: canonical block headers decoded by the allocation-bounded
+/// header-sync codec.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHeadersResponse {
-    pub headers: Vec<Vec<u8>>,
+    pub headers: Vec<BlockHeader>,
 }
 
 // ---------------------------------------------------------------------------

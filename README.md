@@ -2,6 +2,11 @@
 
 **Proof-native Layer 1 ordered by proof of work.**
 
+[Website](https://parano1d.org) ·
+[Documentation](https://docs.parano1d.org) ·
+[Research](https://lab.parano1d.org) ·
+[Releases](https://github.com/ignotusnemo/parano1d/releases)
+
 Blockchains have a fundamental architectural flaw: the present does not prove
 itself. Its validity is inherited from accumulated history. Bitcoin reconstructs
 that validity by validating the chain from genesis. Other networks may shorten
@@ -14,7 +19,7 @@ by prior historical validation.
 
 This is not a temporary limitation. It is baked into the model.
 
-Parano1d is designed to remove this requirement.
+Parano1d removes this requirement.
 
 In Parano1d, validity is established once, where the complete information
 already exists. Authorization is proved locally by the party with the private
@@ -213,7 +218,7 @@ protocol-verifier time by 14.80× and raw algebraic proof bytes by 51.67×.
 Batched sumchecks, zerocheck, lincheck and FRI-Binius close the GF(2) R1CS
 relation without a trusted setup. One joint `GF(2^256)` transcript binds the
 three Link and six Block recursive regions into the outer PCS batch. The two
-authenticated launch matrices, B25 at `m=22` and B255 at `m=24`, are embedded
+authenticated production matrices, B25 at `m=22` and B255 at `m=24`, are embedded
 in the official binary and can be regenerated from source. The Parano1d Lab
 [FROST-GKR research article](https://lab.parano1d.org/research/frost-gkr-global-trace-protocol/)
 links the paper, reference implementation, comparison harness and complete
@@ -240,7 +245,7 @@ propagation, at a 15-second mean. Cumulative work selects the chain. An external
 miner receives an immutable, single-use template and returns only a nonce; it
 cannot alter the transactions or state root.
 
-## Launch Profile
+## Mainnet Profile
 
 | Parameter | Value |
 |---|---:|
@@ -417,4 +422,4 @@ Designed and developed by **Ignotus Nemo**. Licensed under the
 [Apache License 2.0](LICENSE). Please report security issues according to the
 [security policy](.github/SECURITY.md).
 
-Contact: [ignotus.nemo@proton.me](mailto:ignotus.nemo@proton.me)
+Contact: [dev@parano1d.org](mailto:dev@parano1d.org)

@@ -126,7 +126,7 @@ const _: () = assert!(
 /// Consensus hard-finality depth.
 ///
 /// Reorgs that would change the finalized prefix are rejected by fork choice.
-/// Pre-launch provisional value; publication freeze must ratify it independently.
+/// This depth is fixed by the public-network consensus profile.
 pub const CONSENSUS_FINALITY_DEPTH: u64 = 18;
 
 /// Undo-log retention depth for local shallow reorg recovery and incremental

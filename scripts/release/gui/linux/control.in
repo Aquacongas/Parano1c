@@ -3,7 +3,7 @@ Version: @VERSION@
 Section: utils
 Priority: optional
 Architecture: @ARCHITECTURE@
-Maintainer: Paranoid Zero <ignotus.nemo@proton.me>
+Maintainer: Paranoid Zero <dev@parano1d.org>
 Depends: libc6 (>= 2.35), libgcc-s1, xdg-desktop-portal
 Homepage: https://parano1d.org/
 Description: Native Parano1d wallet
