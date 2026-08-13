@@ -143,10 +143,10 @@ const TX_RELAY_RATE_MAX: u32 = 50;
 const GOSSIP_ACCEPT_WINDOW: Duration = Duration::from_secs(10);
 const GOSSIP_ACCEPT_BYTES_PER_WINDOW: usize = 64 * 1024 * 1024;
 const AUTOMATIC_OUTBOUND_TARGET: usize = 12;
-// The shipped topology contains six individual DNS seeds plus one aggregate
-// dnsaddr source. Probe all of them when necessary, but leave room in the
-// global pending table for ordinary peers learned through Kademlia.
-const MAX_PENDING_BOOTSTRAP_DIALS: usize = 7;
+// The shipped topology contains four individual DNS seeds. Probe all of them
+// when necessary, but leave room in the global pending table for ordinary
+// peers learned through Kademlia.
+const MAX_PENDING_BOOTSTRAP_DIALS: usize = 4;
 const MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS: usize =
     AUTOMATIC_OUTBOUND_TARGET + MAX_PENDING_BOOTSTRAP_DIALS + 1;
 // Twelve peers may legitimately use two relay/direct paths each. Keep room
@@ -155,12 +155,12 @@ const MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS: usize =
 const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 32;
 // The swarm itself admits at most 32 pending outbound transports.
 const _: () = assert!(MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS <= 32);
-// One bootstrap transport is enough to enter the routing table. Keeping three
-// seeds per fresh wallet multiplied every launch burst across the public seed
-// fleet and let long-lived edge nodes occupy admission slots needed by new
-// clients. Dead/unreachable seeds still fail over through the shuffled,
-// independently backed-off candidate set below.
-const INITIAL_BOOTSTRAP_FANOUT: usize = 1;
+// Mining requires two independently confirming authenticated peers, and most
+// GUI nodes discovered through Kademlia are not publicly dialable through
+// their NAT. Keep two bootstrap transports until stable ordinary peers replace
+// them one-for-one. This preserves the mining quorum without pinning clients
+// to every public seed.
+const INITIAL_BOOTSTRAP_FANOUT: usize = 2;
 const MAX_AUTOMATIC_PEER_CANDIDATES: usize = 512;
 const MAX_AUTOMATIC_ADDRS_PER_PEER: usize = 8;
 const AUTOMATIC_PEER_HEALTHY_AFTER: Duration = Duration::from_secs(30);
@@ -6198,16 +6198,17 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_is_single_lane_and_released_after_ordinary_replacement() {
-        for (ordinary, expected_seeds) in [(0, 1), (1, 0), (2, 0), (12, 0)] {
+    fn bootstrap_preserves_two_peer_quorum_until_ordinary_replacement() {
+        for (ordinary, expected_seeds) in [(0, 2), (1, 1), (2, 0), (12, 0)] {
             assert_eq!(
                 desired_bootstrap_connections(true, ordinary, 6),
                 expected_seeds,
                 "ordinary={ordinary}"
             );
         }
-        assert_eq!(desired_bootstrap_connections(false, 12, 3), 1);
-        assert_eq!(desired_bootstrap_connections(true, 0, 3), 1);
+        assert_eq!(desired_bootstrap_connections(false, 12, 3), 2);
+        assert_eq!(desired_bootstrap_connections(true, 0, 3), 2);
+        assert_eq!(desired_bootstrap_connections(true, 0, 1), 1);
         assert_eq!(desired_bootstrap_connections(true, 0, 0), 0);
     }
 

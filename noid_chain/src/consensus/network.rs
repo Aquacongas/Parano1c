@@ -130,13 +130,10 @@ impl NetworkConfig {
             // Each hostname creates an independent startup dial; unresolved
             // future seeds fail independently without delaying usable seeds.
             dns_seeds: &[
-                "dnsaddr:noid.network", // _dnsaddr.noid.network TXT (primary)
-                "seed1.noid.network",   // A record: primary miner/seed
-                "seed2.noid.network",   // A record: primary seed
-                "seed3.noid.network",   // A record: primary seed
-                "seed4.noid.network",   // A record: independent seed
-                "seed5.noid.network",   // A record: independent seed
-                "seed6.noid.network",   // A record: independent seed
+                "seed1.noid.network", // A record: primary miner/seed
+                "seed2.noid.network", // A record: primary seed
+                "seed3.noid.network", // A record: primary seed
+                "seed4.noid.network", // A record: independent seed
             ],
         }
     }
@@ -188,17 +185,14 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_has_aggregate_and_individual_dns_seeds() {
+    fn mainnet_has_live_individual_dns_seeds() {
         assert_eq!(
             NetworkConfig::mainnet().dns_seeds,
             &[
-                "dnsaddr:noid.network",
                 "seed1.noid.network",
                 "seed2.noid.network",
                 "seed3.noid.network",
                 "seed4.noid.network",
-                "seed5.noid.network",
-                "seed6.noid.network",
             ]
         );
     }
