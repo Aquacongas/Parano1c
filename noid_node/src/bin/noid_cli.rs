@@ -15,7 +15,7 @@
 
 use anyhow::{bail, Context};
 use clap::{Parser, Subcommand};
-use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+use noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
 use serde_json::Value;
 use std::io::{self, IsTerminal, Write};
 
@@ -609,7 +609,7 @@ async fn cmd_block(ctx: &Ctx<'_>, height: u64) -> anyhow::Result<()> {
 
     if result.is_null() {
         warn_msg(&format!(
-            "Block {height} not available (only last {RECENT_BLOCK_RETENTION_DEPTH} blocks are stored)."
+            "Block {height} not available (the local complete-bundle reserve covers up to the last {RETAINED_BLOCK_SERVING_DEPTH} heights after warm-up)."
         ));
         return Ok(());
     }

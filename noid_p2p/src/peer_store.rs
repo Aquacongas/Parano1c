@@ -68,6 +68,10 @@ impl SuccessfulPeerCache {
         self.prune();
     }
 
+    pub(crate) fn remove(&mut self, peer_id: &PeerId) {
+        self.entries.remove(peer_id);
+    }
+
     fn prune(&mut self) {
         while self.entries.len() > MAX_PEERS {
             let Some(oldest) = self
@@ -190,6 +194,8 @@ mod tests {
         assert_eq!(cache.entries().count(), 0);
         cache.record_success(peer, public_addr("8.8.8.8"));
         assert_eq!(cache.entries().count(), 1);
+        cache.remove(&peer);
+        assert_eq!(cache.entries().count(), 0);
     }
 
     #[test]

@@ -48,6 +48,8 @@ pub enum SnapshotHeaderStagingError {
     Format(&'static str),
     #[error("snapshot header candidate rejected at h={height}: {reason}")]
     InvalidCandidate { height: u64, reason: String },
+    #[error("snapshot header candidate rejected at h={height}: BadParentHash")]
+    ParentMismatch { height: u64 },
     #[error("snapshot header canonical conflict at h={height}: {reason}")]
     CanonicalConflict { height: u64, reason: String },
     #[error("validated snapshot header staging changed before atomic install: {0}")]
@@ -848,9 +850,16 @@ fn validate_next_header(
         anchor.timestamp,
         &anchor.difficulty_target,
     )
-    .map_err(|error| SnapshotHeaderStagingError::InvalidCandidate {
-        height: header.height,
-        reason: error.to_string(),
+    .map_err(|error| match error {
+        noid_chain::consensus::ConsensusError::BadParentHash => {
+            SnapshotHeaderStagingError::ParentMismatch {
+                height: header.height,
+            }
+        }
+        error => SnapshotHeaderStagingError::InvalidCandidate {
+            height: header.height,
+            reason: error.to_string(),
+        },
     })
 }
 
@@ -1321,6 +1330,26 @@ mod tests {
             .is_err());
         assert_eq!(staging.staged_len(), 0);
         assert!(store.get_header(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn first_parent_mismatch_is_typed_for_rebase_discovery() {
+        let db = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging =
+            SnapshotHeaderStaging::create(&stage_dir.path().join("candidate"), store, base)
+                .unwrap();
+        let mut competing = fixture_chain()[1];
+        competing.prev_block_hash = [0xA5; 32];
+
+        assert!(matches!(
+            staging.append_batch(store, &[competing]),
+            Err(SnapshotHeaderStagingError::ParentMismatch { height: 1 })
+        ));
+        assert_eq!(staging.staged_len(), 0);
     }
 
     #[test]

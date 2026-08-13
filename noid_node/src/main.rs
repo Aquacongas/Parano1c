@@ -53,7 +53,7 @@ use noid_chain::storage::snapshot_staging::{
 };
 use noid_chain::storage::{
     encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log, MdbxChainContext,
-    SnapshotSegmentDescriptor,
+    MdbxStore, SnapshotSegmentDescriptor,
 };
 use noid_mempool::{AsyncMempool, ChainView, MempoolConfig};
 use noid_miner::{BlockMiner, MinerConfig};
@@ -168,7 +168,29 @@ struct PendingShallowFork {
     candidates: Vec<AcceptedBlockCandidate>,
     retained_bytes: usize,
     advertised_work: [u8; 32],
-    started_at: Instant,
+    /// Peers that failed to serve the current exact replacement bundle.
+    /// The set is cleared after every correlated bundle makes progress, so a
+    /// healthy peer remains eligible for the next height while one bad or
+    /// stale peer cannot restart the same fixed download indefinitely.
+    attempted_bundle_peers: std::collections::HashSet<libp2p::PeerId>,
+    /// Deadline is measured from exact correlated progress, not from the
+    /// beginning of the whole sequential transfer. A maximum-depth recovery
+    /// can legitimately take longer than one request timeout on a slow link.
+    last_progress_at: Instant,
+}
+
+/// Canonical common ancestor from which a verified fork-choice-winning snapshot may
+/// replace only the local, non-final suffix.  This is armed only after native
+/// header validation and ordinary fork-choice comparison have already selected
+/// a better branch; the atomic installer independently rechecks work and
+/// finality before replacing anything.
+#[derive(Clone, Copy)]
+struct SnapshotRebaseHint {
+    ancestor_height: u64,
+    ancestor_hash: [u8; 32],
+    competing_tip_height: u64,
+    competing_tip_hash: [u8; 32],
+    armed_at: Instant,
 }
 
 impl PendingShallowFork {
@@ -246,6 +268,78 @@ fn unavailable_block_requires_snapshot(
         && retained_suffix_has_more(local_height, announced_height)
 }
 
+fn snapshot_parent_mismatch_is_at_base(
+    staged_len: u64,
+    base_height: u64,
+    start_height: u64,
+    error: &SnapshotHeaderStagingError,
+) -> bool {
+    staged_len == 0
+        && start_height == base_height.saturating_add(1)
+        && matches!(
+            error,
+            SnapshotHeaderStagingError::ParentMismatch { height }
+                if *height == start_height
+        )
+}
+
+fn finalized_header_search_floor(local_height: u64) -> u64 {
+    local_height.saturating_sub(noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH)
+}
+
+fn header_batch_exhausts_nonfinal_window(local_height: u64, oldest_height: u64) -> bool {
+    oldest_height <= finalized_header_search_floor(local_height)
+}
+
+fn competing_suffix_wins(
+    competing_work: &[u8; 32],
+    competing_tip_hash: &[u8; 32],
+    local_work: &[u8; 32],
+    local_tip_hash: &[u8; 32],
+) -> bool {
+    matches!(
+        noid_chain::choose_chain_by_work(
+            competing_work,
+            competing_tip_hash,
+            local_work,
+            local_tip_hash,
+        ),
+        noid_chain::consensus::fork_choice::ChainChoice::A
+    )
+}
+
+fn competing_suffix_tip(competing: &[noid_chain::BlockHeader]) -> Option<(u64, [u8; 32])> {
+    competing
+        .last()
+        .map(|header| (header.height, noid_chain::consensus::pow::block_id(header)))
+}
+
+fn nonfinal_header_discovery_range(local_height: u64) -> Option<(u64, u16)> {
+    if local_height == 0 {
+        return None;
+    }
+    let start_height = finalized_header_search_floor(local_height);
+    let count = local_height.saturating_sub(start_height).saturating_add(1);
+    Some((
+        start_height,
+        u16::try_from(count).expect("finality-bounded header discovery count fits u16"),
+    ))
+}
+
+fn authenticated_height_after_reorg(
+    previous_highest: u64,
+    old_tip_height: u64,
+    new_tip_height: u64,
+) -> u64 {
+    if new_tip_height <= old_tip_height {
+        // A height-only routing hint from the losing branch must not prevent
+        // exact confirmation of the newly selected fork-choice winner.
+        new_tip_height
+    } else {
+        previous_highest.max(new_tip_height)
+    }
+}
+
 fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     let already_ready = *sender.borrow();
     if !already_ready {
@@ -260,11 +354,42 @@ fn initial_sync_may_skip_peer_confirmation(isolated_genesis: bool) -> bool {
 const MINING_PEER_QUORUM: usize = 2;
 const CONNECTED_TIP_PROBE_HEADERS: u16 =
     noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2;
+/// Keep one low-rate authenticated tip lane alive after mining readiness.
+/// Gossip is intentionally only a latency hint; a dropped announcement must
+/// never leave a healthy connected node permanently parked on an old tip.
+const STEADY_TIP_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// At most two exact-tip quorum lanes are opened per interval. Failed or
+/// non-confirming identities rotate least-recently-first.
+const MINING_QUORUM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+/// A peer's tip confirmation is an expiring authorization, not a permanent
+/// property of the connection.  If authenticated tip traffic stops, mining
+/// must stop before the node can keep extending a stale parent indefinitely.
+const MINING_PEER_CONFIRMATION_TTL: std::time::Duration = std::time::Duration::from_secs(45);
+/// Abort a sequential shallow-fork download only when the exact correlated
+/// bundle stream stops making progress. A healthy maximum-depth replacement
+/// is deliberately allowed to span more than one per-request timeout.
+const SHALLOW_FORK_NO_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+fn shallow_fork_progress_deadline_due(last_progress_at: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_progress_at) >= SHALLOW_FORK_NO_PROGRESS_TIMEOUT
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MiningTipConfirmation {
+    height: u64,
+    hash: [u8; 32],
+    confirmed_at: Instant,
+}
 
 struct MiningPeerQuorum {
     isolated: bool,
     connected: std::collections::HashSet<libp2p::PeerId>,
-    confirmed: std::collections::HashSet<libp2p::PeerId>,
+    canonical_tip: Option<(u64, [u8; 32])>,
+    confirmed: std::collections::HashMap<libp2p::PeerId, MiningTipConfirmation>,
+    /// Last exact-tip probe issued to each connected identity. Unconfirmed
+    /// peers are selected least-recently-first, so two stalled connections
+    /// cannot monopolize both bounded quorum lanes forever.
+    probe_attempts: std::collections::HashMap<libp2p::PeerId, Instant>,
     ready: tokio::sync::watch::Sender<bool>,
     count: tokio::sync::watch::Sender<usize>,
 }
@@ -278,7 +403,9 @@ impl MiningPeerQuorum {
         let quorum = Self {
             isolated,
             connected: std::collections::HashSet::new(),
-            confirmed: std::collections::HashSet::new(),
+            canonical_tip: None,
+            confirmed: std::collections::HashMap::new(),
+            probe_attempts: std::collections::HashMap::new(),
             ready,
             count,
         };
@@ -290,18 +417,78 @@ impl MiningPeerQuorum {
         self.connected.insert(peer);
     }
 
-    fn confirm(&mut self, peer: libp2p::PeerId) {
+    fn set_canonical_tip(&mut self, height: u64, hash: [u8; 32]) {
+        let tip = (height, hash);
+        if self.canonical_tip == Some(tip) {
+            return;
+        }
+        self.canonical_tip = Some(tip);
+        let before = self.confirmed.len();
+        self.confirmed
+            .retain(|_, confirmation| (confirmation.height, confirmation.hash) == tip);
+        if self.confirmed.len() != before {
+            self.publish();
+        }
+    }
+
+    fn confirm_tip(&mut self, peer: libp2p::PeerId, height: u64, hash: [u8; 32]) {
+        self.confirm_tip_at(peer, height, hash, Instant::now());
+    }
+
+    fn confirm_tip_at(
+        &mut self,
+        peer: libp2p::PeerId,
+        height: u64,
+        hash: [u8; 32],
+        confirmed_at: Instant,
+    ) {
         // Connectivity is owned exclusively by PeerConnected/Disconnected.
         // A delayed verification result from a closed sync peer must never
-        // resurrect that identity and satisfy the mining network gate.
-        if self.connected.contains(&peer) && self.confirmed.insert(peer) {
+        // resurrect that identity. Likewise, an exact response for an old tip
+        // must never authorize mining after the canonical tip has changed.
+        if self.connected.contains(&peer) && self.canonical_tip == Some((height, hash)) {
+            let newly_confirmed = self
+                .confirmed
+                .insert(
+                    peer,
+                    MiningTipConfirmation {
+                        height,
+                        hash,
+                        confirmed_at,
+                    },
+                )
+                .is_none();
+            if newly_confirmed {
+                self.publish();
+            }
+        }
+    }
+
+    fn expire_stale(&mut self, now: Instant) {
+        let before = self.confirmed.len();
+        let connected = &self.connected;
+        let canonical_tip = self.canonical_tip;
+        self.confirmed.retain(|peer, confirmation| {
+            connected.contains(peer)
+                && canonical_tip == Some((confirmation.height, confirmation.hash))
+                && now.duration_since(confirmation.confirmed_at) < MINING_PEER_CONFIRMATION_TTL
+        });
+        if self.confirmed.len() != before {
             self.publish();
         }
     }
 
     fn disconnect(&mut self, peer: libp2p::PeerId) {
         self.connected.remove(&peer);
-        if self.confirmed.remove(&peer) {
+        self.probe_attempts.remove(&peer);
+        if self.confirmed.remove(&peer).is_some() {
+            self.publish();
+        }
+    }
+
+    fn invalidate_all(&mut self) {
+        if !self.confirmed.is_empty() {
+            self.confirmed.clear();
             self.publish();
         }
     }
@@ -310,11 +497,41 @@ impl MiningPeerQuorum {
         !self.isolated && self.confirmed.len() < MINING_PEER_QUORUM
     }
 
-    fn unconfirmed_connected(&self) -> Vec<libp2p::PeerId> {
-        self.connected
-            .difference(&self.confirmed)
-            .copied()
+    fn probe_candidates(&self, limit: usize) -> Vec<libp2p::PeerId> {
+        let mut confirmed = self
+            .confirmed
+            .iter()
+            .filter(|(peer, _)| self.connected.contains(peer))
+            .map(|(peer, confirmation)| (*peer, confirmation.confirmed_at))
+            .collect::<Vec<_>>();
+        confirmed.sort_by(|(left_peer, left_at), (right_peer, right_at)| {
+            left_at
+                .cmp(right_at)
+                .then_with(|| left_peer.to_bytes().cmp(&right_peer.to_bytes()))
+        });
+        let mut unconfirmed = self
+            .connected
+            .iter()
+            .filter(|peer| !self.confirmed.contains_key(peer))
+            .map(|peer| (*peer, self.probe_attempts.get(peer).copied()))
+            .collect::<Vec<_>>();
+        unconfirmed.sort_by(|(left_peer, left_at), (right_peer, right_at)| {
+            left_at
+                .cmp(right_at)
+                .then_with(|| left_peer.to_bytes().cmp(&right_peer.to_bytes()))
+        });
+        unconfirmed
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .chain(confirmed.into_iter().map(|(peer, _)| peer))
+            .take(limit)
             .collect()
+    }
+
+    fn mark_probe_sent(&mut self, peer: libp2p::PeerId, now: Instant) {
+        if self.connected.contains(&peer) {
+            self.probe_attempts.insert(peer, now);
+        }
     }
 
     fn publish(&self) {
@@ -344,6 +561,12 @@ impl MiningPeerQuorum {
 /// that layer flush a request which never opened a substream before the node
 /// starts another manifest generation.
 const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(38);
+/// A fresh node must not finalize the first valid snapshot merely because its
+/// response won a network race. During this short window it keeps only the
+/// strongest advertised candidate by cumulative work. The selected candidate
+/// is still fully revalidated from canonical headers before any State is
+/// installed, so manifest work remains an untrusted scheduling hint.
+const STATE_MANIFEST_CANDIDATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A terminal normally arrives in about two seconds on the live seed network.
 /// libp2p starts its transport timeout only after an outbound substream opens,
 /// so a request queued behind stream capacity otherwise has no node-visible
@@ -359,6 +582,47 @@ const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 
 fn manifest_round_retry_due(started_at: Option<Instant>, now: Instant) -> bool {
     started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT)
+}
+
+fn manifest_candidate_selection_due(started_at: Option<Instant>, now: Instant) -> bool {
+    started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_CANDIDATE_SETTLE)
+}
+
+fn state_manifest_candidate_is_preferred(
+    candidate: &noid_p2p::protocol::GetStateManifestResponse,
+    current: &noid_p2p::protocol::GetStateManifestResponse,
+) -> bool {
+    matches!(
+        noid_chain::consensus::fork_choice::choose_chain_by_work(
+            &candidate.bridge_cumulative_chainwork,
+            &candidate.bridge_tip_hash,
+            &current.bridge_cumulative_chainwork,
+            &current.bridge_tip_hash,
+        ),
+        noid_chain::consensus::fork_choice::ChainChoice::A
+    )
+}
+
+fn steady_tip_probe_due(
+    last_probe: Instant,
+    now: Instant,
+    waiting_for_quorum: bool,
+    canonical_sync_idle: bool,
+) -> bool {
+    !waiting_for_quorum
+        && canonical_sync_idle
+        && now.duration_since(last_probe) >= STEADY_TIP_PROBE_INTERVAL
+}
+
+fn mining_quorum_probe_due(
+    last_probe: Instant,
+    now: Instant,
+    waiting_for_quorum: bool,
+    canonical_sync_idle: bool,
+) -> bool {
+    waiting_for_quorum
+        && canonical_sync_idle
+        && now.duration_since(last_probe) >= MINING_QUORUM_PROBE_INTERVAL
 }
 
 fn manifest_round_gap_is_resolved(local_height: u64, highest_announced: u64) -> bool {
@@ -770,6 +1034,106 @@ fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
     ip_port_to_multiaddr(addr)
 }
 
+// v1.0.0 could durably finalize the first valid snapshot manifest before a
+// stronger peer's manifest arrived.  The patched bootstrap election cannot
+// safely cross that already-finalized local boundary.  Advance one explicit
+// local chain-data epoch instead: preserve wallet/receipt/identity files,
+// clear only MDBX chain tables, and let the patched verifier select the best
+// available snapshot from genesis.  This is deliberately not a general
+// deep-reorg escape hatch.
+const CHAIN_DATA_EPOCH_MARKER_FILE: &str = ".chain-data-epoch";
+const CHAIN_DATA_EPOCH_MARKER_BYTES: &[u8] = b"parano1d-mainnet-bootstrap-selection-v2\n";
+
+fn chain_data_epoch_is_current(data_dir: &Path) -> anyhow::Result<bool> {
+    let marker = data_dir.join(CHAIN_DATA_EPOCH_MARKER_FILE);
+    match std::fs::read(&marker) {
+        Ok(bytes) => Ok(bytes == CHAIN_DATA_EPOCH_MARKER_BYTES),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("read {}", marker.display())),
+    }
+}
+
+fn persist_chain_data_epoch_marker(data_dir: &Path) -> anyhow::Result<()> {
+    let marker = data_dir.join(CHAIN_DATA_EPOCH_MARKER_FILE);
+    let temporary = data_dir.join(format!(
+        "{CHAIN_DATA_EPOCH_MARKER_FILE}.tmp.{}",
+        std::process::id()
+    ));
+    match std::fs::remove_file(&temporary) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("remove stale marker {}", temporary.display()));
+        }
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("create chain-data epoch marker {}", temporary.display()))?;
+    if let Err(error) = file
+        .write_all(CHAIN_DATA_EPOCH_MARKER_BYTES)
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).context("write chain-data epoch marker");
+    }
+    drop(file);
+
+    #[cfg(target_os = "windows")]
+    if marker.exists() {
+        std::fs::remove_file(&marker)
+            .with_context(|| format!("replace chain-data epoch marker {}", marker.display()))?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, &marker) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error)
+            .with_context(|| format!("install chain-data epoch marker {}", marker.display()));
+    }
+    #[cfg(unix)]
+    std::fs::File::open(data_dir)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync data directory {}", data_dir.display()))?;
+    Ok(())
+}
+
+fn prepare_chain_data_epoch(data_dir: &Path, explicit_purge: bool) -> anyhow::Result<bool> {
+    if !explicit_purge && chain_data_epoch_is_current(data_dir)? {
+        return Ok(false);
+    }
+
+    let store = MdbxStore::open(data_dir).context("open MDBX for chain-data reset")?;
+    let previous_height = store
+        .get_chain_tip()
+        .context("read chain tip before chain-data reset")?
+        .map(|(height, _)| height);
+    if explicit_purge {
+        tracing::info!(
+            ?previous_height,
+            "--purge-state: clearing the chain database"
+        );
+    } else if let Some(height) = previous_height {
+        tracing::warn!(
+            height,
+            "one-time sync upgrade: clearing chain state and preserving wallet data"
+        );
+    } else {
+        tracing::debug!("initializing current chain-data epoch");
+    }
+    store.clear_all().context("clear MDBX chain state")?;
+    drop(store);
+    persist_chain_data_epoch_marker(data_dir)?;
+    Ok(true)
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1044,13 +1408,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Storage ---
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
-    if cli.purge_state {
-        tracing::info!("--purge-state: clearing the chain database before startup");
-        let tmp_store =
-            noid_chain::storage::MdbxStore::open(&data_dir).context("open MDBX for purge")?;
-        tmp_store.clear_all().context("purge state")?;
-        drop(tmp_store);
-    }
+    prepare_chain_data_epoch(&data_dir, cli.purge_state)?;
     let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
     let tip_height = ctx.tip_height();
     let state_root = hex::encode(ctx.tip_header().state_root);
@@ -2144,12 +2502,23 @@ fn prepare_snapshot_header_sync(
     store: &noid_chain::storage::MdbxStore,
     from: libp2p::PeerId,
     manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
+    rebase_base: Option<(u64, [u8; 32])>,
 ) -> Result<PendingSnapshotHeaderSync, String> {
     let target_height = manifest.tip_height;
     let after_target = target_height
         .checked_add(1)
         .ok_or_else(|| "snapshot target height has no representable successor".to_owned())?;
-    let base = highest_snapshot_header_boundary(store, target_height)?;
+    let base = match rebase_base.filter(|(height, _)| *height < target_height) {
+        Some((height, expected_hash)) => {
+            let base = CanonicalHeaderBoundary::load(store, height)
+                .map_err(|error| format!("snapshot rebase boundary rejected: {error}"))?;
+            if base.block_hash != expected_hash {
+                return Err("snapshot rebase boundary changed before staging".into());
+            }
+            base
+        }
+        None => highest_snapshot_header_boundary(store, target_height)?,
+    };
     let directory = staging_root.join("headers");
     std::fs::create_dir_all(&directory)
         .map_err(|error| format!("create snapshot header staging directory: {error}"))?;
@@ -2168,7 +2537,10 @@ fn prepare_snapshot_header_sync(
 
     let staging = if path.exists() {
         match SnapshotHeaderStaging::open(&path, store) {
-            Ok(staging) if staging.next_height().map_err(|e| e.to_string())? <= after_target => {
+            Ok(staging)
+                if staging.base() == base
+                    && staging.next_height().map_err(|e| e.to_string())? <= after_target =>
+            {
                 staging
             }
             Ok(staging) => {
@@ -2219,6 +2591,7 @@ struct VerifiedHistoryStepSnapshot {
     block_hash: [u8; 32],
     boundary: noid_chain::VerifiedSnapshotBoundary,
     headers: ValidatedSnapshotHeaderStaging,
+    allow_nonfinal_rebase: bool,
     /// The exact inbound allocation remains charged until the terminal bytes
     /// have entered the same MDBX transaction as the snapshot state.
     inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -2625,6 +2998,71 @@ async fn apply_reorg_offthread(
                 new_blocks,
             ));
         }
+        let ancestor_header = match ctx.get_header_from_store(ancestor_height) {
+            Ok(Some(header)) => header,
+            Ok(None) => {
+                return Err((
+                    noid_chain::storage::MdbxContextError::Corrupt(
+                        "reorg ancestor header is missing before atomic admission",
+                    ),
+                    new_blocks,
+                ));
+            }
+            Err(error) => return Err((error.into(), new_blocks)),
+        };
+        let mut candidate_work = match ctx.store.get_chain_work(ancestor_height) {
+            Ok(Some(work)) => work,
+            Ok(None) => {
+                return Err((
+                    noid_chain::storage::MdbxContextError::Corrupt(
+                        "reorg ancestor chainwork is missing before atomic admission",
+                    ),
+                    new_blocks,
+                ));
+            }
+            Err(error) => return Err((error.into(), new_blocks)),
+        };
+        let mut expected_height = ancestor_height.saturating_add(1);
+        let mut expected_parent = noid_chain::consensus::pow::block_id(&ancestor_header);
+        for candidate in &new_blocks {
+            if candidate.block.header.height != expected_height
+                || candidate.block.header.prev_block_hash != expected_parent
+            {
+                return Err((
+                    noid_chain::storage::MdbxContextError::Consensus(
+                        noid_chain::consensus::ConsensusError::BadParentHash,
+                    ),
+                    new_blocks,
+                ));
+            }
+            expected_parent = noid_chain::consensus::pow::block_id(&candidate.block.header);
+            candidate_work = noid_chain::consensus::add_work(
+                &candidate_work,
+                &noid_chain::consensus::block_work(
+                    &candidate.block.header.difficulty_target,
+                ),
+            );
+            expected_height = expected_height.saturating_add(1);
+        }
+        if new_blocks.is_empty()
+            || !competing_suffix_wins(
+                &candidate_work,
+                &expected_parent,
+                ctx.tip_chain_work(),
+                &ctx.tip_hash(),
+            )
+        {
+            // The selected branch may have stopped winning while the async
+            // caller waited for the chain write lock. Refuse before undo or
+            // durable state mutation; a later authenticated probe can choose
+            // the now-current branch again.
+            return Err((
+                noid_chain::storage::MdbxContextError::Consensus(
+                    noid_chain::consensus::ConsensusError::BadParentHash,
+                ),
+                new_blocks,
+            ));
+        }
         let mut replacement_blocks = Vec::with_capacity(new_blocks.len());
         let mut replacement_bundles = Vec::with_capacity(new_blocks.len());
         for candidate in new_blocks {
@@ -2728,22 +3166,42 @@ fn state_segment_response_matches_snapshot_boundary(
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_snapshot_segment_response, compact_apply_signals, compact_suffix_eligible,
-        gap_requires_snapshot_sync, initial_sync_may_skip_peer_confirmation, load_or_create_config,
-        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        next_block_has_competing_parent, p2p_listen_to_multiaddr,
-        prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
+        admit_snapshot_segment_response, apply_reorg_offthread, authenticated_height_after_reorg,
+        chain_data_epoch_is_current, compact_apply_signals, compact_suffix_eligible,
+        competing_suffix_tip, competing_suffix_wins, gap_requires_snapshot_sync,
+        header_batch_exhausts_nonfinal_window, initial_sync_may_skip_peer_confirmation,
+        load_or_create_config, manifest_candidate_selection_due, manifest_round_gap_is_resolved,
+        manifest_round_retry_due, mark_initial_sync_ready, mining_quorum_probe_due,
+        next_block_has_competing_parent, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
+        persist_chain_data_epoch_marker, prune_superseded_snapshot_header_staging,
+        rotating_manifest_peers, seed_to_multiaddr, shallow_fork_progress_deadline_due,
         snapshot_bridge_requires_tail, snapshot_header_next_action,
-        snapshot_segment_request_capacity, state_segment_response_matches_snapshot_boundary,
-        terminal_alternate_peer, terminal_transport_can_retry_same_peer,
+        snapshot_parent_mismatch_is_at_base, snapshot_segment_request_capacity,
+        state_manifest_candidate_is_preferred, state_segment_response_matches_snapshot_boundary,
+        steady_tip_probe_due, terminal_alternate_peer, terminal_transport_can_retry_same_peer,
         unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
         validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        SnapshotHeaderPipeline, SnapshotSegmentResponseAdmission, TerminalRequestRace,
-        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
-        HISTORY_STEP_TERMINAL_HEDGE_AFTER, MINING_PEER_QUORUM, SNAPSHOT_HEADER_BATCH,
-        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
+        AcceptedBlockCandidate, MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary,
+        SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
+        SnapshotSegmentResponseAdmission, TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS,
+        HISTORY_STEP_TERMINAL_HARD_DEADLINE, HISTORY_STEP_TERMINAL_HEDGE_AFTER,
+        MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
+        SHALLOW_FORK_NO_PROGRESS_TIMEOUT, SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW,
+        STATE_MANIFEST_CANDIDATE_SETTLE, STATE_MANIFEST_RESPONSE_TIMEOUT,
+        STEADY_TIP_PROBE_INTERVAL,
     };
+
+    #[test]
+    fn chain_data_epoch_marker_requires_exact_durable_value() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(!chain_data_epoch_is_current(directory.path()).unwrap());
+
+        persist_chain_data_epoch_marker(directory.path()).unwrap();
+        assert!(chain_data_epoch_is_current(directory.path()).unwrap());
+
+        std::fs::write(directory.path().join(".chain-data-epoch"), b"incomplete").unwrap();
+        assert!(!chain_data_epoch_is_current(directory.path()).unwrap());
+    }
 
     #[test]
     fn initial_sync_readiness_is_durable_for_all_subscribers() {
@@ -2866,18 +3324,21 @@ mod tests {
         let mut quorum = MiningPeerQuorum::new(false, ready_tx, count_tx);
         let first = libp2p::PeerId::random();
         let second = libp2p::PeerId::random();
+        let height = 17;
+        let hash = [0x17; 32];
 
+        quorum.set_canonical_tip(height, hash);
         quorum.connect(first);
         quorum.connect(second);
-        assert_eq!(quorum.unconfirmed_connected().len(), 2);
+        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 2);
         assert_eq!(*count_rx.borrow(), 0);
         assert!(!*ready_rx.borrow());
 
-        quorum.confirm(first);
+        quorum.confirm_tip(first, height, hash);
         assert_eq!(*count_rx.borrow(), 1);
         assert!(!*ready_rx.borrow());
 
-        quorum.confirm(second);
+        quorum.confirm_tip(second, height, hash);
         assert_eq!(*count_rx.borrow(), MINING_PEER_QUORUM);
         assert!(*ready_rx.borrow());
 
@@ -2885,13 +3346,120 @@ mod tests {
         assert_eq!(*count_rx.borrow(), 1);
         assert!(!*ready_rx.borrow());
 
-        quorum.confirm(first);
+        quorum.confirm_tip(first, height, hash);
         assert_eq!(
             *count_rx.borrow(),
             1,
             "a delayed result cannot resurrect a disconnected peer"
         );
         assert!(!*ready_rx.borrow());
+    }
+
+    #[test]
+    fn mining_quorum_expires_stale_tip_authority() {
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, ready_tx, count_tx);
+        let first = libp2p::PeerId::random();
+        let second = libp2p::PeerId::random();
+        let confirmed_at = std::time::Instant::now();
+        let height = 23;
+        let hash = [0x23; 32];
+
+        quorum.set_canonical_tip(height, hash);
+        quorum.connect(first);
+        quorum.connect(second);
+        quorum.confirm_tip_at(first, height, hash, confirmed_at);
+        quorum.confirm_tip_at(second, height, hash, confirmed_at);
+        assert!(*ready_rx.borrow());
+
+        quorum.expire_stale(
+            confirmed_at + MINING_PEER_CONFIRMATION_TTL - std::time::Duration::from_millis(1),
+        );
+        assert_eq!(*count_rx.borrow(), MINING_PEER_QUORUM);
+        assert!(*ready_rx.borrow());
+
+        quorum.expire_stale(confirmed_at + MINING_PEER_CONFIRMATION_TTL);
+        assert_eq!(*count_rx.borrow(), 0);
+        assert!(!*ready_rx.borrow());
+        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 2);
+    }
+
+    #[test]
+    fn mining_quorum_reacquisition_prioritizes_unconfirmed_public_peers() {
+        let (ready_tx, _ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, ready_tx, count_tx);
+        let peers = (0..64)
+            .map(|_| libp2p::PeerId::random())
+            .collect::<Vec<_>>();
+        for peer in &peers {
+            quorum.connect(*peer);
+        }
+        let height = 31;
+        let hash = [0x31; 32];
+        quorum.set_canonical_tip(height, hash);
+        assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 2);
+
+        quorum.confirm_tip(peers[0], height, hash);
+        quorum.confirm_tip(peers[1], height, hash);
+        let candidates = quorum.probe_candidates(MINING_PEER_QUORUM);
+        assert_eq!(candidates.len(), 2);
+        assert!(!candidates.contains(&peers[0]));
+        assert!(!candidates.contains(&peers[1]));
+    }
+
+    #[test]
+    fn mining_quorum_rotates_unconfirmed_probe_lanes() {
+        let (ready_tx, _ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, ready_tx, count_tx);
+        let peers = (0..6).map(|_| libp2p::PeerId::random()).collect::<Vec<_>>();
+        for peer in &peers {
+            quorum.connect(*peer);
+        }
+
+        let first = quorum.probe_candidates(MINING_PEER_QUORUM);
+        assert_eq!(first.len(), MINING_PEER_QUORUM);
+        let attempted_at = std::time::Instant::now();
+        for peer in &first {
+            quorum.mark_probe_sent(*peer, attempted_at);
+        }
+        let second = quorum.probe_candidates(MINING_PEER_QUORUM);
+        assert_eq!(second.len(), MINING_PEER_QUORUM);
+        assert!(first.iter().all(|peer| !second.contains(peer)));
+
+        assert!(MINING_QUORUM_PROBE_INTERVAL < MINING_PEER_CONFIRMATION_TTL);
+    }
+
+    #[test]
+    fn mining_quorum_is_bound_to_the_exact_current_tip() {
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, ready_tx, count_tx);
+        let first = libp2p::PeerId::random();
+        let second = libp2p::PeerId::random();
+        quorum.connect(first);
+        quorum.connect(second);
+
+        quorum.set_canonical_tip(40, [0x40; 32]);
+        quorum.confirm_tip(first, 40, [0x40; 32]);
+        quorum.confirm_tip(second, 40, [0x40; 32]);
+        assert!(*ready_rx.borrow());
+
+        quorum.set_canonical_tip(41, [0x41; 32]);
+        assert_eq!(*count_rx.borrow(), 0);
+        assert!(!*ready_rx.borrow());
+
+        // Delayed old-tip responses cannot resurrect the mining gate.
+        quorum.confirm_tip(first, 40, [0x40; 32]);
+        quorum.confirm_tip(second, 40, [0x40; 32]);
+        assert_eq!(*count_rx.borrow(), 0);
+        assert!(!*ready_rx.borrow());
+
+        quorum.confirm_tip(first, 41, [0x41; 32]);
+        quorum.confirm_tip(second, 41, [0x41; 32]);
+        assert!(*ready_rx.borrow());
     }
 
     #[test]
@@ -3032,6 +3600,242 @@ mod tests {
     }
 
     #[test]
+    fn serving_reserve_does_not_change_finality_or_snapshot_suffix() {
+        assert_eq!(noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH, 18);
+        assert_eq!(
+            noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+            18
+        );
+        assert_eq!(
+            noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH,
+            42
+        );
+    }
+
+    #[test]
+    fn fork_choice_is_work_first_and_uses_the_canonical_hash_tie_break() {
+        let less = [1u8; 32];
+        let more = [2u8; 32];
+        let smaller_hash = [0x11; 32];
+        let larger_hash = [0x22; 32];
+        assert!(competing_suffix_wins(
+            &more,
+            &larger_hash,
+            &less,
+            &smaller_hash,
+        ));
+        assert!(!competing_suffix_wins(
+            &less,
+            &smaller_hash,
+            &more,
+            &larger_hash,
+        ));
+        assert!(competing_suffix_wins(
+            &more,
+            &smaller_hash,
+            &more,
+            &larger_hash,
+        ));
+        assert!(!competing_suffix_wins(
+            &more,
+            &larger_hash,
+            &more,
+            &smaller_hash,
+        ));
+        assert!(!competing_suffix_wins(
+            &more,
+            &smaller_hash,
+            &more,
+            &smaller_hash,
+        ));
+    }
+
+    #[test]
+    fn an_empty_suffix_from_a_shorter_canonical_peer_is_not_a_fork_candidate() {
+        assert_eq!(competing_suffix_tip(&[]), None);
+
+        let mut header = noid_chain::consensus::genesis::genesis_header();
+        header.height = 7;
+        assert_eq!(
+            competing_suffix_tip(&[header]),
+            Some((7, noid_chain::consensus::pow::block_id(&header)))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reorg_admission_rechecks_the_tip_after_waiting_for_the_write_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let context =
+            noid_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let genesis = *context.tip_header();
+        let genesis_hash = noid_chain::consensus::pow::block_id(&genesis);
+        let mut candidate_header = genesis;
+        candidate_header.height = 1;
+        candidate_header.prev_block_hash = genesis_hash;
+        candidate_header.timestamp = genesis.timestamp.saturating_add(1);
+        candidate_header.tx_root[0] ^= 0xA5;
+        candidate_header.difficulty_target = [0xFF; 32];
+        let candidate_block = noid_chain::Block {
+            header: candidate_header,
+            transactions: Vec::new(),
+        };
+        let mut terminal = noid_chain::history_step::HistoryStepTerminalMetadata::new(
+            candidate_header.height,
+            noid_chain::block_header::semantic_header_id(&candidate_header),
+            0,
+        )
+        .unwrap()
+        .encode_prefix()
+        .to_vec();
+        terminal.push(0xA5);
+        let bundle =
+            noid_chain::AcceptedBlockBundle::try_from_parts(candidate_block.to_bytes(), terminal)
+                .unwrap();
+        let candidate = AcceptedBlockCandidate::from_bundle(bundle);
+        let candidate_total_work = noid_chain::consensus::add_work(
+            context.tip_chain_work(),
+            &noid_chain::consensus::block_work(&candidate_header.difficulty_target),
+        );
+
+        let chain = std::sync::Arc::new(tokio::sync::RwLock::new(context));
+        let wallet: crate::wallet::SharedWallet = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+        // The branch wins against genesis when selected. Hold the write lock
+        // so the blocking admission worker cannot observe the chain until its
+        // tip has advanced to a strictly heavier competing view.
+        let mut current = chain.write().await;
+        let task_chain = std::sync::Arc::clone(&chain);
+        let task_wallet = std::sync::Arc::clone(&wallet);
+        let task = tokio::spawn(async move {
+            apply_reorg_offthread(
+                &task_chain,
+                &task_wallet,
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+                0,
+                vec![candidate],
+                candidate_header.timestamp,
+                None,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        current.tip_height = 1;
+        current.tip_hash = [0xEE; 32];
+        current.tip_chain_work = noid_chain::consensus::add_work(
+            &candidate_total_work,
+            &noid_chain::consensus::block_work(&candidate_header.difficulty_target),
+        );
+        drop(current);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .expect("reorg admission must not stall")
+            .expect("reorg admission task must not panic");
+        assert!(matches!(
+            result,
+            Err((
+                noid_chain::storage::MdbxContextError::Consensus(
+                    noid_chain::consensus::ConsensusError::BadParentHash
+                ),
+                rejected
+            )) if rejected.len() == 1
+        ));
+    }
+
+    #[test]
+    fn shorter_peer_discovery_reads_only_the_complete_nonfinal_window() {
+        assert_eq!(nonfinal_header_discovery_range(100), Some((82, 19)));
+        assert_eq!(nonfinal_header_discovery_range(10), Some((0, 11)));
+        assert_eq!(nonfinal_header_discovery_range(0), None);
+    }
+
+    #[test]
+    fn accepted_shorter_work_reorg_retires_losing_height_hint() {
+        assert_eq!(authenticated_height_after_reorg(120, 100, 99), 99);
+        assert_eq!(authenticated_height_after_reorg(120, 100, 100), 100);
+        assert_eq!(authenticated_height_after_reorg(120, 100, 101), 120);
+        assert_eq!(authenticated_height_after_reorg(100, 100, 101), 101);
+    }
+
+    #[test]
+    fn steady_tip_probe_survives_completed_mining_quorum() {
+        let started = std::time::Instant::now();
+        assert!(!steady_tip_probe_due(
+            started,
+            started + STEADY_TIP_PROBE_INTERVAL,
+            true,
+            true,
+        ));
+        assert!(!steady_tip_probe_due(
+            started,
+            started + STEADY_TIP_PROBE_INTERVAL,
+            false,
+            false,
+        ));
+        assert!(!steady_tip_probe_due(
+            started,
+            started + STEADY_TIP_PROBE_INTERVAL - std::time::Duration::from_millis(1),
+            false,
+            true,
+        ));
+        assert!(steady_tip_probe_due(
+            started,
+            started + STEADY_TIP_PROBE_INTERVAL,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn mining_quorum_refresh_stays_off_the_canonical_sync_path() {
+        let started = std::time::Instant::now();
+        assert!(!mining_quorum_probe_due(
+            started,
+            started + MINING_QUORUM_PROBE_INTERVAL,
+            true,
+            false,
+        ));
+        assert!(!mining_quorum_probe_due(
+            started,
+            started + MINING_QUORUM_PROBE_INTERVAL - std::time::Duration::from_millis(1),
+            true,
+            true,
+        ));
+        assert!(!mining_quorum_probe_due(
+            started,
+            started + MINING_QUORUM_PROBE_INTERVAL,
+            false,
+            true,
+        ));
+        assert!(mining_quorum_probe_due(
+            started,
+            started + MINING_QUORUM_PROBE_INTERVAL,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn shallow_fork_deadline_tracks_exact_bundle_progress() {
+        let started = std::time::Instant::now();
+        assert!(!shallow_fork_progress_deadline_due(
+            started,
+            started + SHALLOW_FORK_NO_PROGRESS_TIMEOUT - std::time::Duration::from_millis(1),
+        ));
+        assert!(shallow_fork_progress_deadline_due(
+            started,
+            started + SHALLOW_FORK_NO_PROGRESS_TIMEOUT,
+        ));
+
+        let progressed = started + std::time::Duration::from_secs(30);
+        assert!(!shallow_fork_progress_deadline_due(
+            progressed,
+            started + SHALLOW_FORK_NO_PROGRESS_TIMEOUT,
+        ));
+    }
+
+    #[test]
     fn exact_recent_extensions_use_one_compact_suffix_terminal() {
         let local = 100;
         assert!(!compact_suffix_eligible(local, local, local + 1));
@@ -3056,6 +3860,26 @@ mod tests {
             noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2
         );
         assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 20);
+    }
+
+    #[test]
+    fn snapshot_parent_mismatch_requires_ancestor_discovery_only_at_the_base() {
+        let mismatch = SnapshotHeaderStagingError::ParentMismatch { height: 83 };
+        assert!(snapshot_parent_mismatch_is_at_base(0, 82, 83, &mismatch));
+        assert!(!snapshot_parent_mismatch_is_at_base(1, 82, 83, &mismatch));
+        assert!(!snapshot_parent_mismatch_is_at_base(0, 81, 83, &mismatch));
+        let malformed = SnapshotHeaderStagingError::InvalidCandidate {
+            height: 83,
+            reason: "BadDifficultyTarget".into(),
+        };
+        assert!(!snapshot_parent_mismatch_is_at_base(0, 82, 83, &malformed));
+    }
+
+    #[test]
+    fn ancestor_search_stops_after_the_complete_nonfinal_window() {
+        assert!(header_batch_exhausts_nonfinal_window(100, 82));
+        assert!(!header_batch_exhausts_nonfinal_window(100, 83));
+        assert!(header_batch_exhausts_nonfinal_window(10, 0));
     }
 
     #[test]
@@ -3309,6 +4133,39 @@ mod tests {
         assert!(manifest_round_retry_due(
             Some(started),
             started + STATE_MANIFEST_RESPONSE_TIMEOUT,
+        ));
+    }
+
+    #[test]
+    fn snapshot_manifest_election_waits_then_prefers_cumulative_work() {
+        let started = std::time::Instant::now();
+        assert!(!manifest_candidate_selection_due(
+            Some(started),
+            started + STATE_MANIFEST_CANDIDATE_SETTLE - std::time::Duration::from_millis(1),
+        ));
+        assert!(manifest_candidate_selection_due(
+            Some(started),
+            started + STATE_MANIFEST_CANDIDATE_SETTLE,
+        ));
+
+        let mut weaker = noid_p2p::protocol::GetStateManifestResponse::default();
+        weaker.bridge_tip_height = 562;
+        weaker.bridge_tip_hash = [0x22; 32];
+        weaker.bridge_cumulative_chainwork[0] = 1;
+
+        let mut stronger = weaker.clone();
+        stronger.bridge_tip_height = 1250;
+        stronger.bridge_tip_hash = [0x11; 32];
+        stronger.bridge_cumulative_chainwork[0] = 2;
+
+        assert!(state_manifest_candidate_is_preferred(&stronger, &weaker));
+        assert!(!state_manifest_candidate_is_preferred(&weaker, &stronger));
+
+        let mut equal_work_better_hash = weaker.clone();
+        equal_work_better_hash.bridge_tip_hash = [0x10; 32];
+        assert!(state_manifest_candidate_is_preferred(
+            &equal_work_better_hash,
+            &weaker,
         ));
     }
 
@@ -3602,6 +4459,11 @@ async fn handle_p2p_events(
     use std::collections::HashMap;
     let mut orphan_pool: HashMap<[u8; 32], OrphanBlock> = HashMap::new();
     let mut pending_shallow_fork: Option<PendingShallowFork> = None;
+    let mut snapshot_rebase_hint: Option<SnapshotRebaseHint> = None;
+    {
+        let ctx = chain.read().await;
+        mining_peer_quorum.set_canonical_tip(ctx.tip_height(), ctx.tip_hash());
+    }
 
     // --- Snapshot verification state ---
     //
@@ -3628,6 +4490,10 @@ async fn handle_p2p_events(
         manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
         history_step: Option<VerifiedHistoryStepSnapshot>,
     }
+    struct SnapshotManifestCandidate {
+        from: libp2p::PeerId,
+        manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
+    }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotHeaderStagingOperationKey {
         Prepare {
@@ -3651,7 +4517,7 @@ async fn handle_p2p_events(
         CandidateRejected {
             sync: PendingSnapshotHeaderSync,
             attempted_peers: std::collections::HashSet<libp2p::PeerId>,
-            error: String,
+            error: SnapshotHeaderStagingError,
         },
         Fatal(String),
     }
@@ -3789,6 +4655,12 @@ async fn handle_p2p_events(
         result: Result<AppliedVerifiedSnapshot, SnapshotInstallError>,
     }
     let mut pending_manifest: Option<PendingManifest> = None;
+    // A bounded pre-install election prevents connection order from becoming
+    // fork choice. Only one manifest body is retained: the strongest advertised
+    // bridge by cumulative work, with the canonical hash tie-break. Its claim
+    // is not authority; exact native header validation follows immediately.
+    let mut best_manifest_candidate: Option<SnapshotManifestCandidate> = None;
+    let mut manifest_candidate_started_at: Option<std::time::Instant> = None;
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
     let mut snapshot_header_pipeline: Option<SnapshotHeaderPipeline> = None;
     let (snapshot_header_staging_tx, mut snapshot_header_staging_rx) =
@@ -3868,11 +4740,24 @@ async fn handle_p2p_events(
     // peer again on the next snapshot generation.
     let mut rejected_terminal_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
+    // A peer whose authenticated header view has no common ancestor in our
+    // complete non-final window cannot be used for an automatic rebase. Keep
+    // it out of snapshot selection for this connection lifetime instead of
+    // cycling through manifests guaranteed to fail at the first parent link.
+    let mut finalized_divergent_peers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
     let mut mempool_sync_requested_peers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     // Bounded retries rotate through the connected set instead of repeatedly
     // selecting the same HashSet iteration prefix.
     let mut manifest_retry_cursor = 0usize;
+    // Independent round-robin cursor for the single steady-state tip lane.
+    // This never fans one logical probe out across the peer set.
+    let mut steady_tip_probe_cursor = 0usize;
+    let mut last_steady_tip_probe = Instant::now();
+    let mut last_mining_quorum_probe = Instant::now()
+        .checked_sub(MINING_QUORUM_PROBE_INTERVAL)
+        .unwrap_or_else(Instant::now);
     // Payloads are authenticated one at a time and sealed to disk.  The
     // session retains only compact descriptors and a received bitset.
     let mut snapshot_staging: Option<SnapshotStagingSession> = None;
@@ -3899,6 +4784,8 @@ async fn handle_p2p_events(
             manifest_force_snapshot_peers.clear();
             manifest_response_count = 0;
             manifest_round_started_at = None;
+            best_manifest_candidate = None;
+            manifest_candidate_started_at = None;
         }};
     }
 
@@ -4008,9 +4895,13 @@ async fn handle_p2p_events(
                 let ctx = chain.read().await;
                 ctx.tip_height()
             };
+            let excluded_peers = rejected_terminal_peers
+                .union(&finalized_divergent_peers)
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
             let candidates = rotating_manifest_peers(
                 &manifest_peers,
-                &rejected_terminal_peers,
+                &excluded_peers,
                 Some(failed_peer),
                 $allow_failed_peer,
                 &mut manifest_retry_cursor,
@@ -4092,6 +4983,10 @@ async fn handle_p2p_events(
             let header_manifest = manifest.clone();
             let terminal_height = manifest.tip_height;
             let terminal_hash = manifest.tip_hash;
+            let rebase_base = snapshot_rebase_hint.and_then(|hint| {
+                (hint.ancestor_height < terminal_height)
+                    .then_some((hint.ancestor_height, hint.ancestor_hash))
+            });
 
             // The manifest fixes a bounded immutable generation. Consecutive
             // ranges come from one selected peer through a bounded ordered
@@ -4149,7 +5044,13 @@ async fn handle_p2p_events(
             tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    prepare_snapshot_header_sync(&staging_root, &store, from, header_manifest)
+                    prepare_snapshot_header_sync(
+                        &staging_root,
+                        &store,
+                        from,
+                        header_manifest,
+                        rebase_base,
+                    )
                 }))
                 .map_err(|_| "snapshot header preparation worker panicked".to_owned())
                 .and_then(|result| result);
@@ -4166,6 +5067,7 @@ async fn handle_p2p_events(
                 peer = %from,
                 target_height = terminal_height,
                 bridge_tip,
+                rebase_base_height = rebase_base.map(|(height, _)| height),
                 "snapshot: staging exact headers"
             );
         }};
@@ -4200,13 +5102,14 @@ async fn handle_p2p_events(
                             sync.next_height = next_height;
                             SnapshotHeaderStagingResult::Success(sync)
                         }
-                        Err(error @ SnapshotHeaderStagingError::InvalidCandidate { .. }) => {
-                            SnapshotHeaderStagingResult::CandidateRejected {
-                                sync,
-                                attempted_peers: range.attempted_peers,
-                                error: error.to_string(),
-                            }
-                        }
+                        Err(
+                            error @ (SnapshotHeaderStagingError::InvalidCandidate { .. }
+                            | SnapshotHeaderStagingError::ParentMismatch { .. }),
+                        ) => SnapshotHeaderStagingResult::CandidateRejected {
+                            sync,
+                            attempted_peers: range.attempted_peers,
+                            error,
+                        },
                         Err(error) => {
                             let message = error.to_string();
                             let _ = sync.staging.discard();
@@ -4269,6 +5172,11 @@ async fn handle_p2p_events(
             let store = snapshot_header_store.clone();
             let verification_chain = Arc::clone(&chain);
             let manifest = sync.manifest;
+            let allow_nonfinal_rebase = snapshot_rebase_hint.is_some_and(|hint| {
+                let base = sync.staging.base();
+                base.header.height == hint.ancestor_height
+                    && base.block_hash == hint.ancestor_hash
+            });
             let staging = sync.staging;
             let staged_header_count = staging.staged_len();
             let terminal_bytes = payload.terminal_bytes;
@@ -4339,6 +5247,7 @@ async fn handle_p2p_events(
                         block_hash: expected_hash,
                         boundary: verified_boundary,
                         headers: validated_headers,
+                        allow_nonfinal_rebase,
                         inbound_memory_permit,
                     })
                 }))
@@ -4738,6 +5647,12 @@ async fn handle_p2p_events(
     let mut fetch_in_progress: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
     let mut recent_header_fetches: HashMap<(libp2p::PeerId, u64, u16), Instant> = HashMap::new();
+    struct PendingBlockFetch {
+        peer: libp2p::PeerId,
+        requested_at: Instant,
+    }
+    let mut pending_block_fetches: HashMap<(u64, [u8; 32]), PendingBlockFetch> = HashMap::new();
+    const BLOCK_FETCH_INFLIGHT_TTL: Duration = Duration::from_secs(8);
     // One bounded hint retained while compact catch-up owns canonical
     // mutation. It preserves an equal-height competing-fork signal without
     // retaining or validating payloads concurrently with the active suffix.
@@ -4762,6 +5677,8 @@ async fn handle_p2p_events(
                         *peer != pending.peer
                             && manifest_peers.contains(peer)
                             && !rejected_terminal_peers.contains(peer)
+                            && !finalized_divergent_peers.contains(peer)
+                            && !fetch_in_progress.contains(peer)
                     })
                     .or_else(|| {
                         manifest_peers
@@ -4769,13 +5686,15 @@ async fn handle_p2p_events(
                             .copied()
                             .filter(|peer| *peer != pending.peer)
                             .filter(|peer| !rejected_terminal_peers.contains(peer))
+                            .filter(|peer| !finalized_divergent_peers.contains(peer))
+                            .filter(|peer| !fetch_in_progress.contains(peer))
                             .min_by_key(|peer| peer.to_bytes())
                     });
                 if let Some(peer) = alternate {
                     let header_count = count.saturating_add(1);
+                    let request_key = (peer, pending.base_height, header_count);
                     fetch_in_progress.insert(peer);
-                    recent_header_fetches
-                        .insert((peer, pending.base_height, header_count), Instant::now());
+                    recent_header_fetches.insert(request_key, Instant::now());
                     tracing::warn!(
                         failed_peer = %pending.peer,
                         alternate = %peer,
@@ -4784,13 +5703,18 @@ async fn handle_p2p_events(
                         reason = $reason,
                         "compact recent suffix abandoned — probing an alternate peer"
                     );
-                    let _ = p2p_cmd
+                    if p2p_cmd
                         .send(noid_p2p::NetworkCommand::FetchHeaders {
                             peer,
                             start_height: pending.base_height,
                             count: header_count,
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        fetch_in_progress.remove(&peer);
+                        recent_header_fetches.remove(&request_key);
+                    }
                 } else {
                     tracing::warn!(
                         peer = %pending.peer,
@@ -4807,6 +5731,221 @@ async fn handle_p2p_events(
                         })
                         .await;
                 }
+            }
+        }};
+    }
+
+    // A branch can advance while its proof-sized bundles are downloaded one
+    // at a time.  Retire the stale exact session and ask one rotating peer for
+    // a fresh linked header view from the already authenticated ancestor.
+    macro_rules! retry_shallow_fork_headers {
+        ($pending:expr, $reason:expr) => {{
+            let pending: PendingShallowFork = $pending;
+            pending_block_fetches.retain(|_, request| request.peer != pending.peer);
+            // General header responses are peer-correlated rather than
+            // request-token-correlated at this layer. Never open a second
+            // same-peer lane while an earlier general request is live.
+            let mut excluded = rejected_terminal_peers
+                .union(&finalized_divergent_peers)
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            excluded.extend(fetch_in_progress.iter().copied());
+            let peer = rotating_manifest_peers(
+                &manifest_peers,
+                &excluded,
+                Some(pending.peer),
+                true,
+                &mut steady_tip_probe_cursor,
+                1,
+            )
+            .into_iter()
+            .next();
+            if let Some(peer) = peer {
+                let span = pending
+                    .tip_height()
+                    .saturating_sub(pending.ancestor_height)
+                    .saturating_add(3)
+                    .max(u64::from(CONNECTED_TIP_PROBE_HEADERS));
+                let count = u16::try_from(span.min(512)).expect("bounded header retry span");
+                let request_key = (peer, pending.ancestor_height, count);
+                fetch_in_progress.insert(peer);
+                recent_header_fetches.insert(request_key, Instant::now());
+                let dispatched = p2p_cmd
+                    .send(noid_p2p::NetworkCommand::FetchHeaders {
+                        peer,
+                        start_height: pending.ancestor_height,
+                        count,
+                    })
+                    .await
+                    .is_ok();
+                if !dispatched {
+                    fetch_in_progress.remove(&peer);
+                    recent_header_fetches.remove(&request_key);
+                }
+                tracing::warn!(
+                    failed_peer = %pending.peer,
+                    retry_peer = %peer,
+                    ancestor = pending.ancestor_height,
+                    old_tip = pending.tip_height(),
+                    dispatched,
+                    reason = $reason,
+                    "moving shallow-fork session retired; probing one fresh header view"
+                );
+            } else {
+                tracing::warn!(
+                    failed_peer = %pending.peer,
+                    ancestor = pending.ancestor_height,
+                    reason = $reason,
+                    "moving shallow-fork session retired; no dispatchable retry peer"
+                );
+            }
+        }};
+    }
+
+    // Keep the native-validated header suffix and every already downloaded
+    // bundle when one source cannot serve the next exact block. Only one body
+    // request remains active: peers are tried sequentially, and every response
+    // is still bound to the fixed expected header hash before it is retained.
+    macro_rules! retry_shallow_fork_bundle_peer {
+        ($failed_peer:expr, $reason:expr) => {{
+            let failed_peer = $failed_peer;
+            let alternate_request = pending_shallow_fork.as_mut().and_then(|pending| {
+                if pending.peer != failed_peer {
+                    return None;
+                }
+                pending.attempted_bundle_peers.insert(failed_peer);
+                let mut excluded = rejected_terminal_peers
+                    .union(&finalized_divergent_peers)
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+                excluded.extend(pending.attempted_bundle_peers.iter().copied());
+                let alternate = rotating_manifest_peers(
+                    &manifest_peers,
+                    &excluded,
+                    Some(failed_peer),
+                    false,
+                    &mut steady_tip_probe_cursor,
+                    1,
+                )
+                .into_iter()
+                .next()?;
+                pending.peer = alternate;
+                let expected = pending.expected_header().copied()?;
+                Some((
+                    alternate,
+                    expected.height,
+                    noid_chain::consensus::pow::block_id(&expected),
+                    pending.candidates.len(),
+                    pending.tip_height(),
+                ))
+            });
+
+            if let Some((peer, height, expected_hash, retained_blocks, tip_height)) =
+                alternate_request
+            {
+                pending_block_fetches.insert(
+                    (height, expected_hash),
+                    PendingBlockFetch {
+                        peer,
+                        requested_at: Instant::now(),
+                    },
+                );
+                let dispatched = p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestBlock { peer, height })
+                    .await
+                    .is_ok();
+                if !dispatched {
+                    pending_block_fetches.remove(&(height, expected_hash));
+                }
+                tracing::warn!(
+                    failed_peer = %failed_peer,
+                    alternate_peer = %peer,
+                    height,
+                    tip_height,
+                    retained_blocks,
+                    dispatched,
+                    reason = $reason,
+                    "continuing fixed shallow-fork bundle download from an alternate peer"
+                );
+                dispatched
+            } else {
+                false
+            }
+        }};
+    }
+
+    // If the first exact replacement bundle has already aged out, the peer
+    // cannot complete an ordinary reorg even though its header chain is valid.
+    // Preserve the authenticated common ancestor and switch one peer onto the
+    // snapshot path.  The durable installer rechecks this hint against current
+    // canonical finality and cumulative work before it may truncate a suffix.
+    macro_rules! request_snapshot_rebase {
+        ($pending:expr, $reason:expr) => {{
+            let pending: PendingShallowFork = $pending;
+            let hint = SnapshotRebaseHint {
+                ancestor_height: pending.ancestor_height,
+                ancestor_hash: pending.ancestor_hash,
+                competing_tip_height: pending.tip_height(),
+                competing_tip_hash: pending.tip_hash(),
+                armed_at: Instant::now(),
+            };
+            snapshot_rebase_hint = Some(hint);
+            pending_block_fetches.retain(|_, request| request.peer != pending.peer);
+            clear_manifest_round_state!();
+            let excluded = rejected_terminal_peers
+                .union(&finalized_divergent_peers)
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            // Keep manifest, exact headers and State on the same authenticated
+            // branch whenever its source is still usable. An arbitrary
+            // alternate may be healthy but currently follow another fork.
+            let peer = manifest_peers
+                .contains(&pending.peer)
+                .then_some(pending.peer)
+                .filter(|peer| !excluded.contains(peer))
+                .or_else(|| {
+                    rotating_manifest_peers(
+                        &manifest_peers,
+                        &excluded,
+                        Some(pending.peer),
+                        false,
+                        &mut manifest_retry_cursor,
+                        1,
+                    )
+                    .into_iter()
+                    .next()
+                });
+            if let Some(peer) = peer {
+                manifest_requested_peers.insert(peer);
+                manifest_force_snapshot_peers.insert(peer);
+                manifest_round_started_at = Some(Instant::now());
+                let our_height = {
+                    let ctx = chain.read().await;
+                    ctx.tip_height()
+                };
+                let _ = p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                        generation: snapshot_sync_generation,
+                        peer,
+                        requester_height: our_height,
+                    })
+                    .await;
+                tracing::warn!(
+                    failed_peer = %pending.peer,
+                    snapshot_peer = %peer,
+                    ancestor = hint.ancestor_height,
+                    competing_tip = hint.competing_tip_height,
+                    competing_tip_hash = %hex::encode(hint.competing_tip_hash),
+                    reason = $reason,
+                    "selected fork bundle aged out; requesting divergence-aware snapshot"
+                );
+            } else {
+                tracing::warn!(
+                    failed_peer = %pending.peer,
+                    ancestor = hint.ancestor_height,
+                    reason = $reason,
+                    "snapshot rebase armed; no dispatchable manifest peer"
+                );
             }
         }};
     }
@@ -4928,13 +6067,6 @@ async fn handle_p2p_events(
     let mut recent_block_fetches: HashMap<(libp2p::PeerId, u64), Instant> = HashMap::new();
     const FETCH_DEDUP_TTL: Duration = Duration::from_secs(15);
 
-    struct PendingBlockFetch {
-        peer: libp2p::PeerId,
-        requested_at: Instant,
-    }
-    let mut pending_block_fetches: HashMap<(u64, [u8; 32]), PendingBlockFetch> = HashMap::new();
-    const BLOCK_FETCH_INFLIGHT_TTL: Duration = Duration::from_secs(8);
-
     let mut peer_tx_rate: HashMap<libp2p::PeerId, (u32, Instant)> = HashMap::new();
     const TX_RATE_WINDOW: Duration = Duration::from_secs(10);
     const TX_RATE_MAX: u32 = 50; // max 50 tx per peer per 10s window
@@ -4953,15 +6085,6 @@ async fn handle_p2p_events(
     const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
     const BLOCK_RATE_MAX: u32 = 40; // 40 blocks per 10s = 4/s max per peer
     let mut block_event_count: u32 = 0;
-
-    // --- FetchHeaders recursion depth limiter ---
-    //
-    // Caps how many times we fetch further-back headers without finding a common
-    // ancestor.  Each step covers 512 blocks, so 4 steps = 2048 blocks, well
-    // beyond CONSENSUS_FINALITY_DEPTH.  If the limit is hit we request a full state
-    // snapshot instead (the designed deep-sync mechanism).
-    let mut fetch_depth: HashMap<libp2p::PeerId, u32> = HashMap::new();
-    const MAX_FETCH_DEPTH: u32 = 4;
 
     // --- Stale-tip detection ---
     //
@@ -4989,6 +6112,20 @@ async fn handle_p2p_events(
         }};
     }
 
+    macro_rules! record_authenticated_reorg_height {
+        ($old_tip:expr, $new_tip:expr, $peer:expr) => {{
+            let old_tip = $old_tip;
+            let new_tip = $new_tip;
+            let next_highest =
+                authenticated_height_after_reorg(highest_announced, old_tip, new_tip);
+            if next_highest != highest_announced {
+                highest_announced = next_highest;
+                sync_phase_telemetry.extend_suffix_target(next_highest);
+            }
+            last_announcement_peer = Some($peer);
+        }};
+    }
+
     macro_rules! request_exact_tip_confirmation {
         ($peer:expr, $local_height:expr) => {{
             let peer = $peer;
@@ -5005,18 +6142,25 @@ async fn handle_p2p_events(
                 if !fetch_in_progress.contains(&peer) && !recently_requested {
                     fetch_in_progress.insert(peer);
                     recent_header_fetches.insert(request_key, Instant::now());
-                    let _ = p2p_cmd
+                    if p2p_cmd
                         .send(noid_p2p::NetworkCommand::FetchHeaders {
                             peer,
                             start_height: local_height,
                             count,
                         })
-                        .await;
-                    tracing::debug!(
-                        peer = %peer,
-                        local_height,
-                        "requesting exact post-commit tip confirmation"
-                    );
+                        .await
+                        .is_ok()
+                    {
+                        mining_peer_quorum.mark_probe_sent(peer, Instant::now());
+                        tracing::debug!(
+                            peer = %peer,
+                            local_height,
+                            "requesting exact post-commit tip confirmation"
+                        );
+                    } else {
+                        fetch_in_progress.remove(&peer);
+                        recent_header_fetches.remove(&request_key);
+                    }
                 }
             }
         }};
@@ -5031,6 +6175,8 @@ async fn handle_p2p_events(
                 && !manifest_peers.is_empty()
                 && manifest_requested_peers.is_empty()
                 && manifest_round_started_at.is_none()
+                && best_manifest_candidate.is_none()
+                && manifest_candidate_started_at.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -5510,9 +6656,21 @@ async fn handle_p2p_events(
                                         received_hash = %hex::encode(block_hash),
                                         "shallow-fork bundle does not match requested header"
                                     );
-                                    pending_shallow_fork = None;
                                     drop(bundle);
                                     drop(inbound_memory_permit.take());
+                                    if retry_shallow_fork_bundle_peer!(
+                                        from,
+                                        "requested peer returned a different block"
+                                    ) {
+                                        continue;
+                                    }
+                                    let stale = pending_shallow_fork
+                                        .take()
+                                        .expect("mismatched shallow-fork session exists");
+                                    retry_shallow_fork_headers!(
+                                        stale,
+                                        "all bundle peers exhausted after a mismatched response"
+                                    );
                                     continue;
                                 }
 
@@ -5546,6 +6704,8 @@ async fn handle_p2p_events(
                                         .expect("matched shallow-fork session exists");
                                     pending.retained_bytes += candidate_bytes;
                                     pending.candidates.push(candidate);
+                                    pending.attempted_bundle_peers.clear();
+                                    pending.last_progress_at = Instant::now();
                                 }
                                 // From here the explicit fork-session byte cap
                                 // owns accounting for retained candidate bytes.
@@ -5587,7 +6747,12 @@ async fn handle_p2p_events(
                                     .expect("complete shallow-fork session exists");
                                 let new_tip_height = completed.tip_height();
                                 let new_tip_hash = completed.tip_hash();
-                                let (our_tip_height, canonical_ancestor, our_extra_work) = {
+                                let (
+                                    our_tip_height,
+                                    our_tip_hash,
+                                    canonical_ancestor,
+                                    our_extra_work,
+                                ) = {
                                     use noid_chain::{add_work, block_work};
                                     let ctx = chain.read().await;
                                     let our_tip_height = ctx.tip_height();
@@ -5613,7 +6778,7 @@ async fn handle_p2p_events(
                                     } else {
                                         work = [0xFF; 32];
                                     }
-                                    (our_tip_height, canonical_ancestor, work)
+                                    (our_tip_height, ctx.tip_hash(), canonical_ancestor, work)
                                 };
 
                                 if canonical_ancestor != Some(completed.ancestor_hash) {
@@ -5622,14 +6787,18 @@ async fn handle_p2p_events(
                                         ancestor = completed.ancestor_height,
                                         "shallow-fork ancestor changed while bundles were downloading"
                                     );
-                                    drop(completed);
+                                    retry_shallow_fork_headers!(
+                                        completed,
+                                        "canonical ancestor changed during bundle download"
+                                    );
                                     continue;
                                 }
-                                let should_reorg = noid_chain::work_gt(
+                                let should_reorg = competing_suffix_wins(
                                     &completed.advertised_work,
+                                    &new_tip_hash,
                                     &our_extra_work,
-                                ) || (completed.advertised_work == our_extra_work
-                                    && new_tip_height > our_tip_height);
+                                    &our_tip_hash,
+                                );
                                 if !should_reorg {
                                     tracing::debug!(
                                         peer = %completed.peer,
@@ -5647,7 +6816,7 @@ async fn handle_p2p_events(
                                     ancestor = completed.ancestor_height,
                                     blocks = completed.candidates.len(),
                                     peer = %completed.peer,
-                                    "reorg: downloaded shallow fork has more work, reorganising"
+                                    "reorg: downloaded shallow fork wins canonical fork choice, reorganising"
                                 );
                                 let _wallet_operation = wallet_operation_gate.lock().await;
                                 let (reorg_reserved_inputs, reorg_reserved_outputs) =
@@ -5666,7 +6835,14 @@ async fn handle_p2p_events(
 
                                 match reorg_result {
                                     Ok(applied_reorg) => {
-                                        record_authenticated_height!(new_tip_height, from);
+                                        snapshot_rebase_hint = None;
+                                        mining_peer_quorum
+                                            .set_canonical_tip(new_tip_height, new_tip_hash);
+                                        record_authenticated_reorg_height!(
+                                            our_tip_height,
+                                            new_tip_height,
+                                            from
+                                        );
                                         external_mining_attempts
                                             .invalidate_for_tip(new_tip_height, new_tip_hash);
                                         mempool
@@ -5687,7 +6863,11 @@ async fn handle_p2p_events(
                                             .await;
                                         last_tip_advance = Instant::now();
                                         request_exact_tip_confirmation!(from, new_tip_height);
-                                        mining_peer_quorum.confirm(from);
+                                        mining_peer_quorum.confirm_tip(
+                                            from,
+                                            new_tip_height,
+                                            new_tip_hash,
+                                        );
                                         let _ = template_changes.send(());
                                         tracing::info!(
                                             new_tip = new_tip_height,
@@ -5840,6 +7020,8 @@ async fn handle_p2p_events(
                                 // before any network or mempool await below.
                                 drop(inbound_memory_permit.take());
                                 let height = applied.height;
+                                mining_peer_quorum
+                                    .set_canonical_tip(height, applied.block_hash);
                                 record_authenticated_height!(height, from);
                                 external_mining_attempts
                                     .invalidate_for_tip(height, applied.block_hash);
@@ -5860,7 +7042,7 @@ async fn handle_p2p_events(
                                 tracing::info!(height, "applied P2P block");
                                 last_tip_advance = Instant::now();
                                 request_exact_tip_confirmation!(from, height);
-                                mining_peer_quorum.confirm(from);
+                                mining_peer_quorum.confirm_tip(from, height, applied.block_hash);
                                 let _ = template_changes.send(()); // cancel/rebuild any active stale template
 
                                 // Continue only to the authenticated/announced target. Pulling
@@ -5900,6 +7082,10 @@ async fn handle_p2p_events(
                                         Ok(applied_orphan) => {
                                             next_hash = applied_orphan.block_hash;
                                             let h = applied_orphan.height;
+                                            mining_peer_quorum.set_canonical_tip(
+                                                h,
+                                                applied_orphan.block_hash,
+                                            );
                                             record_authenticated_height!(h, from);
                                             external_mining_attempts
                                                 .invalidate_for_tip(h, applied_orphan.block_hash);
@@ -5986,7 +7172,7 @@ async fn handle_p2p_events(
                                             w
                                         };
 
-                                        let our_extra_work = {
+                                        let (our_extra_work, our_tip_hash) = {
                                             use noid_chain::{add_work, block_work};
                                             // Work we did from ancestor to our tip
                                             let mut w = [0u8; 32];
@@ -5999,14 +7185,23 @@ async fn handle_p2p_events(
                                                     );
                                                 }
                                             }
-                                            w
+                                            (w, ctx.tip_hash())
                                         };
 
-                                        // Reorg only if competing chain has strictly MORE work
-                                        let should_reorg =
-                                            noid_chain::work_gt(&competing_work, &our_extra_work)
-                                                || (competing_work == our_extra_work
-                                                    && new_tip_height > our_tip_height);
+                                        let competing_tip_hash = new_chain
+                                            .last()
+                                            .map(|candidate| {
+                                                noid_chain::consensus::pow::block_id(
+                                                    &candidate.block.header,
+                                                )
+                                            })
+                                            .expect("competing candidate chain is non-empty");
+                                        let should_reorg = competing_suffix_wins(
+                                            &competing_work,
+                                            &competing_tip_hash,
+                                            &our_extra_work,
+                                            &our_tip_hash,
+                                        );
 
                                         if should_reorg {
                                             tracing::info!(
@@ -6015,7 +7210,7 @@ async fn handle_p2p_events(
                                                 ancestor = ancestor_height,
                                                 blocks = new_chain.len(),
                                                 peer = %from,
-                                                "reorg: competing chain has more work, reorganising"
+                                                "reorg: competing chain wins canonical fork choice, reorganising"
                                             );
 
                                             // Serialize the complete chain + active-wallet
@@ -6046,14 +7241,21 @@ async fn handle_p2p_events(
 
                                             match reorg_result {
                                                 Ok(applied_reorg) => {
-                                                    record_authenticated_height!(
+                                                    let accepted_tip_hash =
+                                                        applied_reorg.view.tip_hash;
+                                                    mining_peer_quorum.set_canonical_tip(
+                                                        new_tip_height,
+                                                        accepted_tip_hash,
+                                                    );
+                                                    record_authenticated_reorg_height!(
+                                                        our_tip_height,
                                                         new_tip_height,
                                                         from
                                                     );
                                                     drop(inbound_memory_permit.take());
                                                     external_mining_attempts.invalidate_for_tip(
                                                         new_tip_height,
-                                                        applied_reorg.view.tip_hash,
+                                                        accepted_tip_hash,
                                                     );
                                                     mempool
                                                         .on_new_block(
@@ -6082,7 +7284,11 @@ async fn handle_p2p_events(
                                                         from,
                                                         new_tip_height
                                                     );
-                                                    mining_peer_quorum.confirm(from);
+                                                    mining_peer_quorum.confirm_tip(
+                                                        from,
+                                                        new_tip_height,
+                                                        accepted_tip_hash,
+                                                    );
                                                     let _ = template_changes.send(());
                                                     let new_tip = new_tip_height;
                                                     tracing::info!(
@@ -6295,10 +7501,37 @@ async fn handle_p2p_events(
                     tracing::warn!(
                         peer = %from,
                         height,
-                        "peer cannot serve the selected shallow-fork bundle — aborting session"
+                        "peer cannot serve the selected shallow-fork bundle"
                     );
-                    pending_shallow_fork = None;
-                    pending_block_fetches.retain(|_, pending| pending.peer != from);
+                    if retry_shallow_fork_bundle_peer!(
+                        from,
+                        "selected peer could not serve the exact replacement bundle"
+                    ) {
+                        continue;
+                    }
+                    let stale = pending_shallow_fork
+                        .take()
+                        .expect("unavailable shallow-fork session exists");
+                    let our_tip = {
+                        let ctx = chain.read().await;
+                        ctx.tip_height()
+                    };
+                    if gap_requires_snapshot_sync(our_tip, stale.tip_height()) {
+                        request_snapshot_rebase!(
+                            stale,
+                            "first required complete bundle is outside the peer serving window"
+                        );
+                    } else {
+                        // A snapshot boundary is normally tip-18 and is not yet
+                        // ahead of this node for a shallow gap. Asking for it
+                        // would be a guaranteed no-op. Rotate one linked-header
+                        // lane instead; a patched peer keeps the wider serving
+                        // reserve and a moving branch is rediscovered here.
+                        retry_shallow_fork_headers!(
+                            stale,
+                            "selected peer could not serve a shallow replacement bundle"
+                        );
+                    }
                     continue;
                 }
                 let unavailable_snapshot_tail = snapshot_tail_request_inflight.is_some_and(|request| {
@@ -6560,19 +7793,25 @@ async fn handle_p2p_events(
                 let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
                 if fetch_in_progress.insert(peer) {
                     recent_header_fetches.insert(request_key, Instant::now());
-                    p2p_cmd
+                    if p2p_cmd
                         .send(noid_p2p::NetworkCommand::FetchHeaders {
                             peer,
                             start_height: our_height,
                             count: CONNECTED_TIP_PROBE_HEADERS,
                         })
                         .await
-                        .ok();
-                    tracing::debug!(
-                        peer = %peer,
-                        start_height = our_height,
-                        "probing connected peer tip with anchored headers"
-                    );
+                        .is_ok()
+                    {
+                        mining_peer_quorum.mark_probe_sent(peer, Instant::now());
+                        tracing::debug!(
+                            peer = %peer,
+                            start_height = our_height,
+                            "probing connected peer tip with anchored headers"
+                        );
+                    } else {
+                        fetch_in_progress.remove(&peer);
+                        recent_header_fetches.remove(&request_key);
+                    }
                 }
 
                 // Mempool payloads can be much larger than the complete cold
@@ -6827,6 +8066,48 @@ async fn handle_p2p_events(
 
                 // Find common ancestor for reorg.
                 if headers.is_empty() {
+                    // A peer on a shorter branch cannot answer a request that
+                    // starts at our tip. It may nevertheless carry greater
+                    // cumulative work. Read exactly the complete non-final
+                    // window once so the normal native-validation and fork-
+                    // choice path can compare it. Healthy current-tip peers
+                    // never take this fallback.
+                    let our_tip = {
+                        let ctx = chain.read().await;
+                        ctx.tip_height()
+                    };
+                    if let Some((start_height, count)) =
+                        nonfinal_header_discovery_range(our_tip)
+                    {
+                        let request_key = (from, start_height, count);
+                        let recently_requested = recent_header_fetches
+                            .get(&request_key)
+                            .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                        if !fetch_in_progress.contains(&from) && !recently_requested {
+                            fetch_in_progress.insert(from);
+                            recent_header_fetches.insert(request_key, Instant::now());
+                            if p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                    peer: from,
+                                    start_height,
+                                    count,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                fetch_in_progress.remove(&from);
+                                recent_header_fetches.remove(&request_key);
+                            } else {
+                                tracing::debug!(
+                                    peer = %from,
+                                    our_tip,
+                                    start_height,
+                                    count,
+                                    "peer returned no header at our tip; probing its bounded non-final view"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -6847,8 +8128,7 @@ async fn handle_p2p_events(
                 };
 
                 if let Some((ancestor_height, ancestor_hash)) = ancestor_opt {
-                    // Found a common ancestor — reset the depth counter for this peer.
-                    *fetch_depth.entry(from).or_insert(0) = 0;
+                    finalized_divergent_peers.remove(&from);
                     // Found common ancestor. The competing chain:
                     // headers with height > ancestor_height, ordered ascending.
                     let mut competing: Vec<noid_chain::BlockHeader> = headers
@@ -6858,9 +8138,9 @@ async fn handle_p2p_events(
                         .collect();
                     competing.sort_by_key(|h| h.height);
 
-                    let new_tip_height = competing
-                        .last()
-                        .map(|h| h.height)
+                    let competing_tip = competing_suffix_tip(&competing);
+                    let new_tip_height = competing_tip
+                        .map(|(height, _)| height)
                         .unwrap_or(ancestor_height);
 
                     if !competing.is_empty() {
@@ -6912,7 +8192,7 @@ async fn handle_p2p_events(
                         clear_manifest_round_state!();
                         mark_initial_sync_ready(&initial_sync_ready);
                         mark_bootstrap_complete_if_caught_up!(our_tip);
-                        mining_peer_quorum.confirm(from);
+                        mining_peer_quorum.confirm_tip(from, our_tip, ancestor_hash);
                         tracing::debug!(
                             peer = %from,
                             height = our_tip,
@@ -6920,11 +8200,32 @@ async fn handle_p2p_events(
                         );
                     }
 
-                    if new_tip_height > our_tip {
+                    // A fork may be equal-height or even shorter while carrying
+                    // more cumulative work. Height gates only the direct
+                    // extension fast path; fork choice below is always work
+                    // first.
+                    if new_tip_height > our_tip || ancestor_height < our_tip {
+                        // A shorter peer on our exact canonical prefix has no
+                        // competing suffix at all. The bounded fallback is
+                        // still useful to distinguish that harmless case from
+                        // a shorter fork-choice winner, but an empty suffix is
+                        // never a fork-choice candidate.
+                        if competing_tip.is_none() {
+                            tracing::debug!(
+                                peer = %from,
+                                peer_tip = ancestor_height,
+                                our_tip,
+                                "peer is behind on the accepted canonical prefix"
+                            );
+                            continue;
+                        }
                         if ancestor_height == our_tip {
                             record_authenticated_height!(new_tip_height, from);
+                            mining_peer_quorum.invalidate_all();
                         }
-                        if gap_requires_snapshot_sync(our_tip, new_tip_height) {
+                        if ancestor_height == our_tip
+                            && gap_requires_snapshot_sync(our_tip, new_tip_height)
+                        {
                             tracing::info!(
                                 peer = %from,
                                 our_tip,
@@ -7090,7 +8391,7 @@ async fn handle_p2p_events(
                             continue;
                         }
 
-                        let (competing_work, our_extra_work) = {
+                        let (competing_work, competing_tip_hash, our_extra_work, our_tip_hash) = {
                             use noid_chain::{add_work, block_work};
                             let mut competing_work = [0u8; 32];
                             for header in &competing {
@@ -7100,6 +8401,9 @@ async fn handle_p2p_events(
                                 );
                             }
                             let mut our_extra_work = [0u8; 32];
+                            let competing_tip_hash = competing_tip
+                                .expect("guarded competing header suffix is non-empty")
+                                .1;
                             let ctx = chain.read().await;
                             for height in (ancestor_height + 1)..=our_tip {
                                 let Some(header) = ctx.recent_headers.get(&height) else {
@@ -7117,12 +8421,19 @@ async fn handle_p2p_events(
                                     &block_work(&header.difficulty_target),
                                 );
                             }
-                            (competing_work, our_extra_work)
+                            (
+                                competing_work,
+                                competing_tip_hash,
+                                our_extra_work,
+                                ctx.tip_hash(),
+                            )
                         };
-                        let advertises_better_chain =
-                            noid_chain::work_gt(&competing_work, &our_extra_work)
-                                || (competing_work == our_extra_work
-                                    && new_tip_height > our_tip);
+                        let advertises_better_chain = competing_suffix_wins(
+                            &competing_work,
+                            &competing_tip_hash,
+                            &our_extra_work,
+                            &our_tip_hash,
+                        );
                         if !advertises_better_chain {
                             tracing::debug!(
                                 ancestor = ancestor_height,
@@ -7133,6 +8444,7 @@ async fn handle_p2p_events(
                             );
                             continue;
                         }
+                        mining_peer_quorum.invalidate_all();
                         record_authenticated_height!(new_tip_height, from);
 
                         if let Some(active) = pending_shallow_fork.as_ref() {
@@ -7151,15 +8463,7 @@ async fn handle_p2p_events(
                             .first()
                             .expect("a competing header suffix is non-empty");
                         let first_hash = noid_chain::consensus::pow::block_id(&first);
-                        tracing::info!(
-                            ancestor = ancestor_height,
-                            our_tip,
-                            competing_tip = new_tip_height,
-                            peer = %from,
-                            bundles = expected_headers.len(),
-                            "shallow fork has more work — starting sequential bundle download"
-                        );
-                        pending_shallow_fork = Some(PendingShallowFork {
+                        let replacement = PendingShallowFork {
                             peer: from,
                             ancestor_height,
                             ancestor_hash,
@@ -7167,8 +8471,25 @@ async fn handle_p2p_events(
                             candidates: Vec::new(),
                             retained_bytes: 0,
                             advertised_work: competing_work,
-                            started_at: Instant::now(),
-                        });
+                            attempted_bundle_peers: std::collections::HashSet::new(),
+                            last_progress_at: Instant::now(),
+                        };
+                        if gap_requires_snapshot_sync(our_tip, new_tip_height) {
+                            request_snapshot_rebase!(
+                                replacement,
+                                "authenticated better fork is already beyond compact catch-up"
+                            );
+                            continue;
+                        }
+                        tracing::info!(
+                            ancestor = ancestor_height,
+                            our_tip,
+                            competing_tip = new_tip_height,
+                            peer = %from,
+                            bundles = replacement.expected_headers.len(),
+                            "shallow fork wins canonical fork choice — starting sequential bundle download"
+                        );
+                        pending_shallow_fork = Some(replacement);
                         pending_block_fetches.insert(
                             (first.height, first_hash),
                             PendingBlockFetch {
@@ -7190,53 +8511,42 @@ async fn handle_p2p_events(
                         );
                     }
                 } else {
-                    // Common ancestor not in our recent chain — request more headers
-                    // going further back, subject to a recursion depth limit.
+                    // `find_ancestor_height` deliberately recognizes only the
+                    // complete non-final window. Once a response begins at its
+                    // floor, fetching still older headers cannot authorize a
+                    // reorg and a state manifest from this branch is guaranteed
+                    // to fail its first parent link. Stop this peer for the
+                    // connection lifetime instead of entering a manifest loop.
                     let oldest = headers.first().map(|h| h.height).unwrap_or(0);
-                    if oldest > 0 {
-                        let depth = fetch_depth.entry(from).or_insert(0);
-                        if *depth >= MAX_FETCH_DEPTH {
-                            tracing::info!(
-                                peer = %from,
-                                depth = *depth,
-                                "FetchHeaders depth limit reached — requesting snapshot manifest"
-                            );
-                            *depth = 0; // reset for next time
-                            if pending_manifest.is_none()
-                                && pending_snapshot_header_sync.is_none()
-                                && snapshot_header_staging_inflight.is_none()
-                                && history_step_verification_inflight.is_none()
-                                && snapshot_staging_inflight.is_none()
-                                && snapshot_install_inflight.is_none()
-                                && pending_segment_ids.is_empty()
-                                && segment_queue.is_empty()
-                                && manifest_requested_peers.insert(from)
-                            {
-                                manifest_force_snapshot_peers.insert(from);
-                                let _ = p2p_cmd
-                                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
-                                        generation: snapshot_sync_generation,
-                                        peer: from,
-                                        requester_height: our_tip,
-                                    })
-                                    .await;
-                            }
-                        } else {
-                            *depth += 1;
-                            let fetch_from = oldest.saturating_sub(512);
-                            tracing::debug!(
-                                fetch_from,
-                                depth = *depth,
-                                "batch headers: ancestor not found, fetching further back"
-                            );
-                            let _ = p2p_cmd
-                                .send(noid_p2p::NetworkCommand::FetchHeaders {
-                                    peer: from,
-                                    start_height: fetch_from,
-                                    count: 512,
-                                })
-                                .await;
-                        }
+                    if header_batch_exhausts_nonfinal_window(our_tip, oldest) {
+                        finalized_divergent_peers.insert(from);
+                        manifest_requested_peers.remove(&from);
+                        manifest_force_snapshot_peers.remove(&from);
+                        tracing::warn!(
+                            peer = %from,
+                            our_tip,
+                            finalized_height = finalized_header_search_floor(our_tip),
+                            peer_range_start = oldest,
+                            "peer branch has no common ancestor inside the accepted non-final window; automatic rebase refused"
+                        );
+                    } else {
+                        let fetch_from = finalized_header_search_floor(our_tip);
+                        let count = 512u16;
+                        let request_key = (from, fetch_from, count);
+                        recent_header_fetches.insert(request_key, Instant::now());
+                        fetch_in_progress.insert(from);
+                        let _ = p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                peer: from,
+                                start_height: fetch_from,
+                                count,
+                            })
+                            .await;
+                        tracing::debug!(
+                            peer = %from,
+                            fetch_from,
+                            "batch headers: common ancestor not present; fetching the complete non-final window"
+                        );
                     }
                 }
             }
@@ -7271,6 +8581,19 @@ async fn handle_p2p_events(
                     continue;
                 }
                 manifest_requested_peers.remove(&from);
+                if finalized_divergent_peers.contains(&from) {
+                    tracing::warn!(
+                        from = %from,
+                        tip = manifest.tip_height,
+                        "ignoring manifest from a branch outside the accepted non-final window"
+                    );
+                    if selected_snapshot_peer!().is_none()
+                        && manifest_requested_peers.is_empty()
+                    {
+                        request_bounded_manifest_failover!(from, false);
+                    }
+                    continue;
+                }
                 if rejected_terminal_peers.contains(&from) {
                     tracing::warn!(
                         from = %from,
@@ -7301,9 +8624,10 @@ async fn handle_p2p_events(
                     continue;
                 }
                 // Received the state manifest (step 1 of snapshot sync).
-                // Structural checks below bound all advertised work. The first
-                // usable response starts speculative staging immediately; the
-                // exact header chain, PoW, recursive terminal, state root and
+                // Structural checks below bound all advertised work. Usable
+                // responses enter a short work-ranked election so connection
+                // order cannot select the finalized branch. The winner's exact
+                // header chain, PoW, recursive terminal, state root and
                 // immutable suffix still provide authority before installation.
                 let force_snapshot = manifest_force_snapshot_peers.remove(&from);
                 manifest_response_count += 1;
@@ -7477,13 +8801,30 @@ async fn handle_p2p_events(
                     && pending_recent_suffix.is_none()
                     && recent_suffix_apply_inflight.is_none()
                 {
-                    tracing::info!(
-                        from = %from,
-                        tip = manifest.tip_height,
-                        segments = manifest.segment_ids.len(),
-                        "usable manifest received — staging immediately"
-                    );
-                    begin_snapshot_header_staging!(from, manifest);
+                    let replace = best_manifest_candidate.as_ref().is_none_or(|current| {
+                        state_manifest_candidate_is_preferred(&manifest, &current.manifest)
+                    });
+                    if replace {
+                        tracing::info!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            bridge_tip = manifest.bridge_tip_height,
+                            segments = manifest.segment_ids.len(),
+                            "stronger snapshot manifest entered bounded candidate election"
+                        );
+                        best_manifest_candidate = Some(SnapshotManifestCandidate {
+                            from,
+                            manifest,
+                        });
+                    } else {
+                        tracing::debug!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            bridge_tip = manifest.bridge_tip_height,
+                            "weaker snapshot manifest ignored during candidate election"
+                        );
+                    }
+                    manifest_candidate_started_at.get_or_insert_with(Instant::now);
                 } else if manifest.tip_height > 0 {
                     // Manifest chainwork is only a claim until its exact native
                     // header chain has been validated. Never interrupt useful
@@ -7500,6 +8841,7 @@ async fn handle_p2p_events(
                 if manifest_tip_height == 0
                     && manifest_requested_peers.is_empty()
                     && selected_snapshot_peer!().is_none()
+                    && best_manifest_candidate.is_none()
                 {
                     let our_height = {
                         let ctx = chain.read().await;
@@ -8256,9 +9598,14 @@ async fn handle_p2p_events(
                 {
                     tracing::debug!(
                         peer = %peer,
-                        "selected shallow-fork peer disconnected; discarding bounded session"
+                        "selected shallow-fork peer disconnected"
                     );
-                    pending_shallow_fork = None;
+                    if !retry_shallow_fork_bundle_peer!(peer, "selected peer disconnected") {
+                        let stale = pending_shallow_fork
+                            .take()
+                            .expect("disconnected shallow-fork session exists");
+                        retry_shallow_fork_headers!(stale, "all bundle peers disconnected");
+                    }
                 }
                 let finalized_tail_no_longer_needs_manifest_peer =
                     finalized_snapshot_waiting.is_some()
@@ -8308,7 +9655,7 @@ async fn handle_p2p_events(
                 pending_block_fetches.retain(|_, pending| pending.peer != peer);
                 manifest_requested_peers.remove(&peer);
                 mempool_sync_requested_peers.remove(&peer);
-                fetch_depth.remove(&peer);
+                finalized_divergent_peers.remove(&peer);
                 peer_tx_rate.remove(&peer);
                 peer_block_rate.remove(&peer);
             }
@@ -8392,6 +9739,77 @@ async fn handle_p2p_events(
                         request_bounded_manifest_failover!(from, true);
                         continue;
                     };
+                    let base_height = sync.staging.base().header.height;
+                    if snapshot_parent_mismatch_is_at_base(
+                        sync.staging.staged_len(),
+                        base_height,
+                        start_height,
+                        &error,
+                    )
+                    {
+                        // A manifest may win the event race before the general
+                        // linked-header probe, or the selected branch may move
+                        // after an earlier rebase hint was armed. In either
+                        // case this exact base is objectively stale. Do not
+                        // rotate the same impossible first range across every
+                        // peer: retire the hint and establish a fresh native-
+                        // validated common ancestor over the complete non-final
+                        // window.
+                        cleanup_snapshot_header_staging_offthread(sync.staging);
+                        snapshot_rebase_hint = None;
+                        reset_sync_state!();
+                        let our_height = {
+                            let ctx = chain.read().await;
+                            ctx.tip_height()
+                        };
+                        let discovery_start = finalized_header_search_floor(our_height);
+                        let discovery_tip = sync
+                            .manifest
+                            .bridge_tip_height
+                            .max(sync.manifest.tip_height);
+                        let discovery_count = discovery_tip
+                            .saturating_sub(discovery_start)
+                            .saturating_add(1)
+                            .clamp(
+                                u64::from(CONNECTED_TIP_PROBE_HEADERS),
+                                MAX_STAGED_HEADER_BATCH as u64,
+                            ) as u16;
+                        let request_key = (range_from, discovery_start, discovery_count);
+                        let discovery_dispatched = if fetch_in_progress.insert(range_from) {
+                            recent_header_fetches.insert(request_key, Instant::now());
+                            if p2p_cmd
+                                .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                    peer: range_from,
+                                    start_height: discovery_start,
+                                    count: discovery_count,
+                                })
+                                .await
+                                .is_ok()
+                            {
+                                true
+                            } else {
+                                fetch_in_progress.remove(&range_from);
+                                recent_header_fetches.remove(&request_key);
+                                false
+                            }
+                        } else {
+                            // A general response from this peer is already
+                            // correlated and will enter the same bounded
+                            // ancestor-discovery path after the snapshot state
+                            // above has been reset.
+                            false
+                        };
+                        tracing::warn!(
+                            manifest_peer = %from,
+                            range_peer = %range_from,
+                            base_height,
+                            discovery_start,
+                            discovery_dispatched,
+                            err = %error,
+                            "snapshot boundary has a competing parent; discovering an authenticated non-final rebase before retry"
+                        );
+                        continue;
+                    }
                     if sync.from != from || !manifest_peers.contains(&from) {
                         let staged_headers = sync.staging.staged_len();
                         drop(sync.staging);
@@ -8722,6 +10140,8 @@ async fn handle_p2p_events(
                         applied.trailing_error.is_some(),
                     );
                     if advanced {
+                        mining_peer_quorum
+                            .set_canonical_tip(applied.height, applied.block_hash);
                         record_authenticated_height!(applied.height, completed.key.peer);
                         external_mining_attempts
                             .invalidate_for_tip(applied.height, applied.block_hash);
@@ -8730,7 +10150,11 @@ async fn handle_p2p_events(
                     }
                     if complete {
                         request_exact_tip_confirmation!(completed.key.peer, applied.height);
-                        mining_peer_quorum.confirm(completed.key.peer);
+                        mining_peer_quorum.confirm_tip(
+                            completed.key.peer,
+                            applied.height,
+                            applied.block_hash,
+                        );
                     }
                     tracing::info!(
                         peer = %completed.key.peer,
@@ -9168,6 +10592,7 @@ async fn handle_p2p_events(
             }
             match completed.result {
                 Ok(applied) => {
+                    snapshot_rebase_hint = None;
                     sync_phase_telemetry.record_state_work(applied.state_install_elapsed);
                     log_sync_phase_measurement(sync_phase_telemetry.finish_headers());
                     log_sync_phase_measurement(sync_phase_telemetry.finish_state());
@@ -9178,6 +10603,7 @@ async fn handle_p2p_events(
                     ));
 
                     let height = applied.height;
+                    mining_peer_quorum.set_canonical_tip(height, applied.block_hash);
                     record_authenticated_height!(height, completed.key.from);
                     tracing::info!(
                         height,
@@ -9190,7 +10616,11 @@ async fn handle_p2p_events(
                         let _ = sync_phase_telemetry.begin_suffix(height, highest_announced);
                     }
                     last_tip_advance = Instant::now();
-                    mining_peer_quorum.confirm(completed.key.from);
+                    mining_peer_quorum.confirm_tip(
+                        completed.key.from,
+                        height,
+                        applied.block_hash,
+                    );
                     let _ = template_changes.send(());
                     let followup_peer = deferred_sync_peer
                         .take()
@@ -9245,6 +10675,7 @@ async fn handle_p2p_events(
                     error,
                     terminal_rejected,
                 }) => {
+                    snapshot_rebase_hint = None;
                     if terminal_rejected {
                         if let Some(terminal_from) = completed.key.terminal_from {
                             rejected_terminal_peers.insert(terminal_from);
@@ -9260,6 +10691,7 @@ async fn handle_p2p_events(
                         applied.tail_apply_elapsed,
                     ));
                     let height = applied.height;
+                    mining_peer_quorum.set_canonical_tip(height, applied.block_hash);
                     record_authenticated_height!(height, completed.key.from);
                     tracing::warn!(
                         from = %completed.key.from,
@@ -9504,11 +10936,74 @@ async fn handle_p2p_events(
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
             let now = Instant::now();
+            let (our_height, our_hash) = {
+                let ctx = chain.read().await;
+                (ctx.tip_height(), ctx.tip_hash())
+            };
+            // This also catches locally mined or RPC-submitted blocks, whose
+            // commits do not pass through this P2P event handler. Old-tip
+            // confirmations are cleared within one heartbeat and cannot be
+            // refreshed by a delayed response for the previous parent.
+            mining_peer_quorum.set_canonical_tip(our_height, our_hash);
+            mining_peer_quorum.expire_stale(now);
             let fetch_cutoff = now - FETCH_DEDUP_TTL;
             recent_header_fetches.retain(|_, t| *t >= fetch_cutoff);
             recent_block_fetches.retain(|_, t| *t >= fetch_cutoff);
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
+
+            if manifest_candidate_selection_due(manifest_candidate_started_at, now)
+                && pending_manifest.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_staging_inflight.is_none()
+                && snapshot_install_inflight.is_none()
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
+            {
+                let candidate = best_manifest_candidate
+                    .take()
+                    .expect("settled manifest election has a candidate");
+                manifest_candidate_started_at = None;
+                let responses_considered = manifest_response_count;
+                manifest_requested_peers.clear();
+                manifest_force_snapshot_peers.clear();
+                manifest_response_count = 0;
+                manifest_round_started_at = None;
+                if candidate.manifest.tip_height > our_height {
+                    tracing::info!(
+                        from = %candidate.from,
+                        tip = candidate.manifest.tip_height,
+                        bridge_tip = candidate.manifest.bridge_tip_height,
+                        responses_considered,
+                        "snapshot manifest election settled — validating strongest advertised chain"
+                    );
+                    begin_snapshot_header_staging!(candidate.from, candidate.manifest);
+                } else {
+                    tracing::debug!(
+                        from = %candidate.from,
+                        tip = candidate.manifest.tip_height,
+                        our_height,
+                        "snapshot manifest candidate became obsolete before election settled"
+                    );
+                }
+            }
+
+            if snapshot_rebase_hint.is_some_and(|hint| {
+                now.duration_since(hint.armed_at) >= Duration::from_secs(600)
+            }) && selected_snapshot_peer!().is_none()
+                && snapshot_install_inflight.is_none()
+            {
+                let expired = snapshot_rebase_hint
+                    .take()
+                    .expect("expired snapshot rebase hint exists");
+                tracing::warn!(
+                    ancestor = expired.ancestor_height,
+                    competing_tip = expired.competing_tip_height,
+                    "snapshot rebase hint expired without an active authenticated candidate"
+                );
+            }
 
             if *initial_sync_ready.borrow() {
                 let mempool_peers = manifest_peers
@@ -9524,18 +11019,50 @@ async fn handle_p2p_events(
                 }
             }
 
-            // Ordinary wallet nodes count toward mining readiness once they
-            // confirm our canonical tip. A wallet may connect while still
-            // catching up, so repeat the bounded tip probe only while the
-            // quorum is incomplete. Once two peers confirm, this adds no
-            // steady-state network traffic.
-            if mining_peer_quorum.waiting_for_quorum() {
-                let our_height = {
-                    let ctx = chain.read().await;
-                    ctx.tip_height()
-                };
-                const MINING_QUORUM_TIP_PROBE_HEADERS: u16 = CONNECTED_TIP_PROBE_HEADERS;
-                for peer in mining_peer_quorum.unconfirmed_connected() {
+            // Mining-authority refresh must not compete with canonical sync
+            // for the bounded general-header request lanes. Connection-time
+            // probes still bootstrap discovery; once a snapshot, suffix, or
+            // reorg session is active, the readiness gate can safely remain
+            // closed until that exact canonical transition has completed.
+            let canonical_sync_idle = pending_shallow_fork.is_none()
+                && pending_block_fetches.is_empty()
+                && pending_recent_suffix.is_none()
+                && recent_suffix_apply_inflight.is_none()
+                && pending_manifest.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_pipeline.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_boundary_terminal_inflight.is_none()
+                && snapshot_tail_terminal_inflight.is_none()
+                && snapshot_staging.is_none()
+                && snapshot_staging_inflight.is_none()
+                && snapshot_tail_request_inflight.is_none()
+                && snapshot_tail_append_inflight.is_none()
+                && snapshot_install_inflight.is_none()
+                && pending_segment_ids.is_empty()
+                && segment_queue.is_empty()
+                && manifest_requested_peers.is_empty();
+
+            // Reacquire a lost quorum through at most two lanes, preferring
+            // peers which have not confirmed the exact current tip. Once the
+            // quorum is complete, the single rotating steady lane below keeps
+            // confirmations fresh without redundant two-lane traffic.
+            const MINING_QUORUM_TIP_PROBE_HEADERS: u16 = CONNECTED_TIP_PROBE_HEADERS;
+            let waiting_for_quorum = mining_peer_quorum.waiting_for_quorum();
+            if mining_quorum_probe_due(
+                last_mining_quorum_probe,
+                now,
+                waiting_for_quorum,
+                canonical_sync_idle,
+            ) {
+                let mut lane_capacity = MINING_PEER_QUORUM
+                    .saturating_sub(fetch_in_progress.len().min(MINING_PEER_QUORUM));
+                let mut dispatched = false;
+                for peer in mining_peer_quorum.probe_candidates(usize::MAX) {
+                    if lane_capacity == 0 {
+                        break;
+                    }
                     let request_key = (peer, our_height, MINING_QUORUM_TIP_PROBE_HEADERS);
                     let recently_requested = recent_header_fetches
                         .get(&request_key)
@@ -9544,31 +11071,94 @@ async fn handle_p2p_events(
                         continue;
                     }
                     fetch_in_progress.insert(peer);
-                    recent_header_fetches.insert(request_key, Instant::now());
-                    let _ = p2p_cmd
+                    recent_header_fetches.insert(request_key, now);
+                    if p2p_cmd
                         .send(noid_p2p::NetworkCommand::FetchHeaders {
                             peer,
                             start_height: our_height,
                             count: MINING_QUORUM_TIP_PROBE_HEADERS,
                         })
-                        .await;
+                        .await
+                        .is_ok()
+                    {
+                        mining_peer_quorum.mark_probe_sent(peer, now);
+                        lane_capacity -= 1;
+                        dispatched = true;
+                    } else {
+                        fetch_in_progress.remove(&peer);
+                        recent_header_fetches.remove(&request_key);
+                    }
+                }
+                if dispatched {
+                    last_mining_quorum_probe = now;
+                }
+            }
+
+            if !waiting_for_quorum {
+                if steady_tip_probe_due(
+                    last_steady_tip_probe,
+                    now,
+                    false,
+                    canonical_sync_idle,
+                ) {
+                    let excluded = std::collections::HashSet::new();
+                    let candidates = rotating_manifest_peers(
+                        &manifest_peers,
+                        &excluded,
+                        None,
+                        false,
+                        &mut steady_tip_probe_cursor,
+                        1,
+                    );
+                    for peer in candidates {
+                        let request_key = (peer, our_height, CONNECTED_TIP_PROBE_HEADERS);
+                        let recently_requested = recent_header_fetches
+                            .get(&request_key)
+                            .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                        if fetch_in_progress.contains(&peer) || recently_requested {
+                            continue;
+                        }
+                        fetch_in_progress.insert(peer);
+                        recent_header_fetches.insert(request_key, now);
+                        if p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                peer,
+                                start_height: our_height,
+                                count: CONNECTED_TIP_PROBE_HEADERS,
+                            })
+                            .await
+                            .is_ok()
+                        {
+                            last_steady_tip_probe = now;
+                            tracing::debug!(
+                                peer = %peer,
+                                our_height,
+                                "steady authenticated tip probe dispatched"
+                            );
+                        } else {
+                            fetch_in_progress.remove(&peer);
+                            recent_header_fetches.remove(&request_key);
+                        }
+                        break;
+                    }
                 }
             }
 
             if pending_shallow_fork
                 .as_ref()
-                .is_some_and(|pending| pending.started_at.elapsed() >= Duration::from_secs(45))
+                .is_some_and(|pending| {
+                    shallow_fork_progress_deadline_due(pending.last_progress_at, now)
+                })
             {
-                let peer = pending_shallow_fork
-                    .as_ref()
-                    .expect("timed-out shallow-fork session exists")
-                    .peer;
+                let stale = pending_shallow_fork
+                    .take()
+                    .expect("timed-out shallow-fork session exists");
+                let peer = stale.peer;
                 tracing::warn!(
                     peer = %peer,
-                    "shallow-fork bundle download timed out — discarding bounded session"
+                    "shallow-fork bundle download made no progress before its deadline — discarding bounded session"
                 );
-                pending_shallow_fork = None;
-                pending_block_fetches.retain(|_, pending| pending.peer != peer);
+                retry_shallow_fork_headers!(stale, "bundle download progress deadline expired");
             }
 
             if snapshot_boundary_terminal_inflight
@@ -9777,6 +11367,7 @@ async fn handle_p2p_events(
             // outstanding round has the same bounded recovery path.
             if manifest_round_started_at.is_none()
                 && !manifest_requested_peers.is_empty()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -9796,6 +11387,7 @@ async fn handle_p2p_events(
             // a bounded peer set; with a single seed there is no second
             // PeerConnected event to save us.
             if manifest_round_retry_due(manifest_round_started_at, now)
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -9839,9 +11431,13 @@ async fn handle_p2p_events(
                         "state manifest round produced no usable candidate — re-requesting"
                     );
                     reset_sync_state!();
+                    let excluded_peers = rejected_terminal_peers
+                        .union(&finalized_divergent_peers)
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>();
                     let retry_peers = rotating_manifest_peers(
                         &manifest_peers,
-                        &rejected_terminal_peers,
+                        &excluded_peers,
                         None,
                         false,
                         &mut manifest_retry_cursor,
@@ -10284,6 +11880,7 @@ async fn apply_verified_snapshot(
     let VerifiedHistoryStepSnapshot {
         boundary,
         mut headers,
+        allow_nonfinal_rebase,
         inbound_memory_permit,
         ..
     } = history_step;
@@ -10302,7 +11899,12 @@ async fn apply_verified_snapshot(
         let mut tail = tail;
         let mut ctx = install_chain.blocking_write();
         let state_install_started = Instant::now();
-        if let Err(error) = ctx.apply_staged_state_snapshot(&staging, &boundary, &mut headers) {
+        if let Err(error) = ctx.apply_staged_state_snapshot(
+            &staging,
+            &boundary,
+            &mut headers,
+            allow_nonfinal_rebase,
+        ) {
             drop(ctx);
             let _ = headers.discard();
             return Err(format!("apply authenticated state snapshot: {error:?}"));

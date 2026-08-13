@@ -155,8 +155,12 @@ const MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS: usize =
 const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 32;
 // The swarm itself admits at most 32 pending outbound transports.
 const _: () = assert!(MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS <= 32);
-const INITIAL_BOOTSTRAP_FANOUT: usize = 3;
-const BOOTSTRAP_RELEASE_NON_SEED_PEERS: usize = 8;
+// One bootstrap transport is enough to enter the routing table. Keeping three
+// seeds per fresh wallet multiplied every launch burst across the public seed
+// fleet and let long-lived edge nodes occupy admission slots needed by new
+// clients. Dead/unreachable seeds still fail over through the shuffled,
+// independently backed-off candidate set below.
+const INITIAL_BOOTSTRAP_FANOUT: usize = 1;
 const MAX_AUTOMATIC_PEER_CANDIDATES: usize = 512;
 const MAX_AUTOMATIC_ADDRS_PER_PEER: usize = 8;
 const AUTOMATIC_PEER_HEALTHY_AFTER: Duration = Duration::from_secs(30);
@@ -445,7 +449,7 @@ impl AutomaticPeerState {
         peer: PeerId,
         addrs: impl IntoIterator<Item = Multiaddr>,
     ) -> bool {
-        if peer == local {
+        if peer == local || self.is_bootstrap_peer(peer) {
             return false;
         }
         let mut accepted = addrs
@@ -524,6 +528,12 @@ impl AutomaticPeerState {
             .collect()
     }
 
+    fn is_bootstrap_peer(&self, peer: PeerId) -> bool {
+        self.bootstrap
+            .values()
+            .any(|candidate| candidate.peer == Some(peer))
+    }
+
     fn connected_bootstrap_peer_ids(&self) -> Vec<PeerId> {
         let bootstrap_peers = self.bootstrap_peer_ids();
         self.managed_connections
@@ -577,6 +587,13 @@ impl AutomaticPeerState {
                 (candidate.peer == Some(peer)).then(|| ManagedOutboundKind::Bootstrap(addr.clone()))
             }),
         };
+        if matches!(&managed_kind, Some(ManagedOutboundKind::Bootstrap(_))) {
+            // A seed may already exist in the successful-peer cache from an
+            // earlier release. Once its identity is learned through an
+            // explicit bootstrap dial, it must no longer compete for an
+            // ordinary neighbour slot.
+            self.peers.remove(&peer);
+        }
         if outbound {
             self.outbound_connections.insert(connection_id, peer);
             let managed_kind = managed_kind.or_else(|| {
@@ -2825,14 +2842,11 @@ fn maintain_automatic_outbound(
     let connected_bootstrap = automatic.connected_bootstrap_peer_ids();
     let bootstrap_peers = automatic.bootstrap_peer_ids();
 
-    // A replacement is connected before the old neighbour is released. This
-    // keeps the maintained set at the target throughout seed→ordinary and
-    // ordinary→seed transitions instead of creating a visible connectivity
-    // dip every time the topology changes.
-    // At the exact target, first establish an ordinary replacement below.
-    // Closing a seed here would create a visible 12→11 connectivity dip.
-    let release_seed = connected_bootstrap.len() > desired_bootstrap
-        && automatic.outbound_peer_count() > AUTOMATIC_OUTBOUND_TARGET;
+    // `desired_bootstrap` falls to zero only after a stable ordinary
+    // replacement exists. Extra bootstrap transports can therefore be closed
+    // immediately without waiting for the complete twelve-peer target; that
+    // target is filled independently from Kademlia below.
+    let release_seed = connected_bootstrap.len() > desired_bootstrap;
     let release_ordinary =
         !release_seed && automatic.outbound_peer_count() > AUTOMATIC_OUTBOUND_TARGET;
     if release_seed || release_ordinary {
@@ -2851,6 +2865,11 @@ fn maintain_automatic_outbound(
             .collect::<Vec<_>>();
         releasable.shuffle(&mut rand::thread_rng());
         if let Some((connection_id, peer)) = releasable.first().copied() {
+            if release_seed {
+                // Do not let later Kademlia maintenance immediately redial a
+                // seed that has just handed us off to ordinary neighbours.
+                swarm.behaviour_mut().kad.remove_peer(&peer);
+            }
             if swarm.close_connection(connection_id) {
                 tracing::debug!(
                     peer = %peer,
@@ -2871,7 +2890,8 @@ fn maintain_automatic_outbound(
     // Pending DNS work is not connectivity. Start a small staggered reserve
     // probe on later maintenance ticks instead of waiting for one dead seed's
     // transport timeout before trying the next hostname.
-    let bootstrap_needed = desired_bootstrap.saturating_sub(connected_bootstrap.len());
+    let bootstrap_needed = desired_bootstrap
+        .saturating_sub(connected_bootstrap.len().saturating_add(pending_bootstrap));
     if bootstrap_needed > 0 {
         let occupied = automatic
             .outbound_peer_count()
@@ -2965,10 +2985,13 @@ fn desired_bootstrap_connections(
     configured_bootstraps: usize,
 ) -> usize {
     let fanout = INITIAL_BOOTSTRAP_FANOUT.min(configured_bootstraps);
-    if !bootstrap_complete || stable_non_bootstrap < BOOTSTRAP_RELEASE_NON_SEED_PEERS {
+    if !bootstrap_complete {
         return fanout;
     }
-    fanout.saturating_sub(stable_non_bootstrap - BOOTSTRAP_RELEASE_NON_SEED_PEERS)
+    // Once sync is complete, one independently discovered connection replaces
+    // the bootstrap transport. The replacement is established first by the
+    // caller, so releasing the seed never creates a connectivity gap.
+    fanout.saturating_sub(stable_non_bootstrap)
 }
 
 fn automatic_ordinary_dial_capacity(
@@ -4041,7 +4064,12 @@ async fn handle_swarm_event(
                     .await;
                 tracing::debug!(peer = %peer_id, "peer sync protocols ready");
             }
-            if automatic_peers.is_outbound(peer_id) {
+            if automatic_peers.is_bootstrap_peer(peer_id) {
+                // Older releases recorded seeds as generic successful peers.
+                // Retire that derived cache entry once the bootstrap identity
+                // is known so restarts do not recreate permanent seed load.
+                successful_peer_cache.remove(&peer_id);
+            } else if automatic_peers.is_outbound(peer_id) {
                 for addr in routable_addrs {
                     successful_peer_cache.record_success(peer_id, addr);
                 }
@@ -6170,17 +6198,17 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_release_is_gradual_and_tiny_network_keeps_every_seed() {
-        for (ordinary, expected_seeds) in [(0, 3), (8, 3), (9, 2), (10, 1), (11, 0), (12, 0)] {
+    fn bootstrap_is_single_lane_and_released_after_ordinary_replacement() {
+        for (ordinary, expected_seeds) in [(0, 1), (1, 0), (2, 0), (12, 0)] {
             assert_eq!(
                 desired_bootstrap_connections(true, ordinary, 6),
                 expected_seeds,
                 "ordinary={ordinary}"
             );
         }
-        assert_eq!(desired_bootstrap_connections(false, 12, 3), 3);
-        assert_eq!(desired_bootstrap_connections(true, 0, 3), 3);
-        assert_eq!(desired_bootstrap_connections(true, 0, 2), 2);
+        assert_eq!(desired_bootstrap_connections(false, 12, 3), 1);
+        assert_eq!(desired_bootstrap_connections(true, 0, 3), 1);
+        assert_eq!(desired_bootstrap_connections(true, 0, 0), 0);
     }
 
     #[test]
@@ -6213,6 +6241,8 @@ mod tests {
         let first = libp2p::swarm::ConnectionId::new_unchecked(71);
         let duplicate = libp2p::swarm::ConnectionId::new_unchecked(72);
         let mut state = AutomaticPeerState::new(local);
+        state.add_peer_candidate(local, peer, ["/ip4/8.8.8.8/tcp/9400".parse().unwrap()]);
+        assert!(state.peers.contains_key(&peer));
         state.register_bootstrap(aggregate.clone());
         state.register_bootstrap(individual.clone());
         state
@@ -6224,6 +6254,9 @@ mod tests {
         );
 
         state.note_connection_established(first, peer, true);
+        assert!(!state.peers.contains_key(&peer));
+        assert!(!state.add_peer_candidate(local, peer, ["/ip4/8.8.4.4/tcp/9400".parse().unwrap()]));
+        assert!(!state.peers.contains_key(&peer));
         state.note_connection_established(duplicate, peer, true);
         state.note_identified(first, peer);
         state.note_identified(duplicate, peer);

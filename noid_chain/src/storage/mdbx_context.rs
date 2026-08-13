@@ -2141,6 +2141,7 @@ impl MdbxChainContext {
         staging: &FinalizedSnapshotStaging,
         boundary: &VerifiedSnapshotBoundary,
         header_source: &mut S,
+        allow_nonfinal_rebase: bool,
     ) -> Result<(), MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
@@ -2229,6 +2230,7 @@ impl MdbxChainContext {
             &decoded_recent,
             boundary,
             header_source,
+            allow_nonfinal_rebase,
         )?;
         debug_assert_eq!(snapshot_state.state.materialized_segment_ids().count(), 0);
 
@@ -2341,6 +2343,13 @@ mod tests {
     use super::*;
 
     fn test_next_bundle(context: &MdbxChainContext) -> crate::AcceptedBlockBundle {
+        test_next_bundle_for_miner(context, 0x44)
+    }
+
+    fn test_next_bundle_for_miner(
+        context: &MdbxChainContext,
+        miner_byte: u8,
+    ) -> crate::AcceptedBlockBundle {
         let parent = *context.tip_header();
         let timestamp = parent.timestamp.saturating_add(1);
         let anchor = context.anchor_info();
@@ -2357,7 +2366,7 @@ mod tests {
             &context.state,
             &finalized_active_counts,
             Vec::new(),
-            noid_poseidon2b::primitives::Address([0x44; 32]),
+            noid_poseidon2b::primitives::Address([miner_byte; 32]),
             timestamp,
             target,
         )
@@ -2780,6 +2789,86 @@ mod tests {
         assert!(result.is_ok(), "compact-suffix reorg failed: {result:?}");
         assert_eq!(context.tip_height(), 2);
         assert_eq!(context.tip_hash(), second.block_hash());
+    }
+
+    #[test]
+    fn reorg_rebinds_surviving_compact_marker_to_the_new_branch() {
+        let producer_a_dir = tempfile::tempdir().unwrap();
+        let mut producer_a = easy_block_context(producer_a_dir.path());
+        let first = test_next_bundle(&producer_a);
+        accept_test_bundle(&mut producer_a, &first);
+        let branch_a = test_next_bundle_for_miner(&producer_a, 0x44);
+
+        let producer_b_dir = tempfile::tempdir().unwrap();
+        let mut producer_b = easy_block_context(producer_b_dir.path());
+        accept_test_bundle(&mut producer_b, &first);
+        let branch_b = test_next_bundle_for_miner(&producer_b, 0x55);
+        assert_ne!(branch_a.block_hash(), branch_b.block_hash());
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = easy_block_context(directory.path());
+        let branch_a_block = crate::Block::from_bytes(branch_a.block_bytes()).unwrap();
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+        let mut authority = context
+            .verify_recursive_suffix(
+                branch_a_block.header,
+                genesis,
+                branch_a.history_step_terminal_bytes().to_vec(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        for bundle in [&first, &branch_a] {
+            let block = crate::Block::from_bytes(bundle.block_bytes()).unwrap();
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    bundle.block_bytes(),
+                    block.header.timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+        }
+
+        let apply =
+            |context: &mut MdbxChainContext, bundle: &crate::AcceptedBlockBundle, local_time| {
+                context.apply_next_block(
+                    bundle,
+                    local_time,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                    |_| Ok(()),
+                )?;
+                Ok(())
+            };
+
+        let branch_b_block = crate::Block::from_bytes(branch_b.block_bytes()).unwrap();
+        context
+            .apply_reorg_mdbx_with_applier(
+                1,
+                std::slice::from_ref(&branch_b),
+                branch_b_block.header.timestamp,
+                apply,
+            )
+            .unwrap();
+        assert_eq!(context.tip_hash(), branch_b.block_hash());
+
+        // The first reorg removed branch A's authority terminal. A second
+        // reorg from the same compact marker must use the marker rebound to
+        // branch B, not fail with "parent authority is missing".
+        context
+            .apply_reorg_mdbx_with_applier(
+                1,
+                std::slice::from_ref(&branch_a),
+                branch_a_block.header.timestamp,
+                apply,
+            )
+            .unwrap();
+        assert_eq!(context.tip_hash(), branch_a.block_hash());
     }
 
     #[test]

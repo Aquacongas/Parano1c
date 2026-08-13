@@ -78,7 +78,7 @@ pub fn preserves_finalized_prefix(
 /// Callers must also enforce `preserves_finalized_prefix`; this helper only
 /// answers whether the depth is inside the configured consensus finality window.
 pub fn reorg_allowed(n_confirmations_to_undo: u64) -> bool {
-    n_confirmations_to_undo < CONSENSUS_FINALITY_DEPTH
+    n_confirmations_to_undo <= CONSENSUS_FINALITY_DEPTH
 }
 
 #[cfg(test)]
@@ -115,7 +115,8 @@ mod tests {
     fn reorg_within_finality_allowed() {
         assert!(reorg_allowed(0));
         assert!(reorg_allowed(17));
-        assert!(!reorg_allowed(18)); // CONSENSUS_FINALITY_DEPTH = 18
+        assert!(reorg_allowed(18)); // preserve the finalized ancestor, replace 18 descendants
+        assert!(!reorg_allowed(19));
         assert!(!reorg_allowed(100));
     }
 

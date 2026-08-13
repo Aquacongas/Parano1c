@@ -21,7 +21,9 @@ use noid_tx::unpack_amount_creation_id;
 
 use crate::block_header::BlockHeader;
 use crate::consensus::da_prune::BlockUndoLog;
-use crate::consensus::params::{RECENT_BLOCK_RETENTION_DEPTH, UNDO_RETENTION_DEPTH};
+use crate::consensus::params::{
+    CONSENSUS_FINALITY_DEPTH, RETAINED_BLOCK_SERVING_DEPTH, UNDO_RETENTION_DEPTH,
+};
 use crate::exact_state_hash::slot_leaf_hash;
 use crate::fri_state::SlotValue;
 use crate::header_anchor::{
@@ -789,7 +791,7 @@ fn prune_retained_payloads_bounded(
     txn: &Transaction<'_, RW, NoWriteMap>,
     current_height: u64,
 ) -> Result<(), StoreError> {
-    if current_height <= RECENT_BLOCK_RETENTION_DEPTH {
+    if current_height <= RETAINED_BLOCK_SERVING_DEPTH {
         return Ok(());
     }
 
@@ -823,7 +825,7 @@ fn prune_retained_payloads_bounded(
         ));
     }
 
-    let cutoff = (current_height - RECENT_BLOCK_RETENTION_DEPTH).min(consensus.finalized.height);
+    let cutoff = (current_height - RETAINED_BLOCK_SERVING_DEPTH).min(consensus.finalized.height);
     let watermark = retained_payload_prune_watermark_in_rw_txn(txn)?;
     if watermark.is_some_and(|height| height > current_height) {
         return Err(StoreError::Decode(
@@ -846,7 +848,7 @@ fn prune_retained_payloads_bounded(
     let mut last_processed = None;
     // Fully retire heights below F. The immediately preceding F may already
     // contain only its terminal: at tip T we deliberately retain bundles
-    // F+1..=T but terminals F..=T, where F=T-18.
+    // F+1..=T but terminals F..=T, where F is the local serving boundary.
     while height < cutoff && processed_heights < RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT {
         let key = u64_key(height);
         let header_raw: Option<Cow<'_, [u8]>> = txn.get(&headers, &key)?;
@@ -1833,6 +1835,7 @@ impl MdbxStore {
         canonical_recent_headers: &[BlockHeader],
         boundary: &crate::storage::VerifiedSnapshotBoundary,
         header_source: &mut S,
+        allow_nonfinal_rebase: bool,
     ) -> Result<ChainState, StoreError> {
         let metadata = staging.metadata();
         let tip_header = *metadata.header();
@@ -1994,6 +1997,8 @@ impl MdbxStore {
             .checked_add(1)
             .ok_or(StoreError::Decode("snapshot header height overflow"))?;
         let mut matched_current_tip = current_tip_height == base_record.header.height;
+        let mut replacing_nonfinal_suffix = false;
+        let mut last_matching_height = base_record.header.height;
         while let Some(record) = header_source
             .next_record()
             .map_err(StoreError::SnapshotHeaders)?
@@ -2022,35 +2027,108 @@ impl MdbxStore {
             )?;
 
             let height_key = u64_key(record.header.height);
-            if record.header.height <= current_tip_height {
+            if record.header.height <= current_tip_height && !replacing_nonfinal_suffix {
                 let stored_header_raw: Option<Vec<u8>> = txn.get(&header_tbl, &height_key)?;
                 let stored_height_raw: Option<Vec<u8>> =
                     txn.get(&hash_to_height_tbl, record.hash.as_slice())?;
                 let stored_work_raw: Option<Vec<u8>> = txn.get(&work_tbl, &height_key)?;
                 let stored_anchor_raw: Option<Vec<u8>> = txn.get(&anchor_tbl, &height_key)?;
-                if stored_header_raw.as_deref().and_then(decode_header) != Some(record.header)
-                    || stored_height_raw.as_deref().and_then(u64_from_key)
-                        != Some(record.header.height)
-                    || stored_work_raw.as_deref().and_then(decode_chain_work)
-                        != Some(record.cumulative_chainwork)
-                    || stored_anchor_raw
+                let matches_canonical = stored_header_raw.as_deref().and_then(decode_header)
+                    == Some(record.header)
+                    && stored_height_raw.as_deref().and_then(u64_from_key)
+                        == Some(record.header.height)
+                    && stored_work_raw.as_deref().and_then(decode_chain_work)
+                        == Some(record.cumulative_chainwork)
+                    && stored_anchor_raw
                         .as_deref()
                         .and_then(decode_header_chain_anchor)
-                        != Some(anchor.clone())
-                {
-                    return Err(StoreError::Decode(
-                        "accepted chain diverged from staged snapshot prefix",
-                    ));
-                }
-                if record.header.height == current_tip_height {
-                    if record.hash != current_tip_hash
-                        || record.cumulative_chainwork != current_meta.cumulative_chainwork
+                        == Some(anchor.clone());
+                if matches_canonical {
+                    last_matching_height = record.header.height;
+                    if record.header.height == current_tip_height {
+                        if record.hash != current_tip_hash
+                            || record.cumulative_chainwork != current_meta.cumulative_chainwork
+                        {
+                            return Err(StoreError::Decode(
+                                "accepted tip hash diverged from staged snapshot prefix",
+                            ));
+                        }
+                        matched_current_tip = true;
+                    }
+                } else {
+                    let ancestor_height = record.header.height.saturating_sub(1);
+                    let reorg_depth = current_tip_height.saturating_sub(ancestor_height);
+                    let candidate_wins = matches!(
+                        crate::consensus::choose_chain_by_work(
+                            &target_record.cumulative_chainwork,
+                            &target_record.hash,
+                            &current_meta.cumulative_chainwork,
+                            &current_tip_hash,
+                        ),
+                        crate::consensus::fork_choice::ChainChoice::A
+                    );
+                    if !allow_nonfinal_rebase
+                        || ancestor_height != last_matching_height
+                        || ancestor_height < current_meta.finalized.height
+                        || reorg_depth > CONSENSUS_FINALITY_DEPTH
+                        || !candidate_wins
                     {
                         return Err(StoreError::Decode(
-                            "accepted tip hash diverged from staged snapshot prefix",
+                            "staged snapshot cannot replace the accepted finalized suffix",
                         ));
                     }
+
+                    // Replace only the losing non-final header suffix.  The
+                    // state, indexes, undo data and retained payload tables are
+                    // replaced later in this same transaction. Any error rolls
+                    // the complete operation back to the old branch.
+                    // The authorized replacement is bounded by finality, so
+                    // delete the exact numeric suffix directly. A cursor from
+                    // the first archived header would turn this rare recovery
+                    // into O(chain age) work despite replacing at most 18 rows.
+                    let mut old_headers = Vec::with_capacity(reorg_depth as usize);
+                    for height in ancestor_height.saturating_add(1)..=current_tip_height {
+                        let raw: Option<Vec<u8>> = txn.get(&header_tbl, &u64_key(height))?;
+                        let header =
+                            raw.as_deref()
+                                .and_then(decode_header)
+                                .ok_or(StoreError::Decode(
+                                    "invalid canonical header during snapshot rebase",
+                                ))?;
+                        old_headers.push((height, crate::hash_block_header(&header)));
+                    }
+                    for (height, hash) in old_headers {
+                        txn.del(&header_tbl, u64_key(height), None)?;
+                        let _ = txn.del(&hash_to_height_tbl, hash.as_slice(), None);
+                        let _ = txn.del(&work_tbl, u64_key(height), None);
+                        let _ = txn.del(&anchor_tbl, u64_key(height), None);
+                    }
+                    replacing_nonfinal_suffix = true;
                     matched_current_tip = true;
+                    txn.put(
+                        &header_tbl,
+                        height_key,
+                        encode_header(&record.header),
+                        WriteFlags::NO_OVERWRITE,
+                    )?;
+                    txn.put(
+                        &hash_to_height_tbl,
+                        record.hash.as_slice(),
+                        height_key,
+                        WriteFlags::NO_OVERWRITE,
+                    )?;
+                    txn.put(
+                        &work_tbl,
+                        height_key,
+                        encode_chain_work(&record.cumulative_chainwork),
+                        WriteFlags::NO_OVERWRITE,
+                    )?;
+                    txn.put(
+                        &anchor_tbl,
+                        height_key,
+                        encode_header_chain_anchor(&anchor),
+                        WriteFlags::NO_OVERWRITE,
+                    )?;
                 }
             } else {
                 txn.put(
@@ -3038,15 +3116,80 @@ impl MdbxStore {
         }
 
         let txn = self.db.begin_rw_txn()?;
-
-        // Validate the first replacement's exact old-branch parent while the
-        // complete terminal which may authorize a compact marker is still in
-        // the transaction view. The suffix above the ancestor is deleted
-        // atomically below; after that deletion only later replacement parents
-        // can be validated from rows installed by this transaction.
-        if let Some(first) = replacement.first() {
-            validate_history_step_parent_boundary_in_rw_txn(&txn, &first.header)?;
+        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        let old_tip_raw: Option<[u8; 40]> = txn.get(&tip_tbl, KEY_TIP)?;
+        let (old_tip_height, _) = old_tip_raw
+            .as_ref()
+            .and_then(|raw| decode_chain_tip(raw))
+            .ok_or(StoreError::Decode("canonical tip is missing during reorg"))?;
+        if old_tip_height < ancestor_height
+            || old_tip_height.saturating_sub(ancestor_height) > CONSENSUS_FINALITY_DEPTH
+        {
+            return Err(StoreError::Decode(
+                "staged reorg lies outside the canonical non-final suffix",
+            ));
         }
+
+        // A compact-sync parent may carry a fixed-size local marker whose
+        // authority terminal lives later in the old canonical suffix. A
+        // successful reorg can remove that terminal while retaining the
+        // marker at or below the common ancestor. Collect every such marker in
+        // the bounded reorg window now, then retarget it to the fully verified
+        // terminal at the replacement tip after that terminal is installed.
+        // This also repairs markers left pointing at an authority removed by
+        // an earlier v1.0.0 reorg.
+        let marker_rebindings = if replacement.is_empty() {
+            Vec::new()
+        } else {
+            let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
+            let header_tbl = txn.open_table(Some(T_HEADERS))?;
+            let first_height = ancestor_height.saturating_sub(CONSENSUS_FINALITY_DEPTH);
+            let mut rebindings = Vec::new();
+            for height in first_height..=ancestor_height {
+                let key = u64_key(height);
+                let terminal: Option<Vec<u8>> = txn.get(&terminal_tbl, &key)?;
+                let Some(terminal) = terminal else {
+                    continue;
+                };
+                if terminal.len() != RECURSIVE_SUFFIX_MARKER_BYTES {
+                    continue;
+                }
+                let header_raw: Option<Vec<u8>> = txn.get(&header_tbl, &key)?;
+                let header =
+                    header_raw
+                        .as_deref()
+                        .and_then(decode_header)
+                        .ok_or(StoreError::Decode(
+                            "recursive suffix marker header is missing during reorg",
+                        ))?;
+                let semantic_id = crate::block_header::semantic_header_id(&header);
+                let (_, _, class_slot) = history_step_terminal_metadata(&terminal).ok_or(
+                    StoreError::Decode("recursive suffix marker metadata is malformed"),
+                )?;
+                if recursive_suffix_marker_authority(
+                    &terminal,
+                    height,
+                    semantic_id,
+                    Some(class_slot),
+                )
+                .is_none()
+                {
+                    return Err(StoreError::Decode(
+                        "recursive suffix marker is malformed during reorg",
+                    ));
+                }
+                rebindings.push((
+                    height,
+                    encode_recursive_suffix_marker(
+                        &header,
+                        class_slot,
+                        final_header.height,
+                        *final_hash,
+                    )?,
+                ));
+            }
+            rebindings
+        };
 
         if replacement.is_empty() && final_header.height != 0 {
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
@@ -3140,47 +3283,29 @@ impl MdbxStore {
         // same transaction, so shorter replacement branches cannot expose a
         // stale suffix after restart.
         let hdr_tbl = txn.open_table(Some(T_HEADERS))?;
-        let old_headers: Vec<(u64, [u8; 32])> = {
-            let mut cursor = txn.cursor(&hdr_tbl)?;
-            let mut old = Vec::new();
-            let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
-            while let Some((key, raw)) = item {
-                if let Some(height) = u64_from_key(&key) {
-                    if height > ancestor_height {
-                        let header = decode_header(&raw)
-                            .ok_or(StoreError::Decode("invalid header during reorg"))?;
-                        old.push((height, crate::hash_block_header(&header)));
-                    }
-                }
-                item = cursor.next()?;
-            }
-            old
-        };
+        let mut old_headers = Vec::with_capacity(
+            usize::try_from(old_tip_height.saturating_sub(ancestor_height))
+                .expect("finality-bounded reorg depth fits usize"),
+        );
+        for height in ancestor_height.saturating_add(1)..=old_tip_height {
+            let raw: Option<Vec<u8>> = txn.get(&hdr_tbl, &u64_key(height))?;
+            let header = raw
+                .as_deref()
+                .and_then(decode_header)
+                .ok_or(StoreError::Decode("invalid header during reorg"))?;
+            old_headers.push((height, crate::hash_block_header(&header)));
+        }
         let h2h_tbl = txn.open_table(Some(T_HASH_TO_HEIGHT))?;
         for (height, hash) in &old_headers {
             txn.del(&hdr_tbl, u64_key(*height), None)?;
             let _ = txn.del(&h2h_tbl, hash.as_slice(), None);
         }
 
-        macro_rules! truncate_height_table_above {
+        macro_rules! truncate_reorg_suffix {
             ($name:expr) => {{
                 let table = txn.open_table(Some($name))?;
-                let keys: Vec<u64> = {
-                    let mut cursor = txn.cursor(&table)?;
-                    let mut keys = Vec::new();
-                    let mut item: Option<(Vec<u8>, Vec<u8>)> = cursor.first()?;
-                    while let Some((key, _)) = item {
-                        if let Some(height) = u64_from_key(&key) {
-                            if height > ancestor_height {
-                                keys.push(height);
-                            }
-                        }
-                        item = cursor.next()?;
-                    }
-                    keys
-                };
-                for height in keys {
-                    txn.del(&table, u64_key(height), None)?;
+                for height in ancestor_height.saturating_add(1)..=old_tip_height {
+                    let _ = txn.del(&table, u64_key(height), None)?;
                 }
             }};
         }
@@ -3191,7 +3316,7 @@ impl MdbxStore {
             T_RECENT_BLOCKS,
             T_HISTORY_STEP_TERMINALS,
         ] {
-            truncate_height_table_above!(table_name);
+            truncate_reorg_suffix!(table_name);
         }
         rewind_retained_payload_prune_watermark(&txn, ancestor_height)?;
 
@@ -3305,7 +3430,19 @@ impl MdbxStore {
             }
         }
 
-        let tip_tbl = txn.open_table(Some(T_CHAIN_TIP))?;
+        // The replacement tip's complete terminal is now present in this
+        // transaction. Rebind surviving compact markers to that canonical
+        // authority before checking the first replacement's parent. The
+        // operation is atomic with deleting the old suffix and installing the
+        // new one, so a crash exposes either the old valid authority graph or
+        // the new valid authority graph.
+        for (height, marker) in marker_rebindings {
+            txn.put(&terminal_tbl, u64_key(height), marker, WriteFlags::empty())?;
+        }
+        if let Some(first) = replacement.first() {
+            validate_history_step_parent_boundary_in_rw_txn(&txn, &first.header)?;
+        }
+
         txn.put(
             &tip_tbl,
             KEY_TIP,
@@ -4099,12 +4236,12 @@ mod tests {
     }
 
     #[test]
-    fn retention_keeps_eighteen_bodies_and_nineteen_terminals() {
+    fn retention_keeps_serving_reserve_bodies_and_boundary_terminal() {
         let directory = tempfile::tempdir().unwrap();
         let store = MdbxStore::open(directory.path()).unwrap();
         let mut parent = crate::consensus::genesis::genesis_header();
         put_test_header_row(&store, &parent);
-        let tip = RECENT_BLOCK_RETENTION_DEPTH + 2;
+        let tip = RETAINED_BLOCK_SERVING_DEPTH + 2;
         let mut tip_hash = [0; 32];
         for height in 1..=tip {
             let candidate = block(&parent, height, height as u8);
@@ -4148,7 +4285,7 @@ mod tests {
         prune_retained_payloads_bounded(&txn, tip).unwrap();
         txn.commit().unwrap();
 
-        let boundary = tip - RECENT_BLOCK_RETENTION_DEPTH;
+        let boundary = tip - RETAINED_BLOCK_SERVING_DEPTH;
         let boundary_hash = crate::hash_block_header(&store.get_header(boundary).unwrap().unwrap());
         assert_eq!(store.get_recent_block(boundary).unwrap(), None);
         assert!(store
@@ -4200,7 +4337,14 @@ mod tests {
         let recent = source.recent.clone();
 
         store
-            .install_finalized_snapshot_staging(&staging, &meta, &recent, &boundary, &mut source)
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                false,
+            )
             .unwrap();
 
         assert_eq!(store.get_chain_tip().unwrap(), Some((2, target.hash)));
@@ -4241,7 +4385,14 @@ mod tests {
         let recent = source.recent.clone();
 
         store
-            .install_finalized_snapshot_staging(&staging, &meta, &recent, &boundary, &mut source)
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                false,
+            )
             .unwrap();
 
         assert_eq!(store.get_chain_tip().unwrap(), Some((2, target.hash)));
@@ -4274,7 +4425,14 @@ mod tests {
         let recent = source.recent.clone();
 
         assert!(store
-            .install_finalized_snapshot_staging(&staging, &meta, &recent, &boundary, &mut source,)
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                false,
+            )
             .is_err());
 
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, divergent_hash)));
@@ -4284,6 +4442,183 @@ mod tests {
         assert!(store
             .has_history_step_terminal_at(1, divergent_hash)
             .unwrap());
+    }
+
+    #[test]
+    fn snapshot_install_replaces_only_an_authorized_nonfinal_suffix() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let (mut source, _) = snapshot_header_source(genesis, &genesis_meta, 2);
+        let mut divergent = block(&genesis, 1, 77);
+        divergent.header.tx_root[0] ^= 0x80;
+        commit_accepted_test_block(&store, &divergent, &genesis_meta);
+        let divergent_hash = crate::hash_block_header(&divergent.header);
+        let meta = target_meta(&source);
+        let target = source.target_record();
+        let staging = finalized_empty_snapshot(staging_root.path(), target.header);
+        let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            target.header,
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
+        );
+        let recent = source.recent.clone();
+
+        store
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(store.get_chain_tip().unwrap(), Some((2, target.hash)));
+        assert_eq!(store.get_header(1).unwrap(), Some(recent[1]));
+        assert_eq!(store.get_header_by_hash(&divergent_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_rebase_refuses_a_boundary_that_does_not_yet_win_fork_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let (mut source, _) = snapshot_header_source(genesis, &genesis_meta, 2);
+
+        // The advertised branch may become the winner only in its later
+        // compact bridge. Replacing durable State at an earlier, still-losing
+        // snapshot boundary would expose a lower-work chain after a crash.
+        // Keep the old chain until the authenticated boundary itself wins.
+        let mut stronger_local = block(&genesis, 1, 0x71);
+        stronger_local.header.difficulty_target = [0u8; 32];
+        stronger_local.header.difficulty_target[0] = 1;
+        let stronger_meta = commit_accepted_test_block(&store, &stronger_local, &genesis_meta);
+        let stronger_hash = stronger_meta.tip_hash;
+
+        let meta = target_meta(&source);
+        let target = source.target_record();
+        let staging = finalized_empty_snapshot(staging_root.path(), target.header);
+        let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            target.header,
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
+        );
+        let recent = source.recent.clone();
+
+        assert!(store
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                true,
+            )
+            .is_err());
+        assert_eq!(store.get_chain_tip().unwrap(), Some((1, stronger_hash)));
+        assert_eq!(store.get_consensus_meta().unwrap(), Some(stronger_meta));
+    }
+
+    #[test]
+    fn snapshot_rebase_accepts_the_exact_maximum_nonfinal_depth() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let target_height = CONSENSUS_FINALITY_DEPTH + 1;
+        let (mut source, _) = snapshot_header_source(genesis, &genesis_meta, target_height);
+
+        let mut divergent_parent = genesis;
+        let mut divergent_meta = genesis_meta;
+        for height in 1..=CONSENSUS_FINALITY_DEPTH {
+            let divergent = block(&divergent_parent, height, (height as u8) ^ 0xA5);
+            divergent_meta = commit_accepted_test_block(&store, &divergent, &divergent_meta);
+            divergent_parent = divergent.header;
+        }
+        let old_tip_hash = divergent_meta.tip_hash;
+        let meta = target_meta(&source);
+        let target = source.target_record();
+        let staging = finalized_empty_snapshot(staging_root.path(), target.header);
+        let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            target.header,
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
+        );
+        let recent = source.recent.clone();
+
+        store
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_chain_tip().unwrap(),
+            Some((target_height, target.hash))
+        );
+        assert_eq!(store.get_header_by_hash(&old_tip_hash).unwrap(), None);
+    }
+
+    #[test]
+    fn snapshot_rebase_cannot_cross_the_local_finalized_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let (mut source, _) = snapshot_header_source(genesis, &genesis_meta, 2);
+        let mut divergent = block(&genesis, 1, 91);
+        divergent.header.tx_root[0] ^= 0x40;
+        let mut divergent_meta = commit_accepted_test_block(&store, &divergent, &genesis_meta);
+        let divergent_hash = crate::hash_block_header(&divergent.header);
+        divergent_meta.finalized = FinalizedCheckpoint {
+            height: 1,
+            hash: divergent_hash,
+        };
+        store.put_consensus_meta(&divergent_meta).unwrap();
+
+        let meta = target_meta(&source);
+        let target = source.target_record();
+        let staging = finalized_empty_snapshot(staging_root.path(), target.header);
+        let boundary = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            target.header,
+            terminal(
+                target.header.height,
+                crate::block_header::semantic_header_id(&target.header),
+                0,
+            ),
+        );
+        let recent = source.recent.clone();
+
+        assert!(store
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                true,
+            )
+            .is_err());
+        assert_eq!(store.get_chain_tip().unwrap(), Some((1, divergent_hash)));
+        assert_eq!(store.get_consensus_meta().unwrap(), Some(divergent_meta));
     }
 
     #[test]
@@ -4308,7 +4643,14 @@ mod tests {
         let recent = source.recent.clone();
 
         assert!(store
-            .install_finalized_snapshot_staging(&staging, &meta, &recent, &boundary, &mut source,)
+            .install_finalized_snapshot_staging(
+                &staging,
+                &meta,
+                &recent,
+                &boundary,
+                &mut source,
+                false,
+            )
             .is_err());
 
         assert_eq!(

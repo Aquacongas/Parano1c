@@ -138,12 +138,27 @@ pub const CONSENSUS_FINALITY_DEPTH: u64 = 18;
 /// finalized generation without rescanning the complete live state.
 pub const UNDO_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH * 2;
 
-/// Recent full-block retention depth for peer serving and normal catch-up.
+/// Authenticated recent-suffix depth for normal catch-up and reorganization.
 ///
-/// Nodes keep accepted block bodies for this recent window, plus the preceding
-/// HistoryStep terminal. Undo metadata has its own longer operational window;
-/// headers remain permanent.
+/// This remains equal to consensus finality. Local nodes may retain additional
+/// complete bundles for serving through `RETAINED_BLOCK_SERVING_DEPTH`, but a
+/// cold snapshot still authenticates and applies only this suffix. Undo
+/// metadata has its own operational window; headers remain permanent.
 pub const RECENT_BLOCK_RETENTION_DEPTH: u64 = CONSENSUS_FINALITY_DEPTH;
+
+/// Local full-block serving window for bounded fork recovery.
+///
+/// This is deliberately not a finality or snapshot parameter.  Nodes still
+/// authenticate and apply the same 18-block compact suffix, while retaining a
+/// bounded set of older complete bundles for peers recovering a non-final
+/// fork.  In the worst automatically recoverable case the receiver may need
+/// `CONSENSUS_FINALITY_DEPTH` replacement blocks below its tip plus
+/// `RECENT_BLOCK_RETENTION_DEPTH` blocks above it before the remote snapshot
+/// boundary is itself ahead.  Six further blocks cover movement while the
+/// oldest bundles are requested.  None of these additional bundles are part
+/// of cold snapshot sync.
+pub const RETAINED_BLOCK_SERVING_DEPTH: u64 =
+    CONSENSUS_FINALITY_DEPTH + RECENT_BLOCK_RETENTION_DEPTH + 6;
 
 /// Number of hard-finalized block headers used for the state-expansion trigger.
 ///
