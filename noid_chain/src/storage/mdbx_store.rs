@@ -469,6 +469,81 @@ fn recursive_suffix_marker_authority(
     (authority_height >= height).then_some((authority_height, authority_hash))
 }
 
+fn recursive_suffix_marker_has_durable_authority(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    marker_height: u64,
+    authority_tip_height: u64,
+    authority_tip_hash: [u8; 32],
+) -> Result<bool, StoreError> {
+    if authority_tip_height <= marker_height {
+        return Ok(false);
+    }
+
+    // While a compact suffix is only partially installed, its verified final
+    // terminal is represented by one crash-recovery authority record. A later
+    // completed suffix may overwrite that transient record, so it cannot be
+    // the durable authority for completed history.
+    let retention = txn.open_table(Some(T_RETENTION_META))?;
+    let authority_raw: Option<Vec<u8>> = txn.get(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY)?;
+    if let Some(authority_raw) = authority_raw {
+        let authority = decode_verified_suffix_authority(&authority_raw).ok_or(
+            StoreError::Decode("verified recursive suffix authority is malformed"),
+        )?;
+        if authority.tip_height == authority_tip_height
+            && authority.tip_hash == authority_tip_hash
+            && marker_height > authority.boundary_height
+            && marker_height < authority.tip_height
+        {
+            return Ok(true);
+        }
+    }
+
+    // Once the suffix is complete, its full terminal at the exact canonical
+    // tip is the permanent authority for every intermediate local marker. It
+    // already carries the recursively verified ancestry, remains available
+    // throughout the reorg window, and avoids retaining an overwrite-prone
+    // singleton side record for each completed suffix.
+    let headers = txn.open_table(Some(T_HEADERS))?;
+    let authority_header_raw: Option<Vec<u8>> =
+        txn.get(&headers, &u64_key(authority_tip_height))?;
+    let Some(authority_header) = authority_header_raw.as_deref().and_then(decode_header) else {
+        return Ok(false);
+    };
+    if authority_header.height != authority_tip_height
+        || crate::block_header::block_id(&authority_header) != authority_tip_hash
+    {
+        return Ok(false);
+    }
+
+    let terminals = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
+    let Some(ObjectLength(length)) = txn.get(&terminals, &u64_key(authority_tip_height))? else {
+        return Ok(false);
+    };
+    if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        return Err(StoreError::Decode(
+            "recursive suffix authority terminal exceeds hard bounds",
+        ));
+    }
+    let authority_terminal: Vec<u8> =
+        txn.get(&terminals, &u64_key(authority_tip_height))?
+            .ok_or(StoreError::Decode(
+                "recursive suffix authority terminal disappeared",
+            ))?;
+    let authority_semantic = crate::block_header::semantic_header_id(&authority_header);
+    Ok(recursive_suffix_marker_authority(
+        &authority_terminal,
+        authority_tip_height,
+        authority_semantic,
+        None,
+    )
+    .is_none()
+        && history_step_terminal_prefix_matches(
+            &authority_terminal,
+            authority_tip_height,
+            authority_semantic,
+        ))
+}
+
 fn validate_history_step_parent_boundary_in_rw_txn(
     txn: &Transaction<'_, RW, NoWriteMap>,
     header: &BlockHeader,
@@ -520,22 +595,14 @@ fn validate_history_step_parent_boundary_in_rw_txn(
             None,
         );
         if let Some((authority_tip_height, authority_tip_hash)) = recursive_authority {
-            let retention = txn.open_table(Some(T_RETENTION_META))?;
-            let authority_raw: Option<Vec<u8>> =
-                txn.get(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY)?;
-            let authority = authority_raw
-                .as_deref()
-                .and_then(decode_verified_suffix_authority)
-                .ok_or(StoreError::Decode(
-                    "recursive suffix parent authority is missing",
-                ))?;
-            if authority.tip_height != authority_tip_height
-                || authority.tip_hash != authority_tip_hash
-                || parent_height <= authority.boundary_height
-                || parent_height >= authority.tip_height
-            {
+            if !recursive_suffix_marker_has_durable_authority(
+                txn,
+                parent_height,
+                authority_tip_height,
+                authority_tip_hash,
+            )? {
                 return Err(StoreError::Decode(
-                    "recursive suffix parent authority does not match its marker",
+                    "recursive suffix parent authority is missing",
                 ));
             }
         } else if !history_step_terminal_prefix_matches(
@@ -2972,6 +3039,15 @@ impl MdbxStore {
 
         let txn = self.db.begin_rw_txn()?;
 
+        // Validate the first replacement's exact old-branch parent while the
+        // complete terminal which may authorize a compact marker is still in
+        // the transaction view. The suffix above the ancestor is deleted
+        // atomically below; after that deletion only later replacement parents
+        // can be validated from rows installed by this transaction.
+        if let Some(first) = replacement.first() {
+            validate_history_step_parent_boundary_in_rw_txn(&txn, &first.header)?;
+        }
+
         if replacement.is_empty() && final_header.height != 0 {
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
             let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
@@ -3136,10 +3212,12 @@ impl MdbxStore {
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
         let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
-        for (bundle, staged) in replacement_bundles.iter().zip(replacement) {
+        for (index, (bundle, staged)) in replacement_bundles.iter().zip(replacement).enumerate() {
             let block = crate::Block::from_bytes(bundle.block_bytes())
                 .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
-            validate_history_step_parent_boundary_in_rw_txn(&txn, &staged.header)?;
+            if index != 0 {
+                validate_history_step_parent_boundary_in_rw_txn(&txn, &staged.header)?;
+            }
             let height_key = u64_key(staged.header.height);
             txn.put(
                 &hdr_tbl,
@@ -3253,7 +3331,6 @@ impl MdbxStore {
             ),
             WriteFlags::empty(),
         )?;
-
         // Rebuild the owner accelerator from the exact post-reorg segment
         // table. Clear is an MDBX operation (no all-key Vec), and records are
         // written as each single decoded segment is visited (no owner map).

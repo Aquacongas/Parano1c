@@ -134,6 +134,14 @@ const TX_DIRECT_SMALL_NETWORK_MAX_PEERS: usize = 8;
 const TX_DIRECT_LARGE_NETWORK_FANOUT: usize = 4;
 const TX_RELAY_RATE_WINDOW: Duration = Duration::from_secs(10);
 const TX_RELAY_RATE_MAX: u32 = 50;
+/// Raw GossipSub payloads accepted for propagation in one fixed window.
+/// GossipSub retains accepted messages for several heartbeats. Bounding bytes
+/// globally, in addition to the per-peer event count, prevents a Sybil set of
+/// individually compliant peers from filling that cache with proof-sized
+/// competing blocks. 64 MiB per ten seconds is orders of magnitude above the
+/// honest 15-second block and bounded transaction workload.
+const GOSSIP_ACCEPT_WINDOW: Duration = Duration::from_secs(10);
+const GOSSIP_ACCEPT_BYTES_PER_WINDOW: usize = 64 * 1024 * 1024;
 const AUTOMATIC_OUTBOUND_TARGET: usize = 12;
 // The shipped topology contains six individual DNS seeds plus one aggregate
 // dnsaddr source. Probe all of them when necessary, but leave room in the
@@ -1122,6 +1130,13 @@ fn snapshot_suffix_is_retained(tip_height: u64, terminal_height: u64) -> bool {
             <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
 }
 
+fn complete_block_gossip_is_relayable(local_tip: u64, block_height: u64) -> bool {
+    let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+    let oldest = local_tip.saturating_sub(retention);
+    let newest = local_tip.saturating_add(retention);
+    (oldest..=newest).contains(&block_height)
+}
+
 /// Choose the finalized snapshot boundary only when its exact HistoryStep
 /// terminal is durably available.
 fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
@@ -1161,17 +1176,33 @@ fn snapshot_bridge_has_live_headroom(live_tip: u64, bridge_tip: u64) -> bool {
     bridge_tip <= live_tip && live_tip.saturating_sub(bridge_tip) <= SNAPSHOT_BRIDGE_MAX_LIVE_GAP
 }
 
-/// Select the freshest complete immutable generation that still has ample
-/// live-window headroom after its captured bridge. The state boundary itself
-/// may be older than the node's newest finalized checkpoint: its terminal and
-/// complete initial suffix are generation-owned and therefore cannot race
-/// pruning.
+fn snapshot_export_selection_rank(
+    key: SnapshotExportKey,
+    bridge_tip_height: u64,
+    leased_keys: &std::collections::HashSet<SnapshotExportKey>,
+) -> (bool, u64, u64) {
+    (leased_keys.contains(&key), key.0, bridge_tip_height)
+}
+
+/// Select one complete immutable generation with ample live-window headroom.
+/// New peers join the freshest still-usable leased generation instead of
+/// splitting an active bootstrap cohort every time the 30-second exporter
+/// publishes a newer boundary. If no leased generation remains usable, select
+/// the freshest generation and let lease admission retire the oldest cohort.
+/// The state boundary itself may be older than the node's newest finalized
+/// checkpoint: its terminal and complete initial suffix are generation-owned
+/// and therefore cannot race pruning.
 fn select_snapshot_export(
     store: &MdbxStore,
     exports: &std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
+    leases: &std::collections::HashMap<PeerId, SnapshotExportLease>,
     requester_height: u64,
 ) -> Option<SnapshotExport> {
     let meta = store.get_consensus_meta().ok().flatten()?;
+    let leased_keys = leases
+        .values()
+        .map(|lease| lease.key)
+        .collect::<std::collections::HashSet<_>>();
     exports
         .values()
         .filter(|generation| {
@@ -1212,9 +1243,10 @@ fn select_snapshot_export(
             boundary_matches && bridge_matches && work_matches
         })
         .max_by_key(|generation| {
-            (
-                generation.manifest().target_height,
+            snapshot_export_selection_rank(
+                generation.key(),
                 generation.manifest().bridge_tip_height,
+                &leased_keys,
             )
         })
         .cloned()
@@ -1929,6 +1961,7 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut tx_gossip_rate: std::collections::HashMap<PeerId, (u32, Instant)> =
         std::collections::HashMap::new();
+    let mut gossip_accept_bytes = GossipByteWindow::new();
     let mut mempool_sync_last_request: std::collections::HashMap<PeerId, Instant> =
         std::collections::HashMap::new();
     let mut mempool_sync_retries: std::collections::HashMap<PeerId, MempoolSyncRetry> =
@@ -2053,6 +2086,7 @@ async fn run_swarm(
                     &mut snapshot_export_leases,
                     &mut block_event_rate,
                     &mut tx_gossip_rate,
+                    &mut gossip_accept_bytes,
                     &mut mempool_sync_last_request,
                     &mut mempool_sync_retries,
                     &mut snapshot_segment_rate,
@@ -2536,13 +2570,36 @@ fn lease_snapshot_export(
     key: SnapshotExportKey,
 ) -> bool {
     prune_snapshot_export_leases(leases);
-    let distinct_other_keys = leases
+    if MAX_SNAPSHOT_EXPORTS == 0 {
+        return false;
+    }
+    let mut distinct_other_keys = leases
         .iter()
         .filter(|(leased_peer, _)| **leased_peer != peer)
         .map(|(_, lease)| lease.key)
         .collect::<std::collections::HashSet<_>>();
-    if !distinct_other_keys.contains(&key) && distinct_other_keys.len() >= MAX_SNAPSHOT_EXPORTS {
-        return false;
+    while !distinct_other_keys.contains(&key) && distinct_other_keys.len() >= MAX_SNAPSHOT_EXPORTS {
+        // A connected client may keep refreshing an obsolete generation while
+        // retrying a failed suffix.  Letting that activity renew the lease
+        // forever allows two stalled clients to deny every later bootstrap
+        // request.  Retire the oldest pinned generation when a fresh exact
+        // generation needs admission.  Requests still holding an Arc finish
+        // safely; subsequent exact requests fail closed and the node FSM
+        // reacquires a current manifest.
+        let Some(oldest_key) = distinct_other_keys
+            .iter()
+            .copied()
+            .min_by_key(|(height, _)| *height)
+        else {
+            return false;
+        };
+        leases.retain(|_, lease| lease.key != oldest_key);
+        distinct_other_keys.remove(&oldest_key);
+        tracing::info!(
+            retired_snapshot_height = oldest_key.0,
+            replacement_snapshot_height = key.0,
+            "retiring obsolete snapshot lease for fresh bootstrap admission"
+        );
     }
     leases.insert(
         peer,
@@ -2602,6 +2659,57 @@ fn allow_peer_rate(
     } else {
         entry.0 += 1;
         true
+    }
+}
+
+#[derive(Debug)]
+struct GossipByteWindow {
+    bytes: usize,
+    started_at: Instant,
+}
+
+impl GossipByteWindow {
+    fn new() -> Self {
+        Self {
+            bytes: 0,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn admit(&mut self, bytes: usize, max_bytes: usize, window: Duration) -> bool {
+        let now = Instant::now();
+        if now.duration_since(self.started_at) > window {
+            self.bytes = 0;
+            self.started_at = now;
+        }
+        let Some(next) = self.bytes.checked_add(bytes) else {
+            return false;
+        };
+        if next > max_bytes {
+            return false;
+        }
+        self.bytes = next;
+        true
+    }
+}
+
+fn report_gossip_validation(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    message_id: &gossipsub::MessageId,
+    propagation_source: &PeerId,
+    acceptance: gossipsub::MessageAcceptance,
+) {
+    if let Err(error) = swarm
+        .behaviour_mut()
+        .gossipsub
+        .report_message_validation_result(message_id, propagation_source, acceptance)
+    {
+        tracing::debug!(
+            peer = %propagation_source,
+            message = %message_id,
+            %error,
+            "GossipSub validation result could not be applied"
+        );
     }
 }
 
@@ -3591,6 +3699,7 @@ async fn handle_swarm_event(
     snapshot_export_leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
     block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
     tx_gossip_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
+    gossip_accept_bytes: &mut GossipByteWindow,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     mempool_sync_retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
     snapshot_segment_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
@@ -3653,8 +3762,8 @@ async fn handle_swarm_event(
         // --- GossipSub: received broadcast ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(gossipsub::Event::Message {
             propagation_source,
+            message_id,
             message,
-            ..
         })) => {
             // Prefer the original publisher (message.source) if we have a direct
             // connection — they definitely have the full block. Fall back to
@@ -3668,21 +3777,56 @@ async fn handle_swarm_event(
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
                 match BlockGossipMsg::decode(&message.data) {
-                    Ok(message) => {
+                    Ok(decoded) => {
                         const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                         const BLOCK_RATE_MAX: u32 = 40;
                         if !allow_peer_rate(
                             block_event_rate,
-                            origin,
+                            propagation_source,
                             BLOCK_RATE_MAX,
                             BLOCK_RATE_WINDOW,
                         ) {
-                            tracing::debug!(peer = %origin, "block announcement rate limit exceeded — dropped before event channel");
+                            report_gossip_validation(
+                                swarm,
+                                &message_id,
+                                &propagation_source,
+                                gossipsub::MessageAcceptance::Ignore,
+                            );
+                            tracing::debug!(peer = %propagation_source, "block announcement rate limit exceeded — dropped before propagation");
                             return;
                         }
-                        match message {
+                        match decoded {
                             BlockGossipMsg::Complete(bundle) => {
-                                tracing::debug!(height = bundle.height(), peer = %propagation_source, "received complete block bundle via gossip");
+                                let height = bundle.height();
+                                let relayable = chain_store
+                                    .get_consensus_meta()
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|meta| {
+                                        complete_block_gossip_is_relayable(meta.tip_height, height)
+                                    });
+                                let within_budget = relayable
+                                    && gossip_accept_bytes.admit(
+                                        message.data.len(),
+                                        GOSSIP_ACCEPT_BYTES_PER_WINDOW,
+                                        GOSSIP_ACCEPT_WINDOW,
+                                    );
+                                report_gossip_validation(
+                                    swarm,
+                                    &message_id,
+                                    &propagation_source,
+                                    if within_budget {
+                                        gossipsub::MessageAcceptance::Accept
+                                    } else {
+                                        gossipsub::MessageAcceptance::Ignore
+                                    },
+                                );
+                                tracing::debug!(
+                                    height,
+                                    peer = %propagation_source,
+                                    relayed = within_budget,
+                                    "received complete block bundle via gossip"
+                                );
                                 let _ = gossip_event_tx.send(NetworkEvent::IncomingBlock {
                                     from: origin,
                                     bundle,
@@ -3690,6 +3834,26 @@ async fn handle_swarm_event(
                                 });
                             }
                             BlockGossipMsg::Header(header) => {
+                                if !gossip_accept_bytes.admit(
+                                    message.data.len(),
+                                    GOSSIP_ACCEPT_BYTES_PER_WINDOW,
+                                    GOSSIP_ACCEPT_WINDOW,
+                                ) {
+                                    report_gossip_validation(
+                                        swarm,
+                                        &message_id,
+                                        &propagation_source,
+                                        gossipsub::MessageAcceptance::Ignore,
+                                    );
+                                    tracing::debug!(peer = %propagation_source, bytes = message.data.len(), "global gossip byte budget exhausted — header dropped before propagation");
+                                    return;
+                                }
+                                report_gossip_validation(
+                                    swarm,
+                                    &message_id,
+                                    &propagation_source,
+                                    gossipsub::MessageAcceptance::Accept,
+                                );
                                 let _ = gossip_event_tx.send(NetworkEvent::BlockAnnouncement {
                                     from: origin,
                                     header,
@@ -3698,6 +3862,12 @@ async fn handle_swarm_event(
                         }
                     }
                     Err(error) => {
+                        report_gossip_validation(
+                            swarm,
+                            &message_id,
+                            &propagation_source,
+                            gossipsub::MessageAcceptance::Reject,
+                        );
                         tracing::debug!(
                             peer = %propagation_source,
                             %error,
@@ -3707,6 +3877,12 @@ async fn handle_swarm_event(
                 }
             } else if topic == topics.txs.as_str() {
                 if message.data.len() > MAX_TX_INTENT_BYTES_GLOBAL {
+                    report_gossip_validation(
+                        swarm,
+                        &message_id,
+                        &propagation_source,
+                        gossipsub::MessageAcceptance::Reject,
+                    );
                     tracing::warn!(peer = %propagation_source, len = message.data.len(), "tx gossip too large — dropped");
                 } else {
                     if !allow_peer_rate(
@@ -3715,15 +3891,48 @@ async fn handle_swarm_event(
                         TX_RELAY_RATE_MAX,
                         TX_RELAY_RATE_WINDOW,
                     ) {
-                        tracing::debug!(peer = %propagation_source, "tx gossip rate limit exceeded — dropped before event channel");
+                        report_gossip_validation(
+                            swarm,
+                            &message_id,
+                            &propagation_source,
+                            gossipsub::MessageAcceptance::Ignore,
+                        );
+                        tracing::debug!(peer = %propagation_source, "tx gossip rate limit exceeded — dropped before propagation");
                         return;
                     }
+                    if !gossip_accept_bytes.admit(
+                        message.data.len(),
+                        GOSSIP_ACCEPT_BYTES_PER_WINDOW,
+                        GOSSIP_ACCEPT_WINDOW,
+                    ) {
+                        report_gossip_validation(
+                            swarm,
+                            &message_id,
+                            &propagation_source,
+                            gossipsub::MessageAcceptance::Ignore,
+                        );
+                        tracing::debug!(peer = %propagation_source, bytes = message.data.len(), "global gossip byte budget exhausted — transaction dropped before propagation");
+                        return;
+                    }
+                    report_gossip_validation(
+                        swarm,
+                        &message_id,
+                        &propagation_source,
+                        gossipsub::MessageAcceptance::Accept,
+                    );
                     let _ = gossip_event_tx.send(NetworkEvent::NewTx {
                         from: propagation_source,
                         intent_bytes: message.data,
                         inbound_memory_permit: None,
                     });
                 }
+            } else {
+                report_gossip_validation(
+                    swarm,
+                    &message_id,
+                    &propagation_source,
+                    gossipsub::MessageAcceptance::Ignore,
+                );
             }
         }
 
@@ -4671,6 +4880,7 @@ async fn handle_swarm_event(
                 let Some(generation) = select_snapshot_export(
                     &chain_store,
                     snapshot_exports,
+                    snapshot_export_leases,
                     request.requester_height,
                 ) else {
                     break 'ready_manifest GetStateManifestResponse::default();
@@ -5806,6 +6016,36 @@ mod tests {
     }
 
     #[test]
+    fn global_gossip_byte_window_is_exact_and_resets() {
+        let mut budget = GossipByteWindow::new();
+        assert!(budget.admit(40, 64, Duration::from_secs(10)));
+        assert!(budget.admit(24, 64, Duration::from_secs(10)));
+        assert!(!budget.admit(1, 64, Duration::from_secs(10)));
+        assert!(!budget.admit(usize::MAX, 64, Duration::from_secs(10)));
+
+        budget.started_at = Instant::now() - Duration::from_secs(11);
+        assert!(budget.admit(64, 64, Duration::from_secs(10)));
+        assert_eq!(budget.bytes, 64);
+    }
+
+    #[test]
+    fn complete_block_gossip_relays_only_the_recent_fork_window() {
+        let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
+        let tip = 100;
+        assert!(complete_block_gossip_is_relayable(tip, tip + 1));
+        assert!(complete_block_gossip_is_relayable(tip, tip + retention));
+        assert!(!complete_block_gossip_is_relayable(
+            tip,
+            tip + retention + 1
+        ));
+        assert!(complete_block_gossip_is_relayable(tip, tip - retention));
+        assert!(!complete_block_gossip_is_relayable(
+            tip,
+            tip - retention - 1
+        ));
+    }
+
+    #[test]
     fn snapshot_terminal_serving_requires_retained_suffix() {
         let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
         assert!(snapshot_suffix_is_retained(100, 100));
@@ -5824,7 +6064,20 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_generation_leases_bound_distinct_pinned_generations() {
+    fn snapshot_selection_keeps_a_live_leased_cohort() {
+        let leased = (100, [1; 32]);
+        let fresh = (101, [2; 32]);
+        let leased_keys = std::collections::HashSet::from([leased]);
+
+        assert!(
+            snapshot_export_selection_rank(leased, 109, &leased_keys)
+                > snapshot_export_selection_rank(fresh, 110, &leased_keys),
+            "a newer disk generation must not split an active bootstrap cohort"
+        );
+    }
+
+    #[test]
+    fn snapshot_generation_leases_retire_the_oldest_key_for_fresh_admission() {
         let first = PeerId::random();
         let second = PeerId::random();
         let third = PeerId::random();
@@ -5836,13 +6089,24 @@ mod tests {
         assert!(lease_snapshot_export(&mut leases, first, key_a));
         assert!(lease_snapshot_export(&mut leases, second, key_b));
         assert!(lease_snapshot_export(&mut leases, third, key_a));
-        assert!(!lease_snapshot_export(&mut leases, third, key_c));
+        assert!(lease_snapshot_export(&mut leases, third, key_c));
+        assert!(!leases.contains_key(&first));
+        assert_eq!(leases.get(&second).map(|lease| lease.key), Some(key_b));
+        assert_eq!(leases.get(&third).map(|lease| lease.key), Some(key_c));
+        assert_eq!(
+            leases
+                .values()
+                .map(|lease| lease.key)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            MAX_SNAPSHOT_EXPORTS
+        );
 
-        leases.get_mut(&first).unwrap().last_activity =
+        leases.get_mut(&second).unwrap().last_activity =
             Instant::now() - SNAPSHOT_EXPORT_LEASE_TTL - Duration::from_secs(1);
         prune_snapshot_export_leases(&mut leases);
-        assert!(!leases.contains_key(&first));
-        assert!(lease_snapshot_export(&mut leases, third, key_c));
+        assert!(!leases.contains_key(&second));
+        assert_eq!(leases.get(&third).map(|lease| lease.key), Some(key_c));
     }
 
     #[test]

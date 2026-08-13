@@ -141,14 +141,23 @@ pub fn revert_block(
     let circulating_supply_micronoid = state
         .supply_after_slot_updates(&undo.slot_changes)
         .ok_or(crate::state::ApplyError::CirculatingSupplyInvariant)?;
-    for (slot_index, prev_value) in undo.slot_changes.iter().rev() {
-        if (*slot_index as u64) < state.state.num_slots() {
-            state
-                .state
-                .set_slot(*slot_index, *prev_value)
-                .map_err(|_| crate::state::ApplyError::SlotOutOfRange)?;
-        }
-    }
+    // Undo entries are unique by construction. Restore them as one unrooted
+    // batch instead of asking the legacy FRI carrier to recompute its global
+    // root after every slot. The caller authenticates the exact consensus
+    // State root once after restoring the header-bound counters. This also
+    // keeps snapshot-installed, untouched segments evicted during a bounded
+    // reorg instead of needlessly hydrating the complete live set.
+    let restored_slots: Vec<_> = undo
+        .slot_changes
+        .iter()
+        .rev()
+        .copied()
+        .filter(|(slot_index, _)| (*slot_index as u64) < state.state.num_slots())
+        .collect();
+    state
+        .state
+        .apply_delta_unrooted(&restored_slots)
+        .map_err(|_| crate::state::ApplyError::SlotOutOfRange)?;
     state.circulating_supply_micronoid = circulating_supply_micronoid;
     Ok(())
 }

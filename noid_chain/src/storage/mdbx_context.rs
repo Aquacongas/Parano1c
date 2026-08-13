@@ -2397,14 +2397,21 @@ mod tests {
             .unwrap();
     }
 
-    fn two_block_suffix() -> (crate::AcceptedBlockBundle, crate::AcceptedBlockBundle) {
+    fn block_sequence(count: usize) -> Vec<crate::AcceptedBlockBundle> {
         let directory = tempfile::tempdir().unwrap();
         let mut producer = easy_block_context(directory.path());
-        let first = test_next_bundle(&producer);
-        accept_test_bundle(&mut producer, &first);
-        let second = test_next_bundle(&producer);
-        accept_test_bundle(&mut producer, &second);
-        (first, second)
+        let mut blocks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let bundle = test_next_bundle(&producer);
+            accept_test_bundle(&mut producer, &bundle);
+            blocks.push(bundle);
+        }
+        blocks
+    }
+
+    fn two_block_suffix() -> (crate::AcceptedBlockBundle, crate::AcceptedBlockBundle) {
+        let mut blocks = block_sequence(2).into_iter();
+        (blocks.next().unwrap(), blocks.next().unwrap())
     }
 
     fn test_context_with_log(path: &Path, log_slots: u32) -> MdbxChainContext {
@@ -2716,6 +2723,129 @@ mod tests {
             second.history_step_terminal_bytes()
         );
         assert!(generation.read_terminal_at(1, first.block_hash()).is_err());
+    }
+
+    #[test]
+    fn completed_recursive_suffix_can_reorg_from_its_last_compact_marker() {
+        let (first, second) = two_block_suffix();
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = easy_block_context(directory.path());
+        let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+        let mut authority = context
+            .verify_recursive_suffix(
+                second_block.header,
+                genesis,
+                second.history_step_terminal_bytes().to_vec(),
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        for bundle in [&first, &second] {
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    bundle.block_bytes(),
+                    crate::Block::from_bytes(bundle.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+        }
+        assert!(authority.is_complete());
+
+        let result = context.apply_reorg_mdbx_with_applier(
+            1,
+            std::slice::from_ref(&second),
+            second_block.header.timestamp,
+            |context, bundle, local_time| {
+                context.apply_next_block(
+                    bundle,
+                    local_time,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                    |_| Ok(()),
+                )?;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_ok(), "compact-suffix reorg failed: {result:?}");
+        assert_eq!(context.tip_height(), 2);
+        assert_eq!(context.tip_hash(), second.block_hash());
+    }
+
+    #[test]
+    fn consecutive_completed_recursive_suffixes_keep_older_markers_reorgable() {
+        let blocks = block_sequence(4);
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = easy_block_context(directory.path());
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+
+        for range in [0..2, 2..4] {
+            let final_bundle = &blocks[range.end - 1];
+            let final_block = crate::Block::from_bytes(final_bundle.block_bytes()).unwrap();
+            let mut authority = context
+                .verify_recursive_suffix(
+                    final_block.header,
+                    genesis,
+                    final_bundle.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            for bundle in &blocks[range] {
+                let block = crate::Block::from_bytes(bundle.block_bytes()).unwrap();
+                context
+                    .apply_verified_recursive_suffix_block(
+                        &mut authority,
+                        bundle.block_bytes(),
+                        block.header.timestamp,
+                        |block, state| {
+                            crate::materialize_accepted_block_state(state, block)
+                                .map_err(|error| format!("{error:?}"))
+                        },
+                    )
+                    .unwrap();
+            }
+            assert!(authority.is_complete());
+        }
+        assert_eq!(context.tip_height(), 4);
+
+        // Height 1 is a marker authorized by the first completed suffix. The
+        // second suffix must not make that still-reorgable parent unusable.
+        let replacement = &blocks[1];
+        let replacement_block = crate::Block::from_bytes(replacement.block_bytes()).unwrap();
+        let result = context.apply_reorg_mdbx_with_applier(
+            1,
+            std::slice::from_ref(replacement),
+            replacement_block.header.timestamp,
+            |context, bundle, local_time| {
+                context.apply_next_block(
+                    bundle,
+                    local_time,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                    |_| Ok(()),
+                )?;
+                Ok(())
+            },
+        );
+
+        assert!(
+            result.is_ok(),
+            "older compact-marker reorg failed: {result:?}"
+        );
+        assert_eq!(context.tip_height(), 2);
+        assert_eq!(context.tip_hash(), replacement.block_hash());
     }
 
     #[test]

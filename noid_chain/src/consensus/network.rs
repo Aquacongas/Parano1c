@@ -102,9 +102,15 @@ impl NetworkConfig {
             magic: [0x4E, 0x4F, 0x49, 0x44], // "NOID"
             default_p2p_port: 9400,
             default_rpc_port: 9401,
-            p2p_protocol_id: "/noid/mainnet/1.0.0",
-            topic_blocks: "/noid/mainnet/blocks/1",
-            topic_txs: "/noid/mainnet/txs/1",
+            // Bind peer admission and GossipSub meshes to the canonical
+            // v1.0.0 genesis (block ID prefix 530016417023d5e9). Withdrawn
+            // pre-launch binaries used a different genesis and namespace;
+            // they may complete Noise transport, but Identify closes them
+            // before they become sync-ready and their gossip topics do not
+            // intersect the canonical network.
+            p2p_protocol_id: "/noid/mainnet/530016417023d5e9/1",
+            topic_blocks: "/noid/mainnet/530016417023d5e9/blocks/1",
+            topic_txs: "/noid/mainnet/530016417023d5e9/txs/1",
             // DNS seeds — two formats supported:
             //
             // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9400
@@ -172,10 +178,13 @@ mod tests {
 
     #[test]
     fn mainnet_protocol_id() {
+        let mainnet = NetworkConfig::mainnet();
+        assert_eq!(mainnet.p2p_protocol_id, "/noid/mainnet/530016417023d5e9/1");
         assert_eq!(
-            NetworkConfig::mainnet().p2p_protocol_id,
-            "/noid/mainnet/1.0.0"
+            mainnet.topic_blocks,
+            "/noid/mainnet/530016417023d5e9/blocks/1"
         );
+        assert_eq!(mainnet.topic_txs, "/noid/mainnet/530016417023d5e9/txs/1");
     }
 
     #[test]

@@ -197,6 +197,13 @@ impl NodeBehaviour {
             .mesh_n_high(8)
             .mesh_outbound_min(1)
             .max_transmit_size(GOSSIP_MAX_TRANSMIT_BYTES)
+            // Hold inbound messages until the network event loop has applied
+            // structural, per-peer, and process-global admission. Without
+            // manual validation, GossipSub forwards and retains a large block
+            // bundle before our rate limit can see it, so many divergent
+            // miners can turn a harmless node-side drop into unbounded
+            // memcache and outbound-buffer growth.
+            .validate_messages()
             // Mainnet: rely on the mesh for publish fanout. Flood-publishing to
             // every connected peer turns inbound spam into O(connected_peers)
             // outbound bandwidth even when downstream validation drops it.
