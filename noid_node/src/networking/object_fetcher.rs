@@ -276,6 +276,30 @@ impl ObjectFetcher {
         Ok(())
     }
 
+    /// The peer explicitly reported that it does not have this exact byte
+    /// encoding. Unlike a transport timeout, retrying the same source cannot
+    /// make progress, so remove only this advertisement. The semantic claim
+    /// and every other source/job remain intact.
+    pub fn mark_unavailable(
+        &mut self,
+        claim: ObjectClaimId,
+        peer: PeerId,
+    ) -> Result<(), FetchError> {
+        self.fail_source(claim, peer)?;
+        let job = self.jobs.get_mut(&claim).ok_or(FetchError::UnknownClaim)?;
+        job.sources.remove(&peer);
+        if job.state == FetchState::Wanted
+            && job.selected_object.is_some_and(|selected| {
+                !job.sources.values().any(|source| source.object == selected)
+            })
+        {
+            job.selected_object = None;
+            job.partial_bytes = 0;
+            job.last_progress_ms = None;
+        }
+        Ok(())
+    }
+
     /// Drop a dead transport source everywhere without discarding any job.
     pub fn disconnect(&mut self, peer: PeerId) {
         for job in self.jobs.values_mut() {
@@ -502,5 +526,31 @@ mod tests {
         fetcher.mark_verified(claim, object).unwrap();
         fetcher.disconnect(peer);
         assert_eq!(fetcher.state(claim), Some(FetchState::Verified { object }));
+    }
+
+    #[test]
+    fn explicit_unavailable_source_is_not_retried_forever() {
+        let mut fetcher = ObjectFetcher::new();
+        let (claim, first_encoding) = body(1, 1);
+        let (_, mut second_encoding) = body(1, 1);
+        let ObjectId::BlockBody(ref mut second) = second_encoding else {
+            unreachable!()
+        };
+        second.byte_digest[0] ^= 0x80;
+        let first = PeerId::random();
+        let second = PeerId::random();
+        fetcher.want(claim);
+        fetcher
+            .advertise(claim, first, FailureDomain(1), first_encoding)
+            .unwrap();
+        fetcher
+            .advertise(claim, second, FailureDomain(2), second_encoding)
+            .unwrap();
+
+        let assignment = fetcher.start_primary(claim, 0).unwrap();
+        fetcher.mark_unavailable(claim, assignment.peer).unwrap();
+        let replacement = fetcher.start_primary(claim, 1).unwrap();
+        assert_ne!(replacement.peer, assignment.peer);
+        assert_ne!(replacement.object, assignment.object);
     }
 }
