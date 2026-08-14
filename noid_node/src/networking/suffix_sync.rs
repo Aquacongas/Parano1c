@@ -68,11 +68,13 @@ impl SuffixOffer {
             if header.header != record.header {
                 return Err(SuffixSyncError::InventoryHeaderMismatch);
             }
-            let body = record.body.ok_or(SuffixSyncError::MissingBody)?;
-            if body.claim.height != header.header.height || body.claim.block_hash != header.hash {
-                return Err(SuffixSyncError::ObjectClaimMismatch);
+            if let Some(body) = record.body {
+                if body.claim.height != header.header.height || body.claim.block_hash != header.hash
+                {
+                    return Err(SuffixSyncError::ObjectClaimMismatch);
+                }
+                objects.push(ObjectId::BlockBody(body));
             }
-            objects.push(ObjectId::BlockBody(body));
         }
         let target_header = headers.last().ok_or(SuffixSyncError::EmptySuffix)?;
         let terminal = records
@@ -99,11 +101,9 @@ impl SuffixOffer {
             )?,
             SyncPlanKind::Snapshot => return Err(SuffixSyncError::WrongPlanKind),
         };
-        if plan
-            .required_objects()
+        if objects
             .iter()
-            .copied()
-            .ne(objects.iter().map(|object| object.claim()))
+            .any(|object| !plan.required_objects().contains(&object.claim()))
         {
             return Err(SuffixSyncError::ObjectClaimMismatch);
         }
@@ -149,6 +149,24 @@ pub struct FetchedSuffix {
     _permits: Vec<Arc<OwnedSemaphorePermit>>,
 }
 
+impl FetchedSuffix {
+    pub fn into_parts(
+        self,
+    ) -> (
+        SyncPlan,
+        Vec<Vec<u8>>,
+        Vec<u8>,
+        Vec<Arc<OwnedSemaphorePermit>>,
+    ) {
+        (
+            self.plan,
+            self.body_bytes,
+            self.terminal_bytes,
+            self._permits,
+        )
+    }
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SuffixSyncError {
     #[error("the suffix is empty")]
@@ -157,8 +175,6 @@ pub enum SuffixSyncError {
     InventoryLength,
     #[error("header inventory identifies another header")]
     InventoryHeaderMismatch,
-    #[error("a suffix header has no exact body identity")]
-    MissingBody,
     #[error("the selected suffix tip has no exact terminal identity")]
     MissingTipTerminal,
     #[error("an exact object claim differs from the immutable plan")]
@@ -201,12 +217,13 @@ impl SuffixSync {
         failure_domain: FailureDomain,
         offer: SuffixOffer,
     ) -> Result<Self, SuffixSyncError> {
+        let token_seed = u64::from_le_bytes(offer.plan.id().0[..8].try_into().unwrap()).max(1);
         let mut runtime = Self {
             plan: offer.plan.clone(),
             fetcher: ObjectFetcher::new(),
             received: HashMap::new(),
             pending: HashMap::new(),
-            next_token: 1,
+            next_token: token_seed,
         };
         for claim in runtime.plan.required_objects() {
             runtime.fetcher.want(*claim);
@@ -237,6 +254,59 @@ impl SuffixSync {
                 .advertise(object.claim(), peer, failure_domain, object)?;
         }
         Ok(())
+    }
+
+    /// Merge storage-backed availability for the already selected semantic
+    /// suffix. A provider may hold only some bodies or only the tip terminal;
+    /// source diversity must not require every object to coexist on one peer.
+    pub fn add_inventory(
+        &mut self,
+        peer: PeerId,
+        failure_domain: FailureDomain,
+        headers: &[ValidatedHeader],
+        records: &[HeaderInventoryRecord],
+    ) -> Result<usize, SuffixSyncError> {
+        if headers != self.plan.headers() || records.len() != headers.len() {
+            return Err(SuffixSyncError::PlanMismatch);
+        }
+        let mut advertised = 0usize;
+        for (header, record) in headers.iter().zip(records) {
+            if record.header != header.header {
+                return Err(SuffixSyncError::InventoryHeaderMismatch);
+            }
+            if let Some(body) = record.body {
+                if body.claim.height != header.header.height || body.claim.block_hash != header.hash
+                {
+                    return Err(SuffixSyncError::ObjectClaimMismatch);
+                }
+                self.fetcher.advertise(
+                    ObjectClaimId::BlockBody(body.claim),
+                    peer,
+                    failure_domain,
+                    ObjectId::BlockBody(body),
+                )?;
+                advertised = advertised.saturating_add(1);
+            }
+        }
+        if let Some(terminal) = records.last().and_then(|record| record.terminal) {
+            let required_terminal = self
+                .plan
+                .required_objects()
+                .last()
+                .copied()
+                .ok_or(SuffixSyncError::MissingTipTerminal)?;
+            if required_terminal != ObjectClaimId::Terminal(terminal.claim) {
+                return Err(SuffixSyncError::ObjectClaimMismatch);
+            }
+            self.fetcher.advertise(
+                required_terminal,
+                peer,
+                failure_domain,
+                ObjectId::Terminal(terminal),
+            )?;
+            advertised = advertised.saturating_add(1);
+        }
+        Ok(advertised)
     }
 
     /// Start all currently schedulable jobs and coalesce body requests by
@@ -321,16 +391,28 @@ impl SuffixSync {
             return Err(SuffixSyncError::CorrelationMismatch);
         }
 
+        // Validate the complete response before advancing any object. One bad
+        // member of a coalesced body response must rotate the whole source
+        // lease, not leave the remaining claims stuck in Receiving after the
+        // correlation token has been consumed.
+        if payloads.iter().any(|payload| {
+            payload
+                .bytes
+                .as_ref()
+                .is_some_and(|bytes| !payload.object.matches_bytes(bytes))
+        }) {
+            for object in pending.objects {
+                let _ = self.fetcher.mark_unavailable(object.claim(), peer);
+            }
+            return Err(SuffixSyncError::ContentMismatch);
+        }
+
         for payload in payloads {
             let claim = payload.object.claim();
             let Some(bytes) = payload.bytes else {
                 self.fetcher.mark_unavailable(claim, peer)?;
                 continue;
             };
-            if !payload.object.matches_bytes(&bytes) {
-                self.fetcher.mark_unavailable(claim, peer)?;
-                return Err(SuffixSyncError::ContentMismatch);
-            }
             self.fetcher.finish_receive(claim, peer, payload.object)?;
             self.fetcher.mark_verified(claim, payload.object)?;
             self.received.insert(
@@ -484,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn offer_requires_every_body_and_one_tip_terminal() {
+    fn offer_accepts_partial_bodies_but_requires_one_tip_terminal() {
         let valid = offer(&[1, 2], 1);
         assert_eq!(valid.plan().required_objects().len(), 3);
 
@@ -495,6 +577,19 @@ mod tests {
             .map(|header| HeaderInventoryRecord::header_only(header.header))
             .collect::<Vec<_>>();
         records[0].body = valid.objects()[0].into_block_body();
+        records[1].terminal = match valid.objects().last().copied().unwrap() {
+            ObjectId::Terminal(terminal) => Some(terminal),
+            _ => panic!("suffix offer must end in a terminal"),
+        };
+        let partial = SuffixOffer::live(
+            valid.plan().base(),
+            valid.plan().headers().to_vec(),
+            &records,
+        )
+        .unwrap();
+        assert_eq!(partial.objects().len(), 2);
+
+        records[1].terminal = None;
         assert_eq!(
             SuffixOffer::live(
                 valid.plan().base(),
@@ -502,7 +597,7 @@ mod tests {
                 &records,
             )
             .unwrap_err(),
-            SuffixSyncError::MissingBody
+            SuffixSyncError::MissingTipTerminal
         );
     }
 
@@ -570,6 +665,39 @@ mod tests {
     }
 
     #[test]
+    fn body_only_inventory_can_join_an_existing_terminal_plan() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let offer = offer(&[1, 2], 1);
+        let headers = offer.plan().headers().to_vec();
+        let mut records = headers
+            .iter()
+            .map(|header| HeaderInventoryRecord::header_only(header.header))
+            .collect::<Vec<_>>();
+        for (record, object) in records.iter_mut().zip(&offer.objects[..headers.len()]) {
+            record.body = (*object).into_block_body();
+        }
+        let first_body = offer.objects[0];
+        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer).unwrap();
+        assert_eq!(
+            sync.add_inventory(second_peer, FailureDomain(2), &headers, &records)
+                .unwrap(),
+            headers.len()
+        );
+        let request = sync
+            .schedule(0)
+            .into_iter()
+            .find(|request| request.objects.contains(&first_body))
+            .unwrap();
+        sync.request_failed(request.token, request.peer, &request.objects)
+            .unwrap();
+        assert!(sync
+            .schedule(1)
+            .iter()
+            .any(|retry| { retry.peer == second_peer && retry.objects.contains(&first_body) }));
+    }
+
+    #[test]
     fn complete_exact_responses_preserve_body_order_and_tip_terminal() {
         let peer = PeerId::random();
         let mut offer = offer(&[1, 2], 1);
@@ -609,6 +737,58 @@ mod tests {
         let fetched = sync.into_fetched().unwrap();
         assert_eq!(fetched.body_bytes, expected_bodies);
         assert_eq!(fetched.terminal_bytes, expected_terminal);
+    }
+
+    #[test]
+    fn one_bad_batched_body_rotates_every_claim_in_the_consumed_request() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let mut offer = offer(&[1, 2], 1);
+        let mut bytes_by_object = HashMap::new();
+        for (index, object) in offer.objects.iter_mut().enumerate() {
+            let bytes = vec![0x70 + index as u8; 13 + index];
+            *object = match *object {
+                ObjectId::BlockBody(body) => {
+                    ObjectId::BlockBody(BlockBodyObjectId::from_bytes(body.claim, &bytes).unwrap())
+                }
+                ObjectId::Terminal(terminal) => ObjectId::Terminal(
+                    TerminalObjectId::from_bytes(terminal.claim, &bytes).unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            bytes_by_object.insert(*object, bytes);
+        }
+        let second_offer = offer.clone();
+        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer).unwrap();
+        sync.add_offer(second_peer, FailureDomain(2), second_offer)
+            .unwrap();
+
+        let request = sync
+            .schedule(0)
+            .into_iter()
+            .find(|request| request.objects.len() == 2)
+            .expect("two body claims are coalesced");
+        let mut payloads = request
+            .objects
+            .iter()
+            .map(|object| ObjectPayload {
+                object: *object,
+                bytes: Some(bytes_by_object[object].clone()),
+            })
+            .collect::<Vec<_>>();
+        payloads[1].bytes.as_mut().unwrap()[0] ^= 1;
+        assert_eq!(
+            sync.accept_response(request.token, request.peer, payloads, None),
+            Err(SuffixSyncError::ContentMismatch)
+        );
+
+        let replacement = sync
+            .schedule(1)
+            .into_iter()
+            .find(|candidate| candidate.objects.len() == 2)
+            .expect("every claim from the consumed request is schedulable again");
+        assert_ne!(replacement.peer, request.peer);
+        assert_eq!(replacement.objects, request.objects);
     }
 
     trait ObjectIdTestExt {

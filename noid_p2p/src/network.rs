@@ -1535,6 +1535,10 @@ pub enum NetworkEvent {
     HeaderAnnouncement {
         from: PeerId,
         announcement: HeaderAnnouncement,
+        /// True only when `from` is the directly connected original
+        /// publisher and advertised both exact objects. A gossipsub forwarder
+        /// is a header source, not automatically a body/proof provider.
+        source_has_objects: bool,
     },
     /// A compact block announcement arrived from a peer.
     ///
@@ -1695,7 +1699,12 @@ pub enum NetworkEvent {
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
     /// A peer connected.
-    PeerConnected(PeerId),
+    PeerConnected {
+        peer: PeerId,
+        /// Coarse public network group (IPv4 /16, IPv6 /32), or an
+        /// identity-derived domain for private/LAN transports.
+        failure_domain: u64,
+    },
     /// A peer disconnected.
     PeerDisconnected(PeerId),
 }
@@ -4053,10 +4062,8 @@ async fn handle_swarm_event(
             // connection — they definitely have the full block. Fall back to
             // propagation_source (forwarder) for nodes not directly connected to
             // the publisher (common in large networks with multi-hop gossip).
-            let origin = message
-                .source
-                .filter(|src| swarm.is_connected(src))
-                .unwrap_or(propagation_source);
+            let direct_origin = message.source.filter(|src| swarm.is_connected(src));
+            let origin = direct_origin.unwrap_or(propagation_source);
 
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
@@ -4086,9 +4093,13 @@ async fn handle_swarm_event(
                             tracing::debug!(peer = %propagation_source, "block announcement rate limit exceeded — dropped before propagation");
                             return;
                         }
+                        let source_has_objects = direct_origin.is_some()
+                            && announcement.providers.serves_body()
+                            && announcement.providers.serves_terminal();
                         let queued = required_event_tx.try_send(NetworkEvent::HeaderAnnouncement {
                             from: origin,
                             announcement,
+                            source_has_objects,
                         });
                         report_gossip_validation(
                             swarm,
@@ -4315,7 +4326,10 @@ async fn handle_swarm_event(
             }
             if sync_paths.try_mark_announced(peer_id) {
                 let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected(peer_id))
+                    .send(NetworkEvent::PeerConnected {
+                        peer: peer_id,
+                        failure_domain: peer_diversity.failure_domain(peer_id),
+                    })
                     .await;
                 tracing::debug!(peer = %peer_id, "peer network-v3 profile ready");
             }
@@ -4552,7 +4566,10 @@ async fn handle_swarm_event(
             sync_paths.mark_profile_verified(peer);
             if sync_paths.try_mark_announced(peer) {
                 let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected(peer))
+                    .send(NetworkEvent::PeerConnected {
+                        peer,
+                        failure_domain: peer_diversity.failure_domain(peer),
+                    })
                     .await;
             }
             tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v3 profile verified");
@@ -6218,7 +6235,10 @@ async fn handle_swarm_event(
             }
             if sync_paths.try_mark_announced(peer_id) {
                 let _ = required_event_tx
-                    .send(NetworkEvent::PeerConnected(peer_id))
+                    .send(NetworkEvent::PeerConnected {
+                        peer: peer_id,
+                        failure_domain: peer_diversity.failure_domain(peer_id),
+                    })
                     .await;
                 tracing::debug!(peer = %peer_id, "peer sync protocols ready after duplicate path closed");
             }

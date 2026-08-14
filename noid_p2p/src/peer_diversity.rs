@@ -96,6 +96,37 @@ pub(crate) struct PeerDiversity {
 }
 
 impl PeerDiversity {
+    /// Stable coarse domain used by higher-level source scheduling. Public
+    /// peers share their admitted IPv4 /16 or IPv6 /32; private/LAN peers fall
+    /// back to their authenticated identity so local test clusters still
+    /// provide independent sources.
+    pub(crate) fn failure_domain(&self, peer: PeerId) -> u64 {
+        let public = self
+            .connections
+            .values()
+            .filter_map(|connection| connection.as_ref())
+            .filter(|connection| connection.peer == peer)
+            .map(|connection| match connection.group {
+                PublicNetworkGroup::Ipv4(prefix) => {
+                    0x1000_0000_0000_0000u64 | u64::from(u16::from_be_bytes(prefix))
+                }
+                PublicNetworkGroup::Ipv6(prefix) => {
+                    0x2000_0000_0000_0000u64 | u64::from(u32::from_be_bytes(prefix))
+                }
+            })
+            .min();
+        public.unwrap_or_else(|| {
+            // FNV-1a is sufficient here: this is scheduling diversity, not a
+            // cryptographic identity. PeerId authentication happens earlier.
+            peer.to_bytes()
+                .iter()
+                .fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+                })
+                | 0x8000_0000_0000_0000
+        })
+    }
+
     pub(crate) fn try_admit(
         &mut self,
         connection_id: ConnectionId,
@@ -565,6 +596,37 @@ mod tests {
             ),
             Err(DiversityRejection::InboundUnclassifiedReserve)
         ));
+    }
+
+    #[test]
+    fn public_failure_domains_follow_network_groups() {
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let mut diversity = PeerDiversity::default();
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(101),
+                first,
+                &addr("/ip4/8.8.1.1/tcp/9400"),
+                true,
+            )
+            .unwrap();
+        diversity
+            .try_admit(
+                ConnectionId::new_unchecked(102),
+                second,
+                &addr("/ip4/8.8.2.2/tcp/9400"),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            diversity.failure_domain(first),
+            diversity.failure_domain(second)
+        );
+        assert_ne!(
+            diversity.failure_domain(first),
+            diversity.failure_domain(PeerId::random())
+        );
     }
 
     #[test]

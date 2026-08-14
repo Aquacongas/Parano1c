@@ -207,7 +207,9 @@ impl RequiredEventReceiver {
 
 fn classify(event: &NetworkEvent) -> EventClass {
     match event {
-        NetworkEvent::PeerConnected(_) | NetworkEvent::PeerDisconnected(_) => EventClass::Control,
+        NetworkEvent::PeerConnected { .. } | NetworkEvent::PeerDisconnected(_) => {
+            EventClass::Control
+        }
         NetworkEvent::HeaderInventoryBatch { .. }
         | NetworkEvent::HeaderAnnouncement { .. }
         | NetworkEvent::HeadersRequestFailed { .. }
@@ -269,8 +271,16 @@ mod tests {
         for height in 0..LIVE_CAPACITY {
             tx.send(live(peer, height as u64)).await.unwrap();
         }
-        tx.send(NetworkEvent::PeerConnected(peer)).await.unwrap();
-        assert!(matches!(rx.recv().await, Some(NetworkEvent::PeerConnected(p)) if p == peer));
+        tx.send(NetworkEvent::PeerConnected {
+            peer,
+            failure_domain: 1,
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            rx.recv().await,
+            Some(NetworkEvent::PeerConnected { peer: connected, .. }) if connected == peer
+        ));
     }
 
     #[tokio::test]
@@ -278,9 +288,12 @@ mod tests {
         let (tx, mut rx) = channel();
         let peer = PeerId::random();
         for height in 0..32 {
-            tx.send(NetworkEvent::PeerConnected(PeerId::random()))
-                .await
-                .unwrap();
+            tx.send(NetworkEvent::PeerConnected {
+                peer: PeerId::random(),
+                failure_domain: height,
+            })
+            .await
+            .unwrap();
             tx.send(live(peer, height)).await.unwrap();
         }
         tx.send(NetworkEvent::StateSegmentRequestFailed {

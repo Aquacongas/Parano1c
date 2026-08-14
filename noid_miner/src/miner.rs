@@ -179,9 +179,13 @@ pub struct BlockMiner {
     /// Permanent stop flag: set only by stop(), never reset. The main loop
     /// checks this at the top of each iteration and breaks cleanly.
     stopped: Arc<AtomicBool>,
-    /// Live network gate. Normal miners require an authenticated peer quorum;
-    /// explicit isolated/genesis mode keeps this true without peers.
-    mining_network_ready: watch::Receiver<bool>,
+    /// Stable permission to construct the recursive proof for the committed
+    /// parent. Ordinary child commits do not revoke it.
+    proof_network_ready: watch::Receiver<bool>,
+    /// Exact authorization to search a nonce for the current template parent.
+    /// This may pause briefly while fresh frontier reports are collected,
+    /// without throwing away an already prepared proof-valid template.
+    nonce_network_ready: watch::Receiver<bool>,
     /// Edge-triggered changes which invalidate a prepared template: a new
     /// canonical tip or a dynamic wallet payout switch.
     template_changes: broadcast::Receiver<()>,
@@ -210,7 +214,8 @@ impl BlockMiner {
         config: MinerConfig,
         mempool: AsyncMempool,
         chain: Arc<RwLock<MdbxChainContext>>,
-        mining_network_ready: watch::Receiver<bool>,
+        proof_network_ready: watch::Receiver<bool>,
+        nonce_network_ready: watch::Receiver<bool>,
         template_change_sender: broadcast::Sender<()>,
         history_step_runtime: Arc<noid_recursive::acceptance::history_step::HistoryStepRuntime>,
         ghost_authorization: Arc<
@@ -242,7 +247,8 @@ impl BlockMiner {
             events,
             cancel_pow: Arc::new(AtomicBool::new(false)),
             stopped: Arc::new(AtomicBool::new(false)),
-            mining_network_ready,
+            proof_network_ready,
+            nonce_network_ready,
             template_changes: template_change_sender.subscribe(),
             _template_change_sender: template_change_sender,
             history_step_runtime,
@@ -307,23 +313,23 @@ impl BlockMiner {
         self.stopped.clone()
     }
 
-    async fn wait_for_mining_network(&mut self) -> bool {
-        if *self.mining_network_ready.borrow() {
+    async fn wait_for_proof_network(&mut self) -> bool {
+        if *self.proof_network_ready.borrow() {
             return true;
         }
-        tracing::info!("miner: waiting for authenticated peer quorum");
+        tracing::info!("miner: waiting for a synchronized authenticated chain view");
         loop {
             if self.stopped.load(Ordering::Acquire) {
                 return false;
             }
             tokio::select! {
-                result = self.mining_network_ready.changed() => {
+                result = self.proof_network_ready.changed() => {
                     if result.is_err() {
-                        tracing::info!("miner: network readiness channel closed");
+                        tracing::info!("miner: proof readiness channel closed");
                         return false;
                     }
-                    if *self.mining_network_ready.borrow() {
-                        tracing::info!("miner: authenticated peer quorum ready");
+                    if *self.proof_network_ready.borrow() {
+                        tracing::info!("miner: synchronized chain view ready for proving");
                         return true;
                     }
                 }
@@ -350,7 +356,7 @@ impl BlockMiner {
                 tracing::info!("miner: shutdown flag set, exiting loop");
                 break;
             }
-            if !self.wait_for_mining_network().await {
+            if !self.wait_for_proof_network().await {
                 break;
             }
 
@@ -481,10 +487,10 @@ impl BlockMiner {
                 );
                 break;
             }
-            if !*self.mining_network_ready.borrow() {
+            if !*self.proof_network_ready.borrow() {
                 tracing::info!(
                     height,
-                    "miner: peer quorum lost during preparation; discarding prepared block"
+                    "miner: canonical sync changed during preparation; discarding prepared block"
                 );
                 continue;
             }
@@ -516,6 +522,60 @@ impl BlockMiner {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => {}
                 Err(broadcast::error::TryRecvError::Closed) => unreachable!(),
+            }
+
+            // Frontier authorization may lag an ordinary child commit by one
+            // compact header round-trip. Preserve the expensive prepared
+            // transition while waiting; only a real parent/sync change makes
+            // it stale.
+            if !*self.nonce_network_ready.borrow() {
+                tracing::info!(
+                    height,
+                    "miner: proof ready; waiting for exact frontier authorization"
+                );
+                loop {
+                    if self.stopped.load(Ordering::Acquire) {
+                        break 'mining;
+                    }
+                    tokio::select! {
+                        readiness = self.nonce_network_ready.changed() => {
+                            match readiness {
+                                Ok(()) if *self.nonce_network_ready.borrow() => break,
+                                Ok(()) => {}
+                                Err(_) => break 'mining,
+                            }
+                        }
+                        readiness = self.proof_network_ready.changed() => {
+                            match readiness {
+                                Ok(()) if !*self.proof_network_ready.borrow() => {
+                                    tracing::info!(height, "miner: canonical sync changed while awaiting frontier authorization");
+                                    continue 'mining;
+                                }
+                                Ok(()) => {}
+                                Err(_) => break 'mining,
+                            }
+                        }
+                        template_change = self.template_changes.recv() => {
+                            match template_change {
+                                Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                                    tracing::debug!(height, "prepared template parent changed while awaiting frontier authorization");
+                                    continue 'mining;
+                                }
+                                Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+                    }
+                }
+                let parent_is_still_tip = {
+                    let context = self.chain.read().await;
+                    context.tip_height() == expected_parent_height
+                        && block_id(context.tip_header()) == expected_parent_hash
+                };
+                if !parent_is_still_tip || !*self.proof_network_ready.borrow() {
+                    tracing::debug!(height, "prepared template became stale before nonce search");
+                    continue;
+                }
             }
 
             tracing::info!(
@@ -557,8 +617,10 @@ impl BlockMiner {
                                 tracing::info!(height, "miner: shutdown requested after PoW; discarding nonce");
                                 break 'mining;
                             }
-                            if !*self.mining_network_ready.borrow() {
-                                tracing::info!(height, "miner: peer quorum lost after PoW; discarding nonce");
+                            if !*self.proof_network_ready.borrow()
+                                || !*self.nonce_network_ready.borrow()
+                            {
+                                tracing::info!(height, "miner: network authority changed after PoW; discarding nonce");
                                 continue;
                             }
                             let nonce_found_at = Instant::now();
@@ -620,8 +682,10 @@ impl BlockMiner {
                                 tracing::info!(height, "miner: shutdown requested during seal; discarding proved block");
                                 break 'mining;
                             }
-                            if !*self.mining_network_ready.borrow() {
-                                tracing::info!(height, "miner: peer quorum lost during seal; discarding proved block");
+                            if !*self.proof_network_ready.borrow()
+                                || !*self.nonce_network_ready.borrow()
+                            {
+                                tracing::info!(height, "miner: network authority changed during seal; discarding proved block");
                                 continue;
                             }
 
@@ -709,15 +773,29 @@ impl BlockMiner {
                     }
                 }
 
-                readiness = self.mining_network_ready.changed() => {
+                readiness = self.nonce_network_ready.changed() => {
                     cancel.store(true, Ordering::Relaxed);
                     let _ = pow_handle.await;
                     match readiness {
-                        Ok(()) if !*self.mining_network_ready.borrow() => {
-                            tracing::info!("miner: authenticated peer quorum lost; pausing");
+                        Ok(()) if !*self.nonce_network_ready.borrow() => {
+                            tracing::info!("miner: frontier authorization lost; pausing nonce search");
                         }
                         Ok(()) => {
-                            tracing::debug!("miner: network readiness changed; rebuilding");
+                            tracing::debug!("miner: frontier authorization changed; rebuilding");
+                        }
+                        Err(_) => break 'mining,
+                    }
+                }
+
+                readiness = self.proof_network_ready.changed() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = pow_handle.await;
+                    match readiness {
+                        Ok(()) if !*self.proof_network_ready.borrow() => {
+                            tracing::info!("miner: canonical sync authority changed; discarding template");
+                        }
+                        Ok(()) => {
+                            tracing::debug!("miner: proof readiness changed; rebuilding");
                         }
                         Err(_) => break 'mining,
                     }
