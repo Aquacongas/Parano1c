@@ -301,6 +301,7 @@ mod tests {
             segment_id: 1,
             expected_tip_height: 10,
             expected_tip_hash: [1; 32],
+            manifest_digest: [2; 32],
         })
         .await
         .unwrap();

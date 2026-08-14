@@ -20,12 +20,15 @@ use noid_chain::{
     LOG_SEGMENT_SIZE,
 };
 
-use crate::protocol::{GetStateManifestRequest, GetStateManifestResponse};
+use crate::protocol::{
+    GetStateManifestRequest, GetStateManifestResponse, SNAPSHOT_MANIFEST_FORMAT_VERSION,
+};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NMQ4";
-const RESPONSE_MAGIC: [u8; 4] = *b"NMF4";
-const REQUEST_BYTES: usize = 4 + 8;
-const RESPONSE_HEADER_BYTES: usize = 4 + 8 + 32 + 32 + 4 + 8 + 8 + 1 + 8 + 32 + 32 + 4;
+const REQUEST_MAGIC: [u8; 4] = *b"NMQ6";
+const RESPONSE_MAGIC: [u8; 4] = *b"NMF6";
+const REQUEST_BYTES: usize = 4 + 8 + 32;
+const RESPONSE_HEADER_BYTES: usize =
+    4 + 8 + 32 + 32 + 4 + 32 + 32 + 4 + 8 + 8 + 1 + 8 + 32 + 32 + 4;
 const SEGMENT_DESCRIPTOR_BYTES: usize = 2 + 32 + 4;
 
 /// Fixed-framing state-manifest request/response codec.
@@ -56,6 +59,7 @@ impl request_response::Codec for StateManifestCodec {
             requester_height: u64::from_le_bytes(
                 encoded[4..12].try_into().expect("fixed requester height"),
             ),
+            requested_manifest_digest: encoded[12..44].try_into().expect("fixed manifest digest"),
         })
     }
 
@@ -136,10 +140,13 @@ impl request_response::Codec for StateManifestCodec {
 
         ensure_eof(io).await?;
 
-        Ok(GetStateManifestResponse {
+        let response = GetStateManifestResponse {
             tip_height: fields.tip_height,
             tip_hash: fields.tip_hash,
             cumulative_chainwork: fields.cumulative_chainwork,
+            format_version: fields.format_version,
+            state_root: fields.state_root,
+            manifest_digest: fields.manifest_digest,
             log_slots: fields.log_slots,
             active_slot_count: fields.active_slot_count,
             alloc_counter: fields.alloc_counter,
@@ -150,7 +157,11 @@ impl request_response::Codec for StateManifestCodec {
             segment_ids,
             segment_roots,
             segment_lengths,
-        })
+        };
+        if response.tip_height != 0 && !response.has_valid_manifest_digest() {
+            return Err(invalid_data("snapshot manifest digest mismatch"));
+        }
+        Ok(response)
     }
 
     async fn write_request<T>(
@@ -165,6 +176,7 @@ impl request_response::Codec for StateManifestCodec {
         let mut encoded = [0u8; REQUEST_BYTES];
         encoded[..4].copy_from_slice(&REQUEST_MAGIC);
         encoded[4..12].copy_from_slice(&request.requester_height.to_le_bytes());
+        encoded[12..44].copy_from_slice(&request.requested_manifest_digest);
         io.write_all(&encoded).await
     }
 
@@ -214,6 +226,9 @@ impl request_response::Codec for StateManifestCodec {
                 "manifest sparse lengths do not match active slot count",
             ));
         }
+        if response.tip_height != 0 && !response.has_valid_manifest_digest() {
+            return Err(invalid_data("snapshot manifest digest mismatch"));
+        }
         // Validate every variable field before emitting the fixed header so an
         // invalid local response cannot create an ambiguous partial frame.
         let header = encode_response_header(&fields);
@@ -237,6 +252,9 @@ struct ResponseFields {
     tip_height: u64,
     tip_hash: [u8; 32],
     cumulative_chainwork: [u8; 32],
+    format_version: u32,
+    state_root: [u8; 32],
+    manifest_digest: [u8; 32],
     log_slots: u32,
     active_slot_count: u64,
     alloc_counter: u64,
@@ -254,6 +272,9 @@ impl ResponseFields {
             tip_height: response.tip_height,
             tip_hash: response.tip_hash,
             cumulative_chainwork: response.cumulative_chainwork,
+            format_version: response.format_version,
+            state_root: response.state_root,
+            manifest_digest: response.manifest_digest,
             log_slots: response.log_slots,
             active_slot_count: response.active_slot_count,
             alloc_counter: response.alloc_counter,
@@ -278,21 +299,30 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
         tip_height: u64::from_le_bytes(header[4..12].try_into().expect("fixed tip height")),
         tip_hash: header[12..44].try_into().expect("fixed tip hash"),
         cumulative_chainwork: header[44..76].try_into().expect("fixed chainwork"),
-        log_slots: u32::from_le_bytes(header[76..80].try_into().expect("fixed log slots")),
+        format_version: u32::from_le_bytes(
+            header[76..80].try_into().expect("fixed format version"),
+        ),
+        state_root: header[80..112].try_into().expect("fixed state root"),
+        manifest_digest: header[112..144].try_into().expect("fixed manifest digest"),
+        log_slots: u32::from_le_bytes(header[144..148].try_into().expect("fixed log slots")),
         active_slot_count: u64::from_le_bytes(
-            header[80..88].try_into().expect("fixed active count"),
+            header[148..156].try_into().expect("fixed active count"),
         ),
         alloc_counter: u64::from_le_bytes(
-            header[88..96].try_into().expect("fixed allocation counter"),
+            header[156..164]
+                .try_into()
+                .expect("fixed allocation counter"),
         ),
-        eff_log: header[96],
+        eff_log: header[164],
         bridge_tip_height: u64::from_le_bytes(
-            header[97..105].try_into().expect("fixed bridge tip height"),
+            header[165..173]
+                .try_into()
+                .expect("fixed bridge tip height"),
         ),
-        bridge_tip_hash: header[105..137].try_into().expect("fixed bridge tip hash"),
-        bridge_cumulative_chainwork: header[137..169].try_into().expect("fixed bridge chainwork"),
+        bridge_tip_hash: header[173..205].try_into().expect("fixed bridge tip hash"),
+        bridge_cumulative_chainwork: header[205..237].try_into().expect("fixed bridge chainwork"),
         segment_count: u32::from_le_bytes(
-            header[169..173].try_into().expect("fixed segment count"),
+            header[237..241].try_into().expect("fixed segment count"),
         ),
         maximum_segments: 0,
     };
@@ -304,6 +334,9 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
     if fields.tip_height == 0 {
         if fields.tip_hash != [0; 32]
             || fields.cumulative_chainwork != [0; 32]
+            || fields.format_version != 0
+            || fields.state_root != [0; 32]
+            || fields.manifest_digest != [0; 32]
             || fields.log_slots != 0
             || fields.active_slot_count != 0
             || fields.alloc_counter != 0
@@ -319,6 +352,10 @@ fn validate_response_fields(fields: &mut ResponseFields) -> io::Result<()> {
         }
         fields.maximum_segments = 0;
         return Ok(());
+    }
+
+    if fields.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION {
+        return Err(invalid_data("unsupported snapshot manifest format"));
     }
 
     if !(1..=32).contains(&fields.log_slots) {
@@ -419,14 +456,17 @@ fn encode_response_header(fields: &ResponseFields) -> [u8; RESPONSE_HEADER_BYTES
     header[4..12].copy_from_slice(&fields.tip_height.to_le_bytes());
     header[12..44].copy_from_slice(&fields.tip_hash);
     header[44..76].copy_from_slice(&fields.cumulative_chainwork);
-    header[76..80].copy_from_slice(&fields.log_slots.to_le_bytes());
-    header[80..88].copy_from_slice(&fields.active_slot_count.to_le_bytes());
-    header[88..96].copy_from_slice(&fields.alloc_counter.to_le_bytes());
-    header[96] = fields.eff_log;
-    header[97..105].copy_from_slice(&fields.bridge_tip_height.to_le_bytes());
-    header[105..137].copy_from_slice(&fields.bridge_tip_hash);
-    header[137..169].copy_from_slice(&fields.bridge_cumulative_chainwork);
-    header[169..173].copy_from_slice(&fields.segment_count.to_le_bytes());
+    header[76..80].copy_from_slice(&fields.format_version.to_le_bytes());
+    header[80..112].copy_from_slice(&fields.state_root);
+    header[112..144].copy_from_slice(&fields.manifest_digest);
+    header[144..148].copy_from_slice(&fields.log_slots.to_le_bytes());
+    header[148..156].copy_from_slice(&fields.active_slot_count.to_le_bytes());
+    header[156..164].copy_from_slice(&fields.alloc_counter.to_le_bytes());
+    header[164] = fields.eff_log;
+    header[165..173].copy_from_slice(&fields.bridge_tip_height.to_le_bytes());
+    header[173..205].copy_from_slice(&fields.bridge_tip_hash);
+    header[205..237].copy_from_slice(&fields.bridge_cumulative_chainwork);
+    header[237..241].copy_from_slice(&fields.segment_count.to_le_bytes());
     header
 }
 
@@ -450,14 +490,17 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/manifest/4")
+        StreamProtocol::new("/noid/test/sync/manifest/6")
     }
 
     fn populated_response() -> GetStateManifestResponse {
-        GetStateManifestResponse {
+        let mut response = GetStateManifestResponse {
             tip_height: 77,
             tip_hash: [0x11; 32],
             cumulative_chainwork: [0x22; 32],
+            format_version: SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: [0x21; 32],
+            manifest_digest: [0; 32],
             log_slots: 17,
             active_slot_count: 9,
             alloc_counter: 12,
@@ -468,7 +511,9 @@ mod tests {
             segment_ids: vec![0, 1],
             segment_roots: vec![[0x33; 32], [0x44; 32]],
             segment_lengths: vec![209, 259],
-        }
+        };
+        assert!(response.seal_manifest_digest());
+        response
     }
 
     fn response_header(mut fields: ResponseFields) -> Vec<u8> {
@@ -481,6 +526,9 @@ mod tests {
             tip_height: 77,
             tip_hash: [0x11; 32],
             cumulative_chainwork: [0x22; 32],
+            format_version: SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: [0x21; 32],
+            manifest_digest: [0x31; 32],
             log_slots: 17,
             active_slot_count: 9,
             alloc_counter: 12,
@@ -502,6 +550,7 @@ mod tests {
                 &mut wire,
                 GetStateManifestRequest {
                     requester_height: 123,
+                    requested_manifest_digest: [0xA5; 32],
                 },
             )
             .await
@@ -513,6 +562,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded.requester_height, 123);
+        assert_eq!(decoded.requested_manifest_digest, [0xA5; 32]);
 
         let mut trailing = wire.into_inner();
         trailing.push(0);
@@ -555,10 +605,13 @@ mod tests {
 
     #[tokio::test]
     async fn expanded_domain_manifest_carries_sparse_upper_half_segment_ids() {
-        let response = GetStateManifestResponse {
+        let mut response = GetStateManifestResponse {
             tip_height: 88,
             tip_hash: [0x51; 32],
             cumulative_chainwork: [0x52; 32],
+            format_version: SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: [0x50; 32],
+            manifest_digest: [0; 32],
             log_slots: 25,
             active_slot_count: 2,
             alloc_counter: 2,
@@ -570,6 +623,7 @@ mod tests {
             segment_roots: vec![[0x53; 32], [0x54; 32]],
             segment_lengths: vec![59, 59],
         };
+        assert!(response.seal_manifest_digest());
         let mut wire = Cursor::new(Vec::new());
         StateManifestCodec
             .write_response(&protocol(), &mut wire, response)

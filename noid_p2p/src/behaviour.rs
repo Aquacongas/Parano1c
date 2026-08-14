@@ -325,7 +325,7 @@ impl NodeBehaviour {
             [(
                 // v2 checks segment/header counts and snapshot geometry before
                 // allocating either manifest vector.
-                StreamProtocol::try_from_owned(format!("{}/sync/manifest/4", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest/6", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -340,7 +340,7 @@ impl NodeBehaviour {
             [(
                 // v3 additionally echoes the exact snapshot boundary in every
                 // response, while retaining pre-allocation length validation.
-                StreamProtocol::try_from_owned(format!("{}/sync/segment/4", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/segment/5", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

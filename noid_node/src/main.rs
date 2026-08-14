@@ -377,8 +377,8 @@ const CONNECTED_TIP_PROBE_HEADERS: u16 =
 /// Gossip is intentionally only a latency hint; a dropped announcement must
 /// never leave a healthy connected node permanently parked on an old tip.
 const STEADY_TIP_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
-/// At most two exact-tip quorum lanes are opened per interval. Failed or
-/// non-confirming identities rotate least-recently-first.
+/// At most two ancestry-lease refresh lanes are opened per interval. Failed
+/// or non-confirming identities rotate least-recently-first.
 const MINING_QUORUM_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 /// A peer's tip confirmation is an expiring authorization, not a permanent
 /// property of the connection.  If authenticated tip traffic stops, mining
@@ -395,17 +395,16 @@ fn shallow_fork_progress_deadline_due(last_progress_at: Instant, now: Instant) -
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MiningTipConfirmation {
-    height: u64,
-    hash: [u8; 32],
     confirmed_at: Instant,
 }
 
 /// Compatibility wrapper around the network-v3 readiness model.
 ///
-/// Stable authenticated chain-view health and exact frontier authorization are
-/// separate. A normal child commit clears only the frontier authorization for
-/// nonce search; it does not turn healthy connected peers into "0/2" and it
-/// does not stop proof construction for the new parent.
+/// Stable authenticated chain-view health and frontier authorization are
+/// separate. A normal child commit preserves still-fresh authorization for an
+/// authenticated ancestor; a branch replacement revokes it. This avoids a
+/// false "0/2" collapse at every honest tip advance without authorizing work
+/// while a stronger or incompatible branch remains unresolved.
 struct MiningPeerQuorum {
     isolated: bool,
     origin: Instant,
@@ -480,17 +479,24 @@ impl MiningPeerQuorum {
         self.publish();
     }
 
-    fn set_canonical_tip(&mut self, height: u64, hash: [u8; 32]) {
+    fn set_canonical_tip(&mut self, height: u64, hash: [u8; 32], extends_previous: bool) {
         let tip = noid_node::networking::ChainPoint::new(height, hash);
         if self.readiness.committed_tip() == tip {
             return;
         }
-        self.readiness.set_committed_tip(tip);
+        self.readiness.set_committed_tip(tip, extends_previous);
         self.unresolved_better_header = false;
         self.readiness
             .set_sync_state(self.initial_sync_complete, false);
-        self.frontier_confirmed.clear();
+        if !extends_previous {
+            self.frontier_confirmed.clear();
+        }
         self.publish();
+    }
+
+    fn reconcile_canonical_tip(&mut self, height: u64, hash: [u8; 32]) {
+        let previous = self.readiness.committed_tip();
+        self.set_canonical_tip(height, hash, height == previous.height.saturating_add(1));
     }
 
     /// A natively validated view refreshes stable network health. It may also
@@ -551,14 +557,8 @@ impl MiningPeerQuorum {
             .readiness
             .authorize_frontier(peer, point, expires_at_ms, now_ms)
         {
-            self.frontier_confirmed.insert(
-                peer,
-                MiningTipConfirmation {
-                    height,
-                    hash,
-                    confirmed_at,
-                },
-            );
+            self.frontier_confirmed
+                .insert(peer, MiningTipConfirmation { confirmed_at });
         }
         self.publish_at(confirmed_at);
     }
@@ -567,10 +567,8 @@ impl MiningPeerQuorum {
         let now_ms = self.now_ms(now);
         self.readiness.expire(now_ms);
         let connected = &self.connected;
-        let tip = self.readiness.committed_tip();
         self.frontier_confirmed.retain(|peer, confirmation| {
             connected.contains_key(peer)
-                && (confirmation.height, confirmation.hash) == (tip.height, tip.hash)
                 && now.saturating_duration_since(confirmation.confirmed_at)
                     < MINING_PEER_CONFIRMATION_TTL
         });
@@ -673,12 +671,6 @@ impl MiningPeerQuorum {
 /// that layer flush a request which never opened a substream before the node
 /// starts another manifest generation.
 const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(38);
-/// A fresh node must not finalize the first valid snapshot merely because its
-/// response won a network race. During this short window it keeps only the
-/// strongest advertised candidate by cumulative work. The selected candidate
-/// is still fully revalidated from canonical headers before any State is
-/// installed, so manifest work remains an untrusted scheduling hint.
-const STATE_MANIFEST_CANDIDATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A terminal normally arrives in about two seconds on the live seed network.
 /// libp2p starts its transport timeout only after an outbound substream opens,
 /// so a request queued behind stream capacity otherwise has no node-visible
@@ -694,25 +686,6 @@ const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 
 fn manifest_round_retry_due(started_at: Option<Instant>, now: Instant) -> bool {
     started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT)
-}
-
-fn manifest_candidate_selection_due(started_at: Option<Instant>, now: Instant) -> bool {
-    started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_CANDIDATE_SETTLE)
-}
-
-fn state_manifest_candidate_is_preferred(
-    candidate: &noid_p2p::protocol::GetStateManifestResponse,
-    current: &noid_p2p::protocol::GetStateManifestResponse,
-) -> bool {
-    matches!(
-        noid_chain::consensus::fork_choice::choose_chain_by_work(
-            &candidate.bridge_cumulative_chainwork,
-            &candidate.bridge_tip_hash,
-            &current.bridge_cumulative_chainwork,
-            &current.bridge_tip_hash,
-        ),
-        noid_chain::consensus::fork_choice::ChainChoice::A
-    )
 }
 
 fn steady_tip_probe_due(
@@ -2036,6 +2009,115 @@ struct PendingSnapshotHeaderSync {
     target_height: u64,
 }
 
+const SNAPSHOT_SEGMENT_SOURCE_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Sources for one immutable snapshot generation. A source is transport, not
+/// authority: equality is established by the manifest digest and every
+/// segment is authenticated against the selected manifest before staging.
+#[derive(Default)]
+struct SnapshotSegmentSources {
+    manifest_digest: Option<[u8; 32]>,
+    providers: std::collections::HashSet<libp2p::PeerId>,
+    attempted_for_object: std::collections::HashSet<libp2p::PeerId>,
+    current: Option<libp2p::PeerId>,
+    retry_after: Option<Instant>,
+}
+
+impl SnapshotSegmentSources {
+    fn begin(
+        &mut self,
+        manifest_digest: [u8; 32],
+        mut providers: std::collections::HashSet<libp2p::PeerId>,
+        initial: libp2p::PeerId,
+    ) {
+        providers.insert(initial);
+        self.manifest_digest = Some(manifest_digest);
+        self.providers = providers;
+        self.attempted_for_object.clear();
+        self.current = None;
+        self.retry_after = None;
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    fn register(&mut self, peer: libp2p::PeerId, manifest_digest: [u8; 32]) -> bool {
+        if self.manifest_digest != Some(manifest_digest) {
+            return false;
+        }
+        self.providers.insert(peer);
+        true
+    }
+
+    fn current(&self) -> Option<libp2p::PeerId> {
+        self.current
+    }
+
+    fn select(
+        &mut self,
+        connected: &std::collections::HashSet<libp2p::PeerId>,
+        now: Instant,
+    ) -> Option<libp2p::PeerId> {
+        if self
+            .current
+            .is_some_and(|peer| connected.contains(&peer) && self.providers.contains(&peer))
+        {
+            return self.current;
+        }
+        self.current = None;
+
+        let mut candidates = self
+            .providers
+            .intersection(connected)
+            .filter(|peer| !self.attempted_for_object.contains(peer))
+            .copied()
+            .collect::<Vec<_>>();
+        if candidates.is_empty()
+            && self
+                .retry_after
+                .is_some_and(|retry_after| now >= retry_after)
+        {
+            self.attempted_for_object.clear();
+            self.retry_after = None;
+            candidates = self.providers.intersection(connected).copied().collect();
+        }
+        candidates.sort_by_key(|peer| peer.to_bytes());
+        self.current = candidates.into_iter().next();
+        self.current
+    }
+
+    fn mark_failed(&mut self, peer: libp2p::PeerId, now: Instant) {
+        self.attempted_for_object.insert(peer);
+        if self.current == Some(peer) {
+            self.current = None;
+        }
+        self.retry_after = Some(now + SNAPSHOT_SEGMENT_SOURCE_RETRY_DELAY);
+    }
+
+    fn mark_succeeded(&mut self, peer: libp2p::PeerId) {
+        self.providers.insert(peer);
+        // Segment authentication runs concurrently with the next network
+        // request. A late completion from the previous source must never
+        // steal ownership from an already-rotated in-flight request.
+        if self.current == Some(peer) {
+            self.attempted_for_object.clear();
+            self.retry_after = None;
+        }
+    }
+
+    fn disconnect(&mut self, peer: libp2p::PeerId) -> bool {
+        self.providers.remove(&peer);
+        self.attempted_for_object.remove(&peer);
+        if self.current == Some(peer) {
+            self.current = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ManifestTerminalCapability {
     boundary_height: u64,
@@ -2763,11 +2845,17 @@ fn validate_snapshot_staged_header_boundary(
     if manifest.tip_height == 0 {
         return Err("snapshot manifest has no tip".into());
     }
+    if !manifest.has_valid_manifest_digest() {
+        return Err("snapshot manifest generation digest is invalid".into());
+    }
     if boundary.tip_header.height != manifest.tip_height || boundary.tip_hash != manifest.tip_hash {
         return Err("snapshot manifest boundary does not match staged header tip".into());
     }
     if boundary.tip_header.log_slots != manifest.log_slots {
         return Err("snapshot manifest log_slots does not match staged header".into());
+    }
+    if boundary.tip_header.state_root != manifest.state_root {
+        return Err("snapshot manifest State root does not match staged header".into());
     }
     if boundary.tip_header.active_slot_count != manifest.active_slot_count {
         return Err("snapshot manifest active_slot_count does not match staged header".into());
@@ -3891,30 +3979,30 @@ fn state_segment_response_matches_snapshot_boundary(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use super::{
         admit_snapshot_segment_response, apply_reorg_offthread, authenticated_height_after_reorg,
         chain_data_epoch_is_current, compact_apply_signals, compact_suffix_eligible,
         competing_suffix_tip, competing_suffix_wins, gap_requires_snapshot_sync,
         header_batch_exhausts_nonfinal_window, initial_sync_may_skip_peer_confirmation,
-        load_or_create_config, manifest_candidate_selection_due, manifest_round_gap_is_resolved,
-        manifest_round_retry_due, mark_initial_sync_ready, mining_quorum_probe_due,
-        next_block_has_competing_parent, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
-        persist_chain_data_epoch_marker, prune_superseded_snapshot_header_staging,
-        rotating_manifest_peers, seed_to_multiaddr, shallow_fork_progress_deadline_due,
-        snapshot_bridge_requires_tail, snapshot_header_next_action,
-        snapshot_parent_mismatch_is_at_base, snapshot_segment_request_capacity,
-        state_manifest_candidate_is_preferred, state_segment_response_matches_snapshot_boundary,
+        load_or_create_config, manifest_round_gap_is_resolved, manifest_round_retry_due,
+        mark_initial_sync_ready, mining_quorum_probe_due, next_block_has_competing_parent,
+        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, persist_chain_data_epoch_marker,
+        prune_superseded_snapshot_header_staging, rotating_manifest_peers, seed_to_multiaddr,
+        shallow_fork_progress_deadline_due, snapshot_bridge_requires_tail,
+        snapshot_header_next_action, snapshot_parent_mismatch_is_at_base,
+        snapshot_segment_request_capacity, state_segment_response_matches_snapshot_boundary,
         steady_tip_probe_due, terminal_alternate_peer, terminal_transport_can_retry_same_peer,
         unavailable_block_requires_snapshot, validate_history_step_tip_future_drift,
         validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
         AcceptedBlockCandidate, MiningPeerQuorum, NodeConfig, SnapshotHeaderBoundary,
         SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
-        SnapshotSegmentResponseAdmission, TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS,
-        HISTORY_STEP_TERMINAL_HARD_DEADLINE, HISTORY_STEP_TERMINAL_HEDGE_AFTER,
-        MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
-        SHALLOW_FORK_NO_PROGRESS_TIMEOUT, SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW,
-        STATE_MANIFEST_CANDIDATE_SETTLE, STATE_MANIFEST_RESPONSE_TIMEOUT,
-        STEADY_TIP_PROBE_INTERVAL,
+        SnapshotSegmentResponseAdmission, SnapshotSegmentSources, TerminalRequestRace,
+        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        HISTORY_STEP_TERMINAL_HEDGE_AFTER, MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM,
+        MINING_QUORUM_PROBE_INTERVAL, SHALLOW_FORK_NO_PROGRESS_TIMEOUT, SNAPSHOT_HEADER_BATCH,
+        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
     };
 
     #[test]
@@ -4054,7 +4142,7 @@ mod tests {
         let height = 17;
         let hash = [0x17; 32];
 
-        quorum.set_canonical_tip(height, hash);
+        quorum.set_canonical_tip(height, hash, false);
         quorum.set_sync_state(true, false);
         quorum.connect(first, noid_node::networking::FailureDomain(1));
         quorum.connect(second, noid_node::networking::FailureDomain(2));
@@ -4096,7 +4184,7 @@ mod tests {
         let height = 23;
         let hash = [0x23; 32];
 
-        quorum.set_canonical_tip(height, hash);
+        quorum.set_canonical_tip(height, hash, false);
         quorum.set_sync_state(true, false);
         quorum.connect(first, noid_node::networking::FailureDomain(1));
         quorum.connect(second, noid_node::networking::FailureDomain(2));
@@ -4130,7 +4218,7 @@ mod tests {
         }
         let height = 31;
         let hash = [0x31; 32];
-        quorum.set_canonical_tip(height, hash);
+        quorum.set_canonical_tip(height, hash, false);
         quorum.set_sync_state(true, false);
         assert_eq!(quorum.probe_candidates(MINING_PEER_QUORUM).len(), 2);
 
@@ -4167,7 +4255,7 @@ mod tests {
     }
 
     #[test]
-    fn mining_quorum_is_bound_to_the_exact_current_tip() {
+    fn mining_quorum_preserves_ancestry_leases_and_revokes_replacements() {
         let (proof_tx, proof_rx) = tokio::sync::watch::channel(false);
         let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
         let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
@@ -4177,25 +4265,28 @@ mod tests {
         quorum.connect(first, noid_node::networking::FailureDomain(1));
         quorum.connect(second, noid_node::networking::FailureDomain(2));
 
-        quorum.set_canonical_tip(40, [0x40; 32]);
+        quorum.set_canonical_tip(40, [0x40; 32], false);
         quorum.set_sync_state(true, false);
         quorum.confirm_tip(first, 40, [0x40; 32]);
         quorum.confirm_tip(second, 40, [0x40; 32]);
         assert!(*ready_rx.borrow());
 
-        quorum.set_canonical_tip(41, [0x41; 32]);
+        quorum.set_canonical_tip(41, [0x41; 32], true);
         assert_eq!(*count_rx.borrow(), MINING_PEER_QUORUM);
         assert!(*proof_rx.borrow());
+        assert!(*ready_rx.borrow());
+
+        quorum.set_canonical_tip(41, [0x51; 32], false);
         assert!(!*ready_rx.borrow());
 
-        // Delayed old-tip responses cannot resurrect the mining gate.
+        // Delayed reports for the displaced branch cannot resurrect the gate.
         quorum.confirm_tip(first, 40, [0x40; 32]);
         quorum.confirm_tip(second, 40, [0x40; 32]);
         assert_eq!(*count_rx.borrow(), MINING_PEER_QUORUM);
         assert!(!*ready_rx.borrow());
 
-        quorum.confirm_tip(first, 41, [0x41; 32]);
-        quorum.confirm_tip(second, 41, [0x41; 32]);
+        quorum.confirm_tip(first, 41, [0x51; 32]);
+        quorum.confirm_tip(second, 41, [0x51; 32]);
         assert!(*ready_rx.borrow());
     }
 
@@ -4321,6 +4412,42 @@ mod tests {
         assert!(!state_segment_response_matches_snapshot_boundary(
             144, [0xA5; 32], 144, [0x5A; 32]
         ));
+    }
+
+    #[test]
+    fn state_segment_source_failure_preserves_plan_and_verified_objects() {
+        let first = libp2p::PeerId::random();
+        let second = libp2p::PeerId::random();
+        let digest = [0xA5; 32];
+        let connected = std::collections::HashSet::from([first, second]);
+        let mut sources = SnapshotSegmentSources::default();
+        sources.begin(digest, std::collections::HashSet::from([second]), first);
+
+        let selected = sources
+            .select(&connected, Instant::now())
+            .expect("one exact provider is selected");
+        let alternate = if selected == first { second } else { first };
+        let mut verified_segments = std::collections::HashSet::from([1u16, 2u16]);
+        let mut pending = std::collections::HashSet::from([3u16]);
+        let mut queue = std::collections::VecDeque::from([4u16]);
+
+        pending.remove(&3);
+        queue.push_front(3);
+        sources.mark_failed(selected, Instant::now());
+
+        assert_eq!(sources.select(&connected, Instant::now()), Some(alternate));
+        sources.mark_succeeded(selected);
+        assert_eq!(
+            sources.current(),
+            Some(alternate),
+            "a late verified completion must not steal the next request"
+        );
+        assert_eq!(queue, std::collections::VecDeque::from([3, 4]));
+        assert_eq!(verified_segments, std::collections::HashSet::from([1, 2]));
+        assert!(sources.register(alternate, digest));
+        assert!(!sources.register(alternate, [0x5A; 32]));
+        verified_segments.insert(3);
+        assert_eq!(verified_segments.len(), 3);
     }
 
     #[test]
@@ -4876,39 +5003,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_manifest_election_waits_then_prefers_cumulative_work() {
-        let started = std::time::Instant::now();
-        assert!(!manifest_candidate_selection_due(
-            Some(started),
-            started + STATE_MANIFEST_CANDIDATE_SETTLE - std::time::Duration::from_millis(1),
-        ));
-        assert!(manifest_candidate_selection_due(
-            Some(started),
-            started + STATE_MANIFEST_CANDIDATE_SETTLE,
-        ));
-
-        let mut weaker = noid_p2p::protocol::GetStateManifestResponse::default();
-        weaker.bridge_tip_height = 562;
-        weaker.bridge_tip_hash = [0x22; 32];
-        weaker.bridge_cumulative_chainwork[0] = 1;
-
-        let mut stronger = weaker.clone();
-        stronger.bridge_tip_height = 1250;
-        stronger.bridge_tip_hash = [0x11; 32];
-        stronger.bridge_cumulative_chainwork[0] = 2;
-
-        assert!(state_manifest_candidate_is_preferred(&stronger, &weaker));
-        assert!(!state_manifest_candidate_is_preferred(&weaker, &stronger));
-
-        let mut equal_work_better_hash = weaker.clone();
-        equal_work_better_hash.bridge_tip_hash = [0x10; 32];
-        assert!(state_manifest_candidate_is_preferred(
-            &equal_work_better_hash,
-            &weaker,
-        ));
-    }
-
-    #[test]
     fn bounded_manifest_retries_rotate_across_six_peers() {
         let peers = (0..6)
             .map(|_| libp2p::PeerId::random())
@@ -5040,18 +5134,21 @@ mod tests {
             &high_start_work,
             &noid_chain::consensus::block_work(&h1.difficulty_target),
         );
-        let manifest = noid_p2p::protocol::GetStateManifestResponse {
+        let mut manifest = noid_p2p::protocol::GetStateManifestResponse {
             tip_height: 1,
             tip_hash: h1_hash,
             cumulative_chainwork: h1_work,
+            state_root: h1.state_root,
             log_slots: h1.log_slots,
             active_slot_count: h1.active_slot_count,
             alloc_counter: h1.alloc_counter,
             bridge_tip_height: 1,
             bridge_tip_hash: h1_hash,
             bridge_cumulative_chainwork: h1_work,
+            format_version: noid_p2p::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
             ..Default::default()
         };
+        assert!(manifest.seal_manifest_digest());
         let boundary = SnapshotHeaderBoundary {
             tip_header: h1,
             tip_hash: h1_hash,
@@ -5073,6 +5170,7 @@ mod tests {
 
         let mut bad = manifest.clone();
         bad.cumulative_chainwork = [3u8; 32];
+        assert!(bad.seal_manifest_digest());
         assert!(validate_snapshot_staged_header_boundary(&bad, &boundary)
             .expect_err("bad chainwork must reject")
             .contains("chainwork"));
@@ -5092,18 +5190,21 @@ mod tests {
             tip_header.height = tip_height;
             let tip_hash = noid_chain::hash_block_header(&tip_header);
             let cumulative_chainwork = [0xA5; 32];
-            let manifest = noid_p2p::protocol::GetStateManifestResponse {
+            let mut manifest = noid_p2p::protocol::GetStateManifestResponse {
                 tip_height,
                 tip_hash,
                 cumulative_chainwork,
+                state_root: tip_header.state_root,
                 log_slots: tip_header.log_slots,
                 active_slot_count: tip_header.active_slot_count,
                 alloc_counter: tip_header.alloc_counter,
                 bridge_tip_height: tip_height,
                 bridge_tip_hash: tip_hash,
                 bridge_cumulative_chainwork: cumulative_chainwork,
+                format_version: noid_p2p::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
                 ..Default::default()
             };
+            assert!(manifest.seal_manifest_digest());
             let mut epoch_anchor_header = noid_chain::consensus::genesis_header();
             epoch_anchor_header.height = expected_epoch_height;
             let boundary = SnapshotHeaderBoundary {
@@ -5127,18 +5228,21 @@ mod tests {
         tip_header.height = tip_height;
         let tip_hash = noid_chain::hash_block_header(&tip_header);
         let cumulative_chainwork = [0x5A; 32];
-        let manifest = noid_p2p::protocol::GetStateManifestResponse {
+        let mut manifest = noid_p2p::protocol::GetStateManifestResponse {
             tip_height,
             tip_hash,
             cumulative_chainwork,
+            state_root: tip_header.state_root,
             log_slots: tip_header.log_slots,
             active_slot_count: tip_header.active_slot_count,
             alloc_counter: tip_header.alloc_counter,
             bridge_tip_height: tip_height,
             bridge_tip_hash: tip_hash,
             bridge_cumulative_chainwork: cumulative_chainwork,
+            format_version: noid_p2p::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
             ..Default::default()
         };
+        assert!(manifest.seal_manifest_digest());
         let mut wrong_anchor = noid_chain::consensus::genesis_header();
         wrong_anchor.height = tip_height;
         let boundary = SnapshotHeaderBoundary {
@@ -5201,7 +5305,7 @@ async fn handle_p2p_events(
     let mut snapshot_rebase_hint: Option<SnapshotRebaseHint> = None;
     {
         let ctx = chain.read().await;
-        mining_peer_quorum.set_canonical_tip(ctx.tip_height(), ctx.tip_hash());
+        mining_peer_quorum.set_canonical_tip(ctx.tip_height(), ctx.tip_hash(), false);
     }
 
     // --- Snapshot verification state ---
@@ -5228,10 +5332,6 @@ async fn handle_p2p_events(
         from: libp2p::PeerId,
         manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
         history_step: Option<VerifiedHistoryStepSnapshot>,
-    }
-    struct SnapshotManifestCandidate {
-        from: libp2p::PeerId,
-        manifest: Box<noid_p2p::protocol::GetStateManifestResponse>,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotHeaderStagingOperationKey {
@@ -5302,7 +5402,7 @@ async fn handle_p2p_events(
             key: SnapshotStagingOperationKey,
             payload_bytes: u64,
             work_elapsed: std::time::Duration,
-            result: Result<SnapshotStagingSession, String>,
+            result: SnapshotSegmentStageResult,
         },
         Finalized {
             key: SnapshotStagingOperationKey,
@@ -5310,6 +5410,14 @@ async fn handle_p2p_events(
             work_elapsed: std::time::Duration,
             result: Result<FinalizedSnapshotStaging, String>,
         },
+    }
+    enum SnapshotSegmentStageResult {
+        Accepted(SnapshotStagingSession),
+        Rejected {
+            staging: SnapshotStagingSession,
+            error: String,
+        },
+        Fatal(String),
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     struct SnapshotTailAppendKey {
@@ -5399,12 +5507,12 @@ async fn handle_p2p_events(
         result: Result<AppliedVerifiedSnapshot, SnapshotInstallError>,
     }
     let mut pending_manifest: Option<PendingManifest> = None;
-    // A bounded pre-install election prevents connection order from becoming
-    // fork choice. Only one manifest body is retained: the strongest advertised
-    // bridge by cumulative work, with the canonical hash tie-break. Its claim
-    // is not authority; exact native header validation follows immediately.
-    let mut best_manifest_candidate: Option<SnapshotManifestCandidate> = None;
-    let mut manifest_candidate_started_at: Option<std::time::Instant> = None;
+    let mut candidate_manifest_providers: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+    let mut snapshot_segment_sources = SnapshotSegmentSources::default();
+    let mut last_snapshot_provider_probe = Instant::now()
+        .checked_sub(Duration::from_secs(5))
+        .unwrap_or_else(Instant::now);
     let mut pending_snapshot_header_sync: Option<PendingSnapshotHeaderSync> = None;
     let mut snapshot_header_pipeline: Option<SnapshotHeaderPipeline> = None;
     let (snapshot_header_staging_tx, mut snapshot_header_staging_rx) =
@@ -5550,8 +5658,7 @@ async fn handle_p2p_events(
             manifest_force_snapshot_peers.clear();
             manifest_response_count = 0;
             manifest_round_started_at = None;
-            best_manifest_candidate = None;
-            manifest_candidate_started_at = None;
+            candidate_manifest_providers.clear();
         }};
     }
 
@@ -5635,6 +5742,7 @@ async fn handle_p2p_events(
             pending_segment_ids.clear();
             snapshot_segment_retry_counts.clear();
             segment_queue.clear();
+            snapshot_segment_sources.clear();
             pending_shallow_fork = None;
             if history_step_verification_inflight.is_some() {
                 tracing::debug!(
@@ -5680,6 +5788,7 @@ async fn handle_p2p_events(
                         generation: snapshot_sync_generation,
                         peer,
                         requester_height: our_height,
+                        requested_manifest_digest: [0; 32],
                     })
                     .await;
             }
@@ -5710,6 +5819,94 @@ async fn handle_p2p_events(
                         })
                 })
                 .or_else(|| history_step_verification_inflight.map(|pending| pending.from))
+        }};
+    }
+
+    macro_rules! dispatch_snapshot_segments_from_available_source {
+        () => {{
+            if let Some((height, hash, digest)) = pending_manifest.as_ref().map(|pending| {
+                (
+                    pending.manifest.tip_height,
+                    pending.manifest.tip_hash,
+                    pending.manifest.manifest_digest,
+                )
+            }) {
+                if let Some(source) =
+                    snapshot_segment_sources.select(&manifest_peers, Instant::now())
+                {
+                    dispatch_queued_snapshot_segments(
+                        &p2p_cmd,
+                        source,
+                        height,
+                        hash,
+                        digest,
+                        snapshot_staging_inflight.is_some(),
+                        queued_segment_response.is_some(),
+                        &mut pending_segment_ids,
+                        &mut segment_queue,
+                    )
+                    .await;
+                }
+            }
+        }};
+    }
+
+    macro_rules! request_snapshot_generation_providers {
+        ($failed_peer:expr) => {{
+            let failed_peer = $failed_peer;
+            let requester_height = {
+                let ctx = chain.read().await;
+                ctx.tip_height()
+            };
+            let excluded = std::collections::HashSet::from([failed_peer]);
+            let requested_manifest_digest = pending_manifest
+                .as_ref()
+                .map(|pending| pending.manifest.manifest_digest)
+                .unwrap_or([0; 32]);
+            let candidates = rotating_manifest_peers(
+                &manifest_peers,
+                &excluded,
+                None,
+                false,
+                &mut manifest_retry_cursor,
+                3,
+            );
+            for peer in candidates {
+                manifest_requested_peers.insert(peer);
+                let _ = p2p_cmd
+                    .send(noid_p2p::NetworkCommand::RequestStateManifest {
+                        generation: snapshot_sync_generation,
+                        peer,
+                        requester_height,
+                        requested_manifest_digest,
+                    })
+                    .await;
+            }
+        }};
+    }
+
+    macro_rules! rotate_snapshot_segment_source {
+        ($failed_peer:expr, $segment_id:expr, $reason:expr) => {{
+            let failed_peer = $failed_peer;
+            let segment_id = $segment_id;
+            pending_segment_ids.remove(&segment_id);
+            if !segment_queue.contains(&segment_id) {
+                segment_queue.push_front(segment_id);
+            }
+            let retry_count = snapshot_segment_retry_counts
+                .entry(segment_id)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+            snapshot_segment_sources.mark_failed(failed_peer, Instant::now());
+            tracing::warn!(
+                peer = %failed_peer,
+                segment = segment_id,
+                retries = *retry_count,
+                reason = $reason,
+                "snapshot object source failed; preserving generation and verified segments"
+            );
+            request_snapshot_generation_providers!(failed_peer);
+            dispatch_snapshot_segments_from_available_source!();
         }};
     }
 
@@ -5787,6 +5984,11 @@ async fn handle_p2p_events(
                 }
             };
             let bridge_tip = manifest.bridge_tip_height;
+            snapshot_segment_sources.begin(
+                manifest.manifest_digest,
+                std::mem::take(&mut candidate_manifest_providers),
+                from,
+            );
             pending_manifest = Some(PendingManifest {
                 from,
                 manifest,
@@ -6071,26 +6273,29 @@ async fn handle_p2p_events(
                 .map_or(0u64, |data| data.len() as u64);
             tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
-                let result =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                        let result = staging
-                            .accept_segment(
-                                segment_id,
-                                response_effective_log,
-                                response
-                                    .data
-                                    .as_deref()
-                                    .expect("present segment payload moved intact"),
-                            )
-                            .map(|()| staging)
-                            .map_err(|error| error.to_string());
-                        // The wire allocation and inbound permit stay charged
-                        // until authentication and atomic disk publication.
-                        drop(response);
-                        result
-                    }))
-                    .map_err(|_| "snapshot segment staging worker panicked".to_owned())
-                    .and_then(|result| result);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    match staging.accept_segment_recoverable(
+                            segment_id,
+                            response_effective_log,
+                            response
+                                .data
+                                .as_deref()
+                                .expect("present segment payload moved intact"),
+                        ) {
+                            Ok(()) => SnapshotSegmentStageResult::Accepted(staging),
+                            Err(error) => SnapshotSegmentStageResult::Rejected {
+                                staging,
+                                error: error.to_string(),
+                            },
+                        }
+                }))
+                .unwrap_or_else(|_| {
+                    SnapshotSegmentStageResult::Fatal(
+                        "snapshot segment staging worker panicked".to_owned(),
+                    )
+                });
+                // The wire allocation and inbound permit stay charged through
+                // authentication and atomic disk publication by the closure.
                 let _ = completion.blocking_send(SnapshotStagingCompletion::Accepted {
                     key,
                     payload_bytes,
@@ -6694,6 +6899,7 @@ async fn handle_p2p_events(
                         generation: snapshot_sync_generation,
                         peer,
                         requester_height: our_height,
+                        requested_manifest_digest: [0; 32],
                     })
                     .await;
                 tracing::warn!(
@@ -6998,8 +7204,6 @@ async fn handle_p2p_events(
                 && !manifest_peers.is_empty()
                 && manifest_requested_peers.is_empty()
                 && manifest_round_started_at.is_none()
-                && best_manifest_candidate.is_none()
-                && manifest_candidate_started_at.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -7117,6 +7321,7 @@ async fn handle_p2p_events(
                                 generation: snapshot_sync_generation,
                                 peer: from,
                                 requester_height: our_height,
+                                requested_manifest_digest: [0; 32],
                             })
                             .await;
                     }
@@ -7277,7 +7482,7 @@ async fn handle_p2p_events(
                     // A gossipsub forwarder is authoritative for neither
                     // advertised object. Ask its storage-backed inventory;
                     // if it is still catching up, periodic probes will
-                    // discover another exact provider. Network v3 never falls
+                    // discover another exact provider. Network v6 never falls
                     // back to complete-bundle pull for ordinary catch-up.
                     let count = 2;
                     let request_key = (from, our_height, count);
@@ -7853,7 +8058,7 @@ async fn handle_p2p_events(
                                     Ok(applied_reorg) => {
                                         snapshot_rebase_hint = None;
                                         mining_peer_quorum
-                                            .set_canonical_tip(new_tip_height, new_tip_hash);
+                                            .set_canonical_tip(new_tip_height, new_tip_hash, false);
                                         record_authenticated_reorg_height!(
                                             our_tip_height,
                                             new_tip_height,
@@ -7957,6 +8162,7 @@ async fn handle_p2p_events(
                                                 generation: snapshot_sync_generation,
                                                 peer: from,
                                                 requester_height: our_tip,
+                                                requested_manifest_digest: [0; 32],
                                             })
                                             .await;
                                     }
@@ -8037,7 +8243,7 @@ async fn handle_p2p_events(
                                 drop(inbound_memory_permit.take());
                                 let height = applied.height;
                                 mining_peer_quorum
-                                    .set_canonical_tip(height, applied.block_hash);
+                                    .set_canonical_tip(height, applied.block_hash, true);
                                 record_authenticated_height!(height, from);
                                 external_mining_attempts
                                     .invalidate_for_tip(height, applied.block_hash);
@@ -8101,6 +8307,7 @@ async fn handle_p2p_events(
                                             mining_peer_quorum.set_canonical_tip(
                                                 h,
                                                 applied_orphan.block_hash,
+                                                true,
                                             );
                                             record_authenticated_height!(h, from);
                                             external_mining_attempts
@@ -8262,6 +8469,7 @@ async fn handle_p2p_events(
                                                     mining_peer_quorum.set_canonical_tip(
                                                         new_tip_height,
                                                         accepted_tip_hash,
+                                                        false,
                                                     );
                                                     record_authenticated_reorg_height!(
                                                         our_tip_height,
@@ -8344,6 +8552,7 @@ async fn handle_p2p_events(
                                                                 generation: snapshot_sync_generation,
                                                                 peer: from,
                                                                 requester_height: our_tip_height,
+                                                                requested_manifest_digest: [0; 32],
                                                             })
                                                             .await;
                                                     }
@@ -8420,6 +8629,7 @@ async fn handle_p2p_events(
                                                         generation: snapshot_sync_generation,
                                                         peer: from,
                                                         requester_height: our_tip_height,
+                                                        requested_manifest_digest: [0; 32],
                                                     })
                                                     .await;
                                             }
@@ -8634,6 +8844,7 @@ async fn handle_p2p_events(
                                 generation: snapshot_sync_generation,
                                 peer: from,
                                 requester_height: our_tip,
+                                requested_manifest_digest: [0; 32],
                             })
                             .await;
                     }
@@ -8803,6 +9014,7 @@ async fn handle_p2p_events(
                             generation: snapshot_sync_generation,
                             peer,
                             requester_height: our_height,
+                            requested_manifest_digest: [0; 32],
                         })
                         .await
                         .ok();
@@ -9192,6 +9404,7 @@ async fn handle_p2p_events(
                                     generation: snapshot_sync_generation,
                                     peer: from,
                                     requester_height: our_height,
+                                    requested_manifest_digest: [0; 32],
                                 })
                                 .await;
                             tracing::info!(
@@ -9452,16 +9665,24 @@ async fn handle_p2p_events(
                     continue;
                 }
                 // Received the state manifest (step 1 of snapshot sync).
-                // Structural checks below bound all advertised work. Usable
-                // responses enter a short work-ranked election so connection
-                // order cannot select the finalized branch. The winner's exact
-                // header chain, PoW, recursive terminal, state root and
-                // immutable suffix still provide authority before installation.
+                // Structural checks below bound all advertised work. A usable
+                // immutable generation starts header validation immediately;
+                // the manifest is scheduling data, never fork-choice authority.
+                // Exact headers, PoW, the recursive terminal and State root all
+                // remain mandatory before installation.
                 let force_snapshot = manifest_force_snapshot_peers.remove(&from);
                 manifest_response_count += 1;
                 if manifest.tip_height == 0 {
                     tracing::debug!(from = %from, "manifest tip_height=0, peer has no state yet");
                 } else {
+                    if !manifest.has_valid_manifest_digest() {
+                        tracing::warn!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            "snapshot manifest has an invalid immutable generation digest"
+                        );
+                        continue;
+                    }
                     if history_step_runtime.is_none() {
                         tracing::warn!(
                             from = %from,
@@ -9575,6 +9796,20 @@ async fn handle_p2p_events(
                             bridge_hash: manifest.bridge_tip_hash,
                         },
                     );
+                    if pending_manifest.as_ref().is_some_and(|pending| {
+                        pending.manifest.manifest_digest == manifest.manifest_digest
+                    }) {
+                        let registered =
+                            snapshot_segment_sources.register(from, manifest.manifest_digest);
+                        debug_assert!(registered, "active generation digest must register");
+                        tracing::debug!(
+                            peer = %from,
+                            snapshot_height = manifest.tip_height,
+                            "registered an additional exact snapshot provider"
+                        );
+                        dispatch_snapshot_segments_from_available_source!();
+                        continue;
+                    }
                     let our_height = {
                         let ctx = chain.read().await;
                         ctx.tip_height()
@@ -9629,30 +9864,16 @@ async fn handle_p2p_events(
                     && pending_recent_suffix.is_none()
                     && recent_suffix_apply_inflight.is_none()
                 {
-                    let replace = best_manifest_candidate.as_ref().is_none_or(|current| {
-                        state_manifest_candidate_is_preferred(&manifest, &current.manifest)
-                    });
-                    if replace {
-                        tracing::info!(
-                            from = %from,
-                            tip = manifest.tip_height,
-                            bridge_tip = manifest.bridge_tip_height,
-                            segments = manifest.segment_ids.len(),
-                            "stronger snapshot manifest entered bounded candidate election"
-                        );
-                        best_manifest_candidate = Some(SnapshotManifestCandidate {
-                            from,
-                            manifest,
-                        });
-                    } else {
-                        tracing::debug!(
-                            from = %from,
-                            tip = manifest.tip_height,
-                            bridge_tip = manifest.bridge_tip_height,
-                            "weaker snapshot manifest ignored during candidate election"
-                        );
-                    }
-                    manifest_candidate_started_at.get_or_insert_with(Instant::now);
+                    tracing::info!(
+                        from = %from,
+                        tip = manifest.tip_height,
+                        segments = manifest.segment_ids.len(),
+                        "validating the first bounded snapshot generation without an election delay"
+                    );
+                    candidate_manifest_providers.clear();
+                    candidate_manifest_providers.insert(from);
+                    manifest_round_started_at = None;
+                    begin_snapshot_header_staging!(from, manifest);
                 } else if manifest.tip_height > 0 {
                     // Manifest chainwork is only a claim until its exact native
                     // header chain has been validated. Never interrupt useful
@@ -9669,7 +9890,6 @@ async fn handle_p2p_events(
                 if manifest_tip_height == 0
                     && manifest_requested_peers.is_empty()
                     && selected_snapshot_peer!().is_none()
-                    && best_manifest_candidate.is_none()
                 {
                     let our_height = {
                         let ctx = chain.read().await;
@@ -9699,12 +9919,12 @@ async fn handle_p2p_events(
                     drop(response);
                     continue;
                 }
-                let Some((selected_peer, selected_tip_height, selected_tip_hash)) =
+                let Some((selected_tip_height, selected_tip_hash, manifest_digest)) =
                     pending_manifest.as_ref().map(|pending| {
                         (
-                            pending.from,
                             pending.manifest.tip_height,
                             pending.manifest.tip_hash,
+                            pending.manifest.manifest_digest,
                         )
                     })
                 else {
@@ -9716,7 +9936,8 @@ async fn handle_p2p_events(
                     drop(response);
                     continue;
                 };
-                if selected_peer != from
+                if snapshot_segment_sources.current() != Some(from)
+                    || response.manifest_digest != manifest_digest
                     || !state_segment_response_matches_snapshot_boundary(
                         response.expected_tip_height,
                         response.expected_tip_hash,
@@ -9726,7 +9947,6 @@ async fn handle_p2p_events(
                 {
                     tracing::warn!(
                         from = %from,
-                        selected_peer = %selected_peer,
                         segment = response.segment_id,
                         response_height = response.expected_tip_height,
                         selected_height = selected_tip_height,
@@ -9736,17 +9956,11 @@ async fn handle_p2p_events(
                     continue;
                 }
                 if response.data.is_none() {
-                    // The selected immutable generation could not serve an
-                    // advertised segment. Preserve the authenticated headers
-                    // and immediately rotate away from that generation owner.
-                    tracing::warn!(
-                        from = %from,
-                        segment = response.segment_id,
-                        "snapshot segment unavailable or stale; rotating snapshot owner"
+                    rotate_snapshot_segment_source!(
+                        from,
+                        response.segment_id,
+                        "provider returned unavailable"
                     );
-                    preserve_active_snapshot_headers!();
-                    reset_sync_state!();
-                    request_bounded_manifest_failover!(from, false);
                     continue;
                 }
 
@@ -9758,12 +9972,10 @@ async fn handle_p2p_events(
                     &mut segment_queue,
                 ) {
                     SnapshotSegmentResponseAdmission::StageNow => {
-                        snapshot_segment_retry_counts.remove(&response.segment_id);
                         stage_snapshot_segment_response!(from, response);
                     }
                     SnapshotSegmentResponseAdmission::BufferOne => {
                         let segment_id = response.segment_id;
-                        snapshot_segment_retry_counts.remove(&segment_id);
                         queued_segment_response = Some((from, response));
                         tracing::debug!(
                             from = %from,
@@ -9791,19 +10003,7 @@ async fn handle_p2p_events(
                         drop(response);
                     }
                 }
-                if let Some(pending) = pending_manifest.as_ref() {
-                    dispatch_queued_snapshot_segments(
-                        &p2p_cmd,
-                        pending.from,
-                        pending.manifest.tip_height,
-                        pending.manifest.tip_hash,
-                        snapshot_staging_inflight.is_some(),
-                        queued_segment_response.is_some(),
-                        &mut pending_segment_ids,
-                        &mut segment_queue,
-                    )
-                    .await;
-                }
+                dispatch_snapshot_segments_from_available_source!();
                 continue;
             }
 
@@ -9812,11 +10012,13 @@ async fn handle_p2p_events(
                 segment_id,
                 expected_tip_height,
                 expected_tip_hash,
+                manifest_digest,
             }) => {
                 let correlated = pending_manifest.as_ref().is_some_and(|pending| {
-                    pending.from == from
+                    snapshot_segment_sources.current() == Some(from)
                         && pending.manifest.tip_height == expected_tip_height
                         && pending.manifest.tip_hash == expected_tip_hash
+                        && pending.manifest.manifest_digest == manifest_digest
                         && pending_segment_ids.contains(&segment_id)
                 });
                 if !correlated {
@@ -9828,47 +10030,7 @@ async fn handle_p2p_events(
                     );
                     continue;
                 }
-                let retry_count = snapshot_segment_retry_counts
-                    .entry(segment_id)
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
-                let alternate_available = manifest_peers.iter().any(|peer| *peer != from);
-                if *retry_count == 1 && !alternate_available {
-                    pending_segment_ids.remove(&segment_id);
-                    if !segment_queue.contains(&segment_id) {
-                        segment_queue.push_front(segment_id);
-                    }
-                    tracing::warn!(
-                        peer = %from,
-                        segment = segment_id,
-                        expected_tip_height,
-                        retry = *retry_count,
-                        "snapshot segment transport failed — retrying only the missing segment"
-                    );
-                    dispatch_queued_snapshot_segments(
-                        &p2p_cmd,
-                        from,
-                        expected_tip_height,
-                        expected_tip_hash,
-                        snapshot_staging_inflight.is_some(),
-                        queued_segment_response.is_some(),
-                        &mut pending_segment_ids,
-                        &mut segment_queue,
-                    )
-                    .await;
-                    continue;
-                }
-                tracing::warn!(
-                    peer = %from,
-                    segment = segment_id,
-                    expected_tip_height,
-                    retries = *retry_count,
-                    alternate_available,
-                    "snapshot segment transport failed; reacquiring immutable generation"
-                );
-                preserve_active_snapshot_headers!();
-                reset_sync_state!();
-                request_bounded_manifest_failover!(from, !alternate_available);
+                rotate_snapshot_segment_source!(from, segment_id, "transport request failed");
             }
 
             Ok(NetworkEvent::HistoryStepTerminal {
@@ -10425,6 +10587,21 @@ async fn handle_p2p_events(
                 manifest_peers.remove(&peer);
                 manifest_terminal_capabilities.remove(&peer);
                 tracing::debug!(peer = %peer, "peer disconnected");
+                if snapshot_segment_sources.disconnect(peer) {
+                    let interrupted = pending_segment_ids.drain().collect::<Vec<_>>();
+                    for segment_id in interrupted.into_iter().rev() {
+                        if !segment_queue.contains(&segment_id) {
+                            segment_queue.push_front(segment_id);
+                        }
+                    }
+                    tracing::warn!(
+                        peer = %peer,
+                        remaining = pending_segment_ids.len() + segment_queue.len(),
+                        "snapshot object source disconnected; preserving exact generation progress"
+                    );
+                    request_snapshot_generation_providers!(peer);
+                    dispatch_snapshot_segments_from_available_source!();
+                }
                 if pending_shallow_fork
                     .as_ref()
                     .is_some_and(|pending| pending.peer == peer)
@@ -10443,6 +10620,13 @@ async fn handle_p2p_events(
                 let finalized_tail_no_longer_needs_manifest_peer =
                     finalized_snapshot_waiting.is_some()
                         && snapshot_tail_terminal_inflight.is_some();
+                let snapshot_state_authority_established = pending_manifest
+                    .as_ref()
+                    .is_some_and(|pending| pending.history_step.is_some())
+                    || snapshot_staging.is_some()
+                    || snapshot_staging_inflight.is_some()
+                    || finalized_snapshot_waiting.is_some()
+                    || snapshot_install_inflight.is_some();
                 let local_header_work_active = snapshot_header_staging_inflight
                     .as_ref()
                     .is_some_and(|key| match key {
@@ -10453,7 +10637,9 @@ async fn handle_p2p_events(
                     }) || history_step_verification_inflight
                     .is_some_and(|pending| pending.from == peer);
                 let snapshot_sync_lost = pending_manifest.as_ref().is_some_and(|pending| {
-                    pending.from == peer && !finalized_tail_no_longer_needs_manifest_peer
+                    pending.from == peer
+                        && !finalized_tail_no_longer_needs_manifest_peer
+                        && !snapshot_state_authority_established
                 })
                     || pending_snapshot_header_sync
                         .as_ref()
@@ -10974,7 +11160,7 @@ async fn handle_p2p_events(
                     );
                     if advanced {
                         mining_peer_quorum
-                            .set_canonical_tip(applied.height, applied.block_hash);
+                            .set_canonical_tip(applied.height, applied.block_hash, true);
                         record_authenticated_height!(applied.height, completed.key.peer);
                         external_mining_attempts
                             .invalidate_for_tip(applied.height, applied.block_hash);
@@ -11104,7 +11290,7 @@ async fn handle_p2p_events(
                         && applied.block_hash == completed.target.hash;
                     if applied.applied_blocks != 0 {
                         mining_peer_quorum
-                            .set_canonical_tip(applied.height, applied.block_hash);
+                            .set_canonical_tip(applied.height, applied.block_hash, true);
                         external_mining_attempts
                             .invalidate_for_tip(applied.height, applied.block_hash);
                         last_tip_advance = Instant::now();
@@ -11138,6 +11324,7 @@ async fn handle_p2p_events(
                     mining_peer_quorum.set_canonical_tip(
                         completed.target.height,
                         completed.target.hash,
+                        false,
                     );
                     external_mining_attempts.invalidate_for_tip(
                         completed.target.height,
@@ -11309,7 +11496,9 @@ async fn handle_p2p_events(
                 tracing::debug!(?key, "discarding superseded snapshot staging completion");
                 match completed {
                     SnapshotStagingCompletion::Accepted {
-                        result: Ok(staging),
+                        result:
+                            SnapshotSegmentStageResult::Accepted(staging)
+                            | SnapshotSegmentStageResult::Rejected { staging, .. },
                         ..
                     } => cleanup_snapshot_staging_session_offthread(staging),
                     SnapshotStagingCompletion::Finalized {
@@ -11338,8 +11527,12 @@ async fn handle_p2p_events(
                         unreachable!("accepted completion always has an accept key");
                     };
                     if generation != snapshot_sync_generation {
-                        if let Ok(staging) = result {
-                            cleanup_snapshot_staging_session_offthread(staging);
+                        match result {
+                            SnapshotSegmentStageResult::Accepted(staging)
+                            | SnapshotSegmentStageResult::Rejected { staging, .. } => {
+                                cleanup_snapshot_staging_session_offthread(staging);
+                            }
+                            SnapshotSegmentStageResult::Fatal(_) => {}
                         }
                         tracing::debug!(
                             from = %from,
@@ -11349,22 +11542,44 @@ async fn handle_p2p_events(
                         continue;
                     }
                     let staging = match result {
-                        Ok(staging) => staging,
-                        Err(error) => {
+                        SnapshotSegmentStageResult::Accepted(staging) => staging,
+                        SnapshotSegmentStageResult::Rejected { staging, error } => {
                             tracing::warn!(
                                 from = %from,
                                 segment = segment_id,
                                 err = %error,
-                                "snapshot segment authentication/staging failed"
+                                "snapshot segment authentication/staging failed; retaining verified objects"
                             );
-                            preserve_active_snapshot_headers!();
+                            snapshot_staging = Some(staging);
+                            rotate_snapshot_segment_source!(
+                                from,
+                                segment_id,
+                                "segment authentication failed"
+                            );
+                            // One exact response may already be buffered behind
+                            // this disk operation. It has its own descriptor and
+                            // root, so authenticate it normally instead of
+                            // throwing away useful bytes with the failed object.
+                            if let Some((queued_from, response)) =
+                                queued_segment_response.take()
+                            {
+                                stage_snapshot_segment_response!(queued_from, response);
+                            }
+                            continue;
+                        }
+                        SnapshotSegmentStageResult::Fatal(error) => {
+                            tracing::error!(
+                                from = %from,
+                                segment = segment_id,
+                                err = %error,
+                                "snapshot segment staging worker failed"
+                            );
                             reset_sync_state!();
-                            request_bounded_manifest_failover!(from, false);
                             continue;
                         }
                     };
                     sync_phase_telemetry.record_state_segment(payload_bytes, work_elapsed);
-                    if !pending_manifest.as_ref().is_some_and(|pending| pending.from == from) {
+                    if pending_manifest.is_none() {
                         tracing::warn!(
                             from = %from,
                             segment = segment_id,
@@ -11372,40 +11587,20 @@ async fn handle_p2p_events(
                         );
                         cleanup_snapshot_staging_session_offthread(staging);
                         reset_sync_state!();
-                        request_bounded_manifest_failover!(from, true);
                         continue;
+                    }
+                    snapshot_segment_retry_counts.remove(&segment_id);
+                    snapshot_segment_sources.mark_succeeded(from);
+                    if !manifest_peers.contains(&from) {
+                        snapshot_segment_sources.disconnect(from);
                     }
                     snapshot_staging = Some(staging);
 
                     if let Some((queued_from, response)) = queued_segment_response.take() {
-                        if queued_from != from {
-                            drop(response);
-                            tracing::warn!(
-                                from = %queued_from,
-                                expected = %from,
-                                "buffered snapshot segment changed peer"
-                            );
-                            preserve_active_snapshot_headers!();
-                            reset_sync_state!();
-                            request_bounded_manifest_failover!(queued_from, false);
-                            continue;
-                        }
                         stage_snapshot_segment_response!(queued_from, response);
                     }
 
-                    if let Some(pending) = pending_manifest.as_ref() {
-                        dispatch_queued_snapshot_segments(
-                            &p2p_cmd,
-                            pending.from,
-                            pending.manifest.tip_height,
-                            pending.manifest.tip_hash,
-                            snapshot_staging_inflight.is_some(),
-                            queued_segment_response.is_some(),
-                            &mut pending_segment_ids,
-                            &mut segment_queue,
-                        )
-                        .await;
-                    }
+                    dispatch_snapshot_segments_from_available_source!();
                     tracing::debug!(
                         from = %from,
                         segment = segment_id,
@@ -11426,9 +11621,13 @@ async fn handle_p2p_events(
                             .take()
                             .expect("accepted snapshot session is available for finalization");
                         let segment_count = staging.descriptors().len();
+                        let manifest_from = pending_manifest
+                            .as_ref()
+                            .expect("snapshot manifest exists during finalization")
+                            .from;
                         let key = SnapshotStagingOperationKey::Finalize {
                             generation: snapshot_sync_generation,
-                            from,
+                            from: manifest_from,
                         };
                         snapshot_staging_inflight = Some(key);
                         let completion = snapshot_staging_completion_tx.clone();
@@ -11554,7 +11753,7 @@ async fn handle_p2p_events(
                     ));
 
                     let height = applied.height;
-                    mining_peer_quorum.set_canonical_tip(height, applied.block_hash);
+                    mining_peer_quorum.set_canonical_tip(height, applied.block_hash, false);
                     record_authenticated_height!(height, completed.key.from);
                     tracing::info!(
                         height,
@@ -11642,7 +11841,7 @@ async fn handle_p2p_events(
                         applied.tail_apply_elapsed,
                     ));
                     let height = applied.height;
-                    mining_peer_quorum.set_canonical_tip(height, applied.block_hash);
+                    mining_peer_quorum.set_canonical_tip(height, applied.block_hash, false);
                     record_authenticated_height!(height, completed.key.from);
                     tracing::warn!(
                         from = %completed.key.from,
@@ -11769,19 +11968,6 @@ async fn handle_p2p_events(
                 }
             };
 
-            if !manifest_peers.contains(&from) {
-                let boundary_height = verified_history_step.height;
-                drop(verified_history_step);
-                tracing::warn!(
-                    peer = %from,
-                    boundary_height,
-                    "snapshot owner disconnected during authority verification; retaining headers for failover"
-                );
-                reset_sync_state!();
-                request_bounded_manifest_failover!(from, false);
-                continue;
-            }
-
             tracing::info!(
                 from = %from,
                 tip = completed.manifest.tip_height,
@@ -11823,10 +12009,11 @@ async fn handle_p2p_events(
                 .manifest
                 .clone();
             let bridge_tip = manifest.bridge_tip_height;
+            let segment_source = snapshot_segment_sources.select(&manifest_peers, Instant::now());
             let staging = begin_snapshot_state_download(
                 &p2p_cmd,
                 &snapshot_staging_root,
-                from,
+                segment_source,
                 &manifest,
                 boundary_header,
                 &mut pending_segment_ids,
@@ -11846,6 +12033,14 @@ async fn handle_p2p_events(
                 }
             };
             snapshot_staging = Some(staging);
+            if segment_source.is_none() && !segment_queue.is_empty() {
+                request_snapshot_generation_providers!(from);
+                tracing::warn!(
+                    snapshot_height = manifest.tip_height,
+                    remaining = segment_queue.len(),
+                    "snapshot authority is verified; waiting for an exact State provider"
+                );
+            }
 
             if bridge_tip == manifest.tip_height {
                 tracing::info!(
@@ -11923,10 +12118,10 @@ async fn handle_p2p_events(
                 }
             }
             // This also catches locally mined or RPC-submitted blocks, whose
-            // commits do not pass through this P2P event handler. Old-tip
-            // confirmations are cleared within one heartbeat and cannot be
-            // refreshed by a delayed response for the previous parent.
-            mining_peer_quorum.set_canonical_tip(our_height, our_hash);
+            // commits do not pass through this P2P event handler. A direct
+            // child preserves fresh ancestry leases; any discontinuity is a
+            // branch replacement and revokes them.
+            mining_peer_quorum.reconcile_canonical_tip(our_height, our_hash);
             let unresolved_canonical_work = active_suffix_sync.is_some()
                 || exact_suffix_apply_inflight.is_some()
                 || header_dag_faulted
@@ -11954,41 +12149,23 @@ async fn handle_p2p_events(
             pending_block_fetches
                 .retain(|_, pending| now.duration_since(pending.requested_at) < BLOCK_FETCH_INFLIGHT_TTL);
 
-            if manifest_candidate_selection_due(manifest_candidate_started_at, now)
-                && pending_manifest.is_none()
-                && pending_snapshot_header_sync.is_none()
-                && snapshot_header_staging_inflight.is_none()
-                && history_step_verification_inflight.is_none()
-                && snapshot_staging_inflight.is_none()
+            if pending_manifest
+                .as_ref()
+                .is_some_and(|pending| pending.history_step.is_some())
                 && snapshot_install_inflight.is_none()
-                && pending_recent_suffix.is_none()
-                && recent_suffix_apply_inflight.is_none()
+                && !segment_queue.is_empty()
             {
-                let candidate = best_manifest_candidate
-                    .take()
-                    .expect("settled manifest election has a candidate");
-                manifest_candidate_started_at = None;
-                let responses_considered = manifest_response_count;
-                manifest_requested_peers.clear();
-                manifest_force_snapshot_peers.clear();
-                manifest_response_count = 0;
-                manifest_round_started_at = None;
-                if candidate.manifest.tip_height > our_height {
-                    tracing::info!(
-                        from = %candidate.from,
-                        tip = candidate.manifest.tip_height,
-                        bridge_tip = candidate.manifest.bridge_tip_height,
-                        responses_considered,
-                        "snapshot manifest election settled — validating strongest advertised chain"
-                    );
-                    begin_snapshot_header_staging!(candidate.from, candidate.manifest);
-                } else {
-                    tracing::debug!(
-                        from = %candidate.from,
-                        tip = candidate.manifest.tip_height,
-                        our_height,
-                        "snapshot manifest candidate became obsolete before election settled"
-                    );
+                dispatch_snapshot_segments_from_available_source!();
+                if snapshot_segment_sources.current().is_none()
+                    && now.saturating_duration_since(last_snapshot_provider_probe)
+                        >= Duration::from_secs(5)
+                {
+                    let original = pending_manifest
+                        .as_ref()
+                        .expect("active snapshot manifest is present")
+                        .from;
+                    request_snapshot_generation_providers!(original);
+                    last_snapshot_provider_probe = now;
                 }
             }
 
@@ -12422,7 +12599,6 @@ async fn handle_p2p_events(
             // outstanding round has the same bounded recovery path.
             if manifest_round_started_at.is_none()
                 && !manifest_requested_peers.is_empty()
-                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -12442,7 +12618,6 @@ async fn handle_p2p_events(
             // a bounded peer set; with a single seed there is no second
             // PeerConnected event to save us.
             if manifest_round_retry_due(manifest_round_started_at, now)
-                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -12505,6 +12680,7 @@ async fn handle_p2p_events(
                                 generation: snapshot_sync_generation,
                                 peer,
                                 requester_height: our_height,
+                                requested_manifest_digest: [0; 32],
                             })
                             .await
                             .ok();
@@ -12549,6 +12725,7 @@ async fn handle_p2p_events(
                                         generation: snapshot_sync_generation,
                                         peer,
                                         requester_height: our_height,
+                                        requested_manifest_digest: [0; 32],
                                     })
                                     .await;
                                 tracing::info!(
@@ -12631,6 +12808,7 @@ fn create_snapshot_staging_session(
     header: noid_chain::BlockHeader,
 ) -> Result<SnapshotStagingSession, String> {
     if header.height != manifest.tip_height
+        || header.state_root != manifest.state_root
         || header.log_slots != manifest.log_slots
         || header.active_slot_count != manifest.active_slot_count
         || header.alloc_counter != manifest.alloc_counter
@@ -12668,7 +12846,7 @@ fn create_snapshot_staging_session(
 
 async fn queue_snapshot_segment_download(
     p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
-    peer: libp2p::PeerId,
+    peer: Option<libp2p::PeerId>,
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
     pending_segment_ids: &mut std::collections::HashSet<u16>,
     segment_queue: &mut std::collections::VecDeque<u16>,
@@ -12676,23 +12854,26 @@ async fn queue_snapshot_segment_download(
     for &seg_id in &manifest.segment_ids {
         segment_queue.push_back(seg_id);
     }
-    dispatch_queued_snapshot_segments(
-        p2p_cmd,
-        peer,
-        manifest.tip_height,
-        manifest.tip_hash,
-        false,
-        false,
-        pending_segment_ids,
-        segment_queue,
-    )
-    .await;
+    if let Some(peer) = peer {
+        dispatch_queued_snapshot_segments(
+            p2p_cmd,
+            peer,
+            manifest.tip_height,
+            manifest.tip_hash,
+            manifest.manifest_digest,
+            false,
+            false,
+            pending_segment_ids,
+            segment_queue,
+        )
+        .await;
+    }
 }
 
 async fn begin_snapshot_state_download(
     p2p_cmd: &tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
     staging_root: &Path,
-    peer: libp2p::PeerId,
+    peer: Option<libp2p::PeerId>,
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
     header: noid_chain::BlockHeader,
     pending_segment_ids: &mut std::collections::HashSet<u16>,
@@ -12753,6 +12934,7 @@ async fn dispatch_queued_snapshot_segments(
     peer: libp2p::PeerId,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
+    manifest_digest: [u8; 32],
     staging_active: bool,
     response_buffered: bool,
     pending_segment_ids: &mut std::collections::HashSet<u16>,
@@ -12774,6 +12956,7 @@ async fn dispatch_queued_snapshot_segments(
                     segment_id: seg_id,
                     expected_tip_height,
                     expected_tip_hash,
+                    manifest_digest,
                 })
                 .await;
         } else {

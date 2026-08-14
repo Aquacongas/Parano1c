@@ -4188,6 +4188,7 @@ version = "1.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "blake3",
  "futures",
  "libc",
  "libp2p",

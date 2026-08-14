@@ -62,6 +62,12 @@ const T_SEGMENTS: &str = "segments";
 const T_SEGMENT_SUMMARIES: &str = "segment_summaries";
 const T_STATE_META: &str = "state_meta";
 const T_RECENT_BLOCKS: &str = "recent";
+/// Content-addressable cache of complete block bodies, independent of the
+/// canonical height row. Snapshot and reorg plans may outlive the moving
+/// retained-height window, and displaced branch bodies remain useful exact
+/// objects until this bounded operational cache expires.
+/// Key: `height_be[8] || block_id[32]`.
+const T_BLOCK_BODY_OBJECTS: &str = "block_body_objects";
 /// Transaction index for receipt lookup. Key: canonical logical txid (32B).
 /// Value: `(height, logical_position)` (12B), with coinbase at position zero.
 const T_TX_INDEX: &str = "tx_index";
@@ -85,7 +91,7 @@ const T_HISTORY_STEP_PROOF_OBJECTS: &str = "history_step_proof_objects";
 /// `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
 const T_RETENTION_META: &str = "retention_meta";
-const N_TABLES: u64 = 16;
+const N_TABLES: u64 = 17;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -155,6 +161,7 @@ impl From<SnapshotStagingError> for StoreError {
 #[derive(Clone)]
 pub struct MdbxStore {
     db: Arc<Database<NoWriteMap>>,
+    block_body_object_retention_floor: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One owned, already native-validated header record from a sealed snapshot
@@ -441,10 +448,20 @@ const RECURSIVE_SUFFIX_MARKER_MAGIC: [u8; 4] = *b"RSM1";
 const RECURSIVE_SUFFIX_MARKER_BYTES: usize =
     crate::history_step::HISTORY_STEP_TERMINAL_BINDING_BYTES + 4 + 8 + 32;
 const HISTORY_STEP_PROOF_OBJECT_KEY_BYTES: usize = 8 + 32 + 1;
+const BLOCK_BODY_OBJECT_KEY_BYTES: usize = 8 + 32;
 /// Operational proof availability window. This is not a consensus retention
 /// rule and may be increased without changing block or proof validity.
 const HISTORY_STEP_PROOF_OBJECT_RETENTION_DEPTH: u64 = 128;
 const HISTORY_STEP_PROOF_OBJECT_PRUNE_LIMIT: usize = 32;
+/// Bodies and terminals use the same operational availability horizon. This
+/// is deliberately independent of finality and consensus validity.
+const BLOCK_BODY_OBJECT_RETENTION_DEPTH: u64 = HISTORY_STEP_PROOF_OBJECT_RETENTION_DEPTH;
+/// An active data-plane lease may extend retention, but never without bound.
+/// At the 15-second target this is about two hours of exact body availability.
+const BLOCK_BODY_OBJECT_MAX_PIN_DEPTH: u64 = 512;
+const BLOCK_BODY_OBJECT_PRUNE_LIMIT: usize = 8;
+const BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT: usize =
+    crate::consensus::wire_limits::MAX_BLOCK_BYTES * 2;
 /// Bound numeric maintenance work even after a large snapshot jump.
 const RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT: usize = 16;
 /// One retained block plus terminal is bounded by the canonical wire caps.
@@ -554,6 +571,44 @@ fn history_step_proof_object_key(
     key
 }
 
+fn block_body_object_key(height: u64, block_hash: [u8; 32]) -> [u8; BLOCK_BODY_OBJECT_KEY_BYTES] {
+    let mut key = [0u8; BLOCK_BODY_OBJECT_KEY_BYTES];
+    key[..8].copy_from_slice(&height.to_be_bytes());
+    key[8..].copy_from_slice(&block_hash);
+    key
+}
+
+fn archive_block_body_object(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    expected_height: u64,
+    expected_hash: [u8; 32],
+    block_bytes: &[u8],
+) -> Result<(), StoreError> {
+    if block_bytes.is_empty() || block_bytes.len() > crate::consensus::wire_limits::MAX_BLOCK_BYTES
+    {
+        return Err(StoreError::Decode(
+            "archived block body length is outside hard bounds",
+        ));
+    }
+    let block = crate::Block::from_bytes(block_bytes)
+        .map_err(|_| StoreError::Decode("archived block body is malformed"))?;
+    if block.header.height != expected_height
+        || crate::block_header::block_id(&block.header) != expected_hash
+    {
+        return Err(StoreError::Decode(
+            "archived block body does not match its object key",
+        ));
+    }
+    let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+    txn.put(
+        &table,
+        block_body_object_key(expected_height, expected_hash),
+        block_bytes,
+        WriteFlags::empty(),
+    )?;
+    Ok(())
+}
+
 fn archive_history_step_proof_object(
     txn: &Transaction<'_, RW, NoWriteMap>,
     terminal_bytes: &[u8],
@@ -611,6 +666,52 @@ fn prune_history_step_proof_objects(
             if height >= cutoff || keys.len() == HISTORY_STEP_PROOF_OBJECT_PRUNE_LIMIT {
                 break;
             }
+            keys.push(key);
+            item = cursor.next()?;
+        }
+        keys
+    };
+    for key in deletions {
+        txn.del(&table, key, None)?;
+    }
+    Ok(())
+}
+
+fn prune_block_body_objects(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    current_height: u64,
+    retention_floor: Option<u64>,
+) -> Result<(), StoreError> {
+    let mut cutoff = current_height.saturating_sub(BLOCK_BODY_OBJECT_RETENTION_DEPTH);
+    if let Some(floor) = retention_floor {
+        let bounded_floor =
+            floor.max(current_height.saturating_sub(BLOCK_BODY_OBJECT_MAX_PIN_DEPTH));
+        cutoff = cutoff.min(bounded_floor.saturating_add(1));
+    }
+    let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+    let deletions = {
+        let mut cursor = txn.cursor(&table)?;
+        let mut item: Option<(Vec<u8>, ObjectLength)> = cursor.first()?;
+        let mut keys = Vec::new();
+        let mut bytes = 0usize;
+        while let Some((key, ObjectLength(value_len))) = item {
+            if key.len() != BLOCK_BODY_OBJECT_KEY_BYTES {
+                return Err(StoreError::Decode("invalid block-body object key length"));
+            }
+            let height = u64::from_be_bytes(key[..8].try_into().unwrap());
+            if height >= cutoff || keys.len() == BLOCK_BODY_OBJECT_PRUNE_LIMIT {
+                break;
+            }
+            if !keys.is_empty()
+                && bytes
+                    .checked_add(value_len)
+                    .is_none_or(|total| total > BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT)
+            {
+                break;
+            }
+            bytes = bytes.checked_add(value_len).ok_or(StoreError::Decode(
+                "block-body prune byte accounting overflow",
+            ))?;
             keys.push(key);
             item = cursor.next()?;
         }
@@ -1365,6 +1466,7 @@ impl MdbxStore {
             T_SEGMENT_SUMMARIES,
             T_STATE_META,
             T_RECENT_BLOCKS,
+            T_BLOCK_BODY_OBJECTS,
             T_TX_INDEX,
             T_HISTORY_STEP_TERMINALS,
             T_HISTORY_STEP_PROOF_OBJECTS,
@@ -1374,7 +1476,10 @@ impl MdbxStore {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
         txn.commit()?;
-        let store = Self { db: Arc::new(db) };
+        let store = Self {
+            db: Arc::new(db),
+            block_body_object_retention_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
         Ok(store)
     }
 
@@ -1388,6 +1493,14 @@ impl MdbxStore {
         Ok(MdbxHistoricalReadSnapshot {
             txn: self.db.begin_ro_txn()?,
         })
+    }
+
+    /// Pin content-addressed bodies above one active snapshot boundary. This
+    /// is an operational serving lease, not consensus state. `None` restores
+    /// the ordinary bounded retention window.
+    pub fn set_block_body_object_retention_floor(&self, floor: Option<u64>) {
+        self.block_body_object_retention_floor
+            .store(floor.unwrap_or(0), std::sync::atomic::Ordering::Release);
     }
 
     pub fn get_chain_tip(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
@@ -1794,6 +1907,32 @@ impl MdbxStore {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         Ok(txn.get(&tbl, &u64_key(height))?)
+    }
+
+    /// Read one bounded content-addressed block body independently of the
+    /// canonical height row. The caller still validates its expected byte
+    /// digest; this lookup only fixes the exact height/header identity.
+    pub fn get_block_body_object(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+        let bytes: Option<Vec<u8>> = txn.get(&table, &block_body_object_key(height, block_hash))?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let block = crate::Block::from_bytes(&bytes)
+            .map_err(|_| StoreError::Decode("cached block-body object is malformed"))?;
+        if block.header.height != height
+            || crate::block_header::block_id(&block.header) != block_hash
+        {
+            return Err(StoreError::Decode(
+                "cached block-body object does not match its key",
+            ));
+        }
+        Ok(Some(bytes))
     }
 
     /// Encode one canonical NAB1 block + HistoryStep terminal from a single
@@ -3124,6 +3263,7 @@ impl MdbxStore {
             let height_key = u64_key(header.height);
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
             txn.put(&recent_tbl, height_key, block_bytes, WriteFlags::empty())?;
+            archive_block_body_object(&txn, header.height, *hash, block_bytes)?;
             let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
             txn.put(
                 &terminal_tbl,
@@ -3576,6 +3716,18 @@ impl MdbxStore {
             let _ = txn.del(&h2h_tbl, hash.as_slice(), None);
         }
 
+        // Preserve displaced, previously canonical bodies as exact objects
+        // before their height-indexed rows are replaced. They remain useful
+        // for another peer's in-flight plan and are bounded by object-cache
+        // retention rather than by fork choice.
+        let old_recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        for (height, hash) in &old_headers {
+            let bytes: Option<Vec<u8>> = txn.get(&old_recent_tbl, &u64_key(*height))?;
+            if let Some(bytes) = bytes {
+                archive_block_body_object(&txn, *height, *hash, &bytes)?;
+            }
+        }
+
         macro_rules! truncate_reorg_suffix {
             ($name:expr) => {{
                 let table = txn.open_table(Some($name))?;
@@ -3663,6 +3815,12 @@ impl MdbxStore {
                 height_key,
                 accepted.block_bytes(),
                 WriteFlags::empty(),
+            )?;
+            archive_block_body_object(
+                &txn,
+                staged.header.height,
+                staged.hash,
+                accepted.block_bytes(),
             )?;
             if staged.header.height != 0 {
                 let expected_class = block
@@ -3816,6 +3974,14 @@ impl MdbxStore {
         let txn = self.db.begin_rw_txn()?;
         prune_retained_payloads_bounded(&txn, current_height)?;
         prune_history_step_proof_objects(&txn, current_height)?;
+        let object_retention_floor = match self
+            .block_body_object_retention_floor
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => None,
+            floor => Some(floor),
+        };
+        prune_block_body_objects(&txn, current_height, object_retention_floor)?;
         txn.commit()?;
 
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
@@ -3848,6 +4014,7 @@ impl MdbxStore {
             T_SEGMENT_SUMMARIES,
             T_STATE_META,
             T_RECENT_BLOCKS,
+            T_BLOCK_BODY_OBJECTS,
             T_TX_INDEX,
             T_HISTORY_STEP_TERMINALS,
             T_HISTORY_STEP_PROOF_OBJECTS,
@@ -4476,6 +4643,10 @@ mod tests {
             store.get_recent_accepted_block_bundle_bounded(1).unwrap(),
             Some(bundle.encode())
         );
+        assert_eq!(
+            store.get_block_body_object(1, hash).unwrap(),
+            Some(block.to_bytes())
+        );
         assert!(store.has_history_step_terminal_at(1, hash).unwrap());
         let semantic_id = crate::block_header::semantic_header_id(&block.header);
         assert_eq!(
@@ -4513,6 +4684,27 @@ mod tests {
             generation.read_boundary_terminal().unwrap(),
             bundle.history_step_terminal_bytes()
         );
+    }
+
+    #[test]
+    fn active_snapshot_floor_pins_exact_block_objects_beyond_normal_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, _) = commit_genesis(&store);
+        let body = block(&genesis, 2, 0x42);
+        let hash = crate::hash_block_header(&body.header);
+        let encoded = body.to_bytes();
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        archive_block_body_object(&txn, 2, hash, &encoded).unwrap();
+        prune_block_body_objects(&txn, 200, Some(1)).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.get_block_body_object(2, hash).unwrap(), Some(encoded));
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        prune_block_body_objects(&txn, 200, None).unwrap();
+        txn.commit().unwrap();
+        assert!(store.get_block_body_object(2, hash).unwrap().is_none());
     }
 
     #[test]

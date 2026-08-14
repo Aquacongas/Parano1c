@@ -158,6 +158,10 @@ pub struct GetHistoryStepTerminalResponse {
 pub struct GetStateManifestRequest {
     /// Requester's current tip height (0 for fresh nodes).
     pub requester_height: u64,
+    /// Zero requests the freshest usable generation. A non-zero digest asks
+    /// for that exact immutable generation so object failover never silently
+    /// changes the selected State plan.
+    pub requested_manifest_digest: [u8; 32],
 }
 
 /// Manifest response: chain metadata + list of active segment IDs.
@@ -165,13 +169,22 @@ pub struct GetStateManifestRequest {
 /// `tip_height = 0` means no snapshot is being advertised.
 /// `tip_height`, `tip_hash`, and `cumulative_chainwork` describe the finalized
 /// snapshot boundary `F`, not the peer's live tip.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct GetStateManifestResponse {
     /// Finalized snapshot boundary height. 0 = "use block sync instead".
     pub tip_height: u64,
     pub tip_hash: [u8; 32],
     /// Exact cumulative chainwork at `tip_height`, as validated with headers.
     pub cumulative_chainwork: [u8; 32],
+    /// Immutable snapshot layout version. This is a transport/storage
+    /// format version, not a consensus parameter.
+    pub format_version: u32,
+    /// Exact State root committed by the boundary header.
+    pub state_root: [u8; 32],
+    /// Source-independent digest of every immutable manifest field and
+    /// segment descriptor. Peers with this same digest may serve different
+    /// segments of one plan without becoming consensus authorities.
+    pub manifest_digest: [u8; 32],
     pub log_slots: u32,
     pub active_slot_count: u64,
     pub alloc_counter: u64,
@@ -194,6 +207,61 @@ pub struct GetStateManifestResponse {
     pub segment_lengths: Vec<u32>,
 }
 
+pub const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 1;
+const SNAPSHOT_MANIFEST_DIGEST_DOMAIN: &[u8] = b"PARANO1D/P2P/SNAPSHOT-MANIFEST/V1";
+
+impl GetStateManifestResponse {
+    /// Compute the canonical network identity of a non-empty immutable
+    /// snapshot manifest. The digest deliberately excludes itself.
+    pub fn computed_manifest_digest(&self) -> Option<[u8; 32]> {
+        if self.tip_height == 0
+            || self.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION
+            || self.segment_ids.len() != self.segment_roots.len()
+            || self.segment_ids.len() != self.segment_lengths.len()
+        {
+            return None;
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(SNAPSHOT_MANIFEST_DIGEST_DOMAIN);
+        hasher.update(&self.format_version.to_le_bytes());
+        hasher.update(&self.tip_height.to_le_bytes());
+        hasher.update(&self.tip_hash);
+        hasher.update(&self.cumulative_chainwork);
+        hasher.update(&self.state_root);
+        hasher.update(&self.log_slots.to_le_bytes());
+        hasher.update(&self.active_slot_count.to_le_bytes());
+        hasher.update(&self.alloc_counter.to_le_bytes());
+        hasher.update(&[self.eff_log]);
+        hasher.update(&self.bridge_tip_height.to_le_bytes());
+        hasher.update(&self.bridge_tip_hash);
+        hasher.update(&self.bridge_cumulative_chainwork);
+        hasher.update(&(self.segment_ids.len() as u64).to_le_bytes());
+        for ((segment_id, segment_root), encoded_len) in self
+            .segment_ids
+            .iter()
+            .zip(&self.segment_roots)
+            .zip(&self.segment_lengths)
+        {
+            hasher.update(&segment_id.to_le_bytes());
+            hasher.update(segment_root);
+            hasher.update(&encoded_len.to_le_bytes());
+        }
+        Some(*hasher.finalize().as_bytes())
+    }
+
+    pub fn seal_manifest_digest(&mut self) -> bool {
+        let Some(digest) = self.computed_manifest_digest() else {
+            return false;
+        };
+        self.manifest_digest = digest;
+        true
+    }
+
+    pub fn has_valid_manifest_digest(&self) -> bool {
+        self.computed_manifest_digest() == Some(self.manifest_digest)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // State sync — single segment (step 2)
 // ---------------------------------------------------------------------------
@@ -209,6 +277,8 @@ pub struct GetStateSegmentRequest {
     /// Expected snapshot hash from the manifest. Height alone is not enough across
     /// reorgs or competing blocks at the same height.
     pub expected_tip_hash: [u8; 32],
+    /// Exact immutable manifest generation selected by the client.
+    pub manifest_digest: [u8; 32],
 }
 
 /// Response: one encoded state segment (~3 MB).
@@ -223,6 +293,8 @@ pub struct GetStateSegmentResponse {
     /// Exact snapshot hash echoed from the request. Together with the segment
     /// ID and libp2p request ID this prevents cross-session response reuse.
     pub expected_tip_hash: [u8; 32],
+    /// Echo of the exact immutable manifest generation.
+    pub manifest_digest: [u8; 32],
     pub eff_log: u8,
     /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
     /// `None` if the peer cannot serve this segment.

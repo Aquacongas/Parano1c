@@ -46,9 +46,9 @@ pub use serial::{
     SparseSegmentView,
 };
 pub use snapshot_generation::{
-    export_snapshot_generation, open_snapshot_generation, SnapshotBridgeDescriptor,
-    SnapshotGeneration, SnapshotGenerationError, SnapshotGenerationManifest,
-    SnapshotSegmentDescriptor,
+    export_snapshot_boundary_generation, export_snapshot_generation, open_snapshot_generation,
+    SnapshotBridgeDescriptor, SnapshotGeneration, SnapshotGenerationError,
+    SnapshotGenerationManifest, SnapshotSegmentDescriptor,
 };
 pub use snapshot_staging::{
     AuthenticatedSnapshotMetadata, FinalizedSnapshotStaging, SnapshotStagingError,

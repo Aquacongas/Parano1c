@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Mining readiness without conflating connectivity and exact-tip authority.
+//! Mining readiness without conflating connectivity and ancestry authority.
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +19,7 @@ struct HealthLease {
 
 #[derive(Clone, Copy, Debug)]
 struct FrontierLease {
-    parent: ChainPoint,
+    confirmed_ancestor: ChainPoint,
     expires_at_ms: u64,
 }
 
@@ -36,7 +36,8 @@ pub struct MiningReadinessSnapshot {
 /// Two deliberately separate permissions:
 ///
 /// - network health is stable across ordinary tip advances;
-/// - frontier authorization is exact to the parent of the next nonce search.
+/// - frontier authorization follows a validated canonical ancestry and is
+///   revoked on branch replacement.
 pub struct MiningReadiness {
     isolated: bool,
     required_failure_domains: usize,
@@ -73,18 +74,12 @@ impl MiningReadiness {
 
     /// A normal commit changes the next template parent. It does not erase
     /// authenticated connectivity or publish a false network-health collapse.
-    pub fn set_committed_tip(&mut self, tip: ChainPoint) {
-        self.committed_tip = tip;
-        self.set_template_parent(tip);
-    }
-
-    pub fn set_template_parent(&mut self, parent: ChainPoint) -> bool {
-        if self.template_parent == parent {
-            return false;
+    pub fn set_committed_tip(&mut self, tip: ChainPoint, extends_previous: bool) {
+        if !extends_previous {
+            self.frontier.clear();
         }
-        self.template_parent = parent;
-        self.frontier.clear();
-        true
+        self.committed_tip = tip;
+        self.template_parent = tip;
     }
 
     /// Renew one authenticated peer's stable chain-view lease.
@@ -114,9 +109,10 @@ impl MiningReadiness {
         }
     }
 
-    /// Record a peer report that natively authorizes the exact template
-    /// parent. The caller may derive this from the exact point or from a
-    /// validated descendant of that point.
+    /// Record a peer report that natively authorizes the exact current
+    /// template parent. A later ordinary child may retain this lease because
+    /// the committer has established that the point remains in the canonical
+    /// ancestry.
     pub fn authorize_frontier(
         &mut self,
         peer: PeerId,
@@ -136,7 +132,7 @@ impl MiningReadiness {
         self.frontier.insert(
             peer,
             FrontierLease {
-                parent,
+                confirmed_ancestor: parent,
                 expires_at_ms: expires_at_ms.min(health.expires_at_ms),
             },
         );
@@ -150,11 +146,8 @@ impl MiningReadiness {
 
     pub fn expire(&mut self, now_ms: u64) {
         self.health.retain(|_, lease| lease.expires_at_ms > now_ms);
-        self.frontier.retain(|peer, lease| {
-            lease.expires_at_ms > now_ms
-                && lease.parent == self.template_parent
-                && self.health.contains_key(peer)
-        });
+        self.frontier
+            .retain(|peer, lease| lease.expires_at_ms > now_ms && self.health.contains_key(peer));
     }
 
     pub fn snapshot(&self, now_ms: u64) -> MiningReadinessSnapshot {
@@ -182,7 +175,8 @@ impl MiningReadiness {
             .iter()
             .filter_map(|(peer, health)| {
                 self.frontier.get(peer).and_then(|lease| {
-                    (lease.expires_at_ms > now_ms && lease.parent == self.template_parent)
+                    (lease.expires_at_ms > now_ms
+                        && lease.confirmed_ancestor.height <= self.committed_tip.height)
                         .then_some(health.failure_domain)
                 })
             })
@@ -239,26 +233,30 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_child_preserves_network_health_but_not_stale_frontier_authority() {
+    fn ordinary_child_preserves_ancestry_authority() {
         let (mut readiness, first, second) = ready_fixture();
         assert!(readiness.snapshot(0).nonce_search_ready);
 
-        readiness.set_committed_tip(point(11));
+        readiness.set_committed_tip(point(11), true);
         let after_commit = readiness.snapshot(0);
         assert!(after_commit.network_health_ready);
         assert!(after_commit.proof_build_ready);
-        assert_eq!(after_commit.frontier_authorizations, 0);
-        assert!(!after_commit.nonce_search_ready);
-
-        assert!(readiness.authorize_frontier(first, point(11), 100, 0));
-        assert!(readiness.authorize_frontier(second, point(11), 100, 0));
-        assert!(readiness.snapshot(0).nonce_search_ready);
+        assert_eq!(after_commit.frontier_authorizations, 2);
+        assert!(after_commit.nonce_search_ready);
+        assert_eq!(
+            readiness.frontier.get(&first).unwrap().confirmed_ancestor,
+            point(10)
+        );
+        assert_eq!(
+            readiness.frontier.get(&second).unwrap().confirmed_ancestor,
+            point(10)
+        );
     }
 
     #[test]
-    fn delayed_ack_for_old_parent_cannot_authorize_a_second_child() {
+    fn branch_replacement_revokes_old_ancestry_authority() {
         let (mut readiness, first, second) = ready_fixture();
-        readiness.set_committed_tip(point(11));
+        readiness.set_committed_tip(point(11), false);
         assert!(!readiness.authorize_frontier(first, point(10), 100, 0));
         assert!(!readiness.authorize_frontier(second, point(10), 100, 0));
         assert!(!readiness.snapshot(0).nonce_search_ready);

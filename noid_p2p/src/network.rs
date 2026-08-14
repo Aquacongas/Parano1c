@@ -29,7 +29,7 @@ use noid_chain::storage::{
     MdbxStore,
 };
 use noid_chain::storage::{
-    export_snapshot_generation, open_snapshot_generation, SnapshotGeneration,
+    export_snapshot_boundary_generation, open_snapshot_generation, SnapshotGeneration,
 };
 use noid_chain::{AcceptedBlockBundle, MAX_ACCEPTED_BLOCK_BUNDLE_BYTES};
 use noid_mempool::AsyncMempool;
@@ -121,12 +121,84 @@ where
 }
 
 type SnapshotExportKey = (u64, [u8; 32]);
-type SnapshotExport = Arc<SnapshotGeneration>;
+struct SnapshotExportEntry {
+    generation: SnapshotGeneration,
+    network_manifest: GetStateManifestResponse,
+}
+
+impl SnapshotExportEntry {
+    fn new(generation: SnapshotGeneration) -> Option<Self> {
+        let manifest = generation.manifest();
+        if manifest.bridge_tip_height != manifest.target_height
+            || manifest.bridge_tip_hash != manifest.target_hash
+            || manifest.bridge_cumulative_chainwork != manifest.cumulative_chainwork
+        {
+            return None;
+        }
+        let mut network_manifest = GetStateManifestResponse {
+            tip_height: manifest.target_height,
+            tip_hash: manifest.target_hash,
+            cumulative_chainwork: manifest.cumulative_chainwork,
+            format_version: crate::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
+            state_root: manifest.state_root,
+            manifest_digest: [0; 32],
+            log_slots: manifest.log_slots,
+            active_slot_count: manifest.active_slot_count,
+            alloc_counter: manifest.alloc_counter,
+            eff_log: manifest.effective_log_segment_size,
+            bridge_tip_height: manifest.bridge_tip_height,
+            bridge_tip_hash: manifest.bridge_tip_hash,
+            bridge_cumulative_chainwork: manifest.bridge_cumulative_chainwork,
+            segment_ids: manifest
+                .segments
+                .iter()
+                .map(|segment| segment.segment_id)
+                .collect(),
+            segment_roots: manifest
+                .segments
+                .iter()
+                .map(|segment| segment.segment_root)
+                .collect(),
+            segment_lengths: manifest
+                .segments
+                .iter()
+                .map(|segment| segment.encoded_len)
+                .collect(),
+        };
+        network_manifest.seal_manifest_digest().then_some(Self {
+            generation,
+            network_manifest,
+        })
+    }
+}
+
+impl std::ops::Deref for SnapshotExportEntry {
+    type Target = SnapshotGeneration;
+
+    fn deref(&self) -> &Self::Target {
+        &self.generation
+    }
+}
+
+type SnapshotExport = Arc<SnapshotExportEntry>;
 
 const MAX_SNAPSHOT_EXPORTS: usize = 2;
 const SNAPSHOT_EXPORT_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
-const SNAPSHOT_BRIDGE_MAX_LIVE_GAP: u64 =
-    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH / 2;
+/// All honest exporters use the same finalized height buckets. Their cached
+/// manifests therefore have a source-independent identity and a client can
+/// rotate individual State objects across peers. Six blocks add at most five
+/// blocks to the ordinary 18-block finalized lag and remain inside undo and
+/// retained-payload windows.
+const SNAPSHOT_BOUNDARY_INTERVAL: u64 = 6;
+const _: () = assert!(SNAPSHOT_BOUNDARY_INTERVAL > 0);
+const _: () =
+    assert!(SNAPSHOT_BOUNDARY_INTERVAL <= noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH);
+/// Keep six blocks of serving reserve beyond the largest suffix admitted from
+/// a cached immutable State boundary. The current retention policy preserves
+/// 42 exact bodies, so a fresh finalized boundary starts 18 blocks behind the
+/// live tip and remains useful without racing the payload pruner.
+const SNAPSHOT_BOUNDARY_MAX_LIVE_GAP: u64 =
+    noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH - 6;
 const MAX_OUTBOUND_BLOCK_RESPONSE_BYTES: usize = MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
 const MAX_OUTBOUND_BLOCK_BODY_BATCH_BYTES: usize =
     (MAX_BLOCK_BYTES + 4) * MAX_BLOCK_BODY_BATCH as usize;
@@ -929,6 +1001,7 @@ const _: () = assert!(
 #[derive(Clone, Copy, Debug)]
 struct SnapshotExportLease {
     key: SnapshotExportKey,
+    manifest_digest: [u8; 32],
     last_activity: Instant,
 }
 
@@ -948,6 +1021,7 @@ struct PendingStateSegmentRequest {
     segment_id: u16,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
+    manifest_digest: [u8; 32],
     issued_at: Instant,
     notify_node: bool,
 }
@@ -1162,6 +1236,7 @@ fn state_segment_response_matches_pending(
         && pending.segment_id == response.segment_id
         && pending.expected_tip_height == response.expected_tip_height
         && pending.expected_tip_hash == response.expected_tip_hash
+        && pending.manifest_digest == response.manifest_digest
 }
 
 fn unavailable_state_segment_response(request: &GetStateSegmentRequest) -> GetStateSegmentResponse {
@@ -1169,6 +1244,7 @@ fn unavailable_state_segment_response(request: &GetStateSegmentRequest) -> GetSt
         segment_id: request.segment_id,
         expected_tip_height: request.expected_tip_height,
         expected_tip_hash: request.expected_tip_hash,
+        manifest_digest: request.manifest_digest,
         eff_log: 0,
         data: None,
         inbound_memory_permit: None,
@@ -1192,6 +1268,7 @@ fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
         return None;
     }
     let newest = meta.finalized.height.min(meta.tip_height);
+    let newest = newest - newest % SNAPSHOT_BOUNDARY_INTERVAL;
     let oldest = meta
         .tip_height
         .saturating_sub(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH);
@@ -1201,9 +1278,13 @@ fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
 
     // Snapshot-installed compact suffix rows intentionally carry local
     // authorization markers rather than duplicate full terminals. Select the
-    // newest canonical boundary in the retained suffix whose complete
-    // terminal is already durable, then export the remaining retained bodies.
-    for height in (oldest.max(1)..=newest).rev() {
+    // newest deterministic checkpoint whose complete terminal is durable.
+    // Never fall back to an arbitrary per-node height: exact cross-peer object
+    // failover depends on independent exporters producing the same manifest.
+    for height in (oldest.max(1)..=newest)
+        .rev()
+        .filter(|height| height % SNAPSHOT_BOUNDARY_INTERVAL == 0)
+    {
         let header = store.get_header(height).ok().flatten()?;
         let block_hash = noid_chain::hash_block_header(&header);
         if height == meta.finalized.height && block_hash != meta.finalized.hash {
@@ -1228,14 +1309,35 @@ fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
 fn load_exact_object(store: &MdbxStore, object: ObjectId) -> Result<Option<Vec<u8>>, String> {
     match object {
         ObjectId::BlockBody(expected) => {
-            let Some(bytes) = store
+            let canonical = store
                 .get_recent_block(expected.claim.height)
-                .map_err(|error| format!("read retained block: {error}"))?
-            else {
+                .map_err(|error| format!("read retained block: {error}"))?;
+            let bytes = match canonical {
+                Some(bytes) => {
+                    let matches = noid_chain::Block::from_bytes(&bytes)
+                        .ok()
+                        .is_some_and(|block| {
+                            block.header.height == expected.claim.height
+                                && noid_chain::block_header::block_id(&block.header)
+                                    == expected.claim.block_hash
+                                && expected.matches_bytes(&bytes)
+                        });
+                    if matches {
+                        return Ok(Some(bytes));
+                    }
+                    store
+                        .get_block_body_object(expected.claim.height, expected.claim.block_hash)
+                        .map_err(|error| format!("read cached block object: {error}"))?
+                }
+                None => store
+                    .get_block_body_object(expected.claim.height, expected.claim.block_hash)
+                    .map_err(|error| format!("read cached block object: {error}"))?,
+            };
+            let Some(bytes) = bytes else {
                 return Ok(None);
             };
             let block = noid_chain::Block::from_bytes(&bytes)
-                .map_err(|error| format!("decode retained block: {error:?}"))?;
+                .map_err(|error| format!("decode cached block object: {error:?}"))?;
             if block.header.height != expected.claim.height
                 || noid_chain::block_header::block_id(&block.header) != expected.claim.block_hash
                 || !expected.matches_bytes(&bytes)
@@ -1287,8 +1389,9 @@ fn load_exact_object(store: &MdbxStore, object: ObjectId) -> Result<Option<Vec<u
     }
 }
 
-fn snapshot_bridge_has_live_headroom(live_tip: u64, bridge_tip: u64) -> bool {
-    bridge_tip <= live_tip && live_tip.saturating_sub(bridge_tip) <= SNAPSHOT_BRIDGE_MAX_LIVE_GAP
+fn snapshot_boundary_has_live_headroom(live_tip: u64, boundary_height: u64) -> bool {
+    boundary_height <= live_tip
+        && live_tip.saturating_sub(boundary_height) <= SNAPSHOT_BOUNDARY_MAX_LIVE_GAP
 }
 
 fn snapshot_export_selection_rank(
@@ -1305,15 +1408,17 @@ fn snapshot_export_selection_rank(
 /// publishes a newer boundary. If no leased generation remains usable, select
 /// the freshest generation and let lease admission retire the oldest cohort.
 /// The state boundary itself may be older than the node's newest finalized
-/// checkpoint: its terminal and complete initial suffix are generation-owned
-/// and therefore cannot race pruning.
+/// checkpoint: its terminal and State segments are generation-owned. The
+/// client selects the moving suffix independently from validated headers.
 fn select_snapshot_export(
     store: &MdbxStore,
     exports: &std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     leases: &std::collections::HashMap<PeerId, SnapshotExportLease>,
     requester_height: u64,
+    requested_manifest_digest: [u8; 32],
 ) -> Option<SnapshotExport> {
     let meta = store.get_consensus_meta().ok().flatten()?;
+    let exact_generation_requested = requested_manifest_digest != [0; 32];
     let leased_keys = leases
         .values()
         .map(|lease| lease.key)
@@ -1322,11 +1427,20 @@ fn select_snapshot_export(
         .values()
         .filter(|generation| {
             let manifest = generation.manifest();
+            if exact_generation_requested
+                && generation.network_manifest.manifest_digest != requested_manifest_digest
+            {
+                return false;
+            }
             if manifest.target_height == 0
-                || manifest.target_height <= requester_height
                 || manifest.target_height > meta.finalized.height
                 || manifest.bridge_tip_height < manifest.target_height
-                || !snapshot_bridge_has_live_headroom(meta.tip_height, manifest.bridge_tip_height)
+                || (!exact_generation_requested && manifest.target_height <= requester_height)
+                || (!exact_generation_requested
+                    && !snapshot_boundary_has_live_headroom(
+                        meta.tip_height,
+                        manifest.target_height,
+                    ))
             {
                 return false;
             }
@@ -1529,6 +1643,7 @@ pub enum NetworkCommand {
         generation: u64,
         peer: PeerId,
         requester_height: u64,
+        requested_manifest_digest: [u8; 32],
     },
     /// Request a single state segment from a peer (step 2, one per segment).
     /// Emits `NetworkEvent::StateSegment`.
@@ -1537,6 +1652,7 @@ pub enum NetworkCommand {
         segment_id: u16,
         expected_tip_height: u64,
         expected_tip_hash: [u8; 32],
+        manifest_digest: [u8; 32],
     },
     /// Request the fused HistoryStep terminal for an exact snapshot boundary.
     RequestHistoryStepTerminal {
@@ -1692,6 +1808,7 @@ pub enum NetworkEvent {
         segment_id: u16,
         expected_tip_height: u64,
         expected_tip_hash: [u8; 32],
+        manifest_digest: [u8; 32],
     },
     /// Fused HistoryStep terminal response for O(1) snapshot sync.
     HistoryStepTerminal {
@@ -1952,6 +2069,7 @@ impl P2PNetwork {
                 generation: 0,
                 peer,
                 requester_height: 0,
+                requested_manifest_digest: [0; 32],
             })
             .await;
     }
@@ -1963,6 +2081,7 @@ impl P2PNetwork {
         segment_id: u16,
         expected_tip_height: u64,
         expected_tip_hash: [u8; 32],
+        manifest_digest: [u8; 32],
     ) {
         let _ = self
             .cmd_tx
@@ -1971,6 +2090,7 @@ impl P2PNetwork {
                 segment_id,
                 expected_tip_height,
                 expected_tip_hash,
+                manifest_digest,
             })
             .await;
     }
@@ -2342,10 +2462,18 @@ async fn run_swarm(
                     snapshot_export_inflight = None;
                     match result {
                         Ok(generation) if generation.key() == key => {
-                            tracing::info!(height = key.0, "published bounded disk snapshot generation");
-                            snapshot_exports.insert(key, Arc::new(generation));
-                            prune_snapshot_export_leases(&mut snapshot_export_leases);
-                            prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
+                            if let Some(export) = SnapshotExportEntry::new(generation) {
+                                tracing::info!(height = key.0, "published bounded disk snapshot generation");
+                                snapshot_exports.insert(key, Arc::new(export));
+                                prune_snapshot_export_leases(&mut snapshot_export_leases);
+                                refresh_snapshot_object_retention_floor(
+                                    &chain_store,
+                                    &snapshot_export_leases,
+                                );
+                                prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
+                            } else {
+                                tracing::error!(height = key.0, "snapshot generation has no canonical network manifest identity");
+                            }
                         }
                         Ok(_) => tracing::warn!(height = key.0, "snapshot generation boundary mismatch"),
                         Err(error) => {
@@ -2368,6 +2496,12 @@ async fn run_swarm(
             }
 
             _ = snapshot_export_timer.tick() => {
+                prune_snapshot_export_leases(&mut snapshot_export_leases);
+                refresh_snapshot_object_retention_floor(
+                    &chain_store,
+                    &snapshot_export_leases,
+                );
+                prune_snapshot_exports(&mut snapshot_exports, &snapshot_export_leases);
                 if snapshot_export_inflight.is_none() {
                     let candidate = local_history_step_boundary(&chain_store).and_then(|key| {
                         if snapshot_exports.contains_key(&key) {
@@ -2377,7 +2511,7 @@ async fn run_swarm(
                                 .iter()
                                 .filter(|((height, _), _)| *height < key.0)
                                 .max_by_key(|((height, _), _)| *height)
-                                .map(|(_, generation)| generation.clone());
+                                .map(|(_, generation)| Arc::clone(generation));
                             Some((key, chain_store.clone(), previous))
                         }
                     });
@@ -2386,11 +2520,11 @@ async fn run_swarm(
                         let export_root = snapshot_export_root.clone();
                         let completion = snapshot_export_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let result = export_snapshot_generation(
+                            let result = export_snapshot_boundary_generation(
                                 &store,
                                 &export_root,
                                 key.0,
-                                previous.as_deref(),
+                                previous.as_ref().map(|entry| &entry.generation),
                             );
                             let _ = completion.blocking_send((key, result));
                         });
@@ -2631,6 +2765,7 @@ async fn run_swarm(
                                 segment_id: request.segment_id,
                                 expected_tip_height: request.expected_tip_height,
                                 expected_tip_hash: request.expected_tip_hash,
+                                manifest_digest: request.manifest_digest,
                             })
                             .await;
                     }
@@ -2763,7 +2898,15 @@ fn load_snapshot_exports(
         }
         match open_snapshot_generation(entry.path()) {
             Ok(generation) => {
-                exports.insert(generation.key(), Arc::new(generation));
+                let key = generation.key();
+                if let Some(export) = SnapshotExportEntry::new(generation) {
+                    exports.insert(key, Arc::new(export));
+                } else {
+                    tracing::warn!(
+                        height = key.0,
+                        "ignoring snapshot generation with invalid network manifest identity"
+                    );
+                }
             }
             Err(error) => {
                 tracing::warn!(path = %entry.path().display(), err = %error, "ignoring invalid snapshot generation");
@@ -2780,10 +2923,18 @@ fn prune_snapshot_export_leases(
     leases.retain(|_, lease| now.duration_since(lease.last_activity) <= SNAPSHOT_EXPORT_LEASE_TTL);
 }
 
+fn refresh_snapshot_object_retention_floor(
+    store: &MdbxStore,
+    leases: &std::collections::HashMap<PeerId, SnapshotExportLease>,
+) {
+    store.set_block_body_object_retention_floor(leases.values().map(|lease| lease.key.0).min());
+}
+
 fn lease_snapshot_export(
     leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
     peer: PeerId,
     key: SnapshotExportKey,
+    manifest_digest: [u8; 32],
 ) -> bool {
     prune_snapshot_export_leases(leases);
     if MAX_SNAPSHOT_EXPORTS == 0 {
@@ -2821,6 +2972,7 @@ fn lease_snapshot_export(
         peer,
         SnapshotExportLease {
             key,
+            manifest_digest,
             last_activity: Instant::now(),
         },
     );
@@ -3599,6 +3751,7 @@ async fn handle_network_command(
             generation,
             peer,
             requester_height,
+            requested_manifest_digest,
         } => {
             if !sync_paths.is_dispatchable(peer) {
                 let _ = required_event_tx
@@ -3640,7 +3793,10 @@ async fn handle_network_command(
             }
             let request_id = swarm.behaviour_mut().state_manifest_sync.send_request(
                 &peer,
-                crate::protocol::GetStateManifestRequest { requester_height },
+                crate::protocol::GetStateManifestRequest {
+                    requester_height,
+                    requested_manifest_digest,
+                },
             );
             let inserted = pending_state_manifest_requests.try_insert(
                 request_id,
@@ -3660,6 +3816,7 @@ async fn handle_network_command(
             segment_id,
             expected_tip_height,
             expected_tip_hash,
+            manifest_digest,
         } => {
             if !sync_paths.is_dispatchable(peer) {
                 let _ = required_event_tx
@@ -3668,6 +3825,7 @@ async fn handle_network_command(
                         segment_id,
                         expected_tip_height,
                         expected_tip_hash,
+                        manifest_digest,
                     })
                     .await;
                 return;
@@ -3678,7 +3836,8 @@ async fn handle_network_command(
             pending_state_segment_requests.retain(|_, pending| {
                 let same_session = pending.peer == peer
                     && pending.expected_tip_height == expected_tip_height
-                    && pending.expected_tip_hash == expected_tip_hash;
+                    && pending.expected_tip_hash == expected_tip_hash
+                    && pending.manifest_digest == manifest_digest;
                 if !same_session || pending.segment_id == segment_id {
                     pending.notify_node = false;
                 }
@@ -3697,6 +3856,7 @@ async fn handle_network_command(
                         segment_id,
                         expected_tip_height,
                         expected_tip_hash,
+                        manifest_digest,
                     })
                     .await;
                 return;
@@ -3707,6 +3867,7 @@ async fn handle_network_command(
                     segment_id,
                     expected_tip_height,
                     expected_tip_hash,
+                    manifest_digest,
                 },
             );
             let inserted = pending_state_segment_requests.try_insert(
@@ -3716,6 +3877,7 @@ async fn handle_network_command(
                     segment_id,
                     expected_tip_height,
                     expected_tip_hash,
+                    manifest_digest,
                     issued_at: Instant::now(),
                     notify_node: true,
                 },
@@ -4073,6 +4235,7 @@ async fn handle_swarm_event(
                         segment_id: pending.segment_id,
                         expected_tip_height: pending.expected_tip_height,
                         expected_tip_hash: pending.expected_tip_hash,
+                        manifest_digest: pending.manifest_digest,
                     })
                     .await;
             }
@@ -4644,6 +4807,10 @@ async fn handle_swarm_event(
                 ..
             },
         )) => {
+            if let Some(lease) = snapshot_export_leases.get_mut(&peer) {
+                lease.last_activity = Instant::now();
+                refresh_snapshot_object_retention_floor(chain_store, snapshot_export_leases);
+            }
             let declared_bytes = request
                 .objects
                 .iter()
@@ -5496,6 +5663,7 @@ async fn handle_swarm_event(
             },
         )) => {
             prune_snapshot_export_leases(snapshot_export_leases);
+            refresh_snapshot_object_retention_floor(chain_store, snapshot_export_leases);
             prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             let response = 'ready_manifest: {
                 let Some(generation) = select_snapshot_export(
@@ -5503,18 +5671,11 @@ async fn handle_swarm_event(
                     snapshot_exports,
                     snapshot_export_leases,
                     request.requester_height,
+                    request.requested_manifest_digest,
                 ) else {
                     break 'ready_manifest GetStateManifestResponse::default();
                 };
                 let key = generation.key();
-                if !lease_snapshot_export(snapshot_export_leases, peer, key) {
-                    tracing::debug!(
-                        peer = %peer,
-                        snapshot_height = key.0,
-                        "snapshot generation lease capacity is full"
-                    );
-                    break 'ready_manifest GetStateManifestResponse::default();
-                }
                 let manifest = generation.manifest();
                 let live_tip = chain_store
                     .get_consensus_meta()
@@ -5522,44 +5683,29 @@ async fn handle_swarm_event(
                     .flatten()
                     .map_or(manifest.bridge_tip_height, |meta| meta.tip_height);
 
-                let segment_ids = manifest
-                    .segments
-                    .iter()
-                    .map(|descriptor| descriptor.segment_id)
-                    .collect();
-                let segment_roots = manifest
-                    .segments
-                    .iter()
-                    .map(|descriptor| descriptor.segment_root)
-                    .collect();
-                let segment_lengths = manifest
-                    .segments
-                    .iter()
-                    .map(|descriptor| descriptor.encoded_len)
-                    .collect();
-                tracing::info!(
+                tracing::debug!(
                     requester_height = request.requester_height,
                     snapshot_height = manifest.target_height,
-                    bridge_tip = manifest.bridge_tip_height,
                     live_tip,
                     segments = manifest.segments.len(),
-                    "serving immutable snapshot manifest and bridge"
+                    "serving cached immutable snapshot manifest"
                 );
-                GetStateManifestResponse {
-                    tip_height: manifest.target_height,
-                    tip_hash: key.1,
-                    cumulative_chainwork: manifest.cumulative_chainwork,
-                    log_slots: manifest.log_slots,
-                    active_slot_count: manifest.active_slot_count,
-                    alloc_counter: manifest.alloc_counter,
-                    eff_log: manifest.effective_log_segment_size,
-                    bridge_tip_height: manifest.bridge_tip_height,
-                    bridge_tip_hash: manifest.bridge_tip_hash,
-                    bridge_cumulative_chainwork: manifest.bridge_cumulative_chainwork,
-                    segment_ids,
-                    segment_roots,
-                    segment_lengths,
+                let response = generation.network_manifest.clone();
+                if !lease_snapshot_export(
+                    snapshot_export_leases,
+                    peer,
+                    key,
+                    response.manifest_digest,
+                ) {
+                    tracing::debug!(
+                        peer = %peer,
+                        snapshot_height = key.0,
+                        "snapshot generation lease capacity is full"
+                    );
+                    break 'ready_manifest GetStateManifestResponse::default();
                 }
+                refresh_snapshot_object_retention_floor(chain_store, snapshot_export_leases);
+                response
             };
             let _ = swarm
                 .behaviour_mut()
@@ -5758,10 +5904,11 @@ async fn handle_swarm_event(
             }
             entry.0 += 1;
             prune_snapshot_export_leases(snapshot_export_leases);
+            refresh_snapshot_object_retention_floor(chain_store, snapshot_export_leases);
             prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             let key = (request.expected_tip_height, request.expected_tip_hash);
             let lease_matches = snapshot_export_leases.get_mut(&peer).is_some_and(|lease| {
-                if lease.key == key {
+                if lease.key == key && lease.manifest_digest == request.manifest_digest {
                     lease.last_activity = Instant::now();
                     true
                 } else {
@@ -5808,6 +5955,7 @@ async fn handle_swarm_event(
             }
             let requested_tip_height = request.expected_tip_height;
             let requested_tip_hash = request.expected_tip_hash;
+            let requested_manifest_digest = request.manifest_digest;
             let completion = segment_response_tx.clone();
             let budget = outbound_response_budget.clone();
             let encode_admission = Arc::clone(segment_encode_semaphore);
@@ -5833,6 +5981,7 @@ async fn handle_swarm_event(
                         segment_id: descriptor.segment_id,
                         expected_tip_height: requested_tip_height,
                         expected_tip_hash: requested_tip_hash,
+                        manifest_digest: requested_manifest_digest,
                         eff_log: effective_log,
                         data: Some(data),
                         inbound_memory_permit: None,
@@ -5844,6 +5993,7 @@ async fn handle_swarm_event(
                             segment_id: descriptor.segment_id,
                             expected_tip_height: requested_tip_height,
                             expected_tip_hash: requested_tip_hash,
+                            manifest_digest: requested_manifest_digest,
                             eff_log: 0,
                             data: None,
                             inbound_memory_permit: None,
@@ -5858,6 +6008,7 @@ async fn handle_swarm_event(
                             segment_id: descriptor.segment_id,
                             expected_tip_height: requested_tip_height,
                             expected_tip_hash: requested_tip_hash,
+                            manifest_digest: requested_manifest_digest,
                             eff_log: 0,
                             data: None,
                             inbound_memory_permit: None,
@@ -6290,6 +6441,7 @@ async fn handle_swarm_event(
                 mempool_sync_retries.remove(&peer_id);
                 snapshot_segment_rate.remove(&peer_id);
                 snapshot_export_leases.remove(&peer_id);
+                refresh_snapshot_object_retention_floor(chain_store, snapshot_export_leases);
                 prune_snapshot_exports(snapshot_exports, snapshot_export_leases);
             }
         }
@@ -6689,12 +6841,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_bridge_keeps_half_window_for_the_live_tail() {
-        let allowance = SNAPSHOT_BRIDGE_MAX_LIVE_GAP;
-        assert!(snapshot_bridge_has_live_headroom(100, 100));
-        assert!(snapshot_bridge_has_live_headroom(100, 100 - allowance));
-        assert!(!snapshot_bridge_has_live_headroom(100, 100 - allowance - 1));
-        assert!(!snapshot_bridge_has_live_headroom(100, 101));
+    fn snapshot_boundary_keeps_payload_pruning_headroom() {
+        let allowance = SNAPSHOT_BOUNDARY_MAX_LIVE_GAP;
+        assert!(snapshot_boundary_has_live_headroom(100, 100));
+        assert!(snapshot_boundary_has_live_headroom(100, 100 - allowance));
+        assert!(!snapshot_boundary_has_live_headroom(
+            100,
+            100 - allowance - 1
+        ));
+        assert!(!snapshot_boundary_has_live_headroom(100, 101));
     }
 
     #[test]
@@ -6720,10 +6875,10 @@ mod tests {
         let key_c = (102, [3; 32]);
         let mut leases = std::collections::HashMap::new();
 
-        assert!(lease_snapshot_export(&mut leases, first, key_a));
-        assert!(lease_snapshot_export(&mut leases, second, key_b));
-        assert!(lease_snapshot_export(&mut leases, third, key_a));
-        assert!(lease_snapshot_export(&mut leases, third, key_c));
+        assert!(lease_snapshot_export(&mut leases, first, key_a, [1; 32]));
+        assert!(lease_snapshot_export(&mut leases, second, key_b, [2; 32]));
+        assert!(lease_snapshot_export(&mut leases, third, key_a, [1; 32]));
+        assert!(lease_snapshot_export(&mut leases, third, key_c, [3; 32]));
         assert!(!leases.contains_key(&first));
         assert_eq!(leases.get(&second).map(|lease| lease.key), Some(key_b));
         assert_eq!(leases.get(&third).map(|lease| lease.key), Some(key_c));
@@ -7164,6 +7319,7 @@ mod tests {
             segment_id: 7,
             expected_tip_height: 144,
             expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0x11; 32],
             issued_at: Instant::now(),
             notify_node: true,
         };
@@ -7171,6 +7327,7 @@ mod tests {
             segment_id: 7,
             expected_tip_height: 144,
             expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0x11; 32],
             eff_log: 0,
             data: None,
             inbound_memory_permit: None,
@@ -7179,8 +7336,7 @@ mod tests {
         assert!(state_segment_response_matches_pending(old, peer, &response));
 
         let new_session = PendingStateSegmentRequest {
-            expected_tip_height: 145,
-            expected_tip_hash: [0x5A; 32],
+            manifest_digest: [0x22; 32],
             ..old
         };
         assert!(!state_segment_response_matches_pending(
@@ -7198,11 +7354,13 @@ mod tests {
             segment_id: 9,
             expected_tip_height: 200,
             expected_tip_hash: [0xCC; 32],
+            manifest_digest: [0x33; 32],
         };
         let unavailable = unavailable_state_segment_response(&request);
         assert_eq!(unavailable.segment_id, request.segment_id);
         assert_eq!(unavailable.expected_tip_height, request.expected_tip_height);
         assert_eq!(unavailable.expected_tip_hash, request.expected_tip_hash);
+        assert_eq!(unavailable.manifest_digest, request.manifest_digest);
     }
 
     #[test]
