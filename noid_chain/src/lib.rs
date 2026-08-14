@@ -57,7 +57,7 @@ pub use segmented_state::{
 pub use storage::{
     reconstruct_historical_exact_state, CanonicalTipBinding, ConsensusMeta, FinalizedCheckpoint,
     HistoricalExactStateView, HistoricalStateError, MdbxChainContext, MdbxContextError, MdbxStore,
-    RamBackend, StateBackend, StoreError, VerifiedSnapshotBoundary,
+    RamBackend, StateBackend, StoreError, VerifiedReorgSuffix, VerifiedSnapshotBoundary,
 };
 
 // ---------------------------------------------------------------------------

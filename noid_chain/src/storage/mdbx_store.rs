@@ -358,11 +358,50 @@ pub(crate) struct StagedAcceptedBlockCommit {
 #[derive(Clone, Copy)]
 pub(crate) enum AcceptedBlockCommit<'a> {
     Complete(&'a crate::AcceptedBlockBundle),
+    /// A complete accepted unit supplied as exact borrowed objects.
+    ///
+    /// This is used by the v2 object pipeline after a body and its terminal
+    /// have been fetched independently.  Storage validates the same binding
+    /// as `Complete`; the variant only avoids rebuilding/copying a roughly
+    /// one-megabyte terminal into an `AcceptedBlockBundle`.
+    CompleteObjects {
+        block_bytes: &'a [u8],
+        terminal_bytes: &'a [u8],
+    },
     RecursiveSuffix {
         block_bytes: &'a [u8],
         authority_tip_height: u64,
         authority_tip_hash: [u8; 32],
     },
+}
+
+impl<'a> AcceptedBlockCommit<'a> {
+    pub(crate) fn block_bytes(self) -> &'a [u8] {
+        match self {
+            Self::Complete(bundle) => bundle.block_bytes(),
+            Self::CompleteObjects { block_bytes, .. }
+            | Self::RecursiveSuffix { block_bytes, .. } => block_bytes,
+        }
+    }
+
+    fn complete_terminal(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Complete(bundle) => Some(bundle.history_step_terminal_bytes()),
+            Self::CompleteObjects { terminal_bytes, .. } => Some(terminal_bytes),
+            Self::RecursiveSuffix { .. } => None,
+        }
+    }
+
+    fn recursive_authority(self) -> Option<(u64, [u8; 32])> {
+        match self {
+            Self::RecursiveSuffix {
+                authority_tip_height,
+                authority_tip_hash,
+                ..
+            } => Some((authority_tip_height, authority_tip_hash)),
+            Self::Complete(_) | Self::CompleteObjects { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2585,6 +2624,10 @@ impl MdbxStore {
                         None,
                     )
                 }
+                AcceptedBlockCommit::CompleteObjects {
+                    block_bytes,
+                    terminal_bytes,
+                } => (block_bytes, Some(terminal_bytes), None),
                 AcceptedBlockCommit::RecursiveSuffix {
                     block_bytes,
                     authority_tip_height,
@@ -3053,7 +3096,7 @@ impl MdbxStore {
         final_dirty_segments: &[(u16, u8, Option<&SegmentColumns>)],
         final_dirty_segment_summaries: &[(u16, u32, [u8; 32])],
         reverted_tx_hashes: &[TxBodyHash],
-        replacement_bundles: &[crate::AcceptedBlockBundle],
+        replacement_objects: &[AcceptedBlockCommit<'_>],
         replacement: &[StagedAcceptedBlockCommit],
         circulating_supply_micronoid: u128,
         consensus_meta: &ConsensusMeta,
@@ -3078,24 +3121,32 @@ impl MdbxStore {
         {
             return Err(StoreError::Decode("invalid staged reorg tip"));
         }
-        if replacement_bundles.len() != replacement.len() {
-            return Err(StoreError::Decode("staged reorg bundle count mismatch"));
+        if replacement_objects.len() != replacement.len() {
+            return Err(StoreError::Decode("staged reorg object count mismatch"));
         }
         let mut expected_height = ancestor_height.saturating_add(1);
-        for (bundle, staged) in replacement_bundles.iter().zip(replacement) {
-            let block = crate::Block::from_bytes(bundle.block_bytes())
+        for (accepted, staged) in replacement_objects.iter().copied().zip(replacement) {
+            let block = crate::Block::from_bytes(accepted.block_bytes())
                 .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
             if staged.header.height != expected_height
                 || block.header != staged.header
                 || staged.hash != crate::hash_block_header(&staged.header)
-                || bundle.height() != staged.header.height
-                || bundle.block_hash() != staged.hash
                 || match crate::block::try_compute_logical_txids(&block.transactions) {
                     Ok(txids) => txids != staged.undo_log.tx_hashes,
                     Err(_) => true,
                 }
             {
                 return Err(StoreError::Decode("invalid staged reorg block"));
+            }
+            if let Some((authority_height, authority_hash)) = accepted.recursive_authority() {
+                if staged.header.height >= authority_height
+                    || authority_height != final_header.height
+                    || authority_hash != *final_hash
+                {
+                    return Err(StoreError::Decode(
+                        "staged reorg marker has the wrong recursive authority",
+                    ));
+                }
             }
             expected_height = expected_height
                 .checked_add(1)
@@ -3113,6 +3164,13 @@ impl MdbxStore {
                 return Err(StoreError::Decode("empty staged reorg changed height"));
             }
             _ => {}
+        }
+        if let Some(last) = replacement_objects.last().copied() {
+            if last.complete_terminal().is_none() {
+                return Err(StoreError::Decode(
+                    "staged reorg tip is missing its complete terminal",
+                ));
+            }
         }
 
         let txn = self.db.begin_rw_txn()?;
@@ -3337,12 +3395,9 @@ impl MdbxStore {
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
         let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
-        for (index, (bundle, staged)) in replacement_bundles.iter().zip(replacement).enumerate() {
-            let block = crate::Block::from_bytes(bundle.block_bytes())
+        for (accepted, staged) in replacement_objects.iter().copied().zip(replacement) {
+            let block = crate::Block::from_bytes(accepted.block_bytes())
                 .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
-            if index != 0 {
-                validate_history_step_parent_boundary_in_rw_txn(&txn, &staged.header)?;
-            }
             let height_key = u64_key(staged.header.height);
             txn.put(
                 &hdr_tbl,
@@ -3389,13 +3444,7 @@ impl MdbxStore {
             txn.put(
                 &recent_tbl,
                 height_key,
-                bundle.block_bytes(),
-                WriteFlags::empty(),
-            )?;
-            txn.put(
-                &terminal_tbl,
-                height_key,
-                bundle.history_step_terminal_bytes(),
+                accepted.block_bytes(),
                 WriteFlags::empty(),
             )?;
             if staged.header.height != 0 {
@@ -3407,16 +3456,39 @@ impl MdbxStore {
                     .ok_or(StoreError::Decode(
                         "staged reorg transaction count has no canonical HistoryStep tier",
                     ))?;
-                if !history_step_terminal_matches_class(
-                    bundle.history_step_terminal_bytes(),
-                    staged.header.height,
-                    crate::block_header::semantic_header_id(&staged.header),
-                    expected_class,
-                ) {
-                    return Err(StoreError::Decode(
-                        "staged reorg terminal class does not match its block",
-                    ));
-                }
+                let terminal_bytes: Cow<'_, [u8]> =
+                    if let Some(terminal) = accepted.complete_terminal() {
+                        if !history_step_terminal_matches_class(
+                            terminal,
+                            staged.header.height,
+                            crate::block_header::semantic_header_id(&staged.header),
+                            expected_class,
+                        ) {
+                            return Err(StoreError::Decode(
+                                "staged reorg terminal class does not match its block",
+                            ));
+                        }
+                        Cow::Borrowed(terminal)
+                    } else {
+                        let (authority_tip_height, authority_tip_hash) = accepted
+                            .recursive_authority()
+                            .ok_or(StoreError::Decode("staged reorg authorization is missing"))?;
+                        Cow::Owned(
+                            encode_recursive_suffix_marker(
+                                &staged.header,
+                                expected_class,
+                                authority_tip_height,
+                                authority_tip_hash,
+                            )?
+                            .to_vec(),
+                        )
+                    };
+                txn.put(
+                    &terminal_tbl,
+                    height_key,
+                    terminal_bytes.as_ref(),
+                    WriteFlags::empty(),
+                )?;
             }
             let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
                 .map_err(|_| StoreError::Decode("staged logical tx stream is malformed"))?;
@@ -3439,8 +3511,16 @@ impl MdbxStore {
         for (height, marker) in marker_rebindings {
             txn.put(&terminal_tbl, u64_key(height), marker, WriteFlags::empty())?;
         }
-        if let Some(first) = replacement.first() {
-            validate_history_step_parent_boundary_in_rw_txn(&txn, &first.header)?;
+        // Validate every parent only after all replacement objects have been
+        // installed in this uncommitted transaction. Intermediate markers in
+        // a one-terminal reorg point at the replacement tip, so their durable
+        // authority becomes visible only when that final terminal row exists.
+        for staged in replacement {
+            validate_history_step_parent_boundary_in_rw_txn(&txn, &staged.header)?;
+        }
+        if !replacement.is_empty() {
+            let retention = txn.open_table(Some(T_RETENTION_META))?;
+            let _ = txn.del(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY, None);
         }
 
         txn.put(
