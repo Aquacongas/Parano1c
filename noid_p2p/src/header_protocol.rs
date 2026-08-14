@@ -22,7 +22,212 @@ pub const HEADER_ANNOUNCE_BYTES: usize =
     4 + BLOCK_HEADER_WIRE_SIZE + 32 + 4 + 32 + 4 + 1 + 1 + RESERVED_BYTES;
 pub const MAX_HEADER_ANNOUNCE_BYTES: usize = 512;
 
+const INVENTORY_BODY: u8 = 1 << 0;
+const INVENTORY_TERMINAL: u8 = 1 << 1;
+const INVENTORY_KNOWN: u8 = INVENTORY_BODY | INVENTORY_TERMINAL;
+const INVENTORY_RESERVED_BYTES: usize = 2;
+pub const HEADER_INVENTORY_RECORD_BYTES: usize =
+    BLOCK_HEADER_WIRE_SIZE + 1 + 1 + INVENTORY_RESERVED_BYTES + 32 + 4 + 32 + 4;
+
 const _: () = assert!(HEADER_ANNOUNCE_BYTES <= MAX_HEADER_ANNOUNCE_BYTES);
+
+/// One canonical header plus scheduling hints for exact retained objects.
+///
+/// Missing object identities are explicit availability statements, not
+/// consensus claims. In particular, a compact recursive marker is never
+/// encoded as a terminal object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeaderInventoryRecord {
+    pub header: BlockHeader,
+    pub body: Option<BlockBodyObjectId>,
+    pub terminal: Option<TerminalObjectId>,
+}
+
+impl HeaderInventoryRecord {
+    pub const fn header_only(header: BlockHeader) -> Self {
+        Self {
+            header,
+            body: None,
+            terminal: None,
+        }
+    }
+
+    pub fn from_announcement(announcement: HeaderAnnouncement) -> Self {
+        Self {
+            header: announcement.header,
+            body: Some(announcement.body),
+            terminal: Some(announcement.terminal),
+        }
+    }
+
+    pub fn from_retained_objects(
+        header: BlockHeader,
+        body_bytes: Option<&[u8]>,
+        terminal_bytes: Option<&[u8]>,
+    ) -> Result<Self, HeaderAnnounceError> {
+        if body_bytes.is_some_and(|bytes| {
+            noid_chain::Block::from_bytes(bytes)
+                .map(|block| block.header != header)
+                .unwrap_or(true)
+        }) {
+            return Err(HeaderAnnounceError::InvalidBundleHeader);
+        }
+        let body_claim = BlockBodyClaimId {
+            height: header.height,
+            block_hash: block_id(&header),
+        };
+        let body = body_bytes
+            .map(|bytes| {
+                BlockBodyObjectId::from_bytes(body_claim, bytes)
+                    .ok_or(HeaderAnnounceError::ObjectLengthOverflow)
+            })
+            .transpose()?;
+        let terminal = terminal_bytes
+            .map(|bytes| {
+                let metadata = HistoryStepTerminalMetadata::decode_prefix(bytes)
+                    .map_err(|_| HeaderAnnounceError::InvalidTerminalMetadata)?;
+                let claim = TerminalClaimId {
+                    height: header.height,
+                    semantic_header_id: semantic_header_id(&header),
+                    proof_class: metadata.class_id(),
+                };
+                if metadata.terminal_height() != claim.height
+                    || metadata.terminal_hash() != claim.semantic_header_id
+                {
+                    return Err(HeaderAnnounceError::TerminalClaimMismatch);
+                }
+                TerminalObjectId::from_bytes(claim, bytes)
+                    .ok_or(HeaderAnnounceError::ObjectLengthOverflow)
+            })
+            .transpose()?;
+        let record = Self {
+            header,
+            body,
+            terminal,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn encode(self) -> Result<[u8; HEADER_INVENTORY_RECORD_BYTES], HeaderAnnounceError> {
+        self.validate()?;
+        let mut encoded = [0u8; HEADER_INVENTORY_RECORD_BYTES];
+        encoded[..BLOCK_HEADER_WIRE_SIZE].copy_from_slice(&self.header.to_bytes());
+        let mut cursor = BLOCK_HEADER_WIRE_SIZE;
+        encoded[cursor] = (self.body.is_some() as u8) * INVENTORY_BODY
+            | (self.terminal.is_some() as u8) * INVENTORY_TERMINAL;
+        cursor += 1;
+        encoded[cursor] = self
+            .terminal
+            .map_or(0, |terminal| terminal.claim.proof_class);
+        cursor += 1 + INVENTORY_RESERVED_BYTES;
+        if let Some(body) = self.body {
+            encoded[cursor..cursor + 32].copy_from_slice(&body.byte_digest);
+            cursor += 32;
+            encoded[cursor..cursor + 4].copy_from_slice(&body.encoded_len.to_le_bytes());
+        } else {
+            cursor += 32 + 4;
+        }
+        cursor += 4;
+        if let Some(terminal) = self.terminal {
+            encoded[cursor..cursor + 32].copy_from_slice(&terminal.byte_digest);
+            cursor += 32;
+            encoded[cursor..cursor + 4].copy_from_slice(&terminal.encoded_len.to_le_bytes());
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, HeaderAnnounceError> {
+        if encoded.len() != HEADER_INVENTORY_RECORD_BYTES {
+            return Err(HeaderAnnounceError::NonCanonicalInventoryLength(
+                encoded.len(),
+            ));
+        }
+        let header = BlockHeader::from_bytes(&encoded[..BLOCK_HEADER_WIRE_SIZE])
+            .map_err(|_| HeaderAnnounceError::InvalidHeader)?;
+        let mut cursor = BLOCK_HEADER_WIRE_SIZE;
+        let flags = encoded[cursor];
+        if flags & !INVENTORY_KNOWN != 0 {
+            return Err(HeaderAnnounceError::UnknownInventoryFlags(flags));
+        }
+        cursor += 1;
+        let proof_class = encoded[cursor];
+        cursor += 1;
+        if encoded[cursor..cursor + INVENTORY_RESERVED_BYTES] != [0; INVENTORY_RESERVED_BYTES] {
+            return Err(HeaderAnnounceError::NonZeroReserved);
+        }
+        cursor += INVENTORY_RESERVED_BYTES;
+
+        let body_digest: [u8; 32] = encoded[cursor..cursor + 32].try_into().unwrap();
+        cursor += 32;
+        let body_len = u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap());
+        cursor += 4;
+        let terminal_digest: [u8; 32] = encoded[cursor..cursor + 32].try_into().unwrap();
+        cursor += 32;
+        let terminal_len = u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap());
+
+        let body = if flags & INVENTORY_BODY != 0 {
+            Some(BlockBodyObjectId {
+                claim: BlockBodyClaimId {
+                    height: header.height,
+                    block_hash: block_id(&header),
+                },
+                byte_digest: body_digest,
+                encoded_len: body_len,
+            })
+        } else {
+            if body_digest != [0; 32] || body_len != 0 {
+                return Err(HeaderAnnounceError::NonCanonicalMissingInventory);
+            }
+            None
+        };
+        let terminal = if flags & INVENTORY_TERMINAL != 0 {
+            Some(TerminalObjectId {
+                claim: TerminalClaimId {
+                    height: header.height,
+                    semantic_header_id: semantic_header_id(&header),
+                    proof_class,
+                },
+                byte_digest: terminal_digest,
+                encoded_len: terminal_len,
+            })
+        } else {
+            if proof_class != 0 || terminal_digest != [0; 32] || terminal_len != 0 {
+                return Err(HeaderAnnounceError::NonCanonicalMissingInventory);
+            }
+            None
+        };
+        let record = Self {
+            header,
+            body,
+            terminal,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub fn validate(&self) -> Result<(), HeaderAnnounceError> {
+        let expected_hash = block_id(&self.header);
+        if self.body.is_some_and(|body| {
+            body.claim.height != self.header.height
+                || body.claim.block_hash != expected_hash
+                || body.encoded_len == 0
+                || body.encoded_len as usize > MAX_BLOCK_BYTES
+        }) {
+            return Err(HeaderAnnounceError::BodyClaimMismatch);
+        }
+        if self.terminal.is_some_and(|terminal| {
+            terminal.claim.height != self.header.height
+                || terminal.claim.semantic_header_id != semantic_header_id(&self.header)
+                || terminal.claim.proof_class >= HISTORY_STEP_CLASS_COUNT
+                || terminal.encoded_len == 0
+                || terminal.encoded_len as usize > MAX_HISTORY_STEP_TERMINAL_BYTES
+        }) {
+            return Err(HeaderAnnounceError::TerminalClaimMismatch);
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProviderFlags(u8);
@@ -218,6 +423,8 @@ impl HeaderAnnouncement {
 pub enum HeaderAnnounceError {
     #[error("header announcement has non-canonical length {0}")]
     NonCanonicalLength(usize),
+    #[error("header inventory record has non-canonical length {0}")]
+    NonCanonicalInventoryLength(usize),
     #[error("header announcement magic/version is invalid")]
     BadMagic,
     #[error("header announcement reserved bytes are non-zero")]
@@ -242,6 +449,10 @@ pub enum HeaderAnnounceError {
     TerminalLength(u32),
     #[error("provider flag byte contains unknown bits: {0:#04x}")]
     UnknownProviderFlags(u8),
+    #[error("header inventory flag byte contains unknown bits: {0:#04x}")]
+    UnknownInventoryFlags(u8),
+    #[error("an unavailable header inventory object has non-zero fields")]
+    NonCanonicalMissingInventory,
 }
 
 #[cfg(test)]
@@ -268,8 +479,9 @@ mod tests {
 
     #[test]
     fn announcement_round_trip_binds_header_and_exact_objects() {
+        let accepted = bundle();
         let announcement = HeaderAnnouncement::from_accepted_bundle(
-            &bundle(),
+            &accepted,
             ProviderFlags::new(true, true, false),
         )
         .unwrap();
@@ -277,10 +489,86 @@ mod tests {
         assert_eq!(decoded, announcement);
         assert!(decoded.providers.serves_body());
         assert!(decoded.providers.serves_terminal());
-        assert!(decoded.body.matches_bytes(bundle().block_bytes()));
+        assert!(decoded.body.matches_bytes(accepted.block_bytes()));
         assert!(decoded
             .terminal
-            .matches_bytes(bundle().history_step_terminal_bytes()));
+            .matches_bytes(accepted.history_step_terminal_bytes()));
+    }
+
+    #[test]
+    fn inventory_round_trip_binds_retained_bytes_to_the_header() {
+        let accepted = bundle();
+        let announcement = HeaderAnnouncement::from_accepted_bundle(
+            &accepted,
+            ProviderFlags::new(true, true, false),
+        )
+        .unwrap();
+        let record = HeaderInventoryRecord::from_retained_objects(
+            announcement.header,
+            Some(accepted.block_bytes()),
+            Some(accepted.history_step_terminal_bytes()),
+        )
+        .unwrap();
+        assert_eq!(
+            HeaderInventoryRecord::decode(&record.encode().unwrap()).unwrap(),
+            record
+        );
+        assert!(record.body.unwrap().matches_bytes(accepted.block_bytes()));
+        assert!(record
+            .terminal
+            .unwrap()
+            .matches_bytes(accepted.history_step_terminal_bytes()));
+    }
+
+    #[test]
+    fn inventory_absence_and_flag_encoding_is_canonical() {
+        let accepted = bundle();
+        let announcement = HeaderAnnouncement::from_accepted_bundle(
+            &accepted,
+            ProviderFlags::new(true, true, false),
+        )
+        .unwrap();
+        let encoded = HeaderInventoryRecord::header_only(announcement.header)
+            .encode()
+            .unwrap();
+        assert_eq!(
+            HeaderInventoryRecord::decode(&encoded).unwrap(),
+            HeaderInventoryRecord::header_only(announcement.header)
+        );
+
+        let mut unknown_flag = encoded;
+        unknown_flag[BLOCK_HEADER_WIRE_SIZE] = 0x80;
+        assert_eq!(
+            HeaderInventoryRecord::decode(&unknown_flag),
+            Err(HeaderAnnounceError::UnknownInventoryFlags(0x80))
+        );
+
+        let mut hidden_body = encoded;
+        hidden_body[BLOCK_HEADER_WIRE_SIZE + 1 + 1 + INVENTORY_RESERVED_BYTES] = 1;
+        assert_eq!(
+            HeaderInventoryRecord::decode(&hidden_body),
+            Err(HeaderAnnounceError::NonCanonicalMissingInventory)
+        );
+    }
+
+    #[test]
+    fn inventory_rejects_body_bytes_from_another_header() {
+        let accepted = bundle();
+        let announcement = HeaderAnnouncement::from_accepted_bundle(
+            &accepted,
+            ProviderFlags::new(true, true, false),
+        )
+        .unwrap();
+        let mut wrong_body = accepted.block_bytes().to_vec();
+        wrong_body[BLOCK_WIRE_HEADER_OFFSET] ^= 1;
+        assert_eq!(
+            HeaderInventoryRecord::from_retained_objects(
+                announcement.header,
+                Some(&wrong_body),
+                None,
+            ),
+            Err(HeaderAnnounceError::InvalidBundleHeader)
+        );
     }
 
     #[test]

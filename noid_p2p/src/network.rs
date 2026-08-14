@@ -36,7 +36,7 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::event_dispatch::{self, RequiredEventReceiver, RequiredEventSender};
-use crate::header_protocol::{HeaderAnnouncement, ProviderFlags};
+use crate::header_protocol::{HeaderAnnouncement, HeaderInventoryRecord, ProviderFlags};
 use crate::network_profile::{NetworkProfile, NetworkProfileRequest, NetworkProfileResponse};
 use crate::object_protocol::{GetObjectsRequest, GetObjectsResponse, ObjectId, ObjectPayload};
 use crate::outbound_budget::OutboundResponseBudget;
@@ -1392,18 +1392,17 @@ fn decode_stored_accepted_block_bundle(
 /// Check the cheap structural shape of one already allocation-bounded decoded
 /// batch. Parent hashes, PoW, ASERT and the remaining consensus rules are
 /// checked once by the authoritative node-side header path.
-fn validate_header_batch_shape(
-    headers: &[noid_chain::block_header::BlockHeader],
-) -> Result<(), &'static str> {
-    if headers.len() > crate::header_sync_codec::MAX_HEADERS_PER_BATCH {
+fn validate_header_batch_shape(records: &[HeaderInventoryRecord]) -> Result<(), &'static str> {
+    if records.len() > crate::header_sync_codec::MAX_HEADERS_PER_BATCH {
         return Err("header count exceeds cap");
     }
-    for pair in headers.windows(2) {
+    for pair in records.windows(2) {
         let [parent, header] = pair else {
             unreachable!("windows(2) always has two entries")
         };
-        if header.height
+        if header.header.height
             != parent
+                .header
                 .height
                 .checked_add(1)
                 .ok_or("header height overflow")?
@@ -1471,7 +1470,8 @@ pub enum NetworkCommand {
         count: u16,
     },
     /// Fetch a range of headers from a peer for reorg ancestor search.
-    /// Emits `NetworkEvent::HeadersBatch` with the decoded headers.
+    /// Emits `NetworkEvent::HeaderInventoryBatch` with decoded headers and
+    /// exact retained-object availability.
     /// Used to find the common ancestor efficiently in O(1) round-trips
     /// instead of O(depth) hop-by-hop backwards traversal.
     FetchHeaders {
@@ -1531,7 +1531,7 @@ pub enum NetworkCommand {
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// Fixed-size network-v2 header announcement with exact body/terminal IDs.
+    /// Fixed-size network-v3 header announcement with exact body/terminal IDs.
     HeaderAnnouncement {
         from: PeerId,
         announcement: HeaderAnnouncement,
@@ -1605,11 +1605,11 @@ pub enum NetworkEvent {
         /// until node-side admission finishes. Gossip messages carry `None`.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     },
-    /// Response to FetchHeaders: decoded headers from the peer.
-    /// Used by reorg detection to find the common ancestor quickly.
-    HeadersBatch {
+    /// Response to FetchHeaders: decoded headers plus exact retained-object
+    /// availability from the peer. Used by HeaderDAG and immutable plans.
+    HeaderInventoryBatch {
         from: PeerId,
-        headers: Vec<noid_chain::block_header::BlockHeader>,
+        records: Vec<HeaderInventoryRecord>,
     },
     /// Transport or decoding failed for one exact header request.
     HeadersRequestFailed {
@@ -2417,7 +2417,7 @@ async fn run_swarm(
                     tracing::warn!(
                         peer = %request.peer,
                         transport_stuck,
-                        "network-v2 profile handshake timed out"
+                        "network-v3 profile handshake timed out"
                     );
                     let _ = swarm.disconnect_peer_id(request.peer);
                 }
@@ -3839,6 +3839,7 @@ async fn handle_network_command(
                 crate::protocol::GetHeadersRequest {
                     start_height,
                     count,
+                    include_inventory: true,
                 },
             );
             let inserted = pending_header_requests.try_insert(
@@ -3908,6 +3909,7 @@ async fn handle_network_command(
                 crate::protocol::GetHeadersRequest {
                     start_height,
                     count,
+                    include_inventory: false,
                 },
             );
             let inserted = pending_header_requests.try_insert(
@@ -4112,7 +4114,7 @@ async fn handle_swarm_event(
                         tracing::debug!(
                             peer = %propagation_source,
                             %error,
-                            "network-v2 header announcement decode failed"
+                            "network-v3 header announcement decode failed"
                         );
                     }
                 }
@@ -4199,16 +4201,20 @@ async fn handle_swarm_event(
                 return;
             }
             // Identify is only capability discovery. The endpoint becomes a
-            // usable network-v2 peer after the explicit profile round trip
+            // usable network-v3 peer after the explicit profile round trip
             // below proves the exact genesis, caps, finality and proof bank.
             let profile_protocol = format!("{}/sync/profile/2", topics.protocol_id);
             let object_protocol = format!("{}/sync/objects/2", topics.protocol_id);
+            let header_protocol = format!("{}/sync/headers/4", topics.protocol_id);
             let supports = |required: &str| {
                 info.protocols
                     .iter()
                     .any(|protocol| protocol.as_ref() == required)
             };
-            if !supports(&profile_protocol) || !supports(&object_protocol) {
+            if !supports(&profile_protocol)
+                || !supports(&object_protocol)
+                || !supports(&header_protocol)
+            {
                 sync_paths.mark_closing(connection_id);
                 let _ = swarm.close_connection(connection_id);
                 swarm.behaviour_mut().kad.remove_peer(&peer_id);
@@ -4216,7 +4222,8 @@ async fn handle_swarm_event(
                     peer = %peer_id,
                     profile_protocol,
                     object_protocol,
-                    "closing endpoint without the complete network-v2 protocol set"
+                    header_protocol,
+                    "closing endpoint without the complete network-v3 protocol set"
                 );
                 return;
             }
@@ -4304,13 +4311,13 @@ async fn handle_swarm_event(
                     },
                 );
                 debug_assert!(inserted, "profile capacity checked before request");
-                tracing::debug!(peer = %peer_id, "network-v2 profile handshake started");
+                tracing::debug!(peer = %peer_id, "network-v3 profile handshake started");
             }
             if sync_paths.try_mark_announced(peer_id) {
                 let _ = required_event_tx
                     .send(NetworkEvent::PeerConnected(peer_id))
                     .await;
-                tracing::debug!(peer = %peer_id, "peer network-v2 profile ready");
+                tracing::debug!(peer = %peer_id, "peer network-v3 profile ready");
             }
             if automatic_peers.is_bootstrap_peer(peer_id) {
                 // Older releases recorded seeds as generic successful peers.
@@ -4537,7 +4544,7 @@ async fn handle_swarm_event(
                     peer = %peer,
                     requested_peer = %pending.peer,
                     profile = ?response.profile.profile_id,
-                    "network-v2 profile mismatch; closing peer"
+                    "network-v3 profile mismatch; closing peer"
                 );
                 let _ = swarm.disconnect_peer_id(peer);
                 return;
@@ -4548,7 +4555,7 @@ async fn handle_swarm_event(
                     .send(NetworkEvent::PeerConnected(peer))
                     .await;
             }
-            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v2 profile verified");
+            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v3 profile verified");
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
@@ -4562,7 +4569,7 @@ async fn handle_swarm_event(
                 .remove(&request_id)
                 .is_some()
             {
-                tracing::warn!(peer = %peer, err = %error, "network-v2 profile handshake failed");
+                tracing::warn!(peer = %peer, err = %error, "network-v3 profile handshake failed");
                 let _ = swarm.disconnect_peer_id(peer);
             }
         }
@@ -4769,8 +4776,8 @@ async fn handle_swarm_event(
                 }
                 return;
             }
-            let headers = response.headers;
-            if let Err(error) = validate_header_batch_shape(&headers) {
+            let records = response.records;
+            if let Err(error) = validate_header_batch_shape(&records) {
                 tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
                 match pending.kind {
                     HeaderRequestKind::General => {
@@ -4800,13 +4807,14 @@ async fn handle_swarm_event(
             match pending.kind {
                 HeaderRequestKind::General => {
                     let _ = required_event_tx
-                        .send(NetworkEvent::HeadersBatch {
+                        .send(NetworkEvent::HeaderInventoryBatch {
                             from: peer,
-                            headers,
+                            records,
                         })
                         .await;
                 }
                 HeaderRequestKind::Snapshot { generation, token } => {
+                    let headers = records.into_iter().map(|record| record.header).collect();
                     let _ = required_event_tx
                         .send(NetworkEvent::SnapshotHeadersBatch {
                             generation,
@@ -4889,6 +4897,7 @@ async fn handle_swarm_event(
                     .expect("header batch cap fits u16"),
             );
             let start_height = request.start_height;
+            let include_inventory = request.include_inventory;
             let store = chain_store.clone();
             let preparation_admission = header_response_prepare_semaphore.clone();
             let completion = header_response_tx.clone();
@@ -4899,7 +4908,59 @@ async fn handle_swarm_event(
                 let _preparation_permit = preparation_permit;
                 let loaded = tokio::task::spawn_blocking(move || {
                     match store.get_headers(start_height, count) {
-                        Ok(headers) => headers,
+                        Ok(headers) => {
+                            let tip_height = store
+                                .get_chain_tip()
+                                .ok()
+                                .flatten()
+                                .map(|(height, _)| height);
+                            let retained_floor = tip_height.map(|height| {
+                                height.saturating_sub(
+                                    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH,
+                                )
+                            });
+                            let target_height = headers.last().map(|header| header.height);
+                            headers
+                                .into_iter()
+                                .map(|header| {
+                                    if !include_inventory {
+                                        return HeaderInventoryRecord::header_only(header);
+                                    }
+                                    let body = retained_floor
+                                        .is_some_and(|floor| header.height >= floor)
+                                        .then(|| {
+                                            store.get_recent_block(header.height).ok().flatten()
+                                        })
+                                        .flatten();
+                                    let terminal = (Some(header.height) == target_height)
+                                        .then(|| {
+                                            store
+                                                .get_history_step_terminal_at(
+                                                    header.height,
+                                                    noid_chain::block_header::block_id(&header),
+                                                )
+                                                .ok()
+                                                .flatten()
+                                        })
+                                        .flatten();
+                                    match HeaderInventoryRecord::from_retained_objects(
+                                        header,
+                                        body.as_deref(),
+                                        terminal.as_deref(),
+                                    ) {
+                                        Ok(record) => record,
+                                        Err(error) => {
+                                            tracing::warn!(
+                                                height = header.height,
+                                                %error,
+                                                "retained header inventory is inconsistent"
+                                            );
+                                            HeaderInventoryRecord::header_only(header)
+                                        }
+                                    }
+                                })
+                                .collect()
+                        }
                         Err(error) => {
                             tracing::warn!(
                                 start_height,
@@ -4912,8 +4973,8 @@ async fn handle_swarm_event(
                     }
                 })
                 .await;
-                let headers = match loaded {
-                    Ok(headers) => headers,
+                let records = match loaded {
+                    Ok(records) => records,
                     Err(error) => {
                         tracing::warn!(
                             start_height,
@@ -4927,7 +4988,7 @@ async fn handle_swarm_event(
                 let _ = completion
                     .send(PendingHeaderResponse {
                         channel,
-                        response: GetHeadersResponse { headers },
+                        response: GetHeadersResponse { records },
                     })
                     .await;
             });
@@ -7213,12 +7274,21 @@ mod tests {
         let mut second = first;
         second.height = 78;
         second.prev_block_hash = noid_chain::hash_block_header(&first);
-        assert_eq!(validate_header_batch_shape(&[first, second]), Ok(()));
+        assert_eq!(
+            validate_header_batch_shape(&[
+                HeaderInventoryRecord::header_only(first),
+                HeaderInventoryRecord::header_only(second),
+            ]),
+            Ok(())
+        );
 
         let mut skipped = second;
         skipped.height = 79;
         assert_eq!(
-            validate_header_batch_shape(&[first, skipped]),
+            validate_header_batch_shape(&[
+                HeaderInventoryRecord::header_only(first),
+                HeaderInventoryRecord::header_only(skipped),
+            ]),
             Err("header batch is not height-contiguous")
         );
 
@@ -7226,7 +7296,13 @@ mod tests {
         // pass in snapshot staging, not the transport-shape layer.
         let mut wrong_parent = second;
         wrong_parent.prev_block_hash[0] ^= 1;
-        assert_eq!(validate_header_batch_shape(&[first, wrong_parent]), Ok(()));
+        assert_eq!(
+            validate_header_batch_shape(&[
+                HeaderInventoryRecord::header_only(first),
+                HeaderInventoryRecord::header_only(wrong_parent),
+            ]),
+            Ok(())
+        );
     }
 
     #[test]

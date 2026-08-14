@@ -2067,7 +2067,7 @@ const SNAPSHOT_HEADER_REQUEST_WINDOW: usize = 4;
 const SNAPSHOT_HEADER_BATCH: u64 = MAX_STAGED_HEADER_BATCH as u64;
 /// A timeout on a slow path reduces only the failed range. Successful paths
 /// retain the full bulk batch, while a VPN or constrained relay can make
-/// progress without repeatedly timing out on the same 0.83 MiB response.
+/// progress without repeatedly timing out on the same full-size response.
 const SNAPSHOT_HEADER_MIN_BATCH: u16 = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6053,7 +6053,8 @@ async fn handle_p2p_events(
     // --- FetchHeaders in-progress guard ---
     //
     // Prevents FetchHeaders from being sent to the same peer thousands of
-    // times during a block burst.  Entry is removed when HeadersBatch arrives
+    // times during a block burst. Entry is removed when HeaderInventoryBatch
+    // arrives
     // from that peer (or on disconnect).  Without this guard, 10 peers each
     // sending 40 blocks/s = 400 redundant FetchHeaders/s.
     // --- Per-peer tx rate limiter ---
@@ -6252,7 +6253,7 @@ async fn handle_p2p_events(
                 // downloading a potentially large accepted bundle. Direct-next
                 // headers can be fully checked against the current tip; larger recent
                 // gaps first pull headers, then bodies are requested only for the
-                // verified competing chain in the HeadersBatch path.
+                // verified competing chain in the HeaderInventoryBatch path.
                 let our_height = {
                     let ctx = chain.read().await;
                     ctx.tip_height()
@@ -8072,7 +8073,11 @@ async fn handle_p2p_events(
                 );
                 continue;
             }
-            Ok(NetworkEvent::HeadersBatch { from, headers }) => {
+            Ok(NetworkEvent::HeaderInventoryBatch { from, records }) => {
+                let headers = records
+                    .iter()
+                    .map(|record| record.header)
+                    .collect::<Vec<_>>();
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
                 if selected_snapshot_peer!().is_some() {

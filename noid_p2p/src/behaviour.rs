@@ -72,7 +72,7 @@ pub struct NodeBehaviour {
     /// Fixed header announcements and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Exact network-v2 profile handshake. A transport is never exposed to
+    /// Exact network-v3 profile handshake. A transport is never exposed to
     /// consensus/sync until this profile matches byte-for-byte.
     pub network_profile_sync: request_response::Behaviour<NetworkProfileCodec>,
 
@@ -284,9 +284,9 @@ impl NodeBehaviour {
 
         let chain_sync = request_response::Behaviour::new(
             [(
-                // v3 carries one bounded zstd frame whose decompressed bytes
-                // are the exact canonical 212-byte header stream.
-                StreamProtocol::try_from_owned(format!("{}/sync/headers/3", protocol_id))?,
+                // v4 carries canonical headers plus optional exact retained-
+                // object inventory in one bounded zstd frame.
+                StreamProtocol::try_from_owned(format!("{}/sync/headers/4", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()

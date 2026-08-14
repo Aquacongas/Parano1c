@@ -208,7 +208,7 @@ impl RequiredEventReceiver {
 fn classify(event: &NetworkEvent) -> EventClass {
     match event {
         NetworkEvent::PeerConnected(_) | NetworkEvent::PeerDisconnected(_) => EventClass::Control,
-        NetworkEvent::HeadersBatch { .. }
+        NetworkEvent::HeaderInventoryBatch { .. }
         | NetworkEvent::HeaderAnnouncement { .. }
         | NetworkEvent::HeadersRequestFailed { .. }
         | NetworkEvent::SnapshotHeadersBatch { .. }

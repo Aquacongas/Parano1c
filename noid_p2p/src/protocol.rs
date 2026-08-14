@@ -39,6 +39,8 @@ use noid_chain::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::header_protocol::HeaderInventoryRecord;
+
 // ---------------------------------------------------------------------------
 // Block pull: headers
 // ---------------------------------------------------------------------------
@@ -48,13 +50,16 @@ use serde::{Deserialize, Serialize};
 pub struct GetHeadersRequest {
     pub start_height: u64,
     pub count: u16, // wire cap: MAX_HEADERS_PER_BATCH; callers may request smaller batches
+    /// Include exact retained-object identities for recent sync planning.
+    /// Snapshot header staging sets this to false and receives headers only.
+    pub include_inventory: bool,
 }
 
-/// Response: canonical block headers decoded by the allocation-bounded
-/// header-sync codec.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Response: canonical block headers and optional exact retained-object
+/// inventory decoded by the allocation-bounded header-sync codec.
+#[derive(Debug, Clone)]
 pub struct GetHeadersResponse {
-    pub headers: Vec<BlockHeader>,
+    pub records: Vec<HeaderInventoryRecord>,
 }
 
 // ---------------------------------------------------------------------------
