@@ -21,9 +21,8 @@ use rand::seq::SliceRandom;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
-    INLINE_BLOCK_GOSSIP_THRESHOLD, MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES,
-    MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS, MAX_SEGMENT_BYTES,
-    MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
+    MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS,
+    MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS, MAX_TX_INTENT_BYTES_GLOBAL,
 };
 use noid_chain::storage::{
     encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log, MdbxChainContext,
@@ -37,13 +36,15 @@ use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::event_dispatch::{self, RequiredEventReceiver, RequiredEventSender};
+use crate::header_protocol::{HeaderAnnouncement, ProviderFlags};
+use crate::network_profile::{NetworkProfile, NetworkProfileRequest, NetworkProfileResponse};
+use crate::object_protocol::{GetObjectsRequest, GetObjectsResponse, ObjectId, ObjectPayload};
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::peer_diversity::{PeerDiversity, PublicNetworkGroup};
 use crate::protocol::{
-    BlockGossipMsg, GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse,
-    GetRecentBlockResponse, GetStateManifestResponse, GetStateSegmentRequest,
-    GetStateSegmentResponse, MempoolRequest, NetworkTopics, RecentBlockPayload,
-    RecentBlockPayloadKind, BLOCK_GOSSIP_FIXED_BYTES, MAX_BLOCK_BODY_BATCH,
+    GetHeadersResponse, GetHistoryStepTerminalResponse, GetMempoolResponse, GetRecentBlockResponse,
+    GetStateManifestResponse, GetStateSegmentRequest, GetStateSegmentResponse, MempoolRequest,
+    NetworkTopics, RecentBlockPayload, RecentBlockPayloadKind, MAX_BLOCK_BODY_BATCH,
 };
 
 struct PendingStateSegmentResponse {
@@ -69,6 +70,25 @@ struct PendingHistoryStepTerminalResponse {
 struct PendingMempoolResponse {
     channel: request_response::ResponseChannel<GetMempoolResponse>,
     response: GetMempoolResponse,
+}
+
+struct PendingObjectResponse {
+    channel: request_response::ResponseChannel<GetObjectsResponse>,
+    response: GetObjectsResponse,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingNetworkProfileRequest {
+    peer: PeerId,
+    issued_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct PendingObjectRequest {
+    token: u64,
+    peer: PeerId,
+    objects: Vec<ObjectId>,
+    issued_at: Instant,
 }
 
 /// Admit the maximum legal response before invoking the payload loader.
@@ -114,6 +134,8 @@ const MAX_OUTBOUND_BLOCK_BODY_BATCH_RESERVATION: usize =
     MAX_OUTBOUND_BLOCK_BODY_BATCH_BYTES + 2 * MAX_ACCEPTED_BLOCK_BUNDLE_BYTES;
 const MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES: usize = MAX_HISTORY_STEP_TERMINAL_BYTES;
 const MAX_PENDING_RETAINED_BLOCK_REQUESTS: usize = 256;
+const MAX_PENDING_NETWORK_PROFILE_REQUESTS: usize = 256;
+const MAX_PENDING_OBJECT_REQUESTS: usize = 64;
 const MAX_PENDING_HEADER_REQUESTS: usize = 64;
 const MAX_PENDING_STATE_MANIFEST_REQUESTS: usize = 16;
 const MAX_PENDING_STATE_SEGMENT_REQUESTS: usize = 64;
@@ -121,6 +143,8 @@ const MAX_PENDING_HISTORY_STEP_REQUESTS: usize = 8;
 /// The request-response transport timeout starts only after substream open.
 /// These complete-local deadlines also cover time queued before that point.
 const SMALL_SYNC_PENDING_DEADLINE: Duration = Duration::from_secs(35);
+const NETWORK_PROFILE_PENDING_DEADLINE: Duration = Duration::from_secs(15);
+const OBJECT_PENDING_DEADLINE: Duration = Duration::from_secs(65);
 const STATE_SEGMENT_PENDING_DEADLINE: Duration = Duration::from_secs(65);
 /// libp2p starts its request timeout only after an outbound substream opens.
 /// Bound the complete local lifetime as well, including time spent waiting in
@@ -211,6 +235,7 @@ struct SyncPath {
 struct PeerSyncPaths {
     paths: std::collections::HashMap<libp2p::swarm::ConnectionId, SyncPath>,
     announced: std::collections::HashSet<PeerId>,
+    profile_verified: std::collections::HashSet<PeerId>,
 }
 
 impl PeerSyncPaths {
@@ -338,6 +363,9 @@ impl PeerSyncPaths {
     }
 
     fn is_dispatchable(&self, peer: PeerId) -> bool {
+        if !self.profile_verified.contains(&peer) {
+            return false;
+        }
         let paths = self
             .paths
             .values()
@@ -351,6 +379,14 @@ impl PeerSyncPaths {
 
     fn try_mark_announced(&mut self, peer: PeerId) -> bool {
         self.is_dispatchable(peer) && self.announced.insert(peer)
+    }
+
+    fn mark_profile_verified(&mut self, peer: PeerId) {
+        self.profile_verified.insert(peer);
+    }
+
+    fn clear_profile_verified(&mut self, peer: PeerId) {
+        self.profile_verified.remove(&peer);
     }
 
     fn is_announced(&self, peer: PeerId) -> bool {
@@ -1148,13 +1184,6 @@ fn snapshot_suffix_is_retained(tip_height: u64, terminal_height: u64) -> bool {
             <= noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
 }
 
-fn complete_block_gossip_is_relayable(local_tip: u64, block_height: u64) -> bool {
-    let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
-    let oldest = local_tip.saturating_sub(retention);
-    let newest = local_tip.saturating_add(retention);
-    (oldest..=newest).contains(&block_height)
-}
-
 /// Choose the finalized snapshot boundary only when its exact HistoryStep
 /// terminal is durably available.
 fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
@@ -1188,6 +1217,60 @@ fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
         }
     }
     None
+}
+
+fn load_exact_object(store: &MdbxStore, object: ObjectId) -> Result<Option<Vec<u8>>, String> {
+    match object {
+        ObjectId::BlockBody(expected) => {
+            let Some(bytes) = store
+                .get_recent_block(expected.claim.height)
+                .map_err(|error| format!("read retained block: {error}"))?
+            else {
+                return Ok(None);
+            };
+            let block = noid_chain::Block::from_bytes(&bytes)
+                .map_err(|error| format!("decode retained block: {error:?}"))?;
+            if block.header.height != expected.claim.height
+                || noid_chain::block_header::block_id(&block.header) != expected.claim.block_hash
+                || !expected.matches_bytes(&bytes)
+            {
+                return Ok(None);
+            }
+            Ok(Some(bytes))
+        }
+        ObjectId::Terminal(expected) => {
+            let Some(header) = store
+                .get_header(expected.claim.height)
+                .map_err(|error| format!("read terminal header: {error}"))?
+            else {
+                return Ok(None);
+            };
+            if noid_chain::block_header::semantic_header_id(&header)
+                != expected.claim.semantic_header_id
+            {
+                return Ok(None);
+            }
+            let block_hash = noid_chain::block_header::block_id(&header);
+            let Some(bytes) = store
+                .get_history_step_terminal_at(expected.claim.height, block_hash)
+                .map_err(|error| format!("read retained terminal: {error}"))?
+            else {
+                return Ok(None);
+            };
+            let metadata =
+                noid_chain::history_step::HistoryStepTerminalMetadata::decode_prefix(&bytes)
+                    .map_err(|error| format!("decode retained terminal metadata: {error}"))?;
+            if metadata.terminal_height() != expected.claim.height
+                || metadata.terminal_hash() != expected.claim.semantic_header_id
+                || metadata.class_id() != expected.claim.proof_class
+                || !expected.matches_bytes(&bytes)
+            {
+                return Ok(None);
+            }
+            Ok(Some(bytes))
+        }
+        ObjectId::SnapshotManifest(_) | ObjectId::StateSegment(_) => Ok(None),
+    }
 }
 
 fn snapshot_bridge_has_live_headroom(live_tip: u64, bridge_tip: u64) -> bool {
@@ -1345,17 +1428,6 @@ fn snapshot_header_request_is_superseded(
     )
 }
 
-fn accepted_block_bundle_wire_len(bundle: &AcceptedBlockBundle) -> usize {
-    noid_chain::ACCEPTED_BLOCK_BUNDLE_HEADER_BYTES
-        + bundle.block_bytes().len()
-        + bundle.history_step_terminal_bytes().len()
-}
-
-fn should_inline_accepted_block_bundle(bundle: &AcceptedBlockBundle) -> bool {
-    accepted_block_bundle_wire_len(bundle).saturating_add(BLOCK_GOSSIP_FIXED_BYTES)
-        <= INLINE_BLOCK_GOSSIP_THRESHOLD
-}
-
 /// Commands sent to the P2P network event loop.
 #[derive(Debug)]
 pub enum NetworkCommand {
@@ -1372,6 +1444,13 @@ pub enum NetworkCommand {
     /// Get current peer count.
     PeerCount {
         reply: tokio::sync::oneshot::Sender<usize>,
+    },
+    /// Fetch one exact content-addressed object set from one candidate source.
+    /// The token is node-local and is returned unchanged in the result.
+    FetchObjects {
+        token: u64,
+        peer: PeerId,
+        objects: Vec<ObjectId>,
     },
     /// Request recent blocks from a specific peer for initial sync.
     /// Fetches blocks from `from_height` to `from_height + count - 1`.
@@ -1452,6 +1531,11 @@ pub enum NetworkCommand {
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
+    /// Fixed-size network-v2 header announcement with exact body/terminal IDs.
+    HeaderAnnouncement {
+        from: PeerId,
+        announcement: HeaderAnnouncement,
+    },
     /// A compact block announcement arrived from a peer.
     ///
     /// Contains only the header; the full block must be pulled via
@@ -1498,6 +1582,20 @@ pub enum NetworkEvent {
         from: PeerId,
         height: u64,
         payload_kind: RecentBlockPayloadKind,
+    },
+    /// Exact-object response correlated to one immutable planner job.
+    ObjectsResponse {
+        token: u64,
+        from: PeerId,
+        objects: Vec<ObjectPayload>,
+        inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    },
+    /// Transport or protocol failure for one exact-object source lease.
+    ObjectsRequestFailed {
+        token: u64,
+        from: PeerId,
+        objects: Vec<ObjectId>,
+        kind: RequestFailureKind,
     },
     /// A new TxIntent arrived from a peer.
     NewTx {
@@ -1987,6 +2085,9 @@ async fn run_swarm(
         std::collections::HashMap::new();
     let mut pending_retained_block_requests =
         BoundedPendingRequests::new(MAX_PENDING_RETAINED_BLOCK_REQUESTS);
+    let mut pending_network_profile_requests =
+        BoundedPendingRequests::new(MAX_PENDING_NETWORK_PROFILE_REQUESTS);
+    let mut pending_object_requests = BoundedPendingRequests::new(MAX_PENDING_OBJECT_REQUESTS);
     let mut pending_header_requests = BoundedPendingRequests::new(MAX_PENDING_HEADER_REQUESTS);
     let mut pending_state_manifest_requests =
         BoundedPendingRequests::new(MAX_PENDING_STATE_MANIFEST_REQUESTS);
@@ -2007,6 +2108,7 @@ async fn run_swarm(
     let (segment_response_tx, mut segment_response_rx) =
         mpsc::channel::<PendingStateSegmentResponse>(1);
     let (mempool_response_tx, mut mempool_response_rx) = mpsc::channel::<PendingMempoolResponse>(1);
+    let (object_response_tx, mut object_response_rx) = mpsc::channel::<PendingObjectResponse>(4);
     let block_response_prepare_semaphore = Arc::new(Semaphore::new(2));
     let header_response_prepare_semaphore = Arc::new(Semaphore::new(2));
     let history_step_response_prepare_semaphore = Arc::new(Semaphore::new(4));
@@ -2067,6 +2169,7 @@ async fn run_swarm(
                 &mut mempool_sync_retries,
                 &required_event_tx,
                 &mut pending_retained_block_requests,
+                &mut pending_object_requests,
                 &mut pending_header_requests,
                 &mut pending_state_manifest_requests,
                 &mut pending_state_segment_requests,
@@ -2098,6 +2201,7 @@ async fn run_swarm(
                     &segment_encode_semaphore,
                     &mempool_response_tx,
                     &mempool_response_prepare_semaphore,
+                    &object_response_tx,
                     &outbound_response_budget,
                     &mut snapshot_exports,
                     &mut snapshot_export_leases,
@@ -2108,6 +2212,8 @@ async fn run_swarm(
                     &mut mempool_sync_retries,
                     &mut snapshot_segment_rate,
                     &mut pending_retained_block_requests,
+                    &mut pending_network_profile_requests,
+                    &mut pending_object_requests,
                     &mut pending_header_requests,
                     &mut pending_state_manifest_requests,
                     &mut pending_state_segment_requests,
@@ -2185,6 +2291,15 @@ async fn run_swarm(
                 }
             }
 
+            prepared = object_response_rx.recv() => {
+                if let Some(prepared) = prepared {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .object_sync
+                        .send_response(prepared.channel, prepared.response);
+                }
+            }
+
             completed = snapshot_export_rx.recv() => {
                 if let Some((key, result)) = completed {
                     snapshot_export_inflight = None;
@@ -2257,6 +2372,7 @@ async fn run_swarm(
                         &mut mempool_sync_retries,
                         &required_event_tx,
                         &mut pending_retained_block_requests,
+                        &mut pending_object_requests,
                         &mut pending_header_requests,
                         &mut pending_state_manifest_requests,
                         &mut pending_state_segment_requests,
@@ -2286,6 +2402,52 @@ async fn run_swarm(
             _ = automatic_peer_timer.tick() => {
                 let now = Instant::now();
                 let mut wedged_sync_peers = std::collections::HashSet::new();
+
+                let expired_profiles = pending_network_profile_requests.take_where_entries(
+                    |request| {
+                        now.saturating_duration_since(request.issued_at)
+                            >= NETWORK_PROFILE_PENDING_DEADLINE
+                    },
+                );
+                for (request_id, request) in expired_profiles {
+                    let transport_stuck = swarm
+                        .behaviour()
+                        .network_profile_sync
+                        .is_pending_outbound(&request.peer, &request_id);
+                    tracing::warn!(
+                        peer = %request.peer,
+                        transport_stuck,
+                        "network-v2 profile handshake timed out"
+                    );
+                    let _ = swarm.disconnect_peer_id(request.peer);
+                }
+
+                let expired_objects = pending_object_requests.take_where_entries(|request| {
+                    now.saturating_duration_since(request.issued_at) >= OBJECT_PENDING_DEADLINE
+                });
+                for (request_id, request) in expired_objects {
+                    let transport_stuck = swarm
+                        .behaviour()
+                        .object_sync
+                        .is_pending_outbound(&request.peer, &request_id);
+                    tracing::warn!(
+                        peer = %request.peer,
+                        token = request.token,
+                        transport_stuck,
+                        "exact-object request exceeded its complete local deadline"
+                    );
+                    let _ = required_event_tx
+                        .send(NetworkEvent::ObjectsRequestFailed {
+                            token: request.token,
+                            from: request.peer,
+                            objects: request.objects,
+                            kind: RequestFailureKind::Timeout,
+                        })
+                        .await;
+                    if transport_stuck {
+                        wedged_sync_peers.insert(request.peer);
+                    }
+                }
 
                 let expired_blocks = pending_retained_block_requests.take_where_entries(
                     |request| {
@@ -3021,6 +3183,10 @@ async fn handle_network_command(
         request_response::OutboundRequestId,
         PendingRetainedBlockRequest,
     >,
+    pending_object_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingObjectRequest,
+    >,
     pending_header_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingHeaderRequest,
@@ -3043,13 +3209,23 @@ async fn handle_network_command(
     match cmd {
         NetworkCommand::AnnounceBlock { bundle } => {
             let height = bundle.height();
-            let inline = should_inline_accepted_block_bundle(&bundle);
-            let message = BlockGossipMsg::from_bundle(bundle, inline);
+            let message = match HeaderAnnouncement::from_accepted_bundle(
+                &bundle,
+                ProviderFlags::new(true, true, false),
+            )
+            .and_then(HeaderAnnouncement::encode)
+            {
+                Ok(message) => message,
+                Err(error) => {
+                    tracing::error!(height, %error, "refusing to announce an invalid local block object set");
+                    return;
+                }
+            };
             let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
             if let Err(error) = swarm
                 .behaviour_mut()
                 .gossipsub
-                .publish(topic, message.encode())
+                .publish(topic, message.to_vec())
             {
                 tracing::debug!(height, err = %error, "gossipsub: block announcement");
             }
@@ -3100,6 +3276,80 @@ async fn handle_network_command(
         NetworkCommand::PeerCount { reply } => {
             let count = sync_paths.dispatchable_peer_count();
             let _ = reply.send(count);
+        }
+        NetworkCommand::FetchObjects {
+            token,
+            peer,
+            objects,
+        } => {
+            let shape_valid = !objects.is_empty()
+                && objects.len() <= crate::object_protocol::MAX_OBJECTS_PER_REQUEST
+                && objects
+                    .iter()
+                    .all(|object| object.is_live_transfer_object())
+                && {
+                    let terminal_count = objects
+                        .iter()
+                        .filter(|object| matches!(object, ObjectId::Terminal(_)))
+                        .count();
+                    terminal_count == 0 || (terminal_count == 1 && objects.len() == 1)
+                }
+                && objects
+                    .iter()
+                    .try_fold(0usize, |total, object| {
+                        total.checked_add(object.encoded_len()? as usize)
+                    })
+                    .is_some_and(|total| {
+                        total <= crate::object_protocol::MAX_OBJECT_RESPONSE_PAYLOAD_BYTES
+                    })
+                && objects
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    == objects.len();
+            if !shape_valid || !sync_paths.is_dispatchable(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::ObjectsRequestFailed {
+                        token,
+                        from: peer,
+                        objects,
+                        kind: if shape_valid {
+                            RequestFailureKind::ConnectionClosed
+                        } else {
+                            RequestFailureKind::InvalidResponse
+                        },
+                    })
+                    .await;
+                return;
+            }
+            if !pending_object_requests.has_capacity() {
+                let _ = required_event_tx
+                    .send(NetworkEvent::ObjectsRequestFailed {
+                        token,
+                        from: peer,
+                        objects,
+                        kind: RequestFailureKind::Timeout,
+                    })
+                    .await;
+                return;
+            }
+            let request_id = swarm.behaviour_mut().object_sync.send_request(
+                &peer,
+                GetObjectsRequest {
+                    objects: objects.clone(),
+                },
+            );
+            let inserted = pending_object_requests.try_insert(
+                request_id,
+                PendingObjectRequest {
+                    token,
+                    peer,
+                    objects,
+                    issued_at: Instant::now(),
+                },
+            );
+            debug_assert!(inserted, "object capacity checked before request");
         }
         NetworkCommand::SyncBlocksFrom {
             peer,
@@ -3717,6 +3967,7 @@ async fn handle_swarm_event(
     segment_encode_semaphore: &Arc<Semaphore>,
     mempool_response_tx: &mpsc::Sender<PendingMempoolResponse>,
     mempool_response_prepare_semaphore: &Arc<Semaphore>,
+    object_response_tx: &mpsc::Sender<PendingObjectResponse>,
     outbound_response_budget: &OutboundResponseBudget,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     snapshot_export_leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
@@ -3729,6 +3980,14 @@ async fn handle_swarm_event(
     pending_retained_block_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingRetainedBlockRequest,
+    >,
+    pending_network_profile_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingNetworkProfileRequest,
+    >,
+    pending_object_requests: &mut BoundedPendingRequests<
+        request_response::OutboundRequestId,
+        PendingObjectRequest,
     >,
     pending_header_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
@@ -3799,16 +4058,23 @@ async fn handle_swarm_event(
 
             let topic = message.topic.as_str();
             if topic == topics.blocks.as_str() {
-                match BlockGossipMsg::decode(&message.data) {
-                    Ok(decoded) => {
+                match HeaderAnnouncement::decode(&message.data) {
+                    Ok(announcement) => {
                         const BLOCK_RATE_WINDOW: Duration = Duration::from_secs(10);
                         const BLOCK_RATE_MAX: u32 = 40;
-                        if !allow_peer_rate(
-                            block_event_rate,
-                            propagation_source,
-                            BLOCK_RATE_MAX,
-                            BLOCK_RATE_WINDOW,
-                        ) {
+                        if !sync_paths.is_dispatchable(propagation_source)
+                            || !allow_peer_rate(
+                                block_event_rate,
+                                propagation_source,
+                                BLOCK_RATE_MAX,
+                                BLOCK_RATE_WINDOW,
+                            )
+                            || !gossip_accept_bytes.admit(
+                                message.data.len(),
+                                GOSSIP_ACCEPT_BYTES_PER_WINDOW,
+                                GOSSIP_ACCEPT_WINDOW,
+                            )
+                        {
                             report_gossip_validation(
                                 swarm,
                                 &message_id,
@@ -3818,70 +4084,22 @@ async fn handle_swarm_event(
                             tracing::debug!(peer = %propagation_source, "block announcement rate limit exceeded — dropped before propagation");
                             return;
                         }
-                        match decoded {
-                            BlockGossipMsg::Complete(bundle) => {
-                                let height = bundle.height();
-                                let relayable = chain_store
-                                    .get_consensus_meta()
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|meta| {
-                                        complete_block_gossip_is_relayable(meta.tip_height, height)
-                                    });
-                                let within_budget = relayable
-                                    && gossip_accept_bytes.admit(
-                                        message.data.len(),
-                                        GOSSIP_ACCEPT_BYTES_PER_WINDOW,
-                                        GOSSIP_ACCEPT_WINDOW,
-                                    );
-                                report_gossip_validation(
-                                    swarm,
-                                    &message_id,
-                                    &propagation_source,
-                                    if within_budget {
-                                        gossipsub::MessageAcceptance::Accept
-                                    } else {
-                                        gossipsub::MessageAcceptance::Ignore
-                                    },
-                                );
-                                tracing::debug!(
-                                    height,
-                                    peer = %propagation_source,
-                                    relayed = within_budget,
-                                    "received complete block bundle via gossip"
-                                );
-                                let _ = gossip_event_tx.send(NetworkEvent::IncomingBlock {
-                                    from: origin,
-                                    bundle,
-                                    inbound_memory_permit: None,
-                                });
-                            }
-                            BlockGossipMsg::Header(header) => {
-                                if !gossip_accept_bytes.admit(
-                                    message.data.len(),
-                                    GOSSIP_ACCEPT_BYTES_PER_WINDOW,
-                                    GOSSIP_ACCEPT_WINDOW,
-                                ) {
-                                    report_gossip_validation(
-                                        swarm,
-                                        &message_id,
-                                        &propagation_source,
-                                        gossipsub::MessageAcceptance::Ignore,
-                                    );
-                                    tracing::debug!(peer = %propagation_source, bytes = message.data.len(), "global gossip byte budget exhausted — header dropped before propagation");
-                                    return;
-                                }
-                                report_gossip_validation(
-                                    swarm,
-                                    &message_id,
-                                    &propagation_source,
-                                    gossipsub::MessageAcceptance::Accept,
-                                );
-                                let _ = gossip_event_tx.send(NetworkEvent::BlockAnnouncement {
-                                    from: origin,
-                                    header,
-                                });
-                            }
+                        let queued = required_event_tx.try_send(NetworkEvent::HeaderAnnouncement {
+                            from: origin,
+                            announcement,
+                        });
+                        report_gossip_validation(
+                            swarm,
+                            &message_id,
+                            &propagation_source,
+                            if queued.is_ok() {
+                                gossipsub::MessageAcceptance::Accept
+                            } else {
+                                gossipsub::MessageAcceptance::Ignore
+                            },
+                        );
+                        if let Err(error) = queued {
+                            tracing::warn!(peer = %propagation_source, %error, "reserved header event lane is full");
                         }
                     }
                     Err(error) => {
@@ -3894,7 +4112,7 @@ async fn handle_swarm_event(
                         tracing::debug!(
                             peer = %propagation_source,
                             %error,
-                            "block gossip message decode failed"
+                            "network-v2 header announcement decode failed"
                         );
                     }
                 }
@@ -3980,23 +4198,25 @@ async fn handle_swarm_event(
             if sync_paths.is_closing(connection_id) {
                 return;
             }
-            // A Noise/libp2p endpoint is not yet a usable ParanO(1)d peer.
-            // Require the current network's exact header protocol before this
-            // connection can satisfy bootstrap fanout or the ordinary peer
-            // target. Old releases are intentionally not wire-compatible.
-            let required_protocol = format!("{}/sync/headers/3", topics.protocol_id);
-            if !info
-                .protocols
-                .iter()
-                .any(|protocol| protocol.as_ref() == required_protocol)
-            {
+            // Identify is only capability discovery. The endpoint becomes a
+            // usable network-v2 peer after the explicit profile round trip
+            // below proves the exact genesis, caps, finality and proof bank.
+            let profile_protocol = format!("{}/sync/profile/2", topics.protocol_id);
+            let object_protocol = format!("{}/sync/objects/2", topics.protocol_id);
+            let supports = |required: &str| {
+                info.protocols
+                    .iter()
+                    .any(|protocol| protocol.as_ref() == required)
+            };
+            if !supports(&profile_protocol) || !supports(&object_protocol) {
                 sync_paths.mark_closing(connection_id);
                 let _ = swarm.close_connection(connection_id);
                 swarm.behaviour_mut().kad.remove_peer(&peer_id);
                 tracing::debug!(
                     peer = %peer_id,
-                    required_protocol,
-                    "closing endpoint without the current ParanO(1)d sync protocol"
+                    profile_protocol,
+                    object_protocol,
+                    "closing endpoint without the complete network-v2 protocol set"
                 );
                 return;
             }
@@ -4058,11 +4278,39 @@ async fn handle_swarm_event(
             );
             automatic_peers.note_identified(connection_id, peer_id);
             sync_paths.mark_identified(connection_id);
+            let profile_request_active = pending_network_profile_requests
+                .entries
+                .values()
+                .any(|pending| pending.peer == peer_id);
+            if !sync_paths.profile_verified.contains(&peer_id) && !profile_request_active {
+                if !pending_network_profile_requests.has_capacity() {
+                    sync_paths.mark_closing(connection_id);
+                    let _ = swarm.close_connection(connection_id);
+                    tracing::warn!(peer = %peer_id, "network-profile correlation table is full");
+                    return;
+                }
+                let expected_profile_id = NetworkProfile::current().profile_id;
+                let request_id = swarm.behaviour_mut().network_profile_sync.send_request(
+                    &peer_id,
+                    NetworkProfileRequest {
+                        expected_profile_id,
+                    },
+                );
+                let inserted = pending_network_profile_requests.try_insert(
+                    request_id,
+                    PendingNetworkProfileRequest {
+                        peer: peer_id,
+                        issued_at: Instant::now(),
+                    },
+                );
+                debug_assert!(inserted, "profile capacity checked before request");
+                tracing::debug!(peer = %peer_id, "network-v2 profile handshake started");
+            }
             if sync_paths.try_mark_announced(peer_id) {
                 let _ = required_event_tx
                     .send(NetworkEvent::PeerConnected(peer_id))
                     .await;
-                tracing::debug!(peer = %peer_id, "peer sync protocols ready");
+                tracing::debug!(peer = %peer_id, "peer network-v2 profile ready");
             }
             if automatic_peers.is_bootstrap_peer(peer_id) {
                 // Older releases recorded seeds as generic successful peers.
@@ -4243,6 +4491,234 @@ async fn handle_swarm_event(
                 );
             }
         },
+
+        // --- Network-v2 profile handshake ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                peer,
+                ..
+            },
+        )) => {
+            let current = NetworkProfile::current();
+            if request.expected_profile_id != current.profile_id {
+                tracing::debug!(
+                    peer = %peer,
+                    expected = ?request.expected_profile_id,
+                    local = ?current.profile_id,
+                    "peer requested a different network profile"
+                );
+            }
+            let _ = swarm
+                .behaviour_mut()
+                .network_profile_sync
+                .send_response(channel, NetworkProfileResponse { profile: current });
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                peer,
+            },
+        )) => {
+            let Some(pending) = pending_network_profile_requests.remove(&request_id) else {
+                tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale network-profile response");
+                return;
+            };
+            if pending.peer != peer || !response.profile.is_current() {
+                tracing::warn!(
+                    peer = %peer,
+                    requested_peer = %pending.peer,
+                    profile = ?response.profile.profile_id,
+                    "network-v2 profile mismatch; closing peer"
+                );
+                let _ = swarm.disconnect_peer_id(peer);
+                return;
+            }
+            sync_paths.mark_profile_verified(peer);
+            if sync_paths.try_mark_announced(peer) {
+                let _ = required_event_tx
+                    .send(NetworkEvent::PeerConnected(peer))
+                    .await;
+            }
+            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v2 profile verified");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+        )) => {
+            if pending_network_profile_requests
+                .remove(&request_id)
+                .is_some()
+            {
+                tracing::warn!(peer = %peer, err = %error, "network-v2 profile handshake failed");
+                let _ = swarm.disconnect_peer_id(peer);
+            }
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+        )) => {
+            tracing::debug!(peer = %peer, ?request_id, err = %error, "network-profile response failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
+            request_response::Event::ResponseSent { .. },
+        )) => {}
+
+        // --- Content-addressed body/terminal transfer ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ObjectSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                peer,
+                ..
+            },
+        )) => {
+            let declared_bytes = request
+                .objects
+                .iter()
+                .filter_map(|object| object.encoded_len())
+                .fold(0usize, |total, length| {
+                    total.saturating_add(length as usize)
+                });
+            let store = chain_store.clone();
+            let budget = outbound_response_budget.clone();
+            let completion = object_response_tx.clone();
+            tokio::spawn(async move {
+                let Ok(outbound_memory_permit) = budget.acquire(declared_bytes).await else {
+                    tracing::warn!(peer = %peer, declared_bytes, "exact-object response admission failed");
+                    return;
+                };
+                let requested = request.objects;
+                let loaded = tokio::task::spawn_blocking(move || {
+                    requested
+                        .into_iter()
+                        .map(|object| {
+                            let bytes = match load_exact_object(&store, object) {
+                                Ok(bytes) => bytes,
+                                Err(error) => {
+                                    tracing::warn!(peer = %peer, ?object, %error, "exact-object storage read failed");
+                                    None
+                                }
+                            };
+                            ObjectPayload { object, bytes }
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+                let Ok(objects) = loaded else {
+                    tracing::warn!(peer = %peer, "exact-object storage worker failed");
+                    return;
+                };
+                let response = GetObjectsResponse {
+                    objects,
+                    inbound_memory_permit: None,
+                    outbound_memory_permit,
+                };
+                let _ = completion
+                    .send(PendingObjectResponse { channel, response })
+                    .await;
+            });
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ObjectSync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Response {
+                        request_id,
+                        response,
+                    },
+                peer,
+            },
+        )) => {
+            let Some(pending) = pending_object_requests.remove(&request_id) else {
+                tracing::debug!(peer = %peer, request_id = %request_id, "ignoring stale exact-object response");
+                return;
+            };
+            let response_ids = response
+                .objects
+                .iter()
+                .map(|payload| payload.object)
+                .collect::<Vec<_>>();
+            if pending.peer != peer || response_ids != pending.objects {
+                drop(response);
+                let _ = required_event_tx
+                    .send(NetworkEvent::ObjectsRequestFailed {
+                        token: pending.token,
+                        from: pending.peer,
+                        objects: pending.objects,
+                        kind: RequestFailureKind::InvalidResponse,
+                    })
+                    .await;
+                return;
+            }
+            let GetObjectsResponse {
+                objects,
+                inbound_memory_permit,
+                outbound_memory_permit,
+            } = response;
+            debug_assert!(outbound_memory_permit.is_none());
+            let _ = required_event_tx
+                .send(NetworkEvent::ObjectsResponse {
+                    token: pending.token,
+                    from: peer,
+                    objects,
+                    inbound_memory_permit,
+                })
+                .await;
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ObjectSync(
+            request_response::Event::OutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+        )) => {
+            let Some(pending) = pending_object_requests.remove(&request_id) else {
+                return;
+            };
+            let _ = required_event_tx
+                .send(NetworkEvent::ObjectsRequestFailed {
+                    token: pending.token,
+                    from: peer,
+                    objects: pending.objects,
+                    kind: RequestFailureKind::from(&error),
+                })
+                .await;
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ObjectSync(
+            request_response::Event::InboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+        )) => {
+            tracing::debug!(peer = %peer, ?request_id, err = %error, "exact-object response failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::ObjectSync(
+            request_response::Event::ResponseSent { .. },
+        )) => {}
 
         // --- Request-Response: headers client side (response to our FetchHeaders) ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::ChainSync(
@@ -5593,6 +6069,18 @@ async fn handle_swarm_event(
                 // disconnect event. This deterministic ordering lets the node
                 // retain or fail over its disk staging without racing the
                 // broader peer cleanup path.
+                let failed_objects =
+                    pending_object_requests.take_where(|pending| pending.peer == peer_id);
+                for pending in failed_objects {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::ObjectsRequestFailed {
+                            token: pending.token,
+                            from: pending.peer,
+                            objects: pending.objects,
+                            kind: RequestFailureKind::ConnectionClosed,
+                        })
+                        .await;
+                }
                 let failed_blocks =
                     pending_retained_block_requests.take_where(|pending| pending.peer == peer_id);
                 for pending in failed_blocks {
@@ -5674,6 +6162,8 @@ async fn handle_swarm_event(
                 tracing::debug!(peer = %peer_id, "peer sync protocols ready after duplicate path closed");
             }
             if num_established == 0 {
+                sync_paths.clear_profile_verified(peer_id);
+                pending_network_profile_requests.take_where(|pending| pending.peer == peer_id);
                 block_event_rate.remove(&peer_id);
                 tx_gossip_rate.remove(&peer_id);
                 mempool_sync_last_request.remove(&peer_id);
@@ -5894,6 +6384,25 @@ mod tests {
     }
 
     #[test]
+    fn identify_alone_cannot_authorize_network_v2_dispatch() {
+        let peer = PeerId::random();
+        let connection = libp2p::swarm::ConnectionId::new_unchecked(10_000);
+        let mut paths = PeerSyncPaths::default();
+
+        paths.insert(connection, peer, true, true);
+        paths.mark_identified(connection);
+        assert!(!paths.is_dispatchable(peer));
+        assert!(!paths.try_mark_announced(peer));
+
+        paths.mark_profile_verified(peer);
+        assert!(paths.is_dispatchable(peer));
+        assert!(paths.try_mark_announced(peer));
+
+        paths.clear_profile_verified(peer);
+        assert!(!paths.is_dispatchable(peer));
+    }
+
+    #[test]
     fn identified_direct_path_wins_over_a_late_dns_duplicate() {
         let local = PeerId::random();
         let peer = PeerId::random();
@@ -5903,6 +6412,7 @@ mod tests {
 
         paths.insert(established, peer, true, true);
         paths.mark_identified(established);
+        paths.mark_profile_verified(peer);
         assert!(paths.is_dispatchable(peer));
         assert!(paths.try_mark_announced(peer));
 
@@ -5981,6 +6491,7 @@ mod tests {
         );
         paths.mark_identified(first);
         paths.mark_identified(duplicate);
+        paths.mark_profile_verified(peer);
         assert!(!paths.is_dispatchable(peer));
 
         assert_eq!(paths.remove(duplicate), Some(peer));
@@ -5998,6 +6509,7 @@ mod tests {
         paths.insert(relay, peer, false, true);
         paths.mark_identified(direct);
         paths.mark_identified(relay);
+        paths.mark_profile_verified(peer);
         assert!(paths.is_dispatchable(peer));
         assert_eq!(paths.dispatchable_peer_count(), 1);
     }
@@ -6017,15 +6529,6 @@ mod tests {
         terminal.extend_from_slice(&noid_chain::block_header::semantic_header_id(&block.header));
         terminal.resize(terminal_len, 1);
         AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
-    }
-
-    #[test]
-    fn inline_policy_counts_the_complete_bundle_and_announcement() {
-        assert!(should_inline_accepted_block_bundle(&accepted_bundle(1, 1)));
-        assert!(!should_inline_accepted_block_bundle(&accepted_bundle(
-            1,
-            MAX_HISTORY_STEP_TERMINAL_BYTES - noid_chain::HISTORY_STEP_TERMINAL_BINDING_BYTES,
-        )));
     }
 
     #[test]
@@ -6054,23 +6557,6 @@ mod tests {
         budget.started_at = Instant::now() - Duration::from_secs(11);
         assert!(budget.admit(64, 64, Duration::from_secs(10)));
         assert_eq!(budget.bytes, 64);
-    }
-
-    #[test]
-    fn complete_block_gossip_relays_only_the_recent_fork_window() {
-        let retention = noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
-        let tip = 100;
-        assert!(complete_block_gossip_is_relayable(tip, tip + 1));
-        assert!(complete_block_gossip_is_relayable(tip, tip + retention));
-        assert!(!complete_block_gossip_is_relayable(
-            tip,
-            tip + retention + 1
-        ));
-        assert!(complete_block_gossip_is_relayable(tip, tip - retention));
-        assert!(!complete_block_gossip_is_relayable(
-            tip,
-            tip - retention - 1
-        ));
     }
 
     #[test]
@@ -6746,9 +7232,8 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn canonical_wire_caps_are_ordered() {
-        assert!(MAX_TX_INTENT_BYTES_GLOBAL < INLINE_BLOCK_GOSSIP_THRESHOLD);
+        assert!(crate::header_protocol::HEADER_ANNOUNCE_BYTES < MAX_TX_INTENT_BYTES_GLOBAL);
         assert!(MAX_MEMPOOL_SYNC_BYTES >= MAX_TX_INTENT_BYTES_GLOBAL);
-        assert!(MAX_ACCEPTED_BLOCK_BUNDLE_BYTES > INLINE_BLOCK_GOSSIP_THRESHOLD);
         assert!(MAX_HISTORY_STEP_TERMINAL_BYTES < MAX_ACCEPTED_BLOCK_BUNDLE_BYTES);
     }
 

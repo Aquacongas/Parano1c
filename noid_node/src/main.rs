@@ -6216,7 +6216,15 @@ async fn handle_p2p_events(
         tokio::select! {
         rx_result = rx.recv() => { let rx_item = rx_result;
         match rx_item {
-            Ok(NetworkEvent::BlockAnnouncement { from, header: announced_header }) => {
+            Ok(header_event @ (NetworkEvent::BlockAnnouncement { .. }
+                | NetworkEvent::HeaderAnnouncement { .. })) => {
+                let (from, announced_header) = match header_event {
+                    NetworkEvent::BlockAnnouncement { from, header } => (from, header),
+                    NetworkEvent::HeaderAnnouncement { from, announcement } => {
+                        (from, announcement.header)
+                    }
+                    _ => unreachable!("matched header announcement event"),
+                };
                 let height = announced_header.height;
                 if selected_snapshot_peer!().is_some_and(|selected| selected != from) {
                     deferred_sync_peer = Some(from);
@@ -6408,6 +6416,35 @@ async fn handle_p2p_events(
                         })
                         .await;
                 }
+            }
+            Ok(NetworkEvent::ObjectsResponse {
+                token,
+                from,
+                objects,
+                mut inbound_memory_permit,
+            }) => {
+                tracing::debug!(
+                    token,
+                    peer = %from,
+                    objects = objects.len(),
+                    "dropping exact-object response without an active v2 plan"
+                );
+                drop(objects);
+                drop(inbound_memory_permit.take());
+            }
+            Ok(NetworkEvent::ObjectsRequestFailed {
+                token,
+                from,
+                objects,
+                kind,
+            }) => {
+                tracing::debug!(
+                    token,
+                    peer = %from,
+                    objects = objects.len(),
+                    ?kind,
+                    "exact-object source lease failed without an active v2 plan"
+                );
             }
             Ok(NetworkEvent::SnapshotBlockBodies {
                 from,

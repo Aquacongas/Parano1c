@@ -386,7 +386,9 @@ pub struct NetworkTopics {
 impl NetworkTopics {
     pub fn for_network_cfg(cfg: &noid_chain::consensus::NetworkConfig) -> Self {
         Self {
-            blocks: cfg.topic_blocks.to_string(),
+            // Network v2 gossips only the fixed header announcement. Large
+            // bodies and terminals travel through exact-object pulls.
+            blocks: format!("{}/gossip/headers/2", cfg.p2p_protocol_id),
             txs: cfg.topic_txs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
         }

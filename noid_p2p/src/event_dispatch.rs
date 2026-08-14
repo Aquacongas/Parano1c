@@ -209,6 +209,7 @@ fn classify(event: &NetworkEvent) -> EventClass {
     match event {
         NetworkEvent::PeerConnected(_) | NetworkEvent::PeerDisconnected(_) => EventClass::Control,
         NetworkEvent::HeadersBatch { .. }
+        | NetworkEvent::HeaderAnnouncement { .. }
         | NetworkEvent::HeadersRequestFailed { .. }
         | NetworkEvent::SnapshotHeadersBatch { .. }
         | NetworkEvent::SnapshotHeadersRequestFailed { .. } => EventClass::Header,
@@ -217,7 +218,9 @@ fn classify(event: &NetworkEvent) -> EventClass {
         | NetworkEvent::RecentBlockUnavailable { .. }
         | NetworkEvent::RecentBlockRequestFailed { .. }
         | NetworkEvent::HistoryStepTerminal { .. }
-        | NetworkEvent::HistoryStepTerminalRequestFailed { .. } => EventClass::Live,
+        | NetworkEvent::HistoryStepTerminalRequestFailed { .. }
+        | NetworkEvent::ObjectsResponse { .. }
+        | NetworkEvent::ObjectsRequestFailed { .. } => EventClass::Live,
         NetworkEvent::SnapshotBlockBodies { .. }
         | NetworkEvent::StateManifest { .. }
         | NetworkEvent::StateManifestRequestFailed { .. }
