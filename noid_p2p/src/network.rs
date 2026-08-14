@@ -36,6 +36,7 @@ use noid_chain::{AcceptedBlockBundle, MAX_ACCEPTED_BLOCK_BUNDLE_BYTES};
 use noid_mempool::AsyncMempool;
 
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
+use crate::event_dispatch::{self, RequiredEventReceiver, RequiredEventSender};
 use crate::outbound_budget::OutboundResponseBudget;
 use crate::peer_diversity::{PeerDiversity, PublicNetworkGroup};
 use crate::protocol::{
@@ -1608,7 +1609,7 @@ pub enum NetworkEvent {
 /// report lag. This prevents a slow consumer from retaining an unbounded
 /// number of bundles or silently losing a requested suffix response.
 pub struct NetworkEventReceiver {
-    required_rx: mpsc::Receiver<NetworkEvent>,
+    required_rx: RequiredEventReceiver,
     gossip_rx: tokio::sync::broadcast::Receiver<NetworkEvent>,
     required_closed: bool,
     gossip_closed: bool,
@@ -1669,7 +1670,6 @@ impl NetworkEventReceiver {
 // The node requests at most eight authenticated state segments concurrently;
 // block pull is one stream and other bounded sync responses occupy the
 // remaining slots. Backpressure begins before a second wave can accumulate.
-const REQUIRED_EVENT_QUEUE_CAPACITY: usize = 16;
 const GOSSIP_EVENT_QUEUE_CAPACITY: usize = 64;
 
 /// The P2P network manager.
@@ -1678,7 +1678,7 @@ pub struct P2PNetwork {
     pub cmd_tx: mpsc::Sender<NetworkCommand>,
     /// Subscribe to events from the event loop.
     gossip_event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
-    required_event_rx: std::sync::Mutex<Option<mpsc::Receiver<NetworkEvent>>>,
+    required_event_rx: std::sync::Mutex<Option<RequiredEventReceiver>>,
 }
 
 impl P2PNetwork {
@@ -1702,7 +1702,7 @@ impl P2PNetwork {
         tracing::info!(peer = %local_peer_id, "loaded persistent P2P identity");
         let (cmd_tx, cmd_rx) = mpsc::channel(256);
         let (gossip_event_tx, _) = tokio::sync::broadcast::channel(GOSSIP_EVENT_QUEUE_CAPACITY);
-        let (required_event_tx, required_event_rx) = mpsc::channel(REQUIRED_EVENT_QUEUE_CAPACITY);
+        let (required_event_tx, required_event_rx) = event_dispatch::channel();
 
         let gossip_event_tx_clone = gossip_event_tx.clone();
         let handle = tokio::spawn(async move {
@@ -1893,7 +1893,7 @@ async fn run_swarm(
     listen_addr: Multiaddr,
     mut cmd_rx: mpsc::Receiver<NetworkCommand>,
     gossip_event_tx: tokio::sync::broadcast::Sender<NetworkEvent>,
-    required_event_tx: mpsc::Sender<NetworkEvent>,
+    required_event_tx: RequiredEventSender,
     chain: Arc<RwLock<MdbxChainContext>>,
     mempool: AsyncMempool,
     topics: NetworkTopics,
@@ -3016,7 +3016,7 @@ async fn handle_network_command(
     topics: &NetworkTopics,
     mempool_sync_last_request: &mut std::collections::HashMap<PeerId, Instant>,
     mempool_sync_retries: &mut std::collections::HashMap<PeerId, MempoolSyncRetry>,
-    required_event_tx: &mpsc::Sender<NetworkEvent>,
+    required_event_tx: &RequiredEventSender,
     pending_retained_block_requests: &mut BoundedPendingRequests<
         request_response::OutboundRequestId,
         PendingRetainedBlockRequest,
@@ -3703,7 +3703,7 @@ async fn handle_swarm_event(
     swarm: &mut libp2p::Swarm<NodeBehaviour>,
     event: SwarmEvent<NodeBehaviourEvent>,
     gossip_event_tx: &tokio::sync::broadcast::Sender<NetworkEvent>,
-    required_event_tx: &mpsc::Sender<NetworkEvent>,
+    required_event_tx: &RequiredEventSender,
     chain_store: &MdbxStore,
     mempool: &AsyncMempool,
     topics: &NetworkTopics,
@@ -6753,40 +6753,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_event_queue_is_hard_bounded_and_backpressured() {
-        let (tx, mut rx) = mpsc::channel(REQUIRED_EVENT_QUEUE_CAPACITY);
-        let peer = libp2p::identity::Keypair::generate_ed25519()
-            .public()
-            .to_peer_id();
-        for height in 0..REQUIRED_EVENT_QUEUE_CAPACITY {
-            tx.try_send(NetworkEvent::RecentBlockUnavailable {
-                from: peer,
-                height: height as u64,
-                payload_kind: RecentBlockPayloadKind::Complete,
-            })
-            .unwrap();
-        }
-        assert!(matches!(
-            tx.try_send(NetworkEvent::RecentBlockUnavailable {
-                from: peer,
-                height: u64::MAX,
-                payload_kind: RecentBlockPayloadKind::Complete,
-            }),
-            Err(mpsc::error::TrySendError::Full(_))
-        ));
-
-        assert!(rx.recv().await.is_some());
-        tx.try_send(NetworkEvent::RecentBlockUnavailable {
-            from: peer,
-            height: u64::MAX,
-            payload_kind: RecentBlockPayloadKind::Complete,
-        })
-        .unwrap();
-    }
-
-    #[tokio::test]
     async fn required_response_survives_recoverable_gossip_lag() {
-        let (required_tx, required_rx) = mpsc::channel(1);
+        let (required_tx, required_rx) = event_dispatch::channel();
         let (gossip_tx, gossip_rx) = tokio::sync::broadcast::channel(2);
         let peer = libp2p::identity::Keypair::generate_ed25519()
             .public()
