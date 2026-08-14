@@ -18,7 +18,7 @@ use libp2p::{
     PeerId,
 };
 use rand::seq::SliceRandom;
-use tokio::sync::{mpsc, RwLock, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 
 use noid_chain::consensus::wire_limits::{
     MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMINAL_BYTES, MAX_MEMPOOL_SYNC_BYTES, MAX_MEMPOOL_SYNC_TXS,
@@ -75,6 +75,95 @@ struct PendingMempoolResponse {
 struct PendingObjectResponse {
     channel: request_response::ResponseChannel<GetObjectsResponse>,
     response: GetObjectsResponse,
+}
+
+/// Fair admission shared by proof, body and State serving. Header/profile
+/// traffic deliberately bypasses it, so bulk clients cannot occupy the
+/// control plane. One peer may hold at most two of eight active data slots.
+struct DataPlaneServingAdmission {
+    global: Arc<Semaphore>,
+    global_outstanding: Arc<Semaphore>,
+    peers: std::collections::HashMap<PeerId, Arc<PeerDataPlaneSlots>>,
+}
+
+struct PeerDataPlaneSlots {
+    active: Arc<Semaphore>,
+    outstanding: Arc<Semaphore>,
+}
+
+struct DataPlaneServingLease {
+    global: Arc<Semaphore>,
+    peer: Arc<PeerDataPlaneSlots>,
+    outstanding: Vec<OwnedSemaphorePermit>,
+}
+
+impl DataPlaneServingLease {
+    async fn acquire(self) -> Result<Vec<OwnedSemaphorePermit>, ()> {
+        // Take the per-peer slot first. At most two requests from one identity
+        // can therefore enter the global FIFO, even if that peer fills every
+        // request-response stream on every bulk protocol.
+        let peer = Arc::clone(&self.peer.active)
+            .acquire_owned()
+            .await
+            .map_err(|_| ())?;
+        let global = self.global.acquire_owned().await.map_err(|_| ())?;
+        let mut permits = self.outstanding;
+        permits.push(peer);
+        permits.push(global);
+        Ok(permits)
+    }
+}
+
+impl DataPlaneServingAdmission {
+    const GLOBAL_SLOTS: usize = 8;
+    const PER_PEER_SLOTS: usize = 2;
+    const GLOBAL_OUTSTANDING: usize = 64;
+    const PER_PEER_OUTSTANDING: usize = 4;
+
+    fn new() -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(Self::GLOBAL_SLOTS)),
+            global_outstanding: Arc::new(Semaphore::new(Self::GLOBAL_OUTSTANDING)),
+            peers: std::collections::HashMap::new(),
+        }
+    }
+
+    fn lease(&mut self, peer: PeerId) -> Option<DataPlaneServingLease> {
+        let peer_slots = self
+            .peers
+            .entry(peer)
+            .or_insert_with(|| {
+                Arc::new(PeerDataPlaneSlots {
+                    active: Arc::new(Semaphore::new(Self::PER_PEER_SLOTS)),
+                    outstanding: Arc::new(Semaphore::new(Self::PER_PEER_OUTSTANDING)),
+                })
+            })
+            .clone();
+        let peer_outstanding = Arc::clone(&peer_slots.outstanding)
+            .try_acquire_owned()
+            .ok()?;
+        let global_outstanding = Arc::clone(&self.global_outstanding)
+            .try_acquire_owned()
+            .ok()?;
+        Some(DataPlaneServingLease {
+            global: Arc::clone(&self.global),
+            peer: peer_slots,
+            outstanding: vec![peer_outstanding, global_outstanding],
+        })
+    }
+
+    fn prune(&mut self, connected: impl Fn(&PeerId) -> bool) {
+        self.peers
+            .retain(|peer, slots| connected(peer) || Arc::strong_count(slots) > 1);
+    }
+
+    fn active_slots(&self) -> usize {
+        Self::GLOBAL_SLOTS.saturating_sub(self.global.available_permits())
+    }
+
+    fn outstanding_slots(&self) -> usize {
+        Self::GLOBAL_OUTSTANDING.saturating_sub(self.global_outstanding.available_permits())
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1192,7 +1281,6 @@ impl<K: std::hash::Hash + Eq, V> BoundedPendingRequests<K, V> {
         self.entries.retain(keep);
     }
 
-    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
@@ -2272,6 +2360,7 @@ async fn run_swarm(
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
     let mempool_response_prepare_semaphore = Arc::new(Semaphore::new(1));
     let outbound_response_budget = OutboundResponseBudget::process_global();
+    let mut data_plane_serving = DataPlaneServingAdmission::new();
     let snapshot_export_root = data_dir.join("snapshot-exports");
     std::fs::create_dir_all(&snapshot_export_root)?;
     let mut snapshot_exports = load_snapshot_exports(&snapshot_export_root);
@@ -2285,6 +2374,9 @@ async fn run_swarm(
     let mut snapshot_export_inflight: Option<SnapshotExportKey> = None;
     let mut snapshot_export_timer = tokio::time::interval(Duration::from_secs(30));
     snapshot_export_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut reactor_health_timer = tokio::time::interval(Duration::from_secs(10));
+    reactor_health_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    reactor_health_timer.tick().await;
 
     // Keep retry jitter effective under a large simultaneous fan-in. Folding
     // this into the two-second peer-maintenance tick would release every due peer
@@ -2360,6 +2452,7 @@ async fn run_swarm(
                     &mempool_response_prepare_semaphore,
                     &object_response_tx,
                     &outbound_response_budget,
+                    &mut data_plane_serving,
                     &mut snapshot_exports,
                     &mut snapshot_export_leases,
                     &mut block_event_rate,
@@ -2529,6 +2622,50 @@ async fn run_swarm(
                             let _ = completion.blocking_send((key, result));
                         });
                     }
+                }
+            }
+
+            _ = reactor_health_timer.tick() => {
+                let queues = required_event_tx.queue_depths();
+                let pending_requests = pending_retained_block_requests.len()
+                    + pending_network_profile_requests.len()
+                    + pending_object_requests.len()
+                    + pending_header_requests.len()
+                    + pending_state_manifest_requests.len()
+                    + pending_state_segment_requests.len()
+                    + pending_history_step_requests.len();
+                let outbound_bytes_in_use =
+                    crate::outbound_budget::OUTBOUND_RESPONSE_BUDGET_BYTES
+                        .saturating_sub(outbound_response_budget.available_bytes());
+                data_plane_serving.prune(|peer| swarm.is_connected(peer));
+                let active_data_serving_slots = data_plane_serving.active_slots();
+                let outstanding_data_serving_slots = data_plane_serving.outstanding_slots();
+                if queues.control != 0 || queues.header != 0 {
+                    tracing::warn!(
+                        control_queue = queues.control,
+                        header_queue = queues.header,
+                        live_queue = queues.live,
+                        historical_queue = queues.historical,
+                        background_queue = queues.background,
+                        queue_total = queues.total(),
+                        pending_requests,
+                        outbound_bytes_in_use,
+                        active_data_serving_slots,
+                        outstanding_data_serving_slots,
+                        "P2P control-plane queue pressure"
+                    );
+                } else {
+                    tracing::debug!(
+                        live_queue = queues.live,
+                        historical_queue = queues.historical,
+                        background_queue = queues.background,
+                        queue_total = queues.total(),
+                        pending_requests,
+                        outbound_bytes_in_use,
+                        active_data_serving_slots,
+                        outstanding_data_serving_slots,
+                        "P2P reactor health"
+                    );
                 }
             }
 
@@ -3241,18 +3378,20 @@ fn maintain_automatic_outbound(
     // Pending DNS work is not connectivity. Start a small staggered reserve
     // probe on later maintenance ticks instead of waiting for one dead seed's
     // transport timeout before trying the next hostname.
-    let bootstrap_needed = desired_bootstrap
-        .saturating_sub(connected_bootstrap.len().saturating_add(pending_bootstrap));
+    let bootstrap_needed = desired_bootstrap.saturating_sub(connected_bootstrap.len());
     if bootstrap_needed > 0 {
         let occupied = automatic
             .outbound_peer_count()
             .saturating_add(automatic.pending.len());
-        let available = AUTOMATIC_OUTBOUND_TARGET
-            .saturating_add(1)
-            .saturating_sub(occupied)
-            .min(pending_capacity)
-            .min(MAX_PENDING_BOOTSTRAP_DIALS.saturating_sub(pending_bootstrap))
-            .min(bootstrap_needed);
+        let available = bootstrap_probe_capacity(
+            desired_bootstrap,
+            connected_bootstrap.len(),
+            pending_bootstrap,
+            pending_capacity,
+            AUTOMATIC_OUTBOUND_TARGET
+                .saturating_add(1)
+                .saturating_sub(occupied),
+        );
         let pending_addrs = automatic
             .pending
             .values()
@@ -3343,6 +3482,23 @@ fn desired_bootstrap_connections(
     // the bootstrap transport. The replacement is established first by the
     // caller, so releasing the seed never creates a connectivity gap.
     fanout.saturating_sub(stable_non_bootstrap)
+}
+
+/// Pending DNS transports are probes, not authenticated connectivity. Keep
+/// opening staggered alternatives until the desired number is established,
+/// while the hard pending and transport caps bound simultaneous work.
+fn bootstrap_probe_capacity(
+    desired: usize,
+    connected: usize,
+    pending: usize,
+    transport_capacity: usize,
+    target_capacity: usize,
+) -> usize {
+    desired
+        .saturating_sub(connected)
+        .min(MAX_PENDING_BOOTSTRAP_DIALS.saturating_sub(pending))
+        .min(transport_capacity)
+        .min(target_capacity)
 }
 
 fn automatic_ordinary_dial_capacity(
@@ -4170,6 +4326,7 @@ async fn handle_swarm_event(
     mempool_response_prepare_semaphore: &Arc<Semaphore>,
     object_response_tx: &mpsc::Sender<PendingObjectResponse>,
     outbound_response_budget: &OutboundResponseBudget,
+    data_plane_serving: &mut DataPlaneServingAdmission,
     snapshot_exports: &mut std::collections::HashMap<SnapshotExportKey, SnapshotExport>,
     snapshot_export_leases: &mut std::collections::HashMap<PeerId, SnapshotExportLease>,
     block_event_rate: &mut std::collections::HashMap<PeerId, (u32, Instant)>,
@@ -4811,6 +4968,10 @@ async fn handle_swarm_event(
                 lease.last_activity = Instant::now();
                 refresh_snapshot_object_retention_floor(chain_store, snapshot_export_leases);
             }
+            let Some(serving_lease) = data_plane_serving.lease(peer) else {
+                tracing::debug!(peer = %peer, "exact-object serving queue is full");
+                return;
+            };
             let declared_bytes = request
                 .objects
                 .iter()
@@ -4822,7 +4983,13 @@ async fn handle_swarm_event(
             let budget = outbound_response_budget.clone();
             let completion = object_response_tx.clone();
             tokio::spawn(async move {
-                let Ok(outbound_memory_permit) = budget.acquire(declared_bytes).await else {
+                let Ok(serving_permits) = serving_lease.acquire().await else {
+                    return;
+                };
+                let Ok(outbound_memory_permit) = budget
+                    .acquire_with_serving(declared_bytes, serving_permits)
+                    .await
+                else {
                     tracing::warn!(peer = %peer, declared_bytes, "exact-object response admission failed");
                     return;
                 };
@@ -5356,6 +5523,10 @@ async fn handle_swarm_event(
                 peer,
             },
         )) => {
+            let Some(serving_lease) = data_plane_serving.lease(peer) else {
+                tracing::debug!(peer = %peer, "block serving queue is full");
+                return;
+            };
             // Reserve the consensus upper bound before the first MDBX value is
             // copied into a Vec. Waiting happens off the swarm loop. The
             // request-response stream cap bounds the waiter count, so a busy
@@ -5385,11 +5556,16 @@ async fn handle_swarm_event(
                 }
             });
             tokio::spawn(async move {
+                let Ok(serving_permits) = serving_lease.acquire().await else {
+                    return;
+                };
                 let Ok(preparation_permit) = preparation_admission.acquire_owned().await else {
                     return;
                 };
                 let _preparation_permit = preparation_permit;
-                let Ok(Some(outbound_memory_permit)) = budget.acquire(response_reservation).await
+                let Ok(Some(outbound_memory_permit)) = budget
+                    .acquire_with_serving(response_reservation, serving_permits)
+                    .await
                 else {
                     return;
                 };
@@ -5477,6 +5653,10 @@ async fn handle_swarm_event(
                 height = request.height,
                 "received HistoryStep terminal request"
             );
+            let Some(serving_lease) = data_plane_serving.lease(peer) else {
+                tracing::debug!(peer = %peer, height = request.height, "terminal serving queue is full");
+                return;
+            };
             // The protocol admits at most four concurrent terminal streams.
             // Queue those streams behind the four storage workers off the
             // swarm loop rather than dropping an exact, immutable terminal
@@ -5501,12 +5681,15 @@ async fn handle_swarm_event(
                 Some(generation.clone())
             });
             tokio::spawn(async move {
+                let Ok(serving_permits) = serving_lease.acquire().await else {
+                    return;
+                };
                 let Ok(preparation_permit) = preparation_admission.acquire_owned().await else {
                     return;
                 };
                 let _preparation_permit = preparation_permit;
                 let Ok(Some(outbound_memory_permit)) = budget
-                    .acquire(MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES)
+                    .acquire_with_serving(MAX_OUTBOUND_HISTORY_STEP_RESPONSE_BYTES, serving_permits)
                     .await
                 else {
                     return;
@@ -5953,6 +6136,10 @@ async fn handle_swarm_event(
                     .send_response(channel, unavailable_state_segment_response(&request));
                 return;
             }
+            let Some(serving_lease) = data_plane_serving.lease(peer) else {
+                tracing::debug!(peer = %peer, segment = request.segment_id, "State segment serving queue is full");
+                return;
+            };
             let requested_tip_height = request.expected_tip_height;
             let requested_tip_hash = request.expected_tip_hash;
             let requested_manifest_digest = request.manifest_digest;
@@ -5960,13 +6147,19 @@ async fn handle_swarm_event(
             let budget = outbound_response_budget.clone();
             let encode_admission = Arc::clone(segment_encode_semaphore);
             tokio::spawn(async move {
+                let Ok(serving_permits) = serving_lease.acquire().await else {
+                    return;
+                };
                 // Stream concurrency and the request rate cap already bound the
                 // waiter count. Queue behind the two disk encoders instead of
                 // lying that an immutable advertised segment is unavailable.
                 let Ok(permit) = encode_admission.acquire_owned().await else {
                     return;
                 };
-                let Ok(Some(outbound_memory_permit)) = budget.acquire(declared_len).await else {
+                let Ok(Some(outbound_memory_permit)) = budget
+                    .acquire_with_serving(declared_len, serving_permits)
+                    .await
+                else {
                     return;
                 };
                 // The exact descriptor length has been admitted before the
@@ -6971,6 +7164,66 @@ mod tests {
         assert_eq!(desired_bootstrap_connections(true, 0, 3), 2);
         assert_eq!(desired_bootstrap_connections(true, 0, 1), 1);
         assert_eq!(desired_bootstrap_connections(true, 0, 0), 0);
+    }
+
+    #[test]
+    fn pending_dns_probe_does_not_impersonate_connected_bootstrap_quorum() {
+        assert_eq!(
+            bootstrap_probe_capacity(2, 1, 1, 8, 8),
+            1,
+            "one connected seed still requires one staggered alternative"
+        );
+        assert_eq!(
+            bootstrap_probe_capacity(2, 0, 2, 8, 8),
+            2,
+            "two unresolved DNS transports must not stop alternate probes"
+        );
+        assert_eq!(bootstrap_probe_capacity(2, 0, 4, 8, 8), 0);
+        assert_eq!(bootstrap_probe_capacity(2, 2, 0, 8, 8), 0);
+    }
+
+    #[tokio::test]
+    async fn data_plane_admission_prevents_one_peer_from_occupying_all_slots() {
+        let mut admission = DataPlaneServingAdmission::new();
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let first_a = admission.lease(first).unwrap().acquire().await.unwrap();
+        let _first_b = admission.lease(first).unwrap().acquire().await.unwrap();
+        let third_from_first = tokio::spawn(admission.lease(first).unwrap().acquire());
+        tokio::task::yield_now().await;
+        assert!(!third_from_first.is_finished());
+        let _fourth_from_first = admission.lease(first).unwrap();
+        assert!(admission.lease(first).is_none());
+
+        let _second = admission.lease(second).unwrap().acquire().await.unwrap();
+        assert_eq!(admission.active_slots(), 3);
+
+        drop(first_a);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), third_from_first)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn data_plane_waiters_are_globally_bounded() {
+        let mut admission = DataPlaneServingAdmission::new();
+        let mut leases = Vec::new();
+        for _ in 0..(DataPlaneServingAdmission::GLOBAL_OUTSTANDING
+            / DataPlaneServingAdmission::PER_PEER_OUTSTANDING)
+        {
+            let peer = PeerId::random();
+            for _ in 0..DataPlaneServingAdmission::PER_PEER_OUTSTANDING {
+                leases.push(admission.lease(peer).unwrap());
+            }
+        }
+        assert_eq!(leases.len(), DataPlaneServingAdmission::GLOBAL_OUTSTANDING);
+        assert!(admission.lease(PeerId::random()).is_none());
+        drop(leases.pop());
+        assert!(admission.lease(PeerId::random()).is_some());
     }
 
     #[test]

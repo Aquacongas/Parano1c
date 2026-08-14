@@ -6,6 +6,10 @@
 use std::{
     fmt,
     future::{ready, Ready},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use tokio::sync::mpsc;
@@ -64,6 +68,22 @@ pub(crate) struct RequiredEventSender {
     live: mpsc::Sender<NetworkEvent>,
     historical: mpsc::Sender<NetworkEvent>,
     background: mpsc::Sender<NetworkEvent>,
+    waiters: Arc<[AtomicUsize; 5]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct EventQueueDepths {
+    pub control: usize,
+    pub header: usize,
+    pub live: usize,
+    pub historical: usize,
+    pub background: usize,
+}
+
+impl EventQueueDepths {
+    pub const fn total(self) -> usize {
+        self.control + self.header + self.live + self.historical + self.background
+    }
 }
 
 pub(crate) struct RequiredEventReceiver {
@@ -89,6 +109,7 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
             live: live_tx,
             historical: historical_tx,
             background: background_tx,
+            waiters: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
         },
         RequiredEventReceiver {
             control: control_rx,
@@ -103,11 +124,36 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
 }
 
 impl RequiredEventSender {
-    /// Kept await-compatible while legacy call sites are replaced. The future
-    /// is immediately ready: the swarm reactor never waits for application
-    /// capacity.
+    /// Reliably enqueue an authoritative event without ever awaiting node-side
+    /// capacity in the swarm reactor.
+    ///
+    /// A full lane moves this one event into a detached waiter. The number of
+    /// such waiters is bounded by the request-correlation tables and transport
+    /// stream caps, while payload bytes remain held by their global permits.
+    /// Replaceable gossip must use `try_send` instead.
     pub(crate) fn send(&self, event: NetworkEvent) -> Ready<Result<(), DispatchError>> {
-        ready(self.try_send(event))
+        let class = classify(&event);
+        let sender = match class {
+            EventClass::Control => self.control.clone(),
+            EventClass::Header => self.header.clone(),
+            EventClass::Live => self.live.clone(),
+            EventClass::Historical => self.historical.clone(),
+            EventClass::Background => self.background.clone(),
+        };
+        let result = match sender.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                let waiters = Arc::clone(&self.waiters);
+                waiters[class.index()].fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    let _ = sender.send(event).await;
+                    waiters[class.index()].fetch_sub(1, Ordering::Relaxed);
+                });
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(DispatchError::Closed(class)),
+        };
+        ready(result)
     }
 
     pub(crate) fn try_send(&self, event: NetworkEvent) -> Result<(), DispatchError> {
@@ -123,6 +169,20 @@ impl RequiredEventSender {
             mpsc::error::TrySendError::Full(_) => DispatchError::Full(class),
             mpsc::error::TrySendError::Closed(_) => DispatchError::Closed(class),
         })
+    }
+
+    pub(crate) fn queue_depths(&self) -> EventQueueDepths {
+        let queued = |sender: &mpsc::Sender<NetworkEvent>, class: EventClass| {
+            sender.max_capacity().saturating_sub(sender.capacity())
+                + self.waiters[class.index()].load(Ordering::Relaxed)
+        };
+        EventQueueDepths {
+            control: queued(&self.control, EventClass::Control),
+            header: queued(&self.header, EventClass::Header),
+            live: queued(&self.live, EventClass::Live),
+            historical: queued(&self.historical, EventClass::Historical),
+            background: queued(&self.background, EventClass::Background),
+        }
     }
 }
 
@@ -252,16 +312,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_is_immediate_even_when_a_lane_is_full() {
-        let (tx, _rx) = channel();
+    async fn reliable_send_is_immediate_and_survives_a_full_lane() {
+        let (tx, mut rx) = channel();
         let peer = PeerId::random();
         for height in 0..LIVE_CAPACITY {
-            tx.send(live(peer, height as u64)).await.unwrap();
+            tx.try_send(live(peer, height as u64)).unwrap();
         }
-        assert_eq!(
-            tx.send(live(peer, u64::MAX)).await,
-            Err(DispatchError::Full(EventClass::Live))
-        );
+        tx.send(live(peer, u64::MAX)).await.unwrap();
+        assert_eq!(tx.queue_depths().live, LIVE_CAPACITY + 1);
+
+        for expected in 0..LIVE_CAPACITY {
+            assert!(matches!(
+                rx.recv().await,
+                Some(NetworkEvent::RecentBlockUnavailable { height, .. })
+                    if height == expected as u64
+            ));
+        }
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap(),
+            Some(NetworkEvent::RecentBlockUnavailable {
+                height: u64::MAX,
+                ..
+            })
+        ));
+        assert_eq!(tx.queue_depths().live, 0);
     }
 
     #[tokio::test]

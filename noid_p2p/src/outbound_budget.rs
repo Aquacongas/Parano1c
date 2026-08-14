@@ -19,7 +19,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 /// being prepared, queued, or written, without scaling with peer count.
 pub const OUTBOUND_RESPONSE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-pub(crate) type OutboundMemoryPermit = Arc<OwnedSemaphorePermit>;
+#[derive(Debug)]
+pub(crate) struct OutboundPermitBundle {
+    _memory: OwnedSemaphorePermit,
+    _serving: Vec<OwnedSemaphorePermit>,
+}
+
+pub(crate) type OutboundMemoryPermit = Arc<OutboundPermitBundle>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct OutboundResponseBudget {
@@ -45,6 +51,17 @@ impl OutboundResponseBudget {
     }
 
     pub(crate) async fn acquire(&self, bytes: usize) -> io::Result<Option<OutboundMemoryPermit>> {
+        self.acquire_with_serving(bytes, Vec::new()).await
+    }
+
+    /// Bind data-plane serving slots to the same lifetime as the encoded-byte
+    /// reservation. Both are released only after the response codec finishes
+    /// (or aborts) its wire write.
+    pub(crate) async fn acquire_with_serving(
+        &self,
+        bytes: usize,
+        serving: Vec<OwnedSemaphorePermit>,
+    ) -> io::Result<Option<OutboundMemoryPermit>> {
         if bytes == 0 {
             return Ok(None);
         }
@@ -65,10 +82,12 @@ impl OutboundResponseBudget {
                     "outbound response byte budget closed",
                 )
             })?;
-        Ok(Some(Arc::new(permit)))
+        Ok(Some(Arc::new(OutboundPermitBundle {
+            _memory: permit,
+            _serving: serving,
+        })))
     }
 
-    #[cfg(test)]
     pub(crate) fn available_bytes(&self) -> usize {
         self.semaphore.available_permits()
     }
@@ -108,5 +127,20 @@ mod tests {
             .unwrap();
         assert_eq!(payload.len(), 12);
         assert!(allocated.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn serving_slot_lives_with_the_wire_byte_permit() {
+        let budget = OutboundResponseBudget::with_capacity(12);
+        let serving = Arc::new(Semaphore::new(1));
+        let serving_permit = Arc::clone(&serving).try_acquire_owned().unwrap();
+        let wire_permit = budget
+            .acquire_with_serving(12, vec![serving_permit])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(serving.available_permits(), 0);
+        drop(wire_permit);
+        assert_eq!(serving.available_permits(), 1);
     }
 }
