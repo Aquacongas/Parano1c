@@ -3578,8 +3578,78 @@ enum HeaderInventoryPlan {
         base: noid_node::networking::ChainPoint,
         target: noid_node::networking::ChainPoint,
     },
-    LosingCandidate,
+    LosingCandidate {
+        headers: Vec<noid_node::networking::header_dag::ValidatedHeader>,
+    },
     FinalizedDivergence,
+}
+
+const HEADER_DAG_MAX_NODES: usize = 1024;
+
+/// Reconstruct the bounded control-plane DAG from the durable canonical
+/// non-final window. This is used at startup and after an atomic snapshot
+/// jump; ordinary header arrivals update the DAG incrementally.
+fn canonical_header_dag(
+    context: &MdbxChainContext,
+) -> Result<noid_node::networking::header_dag::HeaderDag, String> {
+    use noid_node::networking::{header_dag::ValidatedHeader, ChainPoint};
+
+    let finalized = context.finalized_checkpoint();
+    let finalized_work = context
+        .store
+        .get_chain_work(finalized.height)
+        .map_err(|error| format!("load finalized header DAG work: {error}"))?
+        .ok_or_else(|| "finalized header DAG work is missing".to_owned())?;
+    let mut dag = noid_node::networking::header_dag::HeaderDag::new(
+        ChainPoint::new(finalized.height, finalized.hash),
+        finalized_work,
+        HEADER_DAG_MAX_NODES,
+    );
+    for height in finalized.height.saturating_add(1)..=context.tip_height() {
+        let header = context
+            .get_header_from_store(height)
+            .map_err(|error| format!("load canonical header DAG row {height}: {error}"))?
+            .ok_or_else(|| format!("canonical header DAG row {height} is missing"))?;
+        let cumulative_work = context
+            .store
+            .get_chain_work(height)
+            .map_err(|error| format!("load canonical header DAG work {height}: {error}"))?
+            .ok_or_else(|| format!("canonical header DAG work {height} is missing"))?;
+        dag.insert(ValidatedHeader::new_after_consensus_checks(
+            header,
+            cumulative_work,
+        ))
+        .map_err(|error| format!("rebuild canonical header DAG at {height}: {error}"))?;
+    }
+    Ok(dag)
+}
+
+fn record_validated_headers(
+    dag: &mut noid_node::networking::header_dag::HeaderDag,
+    headers: &[noid_node::networking::header_dag::ValidatedHeader],
+) -> Result<(), noid_node::networking::header_dag::HeaderDagError> {
+    for header in headers {
+        dag.insert(*header)?;
+    }
+    Ok(())
+}
+
+fn header_dag_has_unresolved_better_tip(
+    dag: &noid_node::networking::header_dag::HeaderDag,
+    canonical_tip: noid_node::networking::ChainPoint,
+    canonical_work: [u8; 32],
+) -> bool {
+    let best = dag.best_tip();
+    best != canonical_tip
+        && matches!(
+            noid_chain::choose_chain_by_work(
+                &dag.best_work(),
+                &best.hash,
+                &canonical_work,
+                &canonical_tip.hash,
+            ),
+            noid_chain::consensus::fork_choice::ChainChoice::A
+        )
 }
 
 /// Turn one bounded v3 inventory into a source-independent suffix plan. All
@@ -3715,7 +3785,7 @@ async fn plan_header_inventory(
         noid_chain::choose_chain_by_work(&target_work, &target.hash, &our_work, &our_tip_hash,),
         noid_chain::consensus::fork_choice::ChainChoice::A
     ) {
-        return Ok(HeaderInventoryPlan::LosingCandidate);
+        return Ok(HeaderInventoryPlan::LosingCandidate { headers: validated });
     }
     match SuffixOffer::reorg(old_tip, ancestor, validated.clone(), &competing_records) {
         Ok(offer) => Ok(HeaderInventoryPlan::Candidate { offer, old_tip }),
@@ -5391,6 +5461,16 @@ async fn handle_p2p_events(
         let ctx = chain.read().await;
         ctx.store.clone()
     };
+    let (mut header_dag, mut header_dag_canonical_tip) = {
+        let ctx = chain.read().await;
+        let canonical_tip =
+            noid_node::networking::ChainPoint::new(ctx.tip_height(), ctx.tip_hash());
+        let dag = canonical_header_dag(&ctx)
+            .expect("validated durable chain must reconstruct the bounded header DAG");
+        (dag, canonical_tip)
+    };
+    let mut header_dag_faulted = false;
+    let mut last_header_dag_rebuild_attempt = Instant::now();
     // Segment staging is intentionally wiped on startup; validated header
     // candidates are separately crash-resumable and therefore use a sibling.
     let snapshot_header_staging_root =
@@ -6739,9 +6819,12 @@ async fn handle_p2p_events(
     macro_rules! try_start_exact_suffix_apply {
         () => {{
             let ready = exact_suffix_apply_inflight.is_none()
+                && !header_dag_faulted
                 && active_suffix_sync
                     .as_ref()
-                    .is_some_and(|sync| sync.is_complete());
+                    .is_some_and(|sync| {
+                        sync.is_complete() && sync.plan().target() == header_dag.best_tip()
+                    });
             if ready {
                 let sync = active_suffix_sync
                     .take()
@@ -6956,30 +7039,17 @@ async fn handle_p2p_events(
         tokio::select! {
         rx_result = rx.recv() => { let rx_item = rx_result;
         match rx_item {
-            Ok(header_event @ (NetworkEvent::BlockAnnouncement { .. }
-                | NetworkEvent::HeaderAnnouncement { .. })) => {
-                let (from, announced_header, exact_inventory, header_first) = match header_event {
-                    NetworkEvent::BlockAnnouncement { from, header } => {
-                        (from, header, None, false)
-                    }
-                    NetworkEvent::HeaderAnnouncement {
-                        from,
+            Ok(NetworkEvent::HeaderAnnouncement {
+                from,
+                announcement,
+                source_has_objects,
+            }) => {
+                let announced_header = announcement.header;
+                let exact_inventory = source_has_objects.then(|| {
+                    noid_p2p::header_protocol::HeaderInventoryRecord::from_announcement(
                         announcement,
-                        source_has_objects,
-                    } => {
-                        (
-                            from,
-                            announcement.header,
-                            source_has_objects.then(|| {
-                                noid_p2p::header_protocol::HeaderInventoryRecord::from_announcement(
-                                    announcement,
-                                )
-                            }),
-                            true,
-                        )
-                    }
-                    _ => unreachable!("matched header announcement event"),
-                };
+                    )
+                });
                 let height = announced_header.height;
                 if selected_snapshot_peer!().is_some_and(|selected| selected != from) {
                     deferred_sync_peer = Some(from);
@@ -7140,15 +7210,26 @@ async fn handle_p2p_events(
                     mining_peer_quorum.invalidate_all();
                     record_authenticated_height!(height, from);
 
+                    let cumulative_work = noid_chain::add_work(
+                        &base_work,
+                        &noid_chain::block_work(&announced_header.difficulty_target),
+                    );
+                    let validated = noid_node::networking::header_dag::ValidatedHeader::new_after_consensus_checks(
+                        announced_header,
+                        cumulative_work,
+                    );
+                    if let Err(error) = record_validated_headers(&mut header_dag, &[validated]) {
+                        header_dag_faulted = true;
+                        tracing::warn!(
+                            peer = %from,
+                            height,
+                            %error,
+                            "validated direct-child header could not enter the bounded DAG"
+                        );
+                        continue;
+                    }
+
                     if let Some(record) = exact_inventory {
-                        let cumulative_work = noid_chain::add_work(
-                            &base_work,
-                            &noid_chain::block_work(&announced_header.difficulty_target),
-                        );
-                        let validated = noid_node::networking::header_dag::ValidatedHeader::new_after_consensus_checks(
-                            announced_header,
-                            cumulative_work,
-                        );
                         match noid_node::networking::suffix_sync::SuffixOffer::live(
                             base,
                             vec![validated],
@@ -7193,61 +7274,33 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    if header_first {
-                        // A gossipsub forwarder is authoritative for neither
-                        // advertised object. Ask its storage-backed inventory;
-                        // if it is still catching up, periodic probes will
-                        // discover another exact provider without reverting to
-                        // complete-bundle gossip semantics.
-                        let count = 2;
-                        let request_key = (from, our_height, count);
-                        let recently_requested = recent_header_fetches
-                            .get(&request_key)
-                            .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
-                        if !fetch_in_progress.contains(&from) && !recently_requested {
-                            fetch_in_progress.insert(from);
-                            recent_header_fetches.insert(request_key, Instant::now());
-                            if p2p_cmd
-                                .send(noid_p2p::NetworkCommand::FetchHeaders {
-                                    peer: from,
-                                    start_height: our_height,
-                                    count,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                fetch_in_progress.remove(&from);
-                                recent_header_fetches.remove(&request_key);
-                            }
-                        }
-                        continue;
-                    }
-
-                    let fetch_key = (
-                        height,
-                        noid_chain::consensus::pow::block_id(&announced_header),
-                    );
-                    if let Some(pending) = pending_block_fetches.get(&fetch_key) {
-                        if pending.requested_at.elapsed() < BLOCK_FETCH_INFLIGHT_TTL {
-                            tracing::debug!(
-                                peer = %from,
-                                pending_peer = %pending.peer,
-                                height,
-                                "accepted block bundle already in-flight — suppressing duplicate pull"
-                            );
-                            continue;
+                    // A gossipsub forwarder is authoritative for neither
+                    // advertised object. Ask its storage-backed inventory;
+                    // if it is still catching up, periodic probes will
+                    // discover another exact provider. Network v3 never falls
+                    // back to complete-bundle pull for ordinary catch-up.
+                    let count = 2;
+                    let request_key = (from, our_height, count);
+                    let recently_requested = recent_header_fetches
+                        .get(&request_key)
+                        .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                    if !fetch_in_progress.contains(&from) && !recently_requested {
+                        fetch_in_progress.insert(from);
+                        recent_header_fetches.insert(request_key, Instant::now());
+                        if p2p_cmd
+                            .send(noid_p2p::NetworkCommand::FetchHeaders {
+                                peer: from,
+                                start_height: our_height,
+                                count,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            fetch_in_progress.remove(&from);
+                            recent_header_fetches.remove(&request_key);
                         }
                     }
-                    pending_block_fetches.insert(
-                        fetch_key,
-                        PendingBlockFetch {
-                            peer: from,
-                            requested_at: Instant::now(),
-                        },
-                    );
-                    let _ = p2p_cmd
-                        .send(noid_p2p::NetworkCommand::RequestBlock { peer: from, height })
-                        .await;
+                    continue;
                 } else {
                     // Recent gap > 1: pull headers first so complete block bundles are
                     // requested only after the header chain is anchored to our tip.
@@ -7270,6 +7323,13 @@ async fn handle_p2p_events(
                         })
                         .await;
                 }
+            }
+            Ok(NetworkEvent::BlockAnnouncement { from, header }) => {
+                tracing::debug!(
+                    peer = %from,
+                    height = header.height,
+                    "ignoring legacy compact announcement on network v3"
+                );
             }
             Ok(NetworkEvent::ObjectsResponse {
                 token,
@@ -9066,7 +9126,15 @@ async fn handle_p2p_events(
                             "header inventory is behind the canonical view"
                         );
                     }
-                    Ok(HeaderInventoryPlan::LosingCandidate) => {
+                    Ok(HeaderInventoryPlan::LosingCandidate { headers }) => {
+                        if let Err(error) = record_validated_headers(&mut header_dag, &headers) {
+                            header_dag_faulted = true;
+                            tracing::warn!(
+                                peer = %from,
+                                %error,
+                                "validated losing branch could not enter the bounded DAG"
+                            );
+                        }
                         mining_peer_quorum.observe_compatible(from, false);
                         tracing::debug!(
                             peer = %from,
@@ -9137,6 +9205,18 @@ async fn handle_p2p_events(
                     Ok(HeaderInventoryPlan::Candidate { offer, old_tip }) => {
                         finalized_divergent_peers.remove(&from);
                         let target = offer.plan().target();
+                        if let Err(error) =
+                            record_validated_headers(&mut header_dag, offer.plan().headers())
+                        {
+                            header_dag_faulted = true;
+                            tracing::warn!(
+                                peer = %from,
+                                target_height = target.height,
+                                %error,
+                                "validated exact suffix could not enter the bounded DAG"
+                            );
+                            continue;
+                        }
                         mining_peer_quorum.observe_compatible(from, true);
                         record_authenticated_height!(target.height, from);
                         mining_peer_quorum.invalidate_all();
@@ -9186,6 +9266,16 @@ async fn handle_p2p_events(
                         target,
                     }) => {
                         finalized_divergent_peers.remove(&from);
+                        if let Err(error) = record_validated_headers(&mut header_dag, &headers) {
+                            header_dag_faulted = true;
+                            tracing::warn!(
+                                peer = %from,
+                                target_height = target.height,
+                                %error,
+                                "validated partial suffix could not enter the bounded DAG"
+                            );
+                            continue;
+                        }
                         mining_peer_quorum.observe_compatible(from, true);
                         record_authenticated_height!(target.height, from);
                         mining_peer_quorum.invalidate_all();
@@ -11797,10 +11887,41 @@ async fn handle_p2p_events(
         // Heartbeat: re-evaluate manifest timeout without waiting for a new P2P event.
         _ = heartbeat.tick() => {
             let now = Instant::now();
-            let (our_height, our_hash) = {
+            let (our_height, our_hash, our_work, rebuilt_header_dag) = {
                 let ctx = chain.read().await;
-                (ctx.tip_height(), ctx.tip_hash())
+                let canonical_tip = noid_node::networking::ChainPoint::new(
+                    ctx.tip_height(),
+                    ctx.tip_hash(),
+                );
+                let rebuild_due = canonical_tip != header_dag_canonical_tip
+                    || (header_dag_faulted
+                        && now.saturating_duration_since(last_header_dag_rebuild_attempt)
+                            >= Duration::from_secs(10));
+                let rebuilt = rebuild_due.then(|| canonical_header_dag(&ctx));
+                (
+                    ctx.tip_height(),
+                    ctx.tip_hash(),
+                    *ctx.tip_chain_work(),
+                    rebuilt,
+                )
             };
+            if let Some(rebuilt) = rebuilt_header_dag {
+                last_header_dag_rebuild_attempt = now;
+                match rebuilt {
+                    Ok(rebuilt) => {
+                        header_dag = rebuilt;
+                        header_dag_canonical_tip = noid_node::networking::ChainPoint::new(
+                            our_height,
+                            our_hash,
+                        );
+                        header_dag_faulted = false;
+                    }
+                    Err(error) => {
+                        header_dag_faulted = true;
+                        tracing::error!(%error, "canonical header DAG rebuild failed");
+                    }
+                }
+            }
             // This also catches locally mined or RPC-submitted blocks, whose
             // commits do not pass through this P2P event handler. Old-tip
             // confirmations are cleared within one heartbeat and cannot be
@@ -11808,6 +11929,12 @@ async fn handle_p2p_events(
             mining_peer_quorum.set_canonical_tip(our_height, our_hash);
             let unresolved_canonical_work = active_suffix_sync.is_some()
                 || exact_suffix_apply_inflight.is_some()
+                || header_dag_faulted
+                || header_dag_has_unresolved_better_tip(
+                    &header_dag,
+                    noid_node::networking::ChainPoint::new(our_height, our_hash),
+                    our_work,
+                )
                 || pending_shallow_fork.is_some()
                 || pending_recent_suffix.is_some()
                 || recent_suffix_apply_inflight.is_some()

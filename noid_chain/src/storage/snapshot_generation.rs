@@ -722,11 +722,19 @@ pub fn export_snapshot_generation(
     let (boundary_terminal_len, boundary_terminal_digest) = if target_height == 0 {
         (0, [0; 32])
     } else {
-        let terminal = snapshot
-            .get_history_step_terminal_at(target_height, target_hash)?
-            .ok_or(SnapshotGenerationError::MissingBoundaryTerminal(
-                target_height,
-            ))?;
+        let canonical_terminal =
+            snapshot.get_history_step_terminal_at(target_height, target_hash)?;
+        let terminal = match canonical_terminal {
+            Some(terminal) => terminal,
+            None => snapshot
+                .get_any_history_step_proof_object(
+                    target_height,
+                    crate::block_header::semantic_header_id(&target_header),
+                )?
+                .ok_or(SnapshotGenerationError::MissingBoundaryTerminal(
+                    target_height,
+                ))?,
+        };
         if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
             return Err(SnapshotGenerationError::InvalidPayload(
                 "snapshot boundary terminal length is outside bounds",
@@ -796,9 +804,16 @@ pub fn export_snapshot_generation(
     let (bridge_terminal_len, bridge_terminal_digest) = if bridge_span == 0 {
         (0, [0; 32])
     } else {
-        let terminal = snapshot
-            .get_history_step_terminal_at(tip_height, tip_hash)?
-            .ok_or(SnapshotGenerationError::MissingBridgeTerminal(tip_height))?;
+        let canonical_terminal = snapshot.get_history_step_terminal_at(tip_height, tip_hash)?;
+        let terminal = match canonical_terminal {
+            Some(terminal) => terminal,
+            None => snapshot
+                .get_any_history_step_proof_object(
+                    tip_height,
+                    crate::block_header::semantic_header_id(&tip_header),
+                )?
+                .ok_or(SnapshotGenerationError::MissingBridgeTerminal(tip_height))?,
+        };
         if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
             return Err(SnapshotGenerationError::InvalidPayload(
                 "snapshot bridge terminal length is outside bounds",

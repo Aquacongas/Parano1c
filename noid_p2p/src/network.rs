@@ -1209,10 +1209,16 @@ fn local_history_step_boundary(store: &MdbxStore) -> Option<(u64, [u8; 32])> {
         if height == meta.finalized.height && block_hash != meta.finalized.hash {
             return None;
         }
-        if store
+        let has_canonical = store
             .has_history_step_terminal_at(height, block_hash)
-            .ok()?
-        {
+            .ok()?;
+        let has_cached = store
+            .has_any_history_step_proof_object(
+                height,
+                noid_chain::block_header::semantic_header_id(&header),
+            )
+            .ok()?;
+        if has_canonical || has_cached {
             return Some((height, block_hash));
         }
     }
@@ -1239,21 +1245,29 @@ fn load_exact_object(store: &MdbxStore, object: ObjectId) -> Result<Option<Vec<u
             Ok(Some(bytes))
         }
         ObjectId::Terminal(expected) => {
-            let Some(header) = store
+            let canonical = store
                 .get_header(expected.claim.height)
                 .map_err(|error| format!("read terminal header: {error}"))?
-            else {
-                return Ok(None);
+                .filter(|header| {
+                    noid_chain::block_header::semantic_header_id(header)
+                        == expected.claim.semantic_header_id
+                });
+            let canonical_bytes = match canonical {
+                Some(header) => store
+                    .get_history_step_terminal_at(
+                        expected.claim.height,
+                        noid_chain::block_header::block_id(&header),
+                    )
+                    .map_err(|error| format!("read retained terminal: {error}"))?,
+                None => None,
             };
-            if noid_chain::block_header::semantic_header_id(&header)
-                != expected.claim.semantic_header_id
-            {
-                return Ok(None);
-            }
-            let block_hash = noid_chain::block_header::block_id(&header);
-            let Some(bytes) = store
-                .get_history_step_terminal_at(expected.claim.height, block_hash)
-                .map_err(|error| format!("read retained terminal: {error}"))?
+            let Some(bytes) = canonical_bytes.or(store
+                .get_history_step_proof_object(
+                    expected.claim.height,
+                    expected.claim.semantic_header_id,
+                    expected.claim.proof_class,
+                )
+                .map_err(|error| format!("read cached terminal object: {error}"))?)
             else {
                 return Ok(None);
             };
@@ -1365,10 +1379,24 @@ fn local_history_step_terminal(
     if height == 0 || height > tip_height || !snapshot_suffix_is_retained(tip_height, height) {
         return None;
     }
-    store
+    let canonical = store
         .get_history_step_terminal_at(height, block_hash)
         .ok()
-        .flatten()
+        .flatten();
+    canonical.or_else(|| {
+        let header = store.get_header(height).ok().flatten()?;
+        (noid_chain::block_header::block_id(&header) == block_hash)
+            .then(|| {
+                store
+                    .get_any_history_step_proof_object(
+                        height,
+                        noid_chain::block_header::semantic_header_id(&header),
+                    )
+                    .ok()
+                    .flatten()
+            })
+            .flatten()
+    })
 }
 
 fn decode_stored_accepted_block_bundle(
@@ -4951,13 +4979,24 @@ async fn handle_swarm_event(
                                         .flatten();
                                     let terminal = (Some(header.height) == target_height)
                                         .then(|| {
-                                            store
+                                            let canonical = store
                                                 .get_history_step_terminal_at(
                                                     header.height,
                                                     noid_chain::block_header::block_id(&header),
                                                 )
                                                 .ok()
-                                                .flatten()
+                                                .flatten();
+                                            canonical.or_else(|| {
+                                                store
+                                                    .get_any_history_step_proof_object(
+                                                        header.height,
+                                                        noid_chain::block_header::semantic_header_id(
+                                                            &header,
+                                                        ),
+                                                    )
+                                                    .ok()
+                                                    .flatten()
+                                            })
                                         })
                                         .flatten();
                                     match HeaderInventoryRecord::from_retained_objects(

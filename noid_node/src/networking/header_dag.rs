@@ -6,7 +6,9 @@
 use std::collections::{HashMap, HashSet};
 
 use noid_chain::{
+    add_work,
     block_header::{block_id, BlockHeader},
+    block_work,
     consensus::fork_choice::{choose_chain_by_work, ChainChoice},
 };
 use thiserror::Error;
@@ -54,6 +56,8 @@ pub enum HeaderDagError {
     MissingParent,
     #[error("validated header height does not follow its parent")]
     BadHeight,
+    #[error("validated header cumulative work does not extend its parent")]
+    BadCumulativeWork,
     #[error("header hash already identifies different data")]
     HashCollision,
     #[error("header DAG reached its configured capacity")]
@@ -132,16 +136,25 @@ impl HeaderDag {
             return Err(HeaderDagError::Capacity);
         }
 
-        let parent = if candidate.header.prev_block_hash == self.finalized.hash {
-            self.finalized
+        let (parent, parent_work) = if candidate.header.prev_block_hash == self.finalized.hash {
+            (self.finalized, self.finalized_work)
         } else {
-            self.nodes
+            let parent = self
+                .nodes
                 .get(&candidate.header.prev_block_hash)
-                .map(ValidatedHeader::point)
-                .ok_or(HeaderDagError::MissingParent)?
+                .ok_or(HeaderDagError::MissingParent)?;
+            (parent.point(), parent.cumulative_work)
         };
         if candidate.header.height != parent.height.saturating_add(1) {
             return Err(HeaderDagError::BadHeight);
+        }
+        if candidate.cumulative_work
+            != add_work(
+                &parent_work,
+                &block_work(&candidate.header.difficulty_target),
+            )
+        {
+            return Err(HeaderDagError::BadCumulativeWork);
         }
 
         let previous = self.best;
@@ -295,13 +308,14 @@ mod tests {
     use super::*;
     use noid_chain::consensus::genesis_header;
 
-    fn child(parent: BlockHeader, nonce: u128, work: u8) -> ValidatedHeader {
+    fn child(parent: BlockHeader, parent_work: Hash32, nonce: u128) -> ValidatedHeader {
         let mut header = parent;
         header.prev_block_hash = block_id(&parent);
         header.height = parent.height + 1;
         header.timestamp += 1;
         header.nonce = nonce;
-        ValidatedHeader::new_after_consensus_checks(header, [work; 32])
+        let cumulative_work = add_work(&parent_work, &block_work(&header.difficulty_target));
+        ValidatedHeader::new_after_consensus_checks(header, cumulative_work)
     }
 
     #[test]
@@ -309,8 +323,21 @@ mod tests {
         let genesis = genesis_header();
         let finalized = ChainPoint::new(0, block_id(&genesis));
         let mut dag = HeaderDag::new(finalized, [1; 32], 16);
-        let a = child(genesis, 1, 2);
-        let b = child(genesis, 2, 3);
+        let left = child(genesis, [1; 32], 1);
+        let right = child(genesis, [1; 32], 2);
+        let (a, b) = if matches!(
+            choose_chain_by_work(
+                &left.cumulative_work,
+                &left.hash,
+                &right.cumulative_work,
+                &right.hash,
+            ),
+            ChainChoice::A
+        ) {
+            (right, left)
+        } else {
+            (left, right)
+        };
 
         assert!(matches!(
             dag.insert(a).unwrap(),
@@ -328,9 +355,9 @@ mod tests {
         let genesis = genesis_header();
         let finalized = ChainPoint::new(0, block_id(&genesis));
         let mut dag = HeaderDag::new(finalized, [1; 32], 16);
-        let a1 = child(genesis, 1, 2);
-        let a2 = child(a1.header, 2, 3);
-        let b2 = child(a1.header, 3, 4);
+        let a1 = child(genesis, [1; 32], 1);
+        let a2 = child(a1.header, a1.cumulative_work, 2);
+        let b2 = child(a1.header, a1.cumulative_work, 3);
         dag.insert(a1).unwrap();
         dag.insert(a2).unwrap();
         dag.insert(b2).unwrap();
@@ -347,15 +374,29 @@ mod tests {
         let genesis = genesis_header();
         let finalized = ChainPoint::new(0, block_id(&genesis));
         let mut dag = HeaderDag::new(finalized, [1; 32], 1);
-        let a = child(genesis, 1, 2);
-        let mut orphan = child(a.header, 2, 3);
+        let a = child(genesis, [1; 32], 1);
+        let mut orphan = child(a.header, a.cumulative_work, 2);
         orphan.header.prev_block_hash = [9; 32];
         orphan.hash = block_id(&orphan.header);
         assert_eq!(dag.insert(orphan), Err(HeaderDagError::MissingParent));
         assert_eq!(dag.len(), 0);
         dag.insert(a).unwrap();
-        let b = child(genesis, 4, 3);
+        let b = child(genesis, [1; 32], 4);
         assert_eq!(dag.insert(b), Err(HeaderDagError::Capacity));
         assert_eq!(dag.len(), 1);
+    }
+
+    #[test]
+    fn malformed_cached_work_is_rejected_before_insertion() {
+        let genesis = genesis_header();
+        let finalized = ChainPoint::new(0, block_id(&genesis));
+        let mut dag = HeaderDag::new(finalized, [1; 32], 4);
+        let mut candidate = child(genesis, [1; 32], 1);
+        candidate.cumulative_work[0] ^= 1;
+        assert_eq!(
+            dag.insert(candidate),
+            Err(HeaderDagError::BadCumulativeWork)
+        );
+        assert!(dag.is_empty());
     }
 }
