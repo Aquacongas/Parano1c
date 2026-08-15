@@ -296,7 +296,7 @@ def main():
                 for node in nodes
             )
             if sample != last_sample:
-                rendered = {
+                rendered: dict[str, object] = {
                     name: {"height": height, "mempool": pool}
                     for name, height, pool in sample
                 }

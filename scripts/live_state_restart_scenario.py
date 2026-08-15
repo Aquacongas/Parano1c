@@ -69,10 +69,12 @@ def compact_resume_metrics(text):
         None,
     )
     require(line is not None, "restart did not use compact segment summaries")
+    assert line is not None
     metrics = {}
     for field in ("active_segments", "active_slot_count"):
         match = re.search(rf"(?:^|\s){field}=(\d+)(?:\s|$)", line)
         require(match is not None, f"compact resume log misses {field}: {line}")
+        assert match is not None
         metrics[field] = int(match.group(1))
     return metrics
 

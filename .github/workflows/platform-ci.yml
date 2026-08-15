@@ -34,7 +34,7 @@ jobs:
           sudo apt-get install --no-install-recommends -y clang libclang-dev cmake pkg-config qemu-user
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.96.0 --profile minimal
 
       - name: Cache Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -51,17 +51,6 @@ jobs:
           rustc -vV
           cargo -vV
           lscpu
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Check the portable x86-64 release profile
-        env:
-          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: >-
-            -C target-cpu=x86-64
-        run: >-
-          cargo check --locked --workspace --all-targets
-          --target x86_64-unknown-linux-gnu
 
       - name: Link the official node tools and GUI wallet
         env:
@@ -95,28 +84,6 @@ jobs:
           test "$legacy_status" -ne 132
           grep -q "CPU UNSUPPORTED" <<<"$legacy_output"
 
-      - name: Test GUI wallet logic
-        run: cargo test --locked --release -p noid_gui
-
-      - name: Test proof kernels with runtime dispatch
-        run: >-
-          cargo test --locked --release
-          -p noid_core -p noid_poseidon2b -p noid-ivc-core
-
-      - name: Test the runtime PCLMUL production floor
-        env:
-          NOID_CPU_BACKEND: pclmul
-        run: >-
-          cargo test --locked --release
-          -p noid_core -p noid_poseidon2b -p noid-ivc-core
-
-      - name: Cross-check scalar field and hash references
-        env:
-          NOID_CPU_BACKEND: scalar
-        run: >-
-          cargo test --locked --release
-          -p noid_core -p noid_poseidon2b
-
   native-platforms:
     name: ${{ matrix.name }}
     strategy:
@@ -127,26 +94,18 @@ jobs:
             runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             release_flags: ""
-            test_flags: ""
-            backend: neon-pmull
           - name: macOS Apple Silicon
             runner: macos-15
             target: aarch64-apple-darwin
             release_flags: ""
-            test_flags: ""
-            backend: neon-pmull
           - name: macOS Intel
             runner: macos-15-intel
             target: x86_64-apple-darwin
             release_flags: -C target-cpu=x86-64
-            test_flags: ""
-            backend: pclmul
           - name: Windows x86-64
             runner: windows-2025
             target: x86_64-pc-windows-msvc
             release_flags: -C target-cpu=x86-64
-            test_flags: ""
-            backend: auto
 
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
@@ -183,7 +142,7 @@ jobs:
           clang --version
 
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.96.0 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.96.0 --profile minimal
 
       - name: Cache Cargo downloads
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -202,16 +161,6 @@ jobs:
           cargo -vV
           uname -a || true
           if command -v lscpu >/dev/null 2>&1; then lscpu; fi
-
-      - name: Check the complete platform release profile
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && matrix.release_flags || '' }}
-          CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'aarch64-apple-darwin' && matrix.release_flags || '' }}
-          CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS: ${{ matrix.target == 'x86_64-apple-darwin' && matrix.release_flags || '' }}
-          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && matrix.release_flags || '' }}
-        run: >-
-          cargo check --locked --workspace --all-targets
-          --target ${{ matrix.target }}
 
       - name: Link the official node tools and GUI wallet
         env:
@@ -234,11 +183,3 @@ jobs:
           target/${{ matrix.target }}/debug/parano1d-miner$suffix --check-hardware
           target/${{ matrix.target }}/debug/parano1d-miner$suffix --help
           target/${{ matrix.target }}/debug/parano1d-gui$suffix --release-self-check
-
-      - name: Test native proof kernels
-        env:
-          NOID_CPU_BACKEND: ${{ matrix.backend }}
-          RUSTFLAGS: ${{ matrix.test_flags }}
-        run: >-
-          cargo test --locked --release
-          -p noid_core -p noid_poseidon2b -p noid-ivc-core

@@ -3,43 +3,37 @@
 
 //! Wire message types for the Paranoid P2P protocol.
 //!
-//! ## Block propagation
-//!
-//! Blocks use one all-or-none bundle in two propagation modes:
-//!
-//! 1. **Inline** (common case): small blocks (coinbase-only or few txs, total
-//!    < 1 MB) carry one complete accepted-block bundle via gossipsub. Receivers
-//!    can validate immediately —
-//!    no round-trip, no race condition.
-//!
-//! 2. **Compact** (large blocks): header-only gossip (~310 bytes).  Receivers
-//!    pull the complete bundle via `GetRecentBlockRequest`. This mirrors
-//!    Bitcoin's compact block protocol and Ethereum's `NewBlockHashes`.
-//!
-//! The 1 MB inline threshold is well below the 2 MB gossipsub transmit limit
-//! and handles 99%+ of real-world blocks (coinbase-only through ~100 txs).
+//! Block propagation is header-first. Gossip carries one fixed header
+//! announcement; bodies and recursive terminals move only through the exact
+//! content-addressed object protocol selected by HeaderDAG.
 //!
 //! ## State sync
 //!
-//! State snapshots are served in two stages to avoid single responses that can
-//! reach hundreds of MB or even gigabytes on a mature network:
+//! State snapshots are served in three bounded stages:
 //!
-//! 1. Client requests `GetStateManifestRequest` → receives metadata + list of
-//!    active segment IDs (tiny, ~few KB).
-//! 2. Client requests each segment individually via `GetStateSegmentRequest`
+//! 1. Client requests `GetStateManifestRequest` and receives only fixed
+//!    metadata plus at most 64 content-addressed descriptor-page identities.
+//! 2. Descriptor pages move through the bounded State-metadata data plane.
+//! 3. Client requests each segment individually via `GetStateSegmentRequest`
 //!    → receives one 3 MB segment per response.
-//!    Segments are downloaded in parallel for speed.
 //!
 //! This enables progress reporting, resumable sync, and correct memory usage
 //! regardless of total state size.
 
-use noid_chain::{
-    block::BLOCK_WIRE_HEADER_OFFSET, AcceptedBlockBundle, BlockHeader, BLOCK_HEADER_WIRE_SIZE,
-    MAX_ACCEPTED_BLOCK_BUNDLE_BYTES,
-};
+use noid_poseidon2b::native::poseidon2b_hash_bytes;
 use serde::{Deserialize, Serialize};
+use std::{ops::Deref, sync::Arc};
 
 use crate::header_protocol::HeaderInventoryRecord;
+use crate::object_protocol::{ChainPoint, DataResponseStatus, SnapshotId};
+
+/// Deterministic finalized heights at which independent nodes build the same
+/// source-independent snapshot generation. This is an operational serving
+/// cadence, not a consensus parameter.
+pub const SNAPSHOT_BOUNDARY_INTERVAL: u64 = 6;
+const _: () = assert!(SNAPSHOT_BOUNDARY_INTERVAL > 0);
+const _: () =
+    assert!(SNAPSHOT_BOUNDARY_INTERVAL <= noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH);
 
 // ---------------------------------------------------------------------------
 // Block pull: headers
@@ -60,61 +54,11 @@ pub struct GetHeadersRequest {
 #[derive(Debug, Clone)]
 pub struct GetHeadersResponse {
     pub records: Vec<HeaderInventoryRecord>,
-}
-
-// ---------------------------------------------------------------------------
-// Block pull: complete accepted-block bundle
-// ---------------------------------------------------------------------------
-
-/// Payload requested from the bounded recent-block window.
-///
-/// `BlockBody` is the snapshot fast path: the suffix's final recursive
-/// HistoryStep terminal authenticates the complete linked body sequence, so
-/// transferring the same proof-sized terminal with every body is redundant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RecentBlockPayloadKind {
-    Complete,
-    BlockBody,
-}
-
-/// Maximum canonical block bodies returned by one snapshot-tail request.
-///
-/// This is exactly the consensus retention window.  It keeps the fast path to
-/// one bounded response without allowing an unbounded range allocation.
-pub const MAX_BLOCK_BODY_BATCH: u16 =
-    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16;
-
-/// Request one retained proof bundle or one bounded range of block bodies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetRecentBlockRequest {
-    pub height: u64,
-    pub count: u16,
-    pub payload_kind: RecentBlockPayloadKind,
-}
-
-/// One bounded recent-block payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecentBlockPayload {
-    /// Canonical block plus its current-height HistoryStep terminal.
-    Complete(AcceptedBlockBundle),
-    /// Consecutive canonical block bodies. Used exclusively by snapshot
-    /// suffix sync and bounded by [`MAX_BLOCK_BODY_BATCH`].
-    BlockBodies(Vec<Vec<u8>>),
-}
-
-/// Response: the requested payload, or `None` when it is unavailable.
-#[derive(Debug, Clone)]
-pub struct GetRecentBlockResponse {
-    pub height: u64,
-    pub count: u16,
-    pub payload_kind: RecentBlockPayloadKind,
-    pub payload: Option<RecentBlockPayload>,
-    /// Process-global inbound block-byte budget retained until the node has
-    /// consumed this response. It is local flow-control state, never wire data.
-    pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
-    /// Process-wide outbound byte admission retained through the codec write.
-    /// Local flow-control state; never serialized.
-    pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
+    /// Exact deterministic finalized boundary whose complete terminal and
+    /// snapshot generation this responding peer can currently serve. This is
+    /// an availability hint only; the receiver independently verifies every
+    /// referenced object.
+    pub snapshot_boundary: Option<ChainPoint>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +79,7 @@ pub struct GetHistoryStepTerminalResponse {
     /// nonce-bearing chain-link block id.
     pub height: u64,
     pub block_hash: [u8; 32],
+    pub status: DataResponseStatus,
     /// Serialized fused HistoryStep terminal bound to `height` and the
     /// nonce-free semantic id of the same header. Node-side snapshot
     /// verification checks both ids against that authenticated staged header.
@@ -162,6 +107,75 @@ pub struct GetStateManifestRequest {
     /// for that exact immutable generation so object failover never silently
     /// changes the selected State plan.
     pub requested_manifest_digest: [u8; 32],
+}
+
+pub const SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE: usize = 1024;
+pub const SNAPSHOT_MANIFEST_DESCRIPTOR_BYTES: usize = 2 + 32 + 4;
+pub const SNAPSHOT_MANIFEST_PAGE_HEADER_BYTES: usize = 4 + 2 + 2;
+pub const MAX_SNAPSHOT_MANIFEST_PAGES: usize =
+    noid_chain::consensus::wire_limits::MAX_SNAPSHOT_MANIFEST_SEGMENTS
+        .div_ceil(SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE);
+const SNAPSHOT_MANIFEST_PAGE_MAGIC: [u8; 4] = *b"NMP1";
+const SNAPSHOT_MANIFEST_PAGE_DIGEST_DOMAIN: &[u8] = b"PARANO1D/P2P/SNAPSHOT-MANIFEST-PAGE/V1";
+
+/// Exact immutable identity of one canonical descriptor page. Page size and
+/// descriptor count are derived from the manifest's total segment count; a
+/// peer cannot advertise arbitrary page geometry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SnapshotManifestPageRef {
+    pub page_index: u16,
+    pub byte_digest: [u8; 32],
+    pub encoded_len: u32,
+    pub descriptor_count: u16,
+}
+
+impl SnapshotManifestPageRef {
+    pub fn matches_bytes(self, bytes: &[u8]) -> bool {
+        usize::try_from(self.encoded_len).ok() == Some(bytes.len())
+            && poseidon2b_hash_bytes(SNAPSHOT_MANIFEST_PAGE_DIGEST_DOMAIN, bytes)
+                == self.byte_digest
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SnapshotManifestPageObjectId {
+    pub snapshot: SnapshotId,
+    pub page: SnapshotManifestPageRef,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetSnapshotManifestPageRequest {
+    pub object: SnapshotManifestPageObjectId,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetSnapshotManifestPageResponse {
+    pub object: SnapshotManifestPageObjectId,
+    pub status: DataResponseStatus,
+    pub data: Option<Arc<[u8]>>,
+    pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
+    pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
+}
+
+/// Small control-plane response. Segment descriptors never travel in this
+/// frame; only their ordered content identities do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct GetStateManifestHeader {
+    pub tip_height: u64,
+    pub tip_hash: [u8; 32],
+    pub cumulative_chainwork: [u8; 32],
+    pub format_version: u32,
+    pub state_root: [u8; 32],
+    pub manifest_digest: [u8; 32],
+    pub log_slots: u32,
+    pub active_slot_count: u64,
+    pub alloc_counter: u64,
+    pub eff_log: u8,
+    pub bridge_tip_height: u64,
+    pub bridge_tip_hash: [u8; 32],
+    pub bridge_cumulative_chainwork: [u8; 32],
+    pub segment_count: u32,
+    pub descriptor_pages: Vec<SnapshotManifestPageRef>,
 }
 
 /// Manifest response: chain metadata + list of active segment IDs.
@@ -207,18 +221,12 @@ pub struct GetStateManifestResponse {
     pub segment_lengths: Vec<u32>,
 }
 
-pub const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 1;
-const SNAPSHOT_MANIFEST_DIGEST_DOMAIN: &[u8] = b"PARANO1D/P2P/SNAPSHOT-MANIFEST/V1";
+pub const SNAPSHOT_MANIFEST_FORMAT_VERSION: u32 = 2;
+const SNAPSHOT_MANIFEST_DIGEST_DOMAIN: &[u8] = b"PARANO1D/P2P/SNAPSHOT-MANIFEST/V2";
 
-impl GetStateManifestResponse {
-    /// Compute the canonical network identity of a non-empty immutable
-    /// snapshot manifest. The digest deliberately excludes itself.
+impl GetStateManifestHeader {
     pub fn computed_manifest_digest(&self) -> Option<[u8; 32]> {
-        if self.tip_height == 0
-            || self.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION
-            || self.segment_ids.len() != self.segment_roots.len()
-            || self.segment_ids.len() != self.segment_lengths.len()
-        {
+        if self.tip_height == 0 || !self.has_canonical_page_shape() {
             return None;
         }
         let mut hasher = blake3::Hasher::new();
@@ -235,16 +243,13 @@ impl GetStateManifestResponse {
         hasher.update(&self.bridge_tip_height.to_le_bytes());
         hasher.update(&self.bridge_tip_hash);
         hasher.update(&self.bridge_cumulative_chainwork);
-        hasher.update(&(self.segment_ids.len() as u64).to_le_bytes());
-        for ((segment_id, segment_root), encoded_len) in self
-            .segment_ids
-            .iter()
-            .zip(&self.segment_roots)
-            .zip(&self.segment_lengths)
-        {
-            hasher.update(&segment_id.to_le_bytes());
-            hasher.update(segment_root);
-            hasher.update(&encoded_len.to_le_bytes());
+        hasher.update(&self.segment_count.to_le_bytes());
+        hasher.update(&(self.descriptor_pages.len() as u16).to_le_bytes());
+        for page in &self.descriptor_pages {
+            hasher.update(&page.page_index.to_le_bytes());
+            hasher.update(&page.byte_digest);
+            hasher.update(&page.encoded_len.to_le_bytes());
+            hasher.update(&page.descriptor_count.to_le_bytes());
         }
         Some(*hasher.finalize().as_bytes())
     }
@@ -260,6 +265,400 @@ impl GetStateManifestResponse {
     pub fn has_valid_manifest_digest(&self) -> bool {
         self.computed_manifest_digest() == Some(self.manifest_digest)
     }
+
+    pub fn has_canonical_page_shape(&self) -> bool {
+        let Ok(segment_count) = usize::try_from(self.segment_count) else {
+            return false;
+        };
+        if segment_count > noid_chain::consensus::wire_limits::MAX_SNAPSHOT_MANIFEST_SEGMENTS {
+            return false;
+        }
+        let expected_pages = segment_count.div_ceil(SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE);
+        if expected_pages != self.descriptor_pages.len()
+            || expected_pages > MAX_SNAPSHOT_MANIFEST_PAGES
+        {
+            return false;
+        }
+        self.descriptor_pages
+            .iter()
+            .enumerate()
+            .all(|(index, page)| {
+                let first = index.saturating_mul(SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE);
+                let remaining = segment_count.saturating_sub(first);
+                let expected_count = remaining.min(SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE);
+                let expected_len = SNAPSHOT_MANIFEST_PAGE_HEADER_BYTES.saturating_add(
+                    expected_count.saturating_mul(SNAPSHOT_MANIFEST_DESCRIPTOR_BYTES),
+                );
+                usize::from(page.page_index) == index
+                    && usize::from(page.descriptor_count) == expected_count
+                    && usize::try_from(page.encoded_len).ok() == Some(expected_len)
+            })
+    }
+
+    pub fn snapshot_id(&self) -> Option<SnapshotId> {
+        (self.tip_height > 0 && self.has_valid_manifest_digest()).then_some(SnapshotId {
+            boundary: ChainPoint {
+                height: self.tip_height,
+                hash: self.tip_hash,
+            },
+            state_root: self.state_root,
+            manifest_digest: self.manifest_digest,
+            format_version: self.format_version,
+        })
+    }
+
+    fn assemble_manifest(&self, pages: &[Arc<[u8]>]) -> Option<GetStateManifestResponse> {
+        if !self.has_valid_manifest_digest() || pages.len() != self.descriptor_pages.len() {
+            return None;
+        }
+        let mut segment_ids = Vec::with_capacity(self.segment_count as usize);
+        let mut segment_roots = Vec::with_capacity(self.segment_count as usize);
+        let mut segment_lengths = Vec::with_capacity(self.segment_count as usize);
+        for (expected, encoded) in self.descriptor_pages.iter().zip(pages) {
+            let descriptors = decode_snapshot_manifest_page(*expected, encoded)?;
+            for (segment_id, segment_root, encoded_len) in descriptors {
+                if segment_ids
+                    .last()
+                    .is_some_and(|previous| *previous >= segment_id)
+                {
+                    return None;
+                }
+                segment_ids.push(segment_id);
+                segment_roots.push(segment_root);
+                segment_lengths.push(encoded_len);
+            }
+        }
+        if segment_ids.len() != self.segment_count as usize {
+            return None;
+        }
+        let response = GetStateManifestResponse {
+            tip_height: self.tip_height,
+            tip_hash: self.tip_hash,
+            cumulative_chainwork: self.cumulative_chainwork,
+            format_version: self.format_version,
+            state_root: self.state_root,
+            manifest_digest: self.manifest_digest,
+            log_slots: self.log_slots,
+            active_slot_count: self.active_slot_count,
+            alloc_counter: self.alloc_counter,
+            eff_log: self.eff_log,
+            bridge_tip_height: self.bridge_tip_height,
+            bridge_tip_hash: self.bridge_tip_hash,
+            bridge_cumulative_chainwork: self.bridge_cumulative_chainwork,
+            segment_ids,
+            segment_roots,
+            segment_lengths,
+        };
+        validate_manifest_descriptors(&response).then_some(response)
+    }
+}
+
+/// A complete manifest whose small header, every exact descriptor page and
+/// all cross-page State invariants have already been authenticated.  The
+/// constructor is intentionally private to this module: network consumers can
+/// clone the `Arc`, but cannot accidentally turn unverified vectors into
+/// snapshot scheduling authority.
+#[derive(Debug, Clone)]
+pub struct VerifiedStateManifest {
+    manifest: Arc<GetStateManifestResponse>,
+}
+
+impl VerifiedStateManifest {
+    pub(crate) fn empty() -> Self {
+        Self {
+            manifest: Arc::new(GetStateManifestResponse::default()),
+        }
+    }
+
+    /// Build and authenticate a local export.  Page hashing and the full
+    /// descriptor pass are deliberately performed by the caller's blocking
+    /// export worker, never by the swarm reactor.
+    pub(crate) fn prepare_local(
+        mut manifest: GetStateManifestResponse,
+    ) -> Option<(Self, GetStateManifestHeader, Vec<Arc<[u8]>>)> {
+        let (header, pages) = manifest.to_header_and_pages()?;
+        manifest.manifest_digest = header.manifest_digest;
+        if !validate_manifest_descriptors(&manifest) {
+            return None;
+        }
+        Some((
+            Self {
+                manifest: Arc::new(manifest),
+            },
+            header,
+            pages,
+        ))
+    }
+
+    /// Assemble one network manifest after every page has independently
+    /// matched the exact identities committed by the header.  This includes
+    /// the one full cross-page semantic pass and is therefore called only on
+    /// a blocking worker.
+    pub(crate) fn from_pages(header: &GetStateManifestHeader, pages: &[Arc<[u8]>]) -> Option<Self> {
+        let manifest = header.assemble_manifest(pages)?;
+        Some(Self {
+            manifest: Arc::new(manifest),
+        })
+    }
+
+    /// Test/local compatibility constructor. Production network admission
+    /// uses `from_pages`, which never re-encodes an already received page.
+    pub fn verify(manifest: GetStateManifestResponse) -> Option<Self> {
+        if manifest == GetStateManifestResponse::default() {
+            return Some(Self::empty());
+        }
+        let (verified, _, _) = Self::prepare_local(manifest)?;
+        Some(verified)
+    }
+
+    pub fn into_arc(self) -> Arc<GetStateManifestResponse> {
+        self.manifest
+    }
+}
+
+impl Deref for VerifiedStateManifest {
+    type Target = GetStateManifestResponse;
+
+    fn deref(&self) -> &Self::Target {
+        self.manifest.as_ref()
+    }
+}
+
+impl AsRef<GetStateManifestResponse> for VerifiedStateManifest {
+    fn as_ref(&self) -> &GetStateManifestResponse {
+        self.manifest.as_ref()
+    }
+}
+
+impl PartialEq for VerifiedStateManifest {
+    fn eq(&self, other: &Self) -> bool {
+        self.manifest == other.manifest
+    }
+}
+
+impl Eq for VerifiedStateManifest {}
+
+impl GetStateManifestResponse {
+    pub fn to_header_and_pages(&self) -> Option<(GetStateManifestHeader, Vec<Arc<[u8]>>)> {
+        if self.tip_height == 0 {
+            return Some((GetStateManifestHeader::default(), Vec::new()));
+        }
+        if self.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION
+            || self.segment_ids.len() != self.segment_roots.len()
+            || self.segment_ids.len() != self.segment_lengths.len()
+            || self.segment_ids.len()
+                > noid_chain::consensus::wire_limits::MAX_SNAPSHOT_MANIFEST_SEGMENTS
+        {
+            return None;
+        }
+        let mut pages = Vec::with_capacity(
+            self.segment_ids
+                .len()
+                .div_ceil(SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE),
+        );
+        let mut refs = Vec::with_capacity(pages.capacity());
+        for (page_index, first) in (0..self.segment_ids.len())
+            .step_by(SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE)
+            .enumerate()
+        {
+            let end = (first + SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE).min(self.segment_ids.len());
+            let encoded = encode_snapshot_manifest_page(
+                page_index as u16,
+                &self.segment_ids[first..end],
+                &self.segment_roots[first..end],
+                &self.segment_lengths[first..end],
+            )?;
+            refs.push(SnapshotManifestPageRef {
+                page_index: page_index as u16,
+                byte_digest: poseidon2b_hash_bytes(SNAPSHOT_MANIFEST_PAGE_DIGEST_DOMAIN, &encoded),
+                encoded_len: u32::try_from(encoded.len()).ok()?,
+                descriptor_count: u16::try_from(end - first).ok()?,
+            });
+            pages.push(Arc::from(encoded));
+        }
+        let mut header = GetStateManifestHeader {
+            tip_height: self.tip_height,
+            tip_hash: self.tip_hash,
+            cumulative_chainwork: self.cumulative_chainwork,
+            format_version: self.format_version,
+            state_root: self.state_root,
+            manifest_digest: [0; 32],
+            log_slots: self.log_slots,
+            active_slot_count: self.active_slot_count,
+            alloc_counter: self.alloc_counter,
+            eff_log: self.eff_log,
+            bridge_tip_height: self.bridge_tip_height,
+            bridge_tip_hash: self.bridge_tip_hash,
+            bridge_cumulative_chainwork: self.bridge_cumulative_chainwork,
+            segment_count: u32::try_from(self.segment_ids.len()).ok()?,
+            descriptor_pages: refs,
+        };
+        header.seal_manifest_digest().then_some((header, pages))
+    }
+
+    /// Compute the canonical network identity of a non-empty immutable
+    /// snapshot manifest. The digest deliberately excludes itself.
+    pub fn computed_manifest_digest(&self) -> Option<[u8; 32]> {
+        self.to_header_and_pages()?.0.computed_manifest_digest()
+    }
+
+    pub fn seal_manifest_digest(&mut self) -> bool {
+        let Some(digest) = self.computed_manifest_digest() else {
+            return false;
+        };
+        self.manifest_digest = digest;
+        true
+    }
+
+    pub fn has_valid_manifest_digest(&self) -> bool {
+        self.computed_manifest_digest() == Some(self.manifest_digest)
+    }
+}
+
+fn validate_manifest_descriptors(manifest: &GetStateManifestResponse) -> bool {
+    use noid_chain::{
+        consensus::wire_limits::{MAX_SEGMENT_BYTES, MAX_SNAPSHOT_MANIFEST_SEGMENTS},
+        storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
+        LOG_SEGMENT_SIZE,
+    };
+
+    if manifest.tip_height == 0
+        || manifest.format_version != SNAPSHOT_MANIFEST_FORMAT_VERSION
+        || manifest.segment_ids.len() != manifest.segment_roots.len()
+        || manifest.segment_ids.len() != manifest.segment_lengths.len()
+        || manifest.segment_ids.len() > MAX_SNAPSHOT_MANIFEST_SEGMENTS
+        || !(1..=u32::BITS).contains(&manifest.log_slots)
+        || manifest.active_slot_count > manifest.alloc_counter
+        || u64::try_from(manifest.segment_ids.len())
+            .ok()
+            .is_none_or(|count| count > manifest.active_slot_count)
+    {
+        return false;
+    }
+    let Some(slot_domain) = 1u64.checked_shl(manifest.log_slots) else {
+        return false;
+    };
+    if manifest.active_slot_count > slot_domain {
+        return false;
+    }
+    let Some(bridge_span) = manifest.bridge_tip_height.checked_sub(manifest.tip_height) else {
+        return false;
+    };
+    if bridge_span > noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH
+        || (bridge_span == 0
+            && (manifest.bridge_tip_hash != manifest.tip_hash
+                || manifest.bridge_cumulative_chainwork != manifest.cumulative_chainwork))
+        || (bridge_span > 0
+            && !noid_chain::work_gt(
+                &manifest.bridge_cumulative_chainwork,
+                &manifest.cumulative_chainwork,
+            ))
+    {
+        return false;
+    }
+    let expected_eff_log = manifest.log_slots.min(LOG_SEGMENT_SIZE as u32) as u8;
+    if manifest.eff_log != expected_eff_log
+        || max_encoded_segment_len_for_eff_log(manifest.eff_log)
+            .is_none_or(|length| length > MAX_SEGMENT_BYTES)
+    {
+        return false;
+    }
+    let segment_span = manifest
+        .log_slots
+        .saturating_sub(u32::from(manifest.eff_log));
+    let Some(maximum_segments) = 1usize.checked_shl(segment_span) else {
+        return false;
+    };
+    if manifest.segment_ids.len() > maximum_segments
+        || !manifest
+            .segment_ids
+            .windows(2)
+            .all(|pair| pair[0] < pair[1])
+        || manifest
+            .segment_ids
+            .iter()
+            .any(|segment_id| usize::from(*segment_id) >= maximum_segments)
+    {
+        return false;
+    }
+    manifest
+        .segment_lengths
+        .iter()
+        .try_fold(0u64, |total, encoded_len| {
+            let live = encoded_segment_live_count_from_len(
+                manifest.eff_log,
+                usize::try_from(*encoded_len).ok()?,
+            )?;
+            (live > 0)
+                .then_some(())
+                .and_then(|()| total.checked_add(u64::from(live)))
+        })
+        == Some(manifest.active_slot_count)
+}
+
+fn encode_snapshot_manifest_page(
+    page_index: u16,
+    segment_ids: &[u16],
+    segment_roots: &[[u8; 32]],
+    segment_lengths: &[u32],
+) -> Option<Vec<u8>> {
+    if segment_ids.is_empty()
+        || segment_ids.len() > SNAPSHOT_MANIFEST_DESCRIPTORS_PER_PAGE
+        || segment_ids.len() != segment_roots.len()
+        || segment_ids.len() != segment_lengths.len()
+    {
+        return None;
+    }
+    let count = u16::try_from(segment_ids.len()).ok()?;
+    let mut encoded = Vec::with_capacity(
+        SNAPSHOT_MANIFEST_PAGE_HEADER_BYTES
+            + segment_ids.len() * SNAPSHOT_MANIFEST_DESCRIPTOR_BYTES,
+    );
+    encoded.extend_from_slice(&SNAPSHOT_MANIFEST_PAGE_MAGIC);
+    encoded.extend_from_slice(&page_index.to_le_bytes());
+    encoded.extend_from_slice(&count.to_le_bytes());
+    for ((segment_id, segment_root), encoded_len) in
+        segment_ids.iter().zip(segment_roots).zip(segment_lengths)
+    {
+        encoded.extend_from_slice(&segment_id.to_le_bytes());
+        encoded.extend_from_slice(segment_root);
+        encoded.extend_from_slice(&encoded_len.to_le_bytes());
+    }
+    Some(encoded)
+}
+
+pub fn decode_snapshot_manifest_page(
+    expected: SnapshotManifestPageRef,
+    encoded: &[u8],
+) -> Option<Vec<(u16, [u8; 32], u32)>> {
+    if usize::try_from(expected.encoded_len).ok() != Some(encoded.len())
+        || poseidon2b_hash_bytes(SNAPSHOT_MANIFEST_PAGE_DIGEST_DOMAIN, encoded)
+            != expected.byte_digest
+        || encoded.len() < SNAPSHOT_MANIFEST_PAGE_HEADER_BYTES
+        || encoded[..4] != SNAPSHOT_MANIFEST_PAGE_MAGIC
+        || u16::from_le_bytes(encoded[4..6].try_into().ok()?) != expected.page_index
+        || u16::from_le_bytes(encoded[6..8].try_into().ok()?) != expected.descriptor_count
+    {
+        return None;
+    }
+    let count = usize::from(expected.descriptor_count);
+    if count == 0
+        || encoded.len()
+            != SNAPSHOT_MANIFEST_PAGE_HEADER_BYTES + count * SNAPSHOT_MANIFEST_DESCRIPTOR_BYTES
+    {
+        return None;
+    }
+    let mut descriptors = Vec::with_capacity(count);
+    for descriptor in encoded[SNAPSHOT_MANIFEST_PAGE_HEADER_BYTES..]
+        .chunks_exact(SNAPSHOT_MANIFEST_DESCRIPTOR_BYTES)
+    {
+        descriptors.push((
+            u16::from_le_bytes(descriptor[..2].try_into().ok()?),
+            descriptor[2..34].try_into().ok()?,
+            u32::from_le_bytes(descriptor[34..38].try_into().ok()?),
+        ));
+    }
+    Some(descriptors)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +694,7 @@ pub struct GetStateSegmentResponse {
     pub expected_tip_hash: [u8; 32],
     /// Echo of the exact immutable manifest generation.
     pub manifest_digest: [u8; 32],
+    pub status: DataResponseStatus,
     pub eff_log: u8,
     /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
     /// `None` if the peer cannot serve this segment.
@@ -349,100 +749,6 @@ pub struct GetMempoolResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Block announcement (gossip)
-// ---------------------------------------------------------------------------
-
-/// Canonical block-gossip tagged union. A partial block has no representable
-/// shape: gossip carries either one header or one complete accepted bundle.
-#[derive(Debug, Clone)]
-pub enum BlockGossipMsg {
-    Header(BlockHeader),
-    Complete(AcceptedBlockBundle),
-}
-
-const BLOCK_GOSSIP_MAGIC: [u8; 4] = *b"NBG1";
-const BLOCK_GOSSIP_HEADER: u8 = 0;
-const BLOCK_GOSSIP_COMPLETE: u8 = 1;
-pub const BLOCK_GOSSIP_FIXED_BYTES: usize = 4 + 1 + 4;
-
-impl BlockGossipMsg {
-    pub fn from_bundle(bundle: AcceptedBlockBundle, inline: bool) -> Self {
-        if inline {
-            return Self::Complete(bundle);
-        }
-        let block_bytes = bundle.block_bytes();
-        let header_end = BLOCK_WIRE_HEADER_OFFSET
-            .checked_add(BLOCK_HEADER_WIRE_SIZE)
-            .expect("canonical block header range fits usize");
-        let header_bytes = block_bytes
-            .get(BLOCK_WIRE_HEADER_OFFSET..header_end)
-            .expect("AcceptedBlockBundle contains a canonical block header");
-        Self::Header(
-            BlockHeader::from_bytes(header_bytes)
-                .expect("AcceptedBlockBundle contains a canonical BlockHeader"),
-        )
-    }
-
-    pub fn encode(&self) -> Vec<u8> {
-        let (tag, payload) = match self {
-            Self::Header(header) => {
-                let mut bytes = Vec::with_capacity(BLOCK_HEADER_WIRE_SIZE);
-                header.encode(&mut bytes);
-                (BLOCK_GOSSIP_HEADER, bytes)
-            }
-            Self::Complete(bundle) => (BLOCK_GOSSIP_COMPLETE, bundle.encode()),
-        };
-        let mut encoded = Vec::with_capacity(BLOCK_GOSSIP_FIXED_BYTES + payload.len());
-        encoded.extend_from_slice(&BLOCK_GOSSIP_MAGIC);
-        encoded.push(tag);
-        encoded.extend_from_slice(
-            &u32::try_from(payload.len())
-                .expect("bounded block gossip payload length fits u32")
-                .to_le_bytes(),
-        );
-        encoded.extend_from_slice(&payload);
-        encoded
-    }
-
-    pub fn decode(encoded: &[u8]) -> Result<Self, String> {
-        if encoded.len() < BLOCK_GOSSIP_FIXED_BYTES {
-            return Err("block gossip message is truncated".to_string());
-        }
-        if encoded[..4] != BLOCK_GOSSIP_MAGIC {
-            return Err("invalid block gossip magic/version".to_string());
-        }
-        let tag = encoded[4];
-        let payload_len = u32::from_le_bytes(encoded[5..9].try_into().unwrap()) as usize;
-        match tag {
-            BLOCK_GOSSIP_HEADER if payload_len != BLOCK_HEADER_WIRE_SIZE => {
-                return Err("block gossip header length is noncanonical".to_string());
-            }
-            BLOCK_GOSSIP_COMPLETE if payload_len > MAX_ACCEPTED_BLOCK_BUNDLE_BYTES => {
-                return Err("inline accepted-block bundle exceeds its wire cap".to_string());
-            }
-            BLOCK_GOSSIP_HEADER | BLOCK_GOSSIP_COMPLETE => {}
-            _ => return Err("block gossip tag is unknown".to_string()),
-        }
-        let expected = BLOCK_GOSSIP_FIXED_BYTES
-            .checked_add(payload_len)
-            .ok_or_else(|| "block gossip length overflow".to_string())?;
-        if encoded.len() != expected {
-            return Err("block gossip message length is noncanonical".to_string());
-        }
-        let payload = &encoded[BLOCK_GOSSIP_FIXED_BYTES..];
-        match tag {
-            BLOCK_GOSSIP_HEADER => BlockHeader::from_bytes(payload)
-                .map(Self::Header)
-                .map_err(|error| format!("block gossip header decode failed: {error:?}")),
-            BLOCK_GOSSIP_COMPLETE => AcceptedBlockBundle::decode(payload)
-                .map(Self::Complete)
-                .map_err(|error| format!("inline accepted-block bundle: {error}")),
-            _ => unreachable!("tag was validated"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // GossipSub topics
 // ---------------------------------------------------------------------------
 
@@ -463,68 +769,11 @@ pub struct NetworkTopics {
 impl NetworkTopics {
     pub fn for_network_cfg(cfg: &noid_chain::consensus::NetworkConfig) -> Self {
         Self {
-            // Network v2 gossips only the fixed header announcement. Large
+            // Network v7 gossips only the fixed header announcement. Large
             // bodies and terminals travel through exact-object pulls.
-            blocks: format!("{}/gossip/headers/2", cfg.p2p_protocol_id),
+            blocks: format!("{}/gossip/headers/3", cfg.p2p_protocol_id),
             txs: cfg.topic_txs.to_string(),
             protocol_id: cfg.p2p_protocol_id.to_string(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn bundle(height: u64) -> AcceptedBlockBundle {
-        let mut header = noid_chain::consensus::genesis_header();
-        header.height = height;
-        let block = noid_chain::Block {
-            header,
-            transactions: Vec::new(),
-        };
-        let mut terminal = Vec::new();
-        terminal.extend_from_slice(&noid_chain::HISTORY_STEP_TERMINAL_VERSION.to_le_bytes());
-        terminal.extend_from_slice(&height.to_le_bytes());
-        terminal.extend_from_slice(&noid_chain::block_header::semantic_header_id(&block.header));
-        terminal.push(1);
-        terminal.push(0xA5);
-        AcceptedBlockBundle::try_from_parts(block.to_bytes(), terminal).unwrap()
-    }
-
-    #[test]
-    fn gossip_round_trips_each_union_variant() {
-        let bundle = bundle(9);
-        let inline = BlockGossipMsg::from_bundle(bundle.clone(), true);
-        let decoded = BlockGossipMsg::decode(&inline.encode()).unwrap();
-        assert!(matches!(decoded, BlockGossipMsg::Complete(decoded) if decoded == bundle));
-
-        let announcement = BlockGossipMsg::from_bundle(bundle.clone(), false);
-        let decoded = BlockGossipMsg::decode(&announcement.encode()).unwrap();
-        assert!(matches!(decoded, BlockGossipMsg::Header(header)
-            if header.height == bundle.height()
-                && noid_chain::hash_block_header(&header) == bundle.block_hash()));
-    }
-
-    #[test]
-    fn gossip_has_no_partial_shape_or_unknown_tag() {
-        let mut header = BlockGossipMsg::from_bundle(bundle(9), false).encode();
-        header[4] = 2;
-        assert!(BlockGossipMsg::decode(&header).is_err());
-
-        let mut complete = BlockGossipMsg::from_bundle(bundle(9), true).encode();
-        complete.truncate(complete.len() - 1);
-        assert!(BlockGossipMsg::decode(&complete).is_err());
-    }
-
-    #[test]
-    fn gossip_rejects_bundle_length_bomb_before_decode() {
-        let mut encoded = BlockGossipMsg::from_bundle(bundle(9), true).encode();
-        encoded[5..9].copy_from_slice(
-            &u32::try_from(MAX_ACCEPTED_BLOCK_BUNDLE_BYTES + 1)
-                .unwrap()
-                .to_le_bytes(),
-        );
-        assert!(BlockGossipMsg::decode(&encoded).is_err());
     }
 }

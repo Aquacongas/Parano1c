@@ -21,7 +21,8 @@ use libp2p::{request_response, swarm::StreamProtocol};
 const REQUEST_MAGIC: [u8; 4] = *b"NHQ4";
 const RESPONSE_MAGIC: [u8; 4] = *b"NHB4";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
-const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 2 + 4;
+const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 4 + 8 + 32;
+const RESPONSE_HAS_SNAPSHOT_BOUNDARY: u8 = 1;
 const HEADER_COMPRESSION_LEVEL: i32 = 1;
 const HEADER_ZSTD_WINDOW_LOG_MAX: u32 = 21;
 /// Fixed bytes preceding the compressed inventory payload in one response.
@@ -88,13 +89,32 @@ impl request_response::Codec for HeaderSyncCodec {
         if header[..4] != RESPONSE_MAGIC {
             return Err(invalid_data("invalid header-sync response magic/version"));
         }
-        if header[6..8] != [0, 0] {
-            return Err(invalid_data("non-zero header-sync response reserved bytes"));
+        if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[7] != 0 {
+            return Err(invalid_data(
+                "invalid header-sync response flags/reserved byte",
+            ));
         }
         let count = u16::from_le_bytes(header[4..6].try_into().expect("fixed count"));
         validate_count(count)?;
         let compressed_len =
             u32::from_le_bytes(header[8..12].try_into().expect("fixed compressed length")) as usize;
+        let snapshot_height =
+            u64::from_le_bytes(header[12..20].try_into().expect("fixed snapshot height"));
+        let snapshot_hash: [u8; 32] = header[20..52].try_into().expect("fixed snapshot hash");
+        let snapshot_boundary = if header[6] & RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 {
+            if snapshot_height == 0 || snapshot_hash == [0; 32] {
+                return Err(invalid_data("invalid advertised snapshot boundary"));
+            }
+            Some(crate::object_protocol::ChainPoint::new(
+                snapshot_height,
+                snapshot_hash,
+            ))
+        } else {
+            if snapshot_height != 0 || snapshot_hash != [0; 32] {
+                return Err(invalid_data("noncanonical missing snapshot boundary"));
+            }
+            None
+        };
         let canonical_len = canonical_payload_len(count)?;
         validate_compressed_len(canonical_len, compressed_len)?;
 
@@ -122,7 +142,10 @@ impl request_response::Codec for HeaderSyncCodec {
                     .map_err(|_| invalid_data("header inventory decode failed"))?,
             );
         }
-        Ok(GetHeadersResponse { records })
+        Ok(GetHeadersResponse {
+            records,
+            snapshot_boundary,
+        })
     }
 
     async fn write_request<T>(
@@ -181,6 +204,14 @@ impl request_response::Codec for HeaderSyncCodec {
         response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
         response_header[4..6].copy_from_slice(&count.to_le_bytes());
         response_header[8..12].copy_from_slice(&compressed_len.to_le_bytes());
+        if let Some(boundary) = response.snapshot_boundary {
+            if boundary.height == 0 || boundary.hash == [0; 32] {
+                return Err(invalid_data("invalid outgoing snapshot boundary"));
+            }
+            response_header[6] = RESPONSE_HAS_SNAPSHOT_BOUNDARY;
+            response_header[12..20].copy_from_slice(&boundary.height.to_le_bytes());
+            response_header[20..52].copy_from_slice(&boundary.hash);
+        }
         io.write_all(&response_header).await?;
         io.write_all(&compressed).await
     }
@@ -348,8 +379,10 @@ mod tests {
 
     #[tokio::test]
     async fn response_round_trip_restores_exact_canonical_headers() {
+        let snapshot_boundary = crate::object_protocol::ChainPoint::new(42, [0xA5; 32]);
         let response = GetHeadersResponse {
             records: vec![fixture_record(1, 0x11), fixture_record(2, 0x22)],
+            snapshot_boundary: Some(snapshot_boundary),
         };
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
@@ -370,6 +403,7 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.records[0], fixture_record(1, 0x11));
         assert_eq!(decoded.records[1], fixture_record(2, 0x22));
+        assert_eq!(decoded.snapshot_boundary, Some(snapshot_boundary));
     }
 
     #[tokio::test]
@@ -381,6 +415,7 @@ mod tests {
                 &mut wire,
                 GetHeadersResponse {
                     records: vec![fixture_record(1, 1); MAX_HEADERS_PER_BATCH + 1],
+                    snapshot_boundary: None,
                 },
             )
             .await
@@ -440,7 +475,14 @@ mod tests {
         let expected = records.clone();
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
-            .write_response(&protocol(), &mut wire, GetHeadersResponse { records })
+            .write_response(
+                &protocol(),
+                &mut wire,
+                GetHeadersResponse {
+                    records,
+                    snapshot_boundary: None,
+                },
+            )
             .await
             .unwrap();
         assert!(

@@ -13,9 +13,9 @@ use noid_chain::consensus::wire_limits::{MAX_BLOCK_BYTES, MAX_HISTORY_STEP_TERMI
 use crate::{
     inbound_budget::process_global_inbound_budget,
     object_protocol::{
-        BlockBodyClaimId, BlockBodyObjectId, GetObjectsRequest, GetObjectsResponse, ObjectId,
-        ObjectPayload, TerminalClaimId, TerminalObjectId, MAX_OBJECTS_PER_REQUEST,
-        MAX_OBJECT_RESPONSE_PAYLOAD_BYTES,
+        BlockBodyClaimId, BlockBodyObjectId, DataResponseStatus, GetObjectsRequest,
+        GetObjectsResponse, ObjectId, ObjectPayload, TerminalClaimId, TerminalObjectId,
+        MAX_OBJECTS_PER_REQUEST, MAX_OBJECT_RESPONSE_PAYLOAD_BYTES,
     },
 };
 
@@ -103,7 +103,7 @@ impl request_response::Codec for ObjectCodec {
     where
         T: AsyncRead + Unpin + Send,
     {
-        let count = read_header(io, RESPONSE_MAGIC).await?;
+        let (count, status) = read_response_header(io).await?;
         let mut descriptors = Vec::new();
         descriptors
             .try_reserve_exact(count)
@@ -122,6 +122,11 @@ impl request_response::Codec for ObjectCodec {
             .collect::<Vec<_>>();
         validate_request(&ids)?;
         let payload_bytes = response_payload_len(&descriptors)?;
+        if matches!(status, DataResponseStatus::Busy { .. })
+            && descriptors.iter().any(|(_, available)| *available)
+        {
+            return Err(invalid_data("busy exact-object response carries payload"));
+        }
         let inbound_memory_permit = self.acquire_inbound(payload_bytes).await?;
 
         let mut objects = Vec::new();
@@ -153,6 +158,7 @@ impl request_response::Codec for ObjectCodec {
         }
         ensure_eof(io).await?;
         Ok(GetObjectsResponse {
+            status,
             objects,
             inbound_memory_permit,
             outbound_memory_permit: None,
@@ -186,6 +192,7 @@ impl request_response::Codec for ObjectCodec {
         T: AsyncWrite + Unpin + Send,
     {
         let GetObjectsResponse {
+            status,
             objects,
             inbound_memory_permit,
             outbound_memory_permit,
@@ -200,6 +207,14 @@ impl request_response::Codec for ObjectCodec {
             .map(|payload| (payload.object, payload.bytes.is_some()))
             .collect::<Vec<_>>();
         response_payload_len(&descriptors)?;
+        if !status.is_canonical() {
+            return Err(invalid_data("non-canonical exact-object response status"));
+        }
+        if matches!(status, DataResponseStatus::Busy { .. })
+            && objects.iter().any(|payload| payload.bytes.is_some())
+        {
+            return Err(invalid_data("busy exact-object response carries payload"));
+        }
         for payload in &objects {
             if let Some(bytes) = payload.bytes.as_deref() {
                 if !payload.object.matches_bytes(bytes) {
@@ -208,7 +223,7 @@ impl request_response::Codec for ObjectCodec {
             }
         }
 
-        write_header(io, RESPONSE_MAGIC, objects.len()).await?;
+        write_response_header(io, objects.len(), status).await?;
         for payload in &objects {
             write_object_id(io, payload.object).await?;
             io.write_all(&[if payload.bytes.is_some() {
@@ -333,6 +348,49 @@ async fn read_header<T: AsyncRead + Unpin>(io: &mut T, magic: [u8; 4]) -> io::Re
         return Err(invalid_data("exact-object count exceeds the fixed cap"));
     }
     Ok(count)
+}
+
+async fn read_response_header<T: AsyncRead + Unpin>(
+    io: &mut T,
+) -> io::Result<(usize, DataResponseStatus)> {
+    let mut header = [0u8; FIXED_HEADER_BYTES];
+    io.read_exact(&mut header).await?;
+    if header[..4] != RESPONSE_MAGIC {
+        return Err(invalid_data("invalid exact-object magic/version"));
+    }
+    let count = header[4] as usize;
+    if count == 0 || count > MAX_OBJECTS_PER_REQUEST {
+        return Err(invalid_data("exact-object count exceeds the fixed cap"));
+    }
+    let retry_after_ms = u16::from_le_bytes([header[6], header[7]]);
+    let status = match header[5] {
+        0 if retry_after_ms == 0 => DataResponseStatus::Ready,
+        1 => DataResponseStatus::Busy { retry_after_ms },
+        _ => return Err(invalid_data("invalid exact-object response status")),
+    };
+    if !status.is_canonical() {
+        return Err(invalid_data("non-canonical exact-object response status"));
+    }
+    Ok((count, status))
+}
+
+async fn write_response_header<T: AsyncWrite + Unpin>(
+    io: &mut T,
+    count: usize,
+    status: DataResponseStatus,
+) -> io::Result<()> {
+    if !status.is_canonical() {
+        return Err(invalid_data("non-canonical exact-object response status"));
+    }
+    let count = u8::try_from(count).map_err(|_| invalid_data("object count does not fit u8"))?;
+    let mut header = [0u8; FIXED_HEADER_BYTES];
+    header[..4].copy_from_slice(&RESPONSE_MAGIC);
+    header[4] = count;
+    if let DataResponseStatus::Busy { retry_after_ms } = status {
+        header[5] = 1;
+        header[6..8].copy_from_slice(&retry_after_ms.to_le_bytes());
+    }
+    io.write_all(&header).await
 }
 
 async fn write_header<T: AsyncWrite + Unpin>(
@@ -512,6 +570,7 @@ mod tests {
                 &protocol,
                 &mut response_wire,
                 GetObjectsResponse {
+                    status: DataResponseStatus::Ready,
                     objects: vec![
                         ObjectPayload {
                             object: first,
@@ -551,6 +610,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn busy_response_preserves_exact_ids_without_payload() {
+        let object = body(1, 1, b"body");
+        let protocol = StreamProtocol::new("/test");
+        let mut wire = futures::io::Cursor::new(Vec::new());
+        ObjectCodec::default()
+            .write_response(
+                &protocol,
+                &mut wire,
+                GetObjectsResponse {
+                    status: DataResponseStatus::Busy {
+                        retry_after_ms: 700,
+                    },
+                    objects: vec![ObjectPayload {
+                        object,
+                        bytes: None,
+                    }],
+                    inbound_memory_permit: None,
+                    outbound_memory_permit: None,
+                },
+            )
+            .await
+            .unwrap();
+        wire.set_position(0);
+        let response = ObjectCodec::default()
+            .read_response(&protocol, &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status,
+            DataResponseStatus::Busy {
+                retry_after_ms: 700
+            }
+        );
+        assert_eq!(response.objects[0].object, object);
+        assert!(response.objects[0].bytes.is_none());
+    }
+
+    #[tokio::test]
     async fn digest_mismatch_and_trailing_bytes_are_rejected() {
         let bytes = b"canonical".to_vec();
         let object = body(1, 1, &bytes);
@@ -562,6 +659,7 @@ mod tests {
                 &protocol,
                 &mut wire,
                 GetObjectsResponse {
+                    status: DataResponseStatus::Ready,
                     objects: vec![ObjectPayload {
                         object,
                         bytes: Some(bytes),

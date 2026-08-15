@@ -29,8 +29,8 @@ use noid_chain::wire::BLOCK_HEADER_WIRE_SIZE;
 use noid_chain::{hash_block_header, HeaderChainAnchor};
 
 const FILE_MAGIC: [u8; 8] = *b"NHSTAGE1";
-const FILE_VERSION: u32 = 1;
-const FILE_HEADER_SIZE: u64 = 8 + 4 + 4 + 8 + 32 + 32;
+const FILE_VERSION: u32 = 2;
+const FILE_HEADER_SIZE: u64 = 8 + 4 + 4 + 8 + 32 + 32 + 8;
 const RECORD_SIZE: usize = BLOCK_HEADER_WIRE_SIZE + 32 + 32;
 
 /// Matches the P2P header response cap.  Keeping this explicit prevents an
@@ -50,8 +50,10 @@ pub enum SnapshotHeaderStagingError {
     InvalidCandidate { height: u64, reason: String },
     #[error("snapshot header candidate rejected at h={height}: BadParentHash")]
     ParentMismatch { height: u64 },
-    #[error("snapshot header canonical conflict at h={height}: {reason}")]
-    CanonicalConflict { height: u64, reason: String },
+    #[error("snapshot header canonical base moved at h={height}: {reason}")]
+    CanonicalBaseMoved { height: u64, reason: String },
+    #[error("snapshot header canonical-store invariant failed at h={height}: {reason}")]
+    CanonicalInvariant { height: u64, reason: String },
     #[error("validated snapshot header staging changed before atomic install: {0}")]
     VerifiedFileChanged(&'static str),
     #[error("snapshot header staging is poisoned by a failed durable write; reopen it")]
@@ -60,37 +62,88 @@ pub enum SnapshotHeaderStagingError {
 
 type Result<T> = std::result::Result<T, SnapshotHeaderStagingError>;
 
+/// Distinguish an ordinary non-final canonical movement from a broken durable
+/// invariant. A non-final base may legitimately change while snapshot headers
+/// are staged; finalized canonical rows may not disappear or disagree.
+fn canonical_source_error(
+    height: u64,
+    finalized_height_at_pin: u64,
+    reason: impl Into<String>,
+) -> SnapshotHeaderStagingError {
+    let reason = reason.into();
+    if height > finalized_height_at_pin {
+        SnapshotHeaderStagingError::CanonicalBaseMoved { height, reason }
+    } else {
+        SnapshotHeaderStagingError::CanonicalInvariant { height, reason }
+    }
+}
+
 /// Immutable canonical boundary from which one candidate suffix is built.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 pub struct CanonicalHeaderBoundary {
     pub header: BlockHeader,
     pub block_hash: [u8; 32],
     pub cumulative_chainwork: [u8; 32],
+    finalized_height_at_pin: u64,
 }
+
+impl PartialEq for CanonicalHeaderBoundary {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header
+            && self.block_hash == other.block_hash
+            && self.cumulative_chainwork == other.cumulative_chainwork
+    }
+}
+
+impl Eq for CanonicalHeaderBoundary {}
 
 impl CanonicalHeaderBoundary {
     /// Load a boundary which is backed by the canonical header-anchor table.
     /// Merely finding a loose header row is not sufficient authority.
     pub fn load(store: &MdbxStore, height: u64) -> Result<Self> {
+        let finalized_height_at_pin = store
+            .get_consensus_meta()
+            .map_err(store_error)?
+            .ok_or_else(|| SnapshotHeaderStagingError::CanonicalInvariant {
+                height,
+                reason: "canonical consensus metadata is missing".into(),
+            })?
+            .finalized
+            .height;
+        Self::load_with_pinned_finality(store, height, finalized_height_at_pin)
+    }
+
+    fn load_with_pinned_finality(
+        store: &MdbxStore,
+        height: u64,
+        finalized_height_at_pin: u64,
+    ) -> Result<Self> {
         let header = store
             .get_header(height)
             .map_err(store_error)?
-            .ok_or_else(|| SnapshotHeaderStagingError::CanonicalConflict {
-                height,
-                reason: "canonical base header is missing".into(),
+            .ok_or_else(|| {
+                canonical_source_error(
+                    height,
+                    finalized_height_at_pin,
+                    "canonical base header is missing",
+                )
             })?;
         let block_hash = hash_block_header(&header);
         let cumulative_chainwork = store
             .get_chain_work(height)
             .map_err(store_error)?
-            .ok_or_else(|| SnapshotHeaderStagingError::CanonicalConflict {
-                height,
-                reason: "canonical base chainwork is missing".into(),
+            .ok_or_else(|| {
+                canonical_source_error(
+                    height,
+                    finalized_height_at_pin,
+                    "canonical base chainwork is missing",
+                )
             })?;
         let boundary = Self {
             header,
             block_hash,
             cumulative_chainwork,
+            finalized_height_at_pin,
         };
         boundary.validate_against(store)?;
         Ok(boundary)
@@ -98,13 +151,12 @@ impl CanonicalHeaderBoundary {
 
     fn validate_against(&self, store: &MdbxStore) -> Result<()> {
         if self.header.height == u64::MAX {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
-                height: self.header.height,
-                reason: "canonical base has no representable child height".into(),
-            });
+            return Err(SnapshotHeaderStagingError::Format(
+                "canonical base has no representable child height",
+            ));
         }
         if hash_block_header(&self.header) != self.block_hash {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
+            return Err(SnapshotHeaderStagingError::CanonicalInvariant {
                 height: self.header.height,
                 reason: "base header does not match its claimed hash".into(),
             });
@@ -112,25 +164,30 @@ impl CanonicalHeaderBoundary {
         let stored_header = store
             .get_header(self.header.height)
             .map_err(store_error)?
-            .ok_or_else(|| SnapshotHeaderStagingError::CanonicalConflict {
-                height: self.header.height,
-                reason: "canonical base header disappeared".into(),
+            .ok_or_else(|| {
+                canonical_source_error(
+                    self.header.height,
+                    self.finalized_height_at_pin,
+                    "canonical base header disappeared",
+                )
             })?;
         if stored_header != self.header {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
-                height: self.header.height,
-                reason: "canonical base header changed".into(),
-            });
+            return Err(canonical_source_error(
+                self.header.height,
+                self.finalized_height_at_pin,
+                "canonical base header changed",
+            ));
         }
         if store
             .get_chain_work(self.header.height)
             .map_err(store_error)?
             != Some(self.cumulative_chainwork)
         {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
-                height: self.header.height,
-                reason: "canonical base chainwork changed".into(),
-            });
+            return Err(canonical_source_error(
+                self.header.height,
+                self.finalized_height_at_pin,
+                "canonical base chainwork changed",
+            ));
         }
         let expected_anchor = HeaderChainAnchor {
             height: self.header.height,
@@ -148,10 +205,11 @@ impl CanonicalHeaderBoundary {
             .map_err(store_error)?
             != Some(expected_anchor)
         {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
-                height: self.header.height,
-                reason: "canonical base header anchor is missing or inconsistent".into(),
-            });
+            return Err(canonical_source_error(
+                self.header.height,
+                self.finalized_height_at_pin,
+                "canonical base header anchor is missing or inconsistent",
+            ));
         }
         Ok(())
     }
@@ -245,7 +303,7 @@ impl SnapshotHeaderStaging {
             .map_err(store_error)?
             .is_some()
         {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
+            return Err(SnapshotHeaderStagingError::CanonicalBaseMoved {
                 height: first_missing,
                 reason: "candidate base is not immediately before the first missing header".into(),
             });
@@ -287,14 +345,19 @@ impl SnapshotHeaderStaging {
     pub fn open(path: &Path, store: &MdbxStore) -> Result<Self> {
         let mut file = secure_open_existing(path)?;
         let encoded_base = read_file_header(&mut file)?;
-        let base = CanonicalHeaderBoundary::load(store, encoded_base.height)?;
+        let base = CanonicalHeaderBoundary::load_with_pinned_finality(
+            store,
+            encoded_base.height,
+            encoded_base.finalized_height_at_pin,
+        )?;
         if base.block_hash != encoded_base.block_hash
             || base.cumulative_chainwork != encoded_base.cumulative_chainwork
         {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
-                height: base.header.height,
-                reason: "staging file is pinned to a different canonical base".into(),
-            });
+            return Err(canonical_source_error(
+                base.header.height,
+                encoded_base.finalized_height_at_pin,
+                "staging file is pinned to a different canonical base",
+            ));
         }
 
         let len = file.metadata()?.len();
@@ -541,13 +604,20 @@ impl SnapshotHeaderStaging {
                 .saturating_add(1) as usize,
         );
         for height in first_recent..=boundary.tip_header.height {
-            recent_headers.push(self.header_at(store, height)?.ok_or(
-                SnapshotHeaderStagingError::CanonicalConflict {
-                    height,
-                    reason:
-                        "header required by the post-snapshot consensus window is missing".into(),
-                },
-            )?);
+            let header = self.header_at(store, height)?.ok_or_else(|| {
+                if height <= self.base.header.height {
+                    canonical_source_error(
+                        height,
+                        self.base.finalized_height_at_pin,
+                        "header required by the post-snapshot consensus window is missing",
+                    )
+                } else {
+                    SnapshotHeaderStagingError::Format(
+                        "staged post-snapshot consensus-window header is missing",
+                    )
+                }
+            })?;
+            recent_headers.push(header);
         }
         if StagingFileIdentity::capture(&self.file)? != sealed_identity {
             return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
@@ -600,9 +670,16 @@ impl SnapshotHeaderStaging {
         let mut window = VecDeque::with_capacity(max_window);
         for height in start..=tip_height {
             let header = self.header_at(store, height)?.ok_or_else(|| {
-                SnapshotHeaderStagingError::CanonicalConflict {
-                    height,
-                    reason: "header needed by the bounded consensus window is missing".into(),
+                if height <= self.base.header.height {
+                    canonical_source_error(
+                        height,
+                        self.base.finalized_height_at_pin,
+                        "header needed by the bounded consensus window is missing",
+                    )
+                } else {
+                    SnapshotHeaderStagingError::Format(
+                        "staged bounded consensus-window header is missing",
+                    )
                 }
             })?;
             window.push_back(header);
@@ -622,11 +699,11 @@ impl SnapshotHeaderStaging {
         if encoded_base.height != self.base.header.height
             || encoded_base.block_hash != self.base.block_hash
             || encoded_base.cumulative_chainwork != self.base.cumulative_chainwork
+            || encoded_base.finalized_height_at_pin != self.base.finalized_height_at_pin
         {
-            return Err(SnapshotHeaderStagingError::CanonicalConflict {
-                height: self.base.header.height,
-                reason: "staging file base header changed".into(),
-            });
+            return Err(SnapshotHeaderStagingError::VerifiedFileChanged(
+                "staging file base header changed",
+            ));
         }
         let mut content_hasher = initial_content_hasher(&self.base);
         let mut window = self.load_canonical_window(store)?;
@@ -693,9 +770,12 @@ impl SnapshotHeaderStaging {
             let header = store
                 .get_header(height)
                 .map_err(store_error)?
-                .ok_or_else(|| SnapshotHeaderStagingError::CanonicalConflict {
-                    height,
-                    reason: "canonical consensus-window header is missing".into(),
+                .ok_or_else(|| {
+                    canonical_source_error(
+                        height,
+                        self.base.finalized_height_at_pin,
+                        "canonical consensus-window header is missing",
+                    )
                 })?;
             window.push_back(header);
         }
@@ -894,12 +974,16 @@ pub fn validate_bounded_header_extension(
     let start = ancestor_height.saturating_sub(max_window as u64 - 1);
     let mut window = VecDeque::with_capacity(max_window);
     for height in start..=ancestor_height {
-        let header = store.get_header(height).map_err(store_error)?.ok_or(
-            SnapshotHeaderStagingError::CanonicalConflict {
-                height,
-                reason: "canonical consensus-window header is missing".into(),
-            },
-        )?;
+        let header = store
+            .get_header(height)
+            .map_err(store_error)?
+            .ok_or_else(|| {
+                canonical_source_error(
+                    height,
+                    base.finalized_height_at_pin,
+                    "canonical consensus-window header is missing",
+                )
+            })?;
         window.push_back(header);
     }
 
@@ -1000,6 +1084,7 @@ fn encode_file_header(base: &CanonicalHeaderBoundary) -> [u8; FILE_HEADER_SIZE a
     encoded[16..24].copy_from_slice(&base.header.height.to_le_bytes());
     encoded[24..56].copy_from_slice(&base.block_hash);
     encoded[56..88].copy_from_slice(&base.cumulative_chainwork);
+    encoded[88..96].copy_from_slice(&base.finalized_height_at_pin.to_le_bytes());
     encoded
 }
 
@@ -1014,6 +1099,7 @@ struct EncodedBase {
     height: u64,
     block_hash: [u8; 32],
     cumulative_chainwork: [u8; 32],
+    finalized_height_at_pin: u64,
 }
 
 fn read_file_header(file: &mut File) -> Result<EncodedBase> {
@@ -1036,12 +1122,15 @@ fn read_file_header(file: &mut File) -> Result<EncodedBase> {
     let height = u64::from_le_bytes(bytes[16..24].try_into().expect("fixed range"));
     let block_hash = bytes[24..56].try_into().expect("fixed range");
     let cumulative_chainwork = bytes[56..88].try_into().expect("fixed range");
+    let finalized_height_at_pin =
+        u64::from_le_bytes(bytes[88..96].try_into().expect("fixed range"));
     // The header itself is deliberately sourced from canonical MDBX during
     // `open`; only its identity and work are persisted in this untrusted file.
     Ok(EncodedBase {
         height,
         block_hash,
         cumulative_chainwork,
+        finalized_height_at_pin,
     })
 }
 
@@ -1170,6 +1259,18 @@ mod tests {
     use noid_chain::consensus::params::BLOCK_TIME;
     use std::sync::OnceLock;
 
+    #[test]
+    fn canonical_movement_is_classified_against_pinned_finality() {
+        assert!(matches!(
+            canonical_source_error(11, 10, "moved"),
+            SnapshotHeaderStagingError::CanonicalBaseMoved { height: 11, .. }
+        ));
+        assert!(matches!(
+            canonical_source_error(10, 10, "broken"),
+            SnapshotHeaderStagingError::CanonicalInvariant { height: 10, .. }
+        ));
+    }
+
     fn occupancy_header(height: u64, active_slot_count: u64) -> BlockHeader {
         let mut header = genesis_header();
         header.height = height;
@@ -1229,7 +1330,7 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    nonce: 605_382,
+                    nonce: 39_433,
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
@@ -1286,7 +1387,7 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        .into_block(115_409)
+        .into_block(294_184)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a
@@ -1374,6 +1475,10 @@ mod tests {
         let reopened = SnapshotHeaderStaging::open(&path, store).unwrap();
         assert_eq!(reopened.staged_len(), 1);
         assert_eq!(reopened.next_height().unwrap(), 2);
+        assert_eq!(
+            reopened.base.finalized_height_at_pin,
+            base.finalized_height_at_pin
+        );
     }
 
     #[test]
@@ -1518,7 +1623,7 @@ mod tests {
             SnapshotHeaderStaging::create(&stage_dir.path().join("ordinary"), store, genesis_base);
         assert!(matches!(
             ordinary,
-            Err(SnapshotHeaderStagingError::CanonicalConflict { height: 1, .. })
+            Err(SnapshotHeaderStagingError::CanonicalBaseMoved { height: 1, .. })
         ));
         let exact = SnapshotHeaderStaging::create_at_canonical_boundary(
             &stage_dir.path().join("exact"),

@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Build-authenticated embedded `HistoryStep` release pack.
+//! Preflight-authenticated embedded `HistoryStep` release pack.
 //!
 //! Development builds may contain no pack.  Official release builds contain
 //! one pinned runtime-metadata artifact and the two canonical class
-//! matrices, all authenticated by `build.rs` before rustc embeds them. The
-//! packed runtime layout is derived once per release into the node's local
-//! runtime cache directory.
+//! matrices from that approved pack. `build.rs` only stages those bytes; the
+//! expensive semantic authentication is an explicit pack-preflight step and
+//! is not repeated for every executable. The packed runtime layout is derived
+//! once per release into the node's local runtime cache directory.
 
 use noid_miner::{
     EmbeddedHistoryStepMatrixError, EmbeddedHistoryStepMatrixLeaf, EmbeddedHistoryStepMatrixSource,
@@ -33,8 +34,8 @@ impl EmbeddedHistoryStepPack {
         &self,
         runtime_cache_directory: Option<std::path::PathBuf>,
     ) -> Result<EmbeddedHistoryStepMatrixSource, EmbeddedHistoryStepMatrixError> {
-        // SAFETY: this private pack is emitted only by `noid_node/build.rs`,
-        // which authenticates every pinned canonical leaf.
+        // SAFETY: this private pack is emitted only from the canonical pack
+        // accepted by the explicit release preflight.
         let source = unsafe { EmbeddedHistoryStepMatrixSource::from_release_build(self.leaves) }?;
         Ok(match runtime_cache_directory {
             Some(directory) => source.with_runtime_cache(directory),
@@ -78,7 +79,7 @@ mod tests {
             );
             assert!(!leaf.compressed_canonical().is_empty());
             assert!(leaf.build_seal().canonical_bytes() > 0);
-            assert!(leaf.build_seal().canonical_bytes() > 0);
+            assert_ne!(leaf.build_seal().statement_digest(), [0; 32]);
         }
     }
 }

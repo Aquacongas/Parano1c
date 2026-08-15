@@ -19,7 +19,7 @@ struct HealthLease {
 
 #[derive(Clone, Copy, Debug)]
 struct FrontierLease {
-    confirmed_ancestor: ChainPoint,
+    authorized_parent: ChainPoint,
     expires_at_ms: u64,
 }
 
@@ -72,10 +72,22 @@ impl MiningReadiness {
         self.unresolved_better_header = unresolved_better_header;
     }
 
-    /// A normal commit changes the next template parent. It does not erase
-    /// authenticated connectivity or publish a false network-health collapse.
+    /// A normal canonical child preserves the network view which authorized
+    /// its parent. A branch replacement revokes it. This matches ordinary
+    /// node mining: a locally accepted child does not require a peer to echo
+    /// the new hash before nonce search may continue.
     pub fn set_committed_tip(&mut self, tip: ChainPoint, extends_previous: bool) {
-        if !extends_previous {
+        if extends_previous {
+            let previous_parent = self.template_parent;
+            self.frontier.retain(|_, lease| {
+                if lease.authorized_parent == previous_parent {
+                    lease.authorized_parent = tip;
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
             self.frontier.clear();
         }
         self.committed_tip = tip;
@@ -132,7 +144,7 @@ impl MiningReadiness {
         self.frontier.insert(
             peer,
             FrontierLease {
-                confirmed_ancestor: parent,
+                authorized_parent: parent,
                 expires_at_ms: expires_at_ms.min(health.expires_at_ms),
             },
         );
@@ -176,7 +188,7 @@ impl MiningReadiness {
             .filter_map(|(peer, health)| {
                 self.frontier.get(peer).and_then(|lease| {
                     (lease.expires_at_ms > now_ms
-                        && lease.confirmed_ancestor.height <= self.committed_tip.height)
+                        && lease.authorized_parent == self.template_parent)
                         .then_some(health.failure_domain)
                 })
             })
@@ -233,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_child_preserves_ancestry_authority() {
+    fn ordinary_canonical_child_preserves_mining_authorization() {
         let (mut readiness, first, second) = ready_fixture();
         assert!(readiness.snapshot(0).nonce_search_ready);
 
@@ -243,14 +255,8 @@ mod tests {
         assert!(after_commit.proof_build_ready);
         assert_eq!(after_commit.frontier_authorizations, 2);
         assert!(after_commit.nonce_search_ready);
-        assert_eq!(
-            readiness.frontier.get(&first).unwrap().confirmed_ancestor,
-            point(10)
-        );
-        assert_eq!(
-            readiness.frontier.get(&second).unwrap().confirmed_ancestor,
-            point(10)
-        );
+        assert!(!readiness.authorize_frontier(first, point(10), 100, 0));
+        assert!(!readiness.authorize_frontier(second, point(10), 100, 0));
     }
 
     #[test]

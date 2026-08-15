@@ -2878,17 +2878,36 @@ mod split_walk_a_layout_tests {
             let mut malformed = committed.clone();
             malformed[column][slot] += F128::ONE;
             let malformed_refs = malformed.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            let mut prover = FsLaneChallenger::new(domain);
-            let (proof, _) = prove_merkle_union_with_challenger(
-                w_log,
-                &fixed,
-                &[0, 1, 2, 3],
-                &families,
-                &malformed_refs,
-                &columns.s0,
-                &columns.s_out,
-                &mut prover,
-            );
+            let proof = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut prover = FsLaneChallenger::new(domain);
+                prove_merkle_union_with_challenger(
+                    w_log,
+                    &fixed,
+                    &[0, 1, 2, 3],
+                    &families,
+                    &malformed_refs,
+                    &columns.s0,
+                    &columns.s_out,
+                    &mut prover,
+                )
+                .0
+            })) {
+                Ok(proof) => proof,
+                Err(payload) => {
+                    let message = payload
+                        .downcast_ref::<String>()
+                        .map(String::as_str)
+                        .or_else(|| payload.downcast_ref::<&'static str>().copied())
+                        .unwrap_or_default();
+                    if message.contains("relation prover-side round mismatch") {
+                        // Debug builds reject a dishonest witness before it can
+                        // produce an invalid proof. Release builds exercise the
+                        // verifier-side Zero rejection below.
+                        continue;
+                    }
+                    std::panic::resume_unwind(payload);
+                }
+            };
             let mut verifier = FsLaneChallenger::new(domain);
             assert!(
                 matches!(

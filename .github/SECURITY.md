@@ -4,10 +4,10 @@
 
 | Release line | Security support |
 |---|---|
-| `0.1.x` | Supported |
-| `0.0.x` and earlier | Unsupported |
+| `2.0.x` public testnet | Supported |
+| Withdrawn pre-v2 releases | Unsupported |
 
-Security fixes are published for the current mainnet release line. Node
+Security fixes are published for the current public-testnet release line. Node
 operators and wallet users should run its latest patch release.
 
 ## Reporting a vulnerability

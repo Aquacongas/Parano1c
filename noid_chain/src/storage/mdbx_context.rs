@@ -124,6 +124,44 @@ impl From<ConsensusError> for MdbxContextError {
     }
 }
 
+/// Failure while atomically installing a preverified recursive suffix.
+///
+/// `body_index` is present only when validation actually entered that exact
+/// replacement body. Preflight fork-choice races, canonical-view changes and
+/// database failures deliberately carry no peer attribution.
+#[derive(Debug)]
+pub struct IndexedReorgSuffixError {
+    pub body_index: Option<usize>,
+    pub error: MdbxContextError,
+}
+
+impl std::fmt::Display for IndexedReorgSuffixError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for IndexedReorgSuffixError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<MdbxContextError> for IndexedReorgSuffixError {
+    fn from(error: MdbxContextError) -> Self {
+        Self {
+            body_index: None,
+            error,
+        }
+    }
+}
+
+impl From<StoreError> for IndexedReorgSuffixError {
+    fn from(error: StoreError) -> Self {
+        MdbxContextError::Store(error).into()
+    }
+}
+
 /// One block's claim that a terminal attests its own HistoryStep.
 ///
 /// `noid_chain` resolves the canonical headers the native verifier must bind
@@ -139,6 +177,72 @@ pub struct HistoryStepTerminalClaim<'a> {
     pub header: BlockHeader,
     /// Canonical transaction-epoch anchor header for height C.
     pub epoch_anchor_header: BlockHeader,
+}
+
+/// Non-cloneable proof that one exact terminal passed the pinned recursive
+/// verifier for its sealed tip and transaction-epoch anchor. Canonical base
+/// and fork-choice checks intentionally happen later when a chain context
+/// consumes this capability under the sole-writer boundary.
+#[derive(Debug)]
+pub struct VerifiedHistoryStepTerminal {
+    tip_header: BlockHeader,
+    epoch_anchor_header: BlockHeader,
+    terminal_bytes: Vec<u8>,
+}
+
+/// Perform the expensive recursive verification without holding the mutable
+/// chain lock. The returned capability cannot commit anything by itself.
+pub fn verify_history_step_terminal_candidate<A>(
+    tip_header: BlockHeader,
+    epoch_anchor_header: BlockHeader,
+    terminal_bytes: Vec<u8>,
+    verify_history_step_terminal: A,
+) -> Result<VerifiedHistoryStepTerminal, MdbxContextError>
+where
+    A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
+{
+    if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        return Err(MdbxContextError::Consensus(
+            ConsensusError::BadHistoryStepTerminal(
+                "recursive suffix terminal exceeds the wire cap".to_string(),
+            ),
+        ));
+    }
+    let expected_epoch_height = tx_epoch_anchor_height_for_child(tip_header.height);
+    if epoch_anchor_header.height != expected_epoch_height {
+        return Err(MdbxContextError::Consensus(
+            ConsensusError::BadHistoryStepTerminal(
+                "recursive suffix terminal epoch anchor is invalid".to_string(),
+            ),
+        ));
+    }
+    let metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(&terminal_bytes)
+        .map_err(|error| {
+            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(format!(
+                "recursive suffix terminal metadata is invalid: {error}"
+            )))
+        })?;
+    if metadata.terminal_height() != tip_header.height
+        || metadata.terminal_hash() != crate::block_header::semantic_header_id(&tip_header)
+    {
+        return Err(MdbxContextError::Consensus(
+            ConsensusError::BadHistoryStepTerminal(
+                "recursive suffix terminal does not bind its sealed tip".to_string(),
+            ),
+        ));
+    }
+    verify_history_step_terminal(&HistoryStepTerminalClaim {
+        terminal_bytes: &terminal_bytes,
+        header: tip_header,
+        epoch_anchor_header,
+    })
+    .map_err(|error| MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(error)))?;
+
+    Ok(VerifiedHistoryStepTerminal {
+        tip_header,
+        epoch_anchor_header,
+        terminal_bytes,
+    })
 }
 
 /// Non-cloneable authority for one exact linked snapshot suffix.
@@ -1574,11 +1678,33 @@ impl MdbxChainContext {
     /// branch; only the fully validated replacement reaches MDBX.
     pub fn apply_verified_reorg_suffix_with_applier<F, E>(
         &mut self,
+        authority: VerifiedReorgSuffix,
+        replacement: &[Vec<u8>],
+        local_time: u64,
+        materialize_state: F,
+    ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError>
+    where
+        F: FnMut(&Block, &mut ChainState) -> Result<[u8; 32], E>,
+        E: std::fmt::Display,
+    {
+        self.apply_verified_reorg_suffix_with_applier_indexed(
+            authority,
+            replacement,
+            local_time,
+            materialize_state,
+        )
+        .map_err(|failure| failure.error)
+    }
+
+    /// Indexed variant used by the network admission path to quarantine only
+    /// the source of an exact body that actually failed native application.
+    pub fn apply_verified_reorg_suffix_with_applier_indexed<F, E>(
+        &mut self,
         mut authority: VerifiedReorgSuffix,
         replacement: &[Vec<u8>],
         local_time: u64,
         mut materialize_state: F,
-    ) -> Result<crate::consensus::reorg::ReorgResult, MdbxContextError>
+    ) -> Result<crate::consensus::reorg::ReorgResult, IndexedReorgSuffixError>
     where
         F: FnMut(&Block, &mut ChainState) -> Result<[u8; 32], E>,
         E: std::fmt::Display,
@@ -1587,19 +1713,18 @@ impl MdbxChainContext {
             || self.tip_hash != authority.original_tip_hash
             || self.finalized != authority.original_finalized
         {
-            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash).into());
         }
         if replacement.is_empty() {
-            return Err(MdbxContextError::Corrupt(
-                "recursive reorg replacement is empty",
-            ));
+            return Err(MdbxContextError::Corrupt("recursive reorg replacement is empty").into());
         }
         if replacement.len() > MAX_REORG_REPLACEMENT_BLOCKS {
             return Err(MdbxContextError::ResourceLimit {
                 resource: "recursive reorg bodies",
                 actual: replacement.len(),
                 maximum: MAX_REORG_REPLACEMENT_BLOCKS,
-            });
+            }
+            .into());
         }
 
         let ancestor_height = authority.suffix.boundary_height;
@@ -1610,7 +1735,7 @@ impl MdbxChainContext {
                 ))?;
         let ancestor_hash = block_id(&ancestor_header);
         if ancestor_hash != authority.suffix.previous_hash {
-            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash).into());
         }
         let mut expected_height = ancestor_height.saturating_add(1);
         let mut previous_hash = ancestor_hash;
@@ -1620,14 +1745,19 @@ impl MdbxChainContext {
                 .ok_or(MdbxContextError::Corrupt(
                     "reorg ancestor chainwork disappeared",
                 ))?;
-        for body_bytes in replacement {
-            let block = Block::from_bytes(body_bytes)
-                .map_err(|_| MdbxContextError::Corrupt("recursive reorg body is malformed"))?;
+        for (index, body_bytes) in replacement.iter().enumerate() {
+            let block = Block::from_bytes(body_bytes).map_err(|_| IndexedReorgSuffixError {
+                body_index: Some(index),
+                error: MdbxContextError::Corrupt("recursive reorg body is malformed"),
+            })?;
             if block.header.height != expected_height
                 || block.header.prev_block_hash != previous_hash
                 || block.header.height > authority.suffix.tip_header.height
             {
-                return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+                return Err(IndexedReorgSuffixError {
+                    body_index: Some(index),
+                    error: MdbxContextError::Consensus(ConsensusError::BadParentHash),
+                });
             }
             previous_hash = block_id(&block.header);
             candidate_work = add_work(
@@ -1643,15 +1773,19 @@ impl MdbxChainContext {
                 .last()
                 .expect("non-empty recursive reorg was checked"),
         )
-        .map_err(|_| MdbxContextError::Corrupt("recursive reorg tip body is malformed"))?;
+        .map_err(|_| IndexedReorgSuffixError {
+            body_index: Some(replacement.len() - 1),
+            error: MdbxContextError::Corrupt("recursive reorg tip body is malformed"),
+        })?;
         if final_block.header != authority.suffix.tip_header
             || previous_hash != authority.suffix.tip_hash()
         {
-            return Err(MdbxContextError::Consensus(
-                ConsensusError::BadHistoryStepTerminal(
+            return Err(IndexedReorgSuffixError {
+                body_index: Some(replacement.len() - 1),
+                error: MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(
                     "recursive reorg bodies do not end at the verified tip".to_string(),
-                ),
-            ));
+                )),
+            });
         }
         if !matches!(
             crate::consensus::fork_choice::choose_chain_by_work(
@@ -1662,7 +1796,7 @@ impl MdbxChainContext {
             ),
             crate::consensus::fork_choice::ChainChoice::A
         ) {
-            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
+            return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash).into());
         }
 
         // Keep the commit payload independent from the linearly consumed
@@ -1690,21 +1824,31 @@ impl MdbxChainContext {
             })
             .collect();
 
-        let result = self.apply_reorg_mdbx_with_objects(
-            ancestor_height,
-            &replacement_objects,
-            local_time,
-            |context, index, time| {
-                context
-                    .apply_verified_recursive_suffix_block(
-                        &mut authority.suffix,
-                        &replacement[index],
-                        time,
-                        |block, state| materialize_state(block, state),
-                    )
-                    .map(|_| ())
-            },
-        )?;
+        let failed_body_index = std::cell::Cell::new(None);
+        let result = self
+            .apply_reorg_mdbx_with_objects(
+                ancestor_height,
+                &replacement_objects,
+                local_time,
+                |context, index, time| {
+                    let result = context
+                        .apply_verified_recursive_suffix_block(
+                            &mut authority.suffix,
+                            &replacement[index],
+                            time,
+                            |block, state| materialize_state(block, state),
+                        )
+                        .map(|_| ());
+                    if result.is_err() {
+                        failed_body_index.set(Some(index));
+                    }
+                    result
+                },
+            )
+            .map_err(|error| IndexedReorgSuffixError {
+                body_index: failed_body_index.get(),
+                error,
+            })?;
         debug_assert!(authority.suffix.is_complete());
         debug_assert_eq!(self.tip_chain_work, candidate_work);
         Ok(result)
@@ -2231,38 +2375,23 @@ impl MdbxChainContext {
         ))
     }
 
-    fn verify_recursive_terminal_from_boundary<A>(
+    fn authorize_recursive_terminal_from_boundary(
         &self,
         boundary_height: u64,
         boundary_hash: [u8; 32],
-        tip_header: BlockHeader,
-        epoch_anchor_header: BlockHeader,
-        terminal_bytes: Vec<u8>,
-        verify_history_step_terminal: A,
-    ) -> Result<VerifiedRecursiveSuffix, MdbxContextError>
-    where
-        A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
-    {
+        verified: VerifiedHistoryStepTerminal,
+    ) -> Result<VerifiedRecursiveSuffix, MdbxContextError> {
+        let VerifiedHistoryStepTerminal {
+            tip_header,
+            epoch_anchor_header,
+            terminal_bytes,
+        } = verified;
         if tip_header.height <= boundary_height {
             return Err(MdbxContextError::Corrupt(
                 "recursive suffix tip does not advance its exact boundary",
             ));
         }
-        if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
-            return Err(MdbxContextError::Consensus(
-                ConsensusError::BadHistoryStepTerminal(
-                    "recursive suffix terminal exceeds the wire cap".to_string(),
-                ),
-            ));
-        }
         let expected_epoch_height = tx_epoch_anchor_height_for_child(tip_header.height);
-        if epoch_anchor_header.height != expected_epoch_height {
-            return Err(MdbxContextError::Consensus(
-                ConsensusError::BadHistoryStepTerminal(
-                    "recursive suffix terminal epoch anchor is invalid".to_string(),
-                ),
-            ));
-        }
         if expected_epoch_height <= boundary_height {
             let canonical_epoch_anchor = self.get_header_from_store(expected_epoch_height)?.ok_or(
                 MdbxContextError::Corrupt("recursive suffix canonical epoch anchor is missing"),
@@ -2281,31 +2410,6 @@ impl MdbxChainContext {
                 ),
             ));
         }
-        let metadata =
-            crate::history_step::HistoryStepTerminalMetadata::decode_prefix(&terminal_bytes)
-                .map_err(|error| {
-                    MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(format!(
-                        "recursive suffix terminal metadata is invalid: {error}"
-                    )))
-                })?;
-        if metadata.terminal_height() != tip_header.height
-            || metadata.terminal_hash() != crate::block_header::semantic_header_id(&tip_header)
-        {
-            return Err(MdbxContextError::Consensus(
-                ConsensusError::BadHistoryStepTerminal(
-                    "recursive suffix terminal does not bind its sealed tip".to_string(),
-                ),
-            ));
-        }
-        verify_history_step_terminal(&HistoryStepTerminalClaim {
-            terminal_bytes: &terminal_bytes,
-            header: tip_header,
-            epoch_anchor_header,
-        })
-        .map_err(|error| {
-            MdbxContextError::Consensus(ConsensusError::BadHistoryStepTerminal(error))
-        })?;
-
         Ok(VerifiedRecursiveSuffix {
             boundary_height,
             tip_header,
@@ -2344,15 +2448,32 @@ impl MdbxChainContext {
                 "recursive suffix tip does not advance the canonical boundary",
             ));
         }
-        let boundary_height = self.tip_height;
-        let boundary_hash = self.tip_hash;
-        let authority = self.verify_recursive_terminal_from_boundary(
-            boundary_height,
-            boundary_hash,
+        let verified = verify_history_step_terminal_candidate(
             tip_header,
             epoch_anchor_header,
             terminal_bytes,
             verify_history_step_terminal,
+        )?;
+        self.begin_preverified_recursive_suffix(verified)
+    }
+
+    /// Consume an already verified terminal under the current canonical base
+    /// and persist its crash-recovery authority before body application.
+    pub fn begin_preverified_recursive_suffix(
+        &mut self,
+        verified: VerifiedHistoryStepTerminal,
+    ) -> Result<VerifiedRecursiveSuffix, MdbxContextError> {
+        if self.reorg_staging.is_some() {
+            return Err(MdbxContextError::Corrupt(
+                "recursive suffix cannot begin during reorg staging",
+            ));
+        }
+        let boundary_height = self.tip_height;
+        let boundary_hash = self.tip_hash;
+        let authority = self.authorize_recursive_terminal_from_boundary(
+            boundary_height,
+            boundary_hash,
+            verified,
         )?;
         self.store.begin_verified_recursive_suffix(
             boundary_height,
@@ -2376,6 +2497,22 @@ impl MdbxChainContext {
     where
         A: FnOnce(&HistoryStepTerminalClaim<'_>) -> Result<(), String>,
     {
+        let verified = verify_history_step_terminal_candidate(
+            tip_header,
+            epoch_anchor_header,
+            terminal_bytes,
+            verify_history_step_terminal,
+        )?;
+        self.authorize_preverified_reorg_suffix(ancestor_height, verified)
+    }
+
+    /// Bind a preverified terminal to the exact current non-final canonical
+    /// view. This is cheap and is repeated immediately before atomic commit.
+    pub fn authorize_preverified_reorg_suffix(
+        &self,
+        ancestor_height: u64,
+        verified: VerifiedHistoryStepTerminal,
+    ) -> Result<VerifiedReorgSuffix, MdbxContextError> {
         if self.reorg_staging.is_some() {
             return Err(MdbxContextError::Corrupt(
                 "recursive reorg cannot begin during reorg staging",
@@ -2396,13 +2533,10 @@ impl MdbxChainContext {
         if ancestor_height == self.finalized.height && ancestor_hash != self.finalized.hash {
             return Err(MdbxContextError::Consensus(ConsensusError::BadParentHash));
         }
-        let suffix = self.verify_recursive_terminal_from_boundary(
+        let suffix = self.authorize_recursive_terminal_from_boundary(
             ancestor_height,
             ancestor_hash,
-            tip_header,
-            epoch_anchor_header,
-            terminal_bytes,
-            verify_history_step_terminal,
+            verified,
         )?;
         Ok(VerifiedReorgSuffix {
             suffix,
@@ -2519,6 +2653,18 @@ impl MdbxChainContext {
         self.finalized = finalized;
         self.defer_finality_updates = false;
         Ok(())
+    }
+
+    /// Preserve a complete, already verified terminal for a canonical
+    /// finalized snapshot boundary. This is operational proof availability,
+    /// not consensus state: failure cannot change the accepted chain.
+    pub fn cache_verified_snapshot_boundary_proof(
+        &self,
+        boundary: &VerifiedSnapshotBoundary,
+    ) -> Result<(), MdbxContextError> {
+        self.store
+            .cache_verified_snapshot_boundary_proof(boundary)
+            .map_err(MdbxContextError::Store)
     }
 
     // -----------------------------------------------------------------------
@@ -3168,7 +3314,7 @@ mod tests {
             .unwrap();
         let bodies = vec![first.block_bytes().to_vec(), second.block_bytes().to_vec()];
         let applied = std::cell::Cell::new(0usize);
-        let result = context.apply_verified_reorg_suffix_with_applier(
+        let result = context.apply_verified_reorg_suffix_with_applier_indexed(
             authority,
             &bodies,
             second_block.header.timestamp,
@@ -3183,7 +3329,8 @@ mod tests {
             },
         );
 
-        assert!(result.is_err());
+        let failure = result.expect_err("deliberate replacement failure must abort reorg");
+        assert_eq!(failure.body_index, Some(1));
         assert_eq!(applied.get(), 2);
         assert_eq!(context.tip_height(), 1);
         assert_eq!(context.tip_hash(), old_tip);

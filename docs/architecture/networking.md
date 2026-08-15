@@ -4,11 +4,11 @@ Parano1d uses libp2p for peer identity, discovery, relay and synchronization.
 The public network protocol is identified as:
 
 ```text
-/noid/mainnet/1.0.0
+/noid/testnet/530016417023d5e9/1
 ```
 
-The default P2P listener is TCP `9400`. JSON-RPC is a separate local
-administration interface on `127.0.0.1:9401`.
+The default P2P listener is TCP `9500`. JSON-RPC is a separate local
+administration interface on `127.0.0.1:9501`.
 
 ## Peer identity and consensus identity
 
@@ -42,12 +42,11 @@ remains the same.
 
 ## Gossip
 
-GossipSub carries transaction intents and block announcements.
-
-A complete atomic block bundle is sent inline when it fits below the inline
-limit. Larger blocks are announced by header and pulled through a typed
-request-response exchange. Gossip messages have a strict maximum size so a
-peer cannot turn ordinary relay into unbounded allocation.
+GossipSub carries transaction intents and small header-first block
+announcements. Bodies and recursive terminals are never required to share the
+header control lane: they are pulled afterwards by exact content identity.
+Gossip messages have a strict maximum size so a peer cannot turn ordinary
+relay into unbounded allocation.
 
 A transaction is relayed only after local mempool admission has verified its
 canonical structure, authorization and current conflicts. Receiving gossip is
@@ -65,7 +64,7 @@ Typed exchanges serve:
 
 - header batches;
 - retained block bodies and recursive suffix-tip terminals;
-- snapshot manifests and State segments;
+- small snapshot headers, content-addressed manifest pages and State segments;
 - recent mempool inventory and missing intents.
 
 Direct catch-up requests ask for at most 512 headers at a time. Snapshot
@@ -73,8 +72,10 @@ header staging uses batches of up to 4,096 headers. Each batch is compressed
 with zstd. Both the compressed input and decompressed output have strict size
 limits; the output is at most 0.83 MiB of canonical 212-byte headers. Decoded
 headers enter the existing validation and storage path unchanged.
-Snapshot State is transferred as a manifest followed by individually
-authenticated segments rather than as one unbounded message.
+Snapshot State is transferred as a small manifest header, bounded descriptor
+pages and individually authenticated segments rather than as one unbounded
+message. One immutable plan may obtain different exact objects from different
+peers; losing a source does not discard already verified progress.
 
 When a peer connects, nodes can reconcile recent mempool contents. Every
 received intent still passes ordinary local admission.
@@ -103,7 +104,7 @@ infrastructure should span independent networks and operators.
 
 ## Mining peer gate
 
-Ordinary mining requires two authenticated peers. This prevents an unattended
+Ordinary mining requires one authenticated peer. This prevents an unattended
 node from extending an isolated private view merely because its network link
 failed.
 
@@ -113,7 +114,7 @@ proof verification and cumulative-work consensus.
 
 ## Interface boundaries
 
-P2P port `9400` is intended for public exposure. RPC port `9401` is not. RPC
+P2P port `9500` is intended for public exposure. RPC port `9501` is not. RPC
 includes wallet and process-control methods and has no public transport
 authentication layer; keep it on loopback or behind an authenticated private
 tunnel.

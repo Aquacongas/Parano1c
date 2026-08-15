@@ -29,7 +29,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use libp2p::{
-    dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response, swarm::NetworkBehaviour,
+    dcutr, gossipsub, identify, kad, mdns, ping, relay, request_response,
+    swarm::{behaviour::toggle::Toggle, NetworkBehaviour},
     StreamProtocol,
 };
 use libp2p_connection_limits as connection_limits;
@@ -38,13 +39,14 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
-use crate::block_sync_codec::BlockSyncCodec;
 use crate::header_protocol::MAX_HEADER_ANNOUNCE_BYTES;
 use crate::header_sync_codec::HeaderSyncCodec;
 use crate::history_step_codec::HistoryStepTerminalCodec;
+use crate::manifest_page_codec::ManifestPageCodec;
 use crate::mempool_sync_codec::MempoolSyncCodec;
 use crate::network_profile::NetworkProfileCodec;
 use crate::object_codec::ObjectCodec;
+use crate::resource_profile::BackgroundCapacity;
 use crate::state_manifest_codec::StateManifestCodec;
 use crate::state_segment_codec::StateSegmentCodec;
 
@@ -72,7 +74,7 @@ pub struct NodeBehaviour {
     /// Fixed header announcements and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Exact network-v3 profile handshake. A transport is never exposed to
+    /// Exact network-v7 profile handshake. A transport is never exposed to
     /// consensus/sync until this profile matches byte-for-byte.
     pub network_profile_sync: request_response::Behaviour<NetworkProfileCodec>,
 
@@ -82,9 +84,6 @@ pub struct NodeBehaviour {
 
     /// Typed request-response for chain headers.
     pub chain_sync: request_response::Behaviour<HeaderSyncCodec>,
-
-    /// Block sync (recent blocks).
-    pub block_sync: request_response::Behaviour<BlockSyncCodec>,
 
     /// Fused HistoryStep terminal for O(1) snapshot sync.
     pub history_step_sync: request_response::Behaviour<HistoryStepTerminalCodec>,
@@ -119,6 +118,11 @@ pub struct NodeBehaviour {
     ///   /ip4/<relay>/tcp/<port>/p2p/<relay_id>/p2p-circuit/p2p/<our_id>
     pub relay_client: relay::client::Behaviour,
 
+    /// Bounded Circuit Relay v2 service, enabled automatically only when this
+    /// node declares a globally routable direct address. Private GUI nodes are
+    /// relay clients, never accidental relay servers.
+    pub relay_server: Toggle<relay::Behaviour>,
+
     /// DCUtR — Direct Connection Upgrade Through Relay.
     ///
     /// Once two NAT'd nodes are connected through a relay, DCUtR coordinates
@@ -126,9 +130,12 @@ pub struct NodeBehaviour {
     /// On success the relay connection is replaced by a direct connection.
     pub dcutr: dcutr::Behaviour,
 
-    /// State manifest sync — step 1: request chain metadata + active segment IDs.
-    /// Tiny response (~few KB), establishes what needs downloading.
+    /// State manifest sync — small control header only.
     pub state_manifest_sync: request_response::Behaviour<StateManifestCodec>,
+
+    /// Exact content-addressed descriptor pages. This is a State-metadata data
+    /// plane separate from live bodies/terminals and multi-megabyte segments.
+    pub manifest_page_sync: request_response::Behaviour<ManifestPageCodec>,
 
     /// State segment sync — step 2: request individual segments (~3 MB each).
     /// The node keeps one network request in flight and overlaps transfer with
@@ -147,8 +154,8 @@ impl NodeBehaviour {
     /// Build the combined behaviour from a libp2p keypair.
     ///
     /// `protocol_id` is the network-specific prefix used for all sync stream
-    /// protocols (e.g. `/noid/mainnet/1.0.0`).  This ensures mainnet and
-    /// testnet nodes can never accidentally sync with each other.
+    /// protocols (for example the current public-testnet namespace). This
+    /// ensures distinct networks can never accidentally sync with each other.
     /// Build the combined behaviour.
     ///
     /// `relay_client` MUST come from `SwarmBuilder::with_relay_client()` —
@@ -158,6 +165,8 @@ impl NodeBehaviour {
         key: &libp2p::identity::Keypair,
         protocol_id: &str,
         relay_client: relay::client::Behaviour,
+        background_capacity: BackgroundCapacity,
+        serve_relay: bool,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use libp2p::gossipsub::MessageAuthenticity;
         use libp2p::request_response::ProtocolSupport;
@@ -211,7 +220,7 @@ impl NodeBehaviour {
             // miners can turn a harmless node-side drop into unbounded
             // memcache and outbound-buffer growth.
             .validate_messages()
-            // Mainnet: rely on the mesh for publish fanout. Flood-publishing to
+            // Public network: rely on the mesh for publish fanout. Flood-publishing to
             // every connected peer turns inbound spam into O(connected_peers)
             // outbound bandwidth even when downstream validation drops it.
             .flood_publish(false)
@@ -261,10 +270,10 @@ impl NodeBehaviour {
         // ----------------------------------------------------------------
         //
         // Network-aware protocol IDs — use the network's protocol_id prefix.
-        // This ensures mainnet and testnet sync protocols are fully isolated.
+        // This keeps distinct network sync protocols fully isolated.
         let network_profile_sync = request_response::Behaviour::new(
             [(
-                StreamProtocol::try_from_owned(format!("{}/sync/profile/2", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/profile/6", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -294,19 +303,6 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(8),
         );
 
-        let block_sync = request_response::Behaviour::new(
-            [(
-                // v3 returns the bounded authenticated snapshot bridge as one
-                // range of bodies without repeating proof-sized terminals or
-                // opening one request stream per retained height.
-                StreamProtocol::try_from_owned(format!("{}/sync/block/3", protocol_id))?,
-                ProtocolSupport::Full,
-            )],
-            request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30))
-                .with_max_concurrent_streams(4),
-        );
-
         let history_step_sync = request_response::Behaviour::new(
             [(
                 StreamProtocol::try_from_owned(format!("{}/sync/history-step/1", protocol_id))?,
@@ -320,12 +316,20 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(4),
         );
 
-        // Manifest: tiny request/response, short timeout is fine.
+        // Manifest v7 carries only fixed metadata and <=64 page identities.
         let state_manifest_sync = request_response::Behaviour::new(
             [(
-                // v2 checks segment/header counts and snapshot geometry before
-                // allocating either manifest vector.
-                StreamProtocol::try_from_owned(format!("{}/sync/manifest/6", protocol_id))?,
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest/7", protocol_id))?,
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(8),
+        );
+
+        let manifest_page_sync = request_response::Behaviour::new(
+            [(
+                StreamProtocol::try_from_owned(format!("{}/sync/manifest-page/1", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -370,8 +374,8 @@ impl NodeBehaviour {
         // Kademlia DHT
         // ----------------------------------------------------------------
         //
-        // Network-isolated: each chain gets its own protocol ID so mainnet
-        // and testnet never pollute each other's routing tables.
+        // Network-isolated: each chain gets its own protocol ID so distinct
+        // networks never pollute each other's routing tables.
         //
         // KBucketInserts::OnConnected: only insert peers we actually have
         // open connections to. This prevents phantom entries from stale
@@ -433,6 +437,32 @@ impl NodeBehaviour {
         // DCUtR: coordinates simultaneous dial attempts between two NAT'd
         // nodes connected through a relay, upgrading to a direct connection.
         let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+        let relay_server = serve_relay
+            .then(|| {
+                relay::Behaviour::new(
+                    key.public().to_peer_id(),
+                    relay::Config {
+                        max_reservations: background_capacity.relay_max_reservations(),
+                        max_reservations_per_peer:
+                            crate::resource_profile::relay_018_per_peer_config(1),
+                        // Relay is an auxiliary reachability path, not the
+                        // bulk-data backbone. A small per-node cap protects
+                        // ordinary public nodes while capacity grows with
+                        // their number.
+                        max_circuits: background_capacity.relay_max_circuits(),
+                        max_circuits_per_peer: crate::resource_profile::relay_018_per_peer_config(
+                            background_capacity.relay_max_circuits_per_peer(),
+                        ),
+                        max_circuit_duration: Duration::from_secs(5 * 60),
+                        // A client that cannot complete DCUtR must still
+                        // sustain the declared 256 KiB/s minimum for the
+                        // complete five-minute circuit lifetime.
+                        max_circuit_bytes: 80 * 1024 * 1024,
+                        ..relay::Config::default()
+                    },
+                )
+            })
+            .into();
 
         // ----------------------------------------------------------------
         // Connection limits
@@ -460,15 +490,16 @@ impl NodeBehaviour {
             network_profile_sync,
             object_sync,
             chain_sync,
-            block_sync,
             history_step_sync,
             kad,
             mdns,
             identify,
             ping,
             relay_client,
+            relay_server,
             dcutr,
             state_manifest_sync,
+            manifest_page_sync,
             state_segment_sync,
             mempool_sync,
         })

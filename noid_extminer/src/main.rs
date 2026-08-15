@@ -11,13 +11,13 @@
 //!
 //! ```bash
 //! # Solo (node on localhost, no auth)
-//! parano1d-miner --rpc http://127.0.0.1:9401
+//! parano1d-miner --rpc http://127.0.0.1:9501
 //!
 //! # Pool (remote node with bearer token)
-//! parano1d-miner --rpc https://pool.example.com:9401 --key my-secret-token
+//! parano1d-miner --rpc https://pool.example.com:9501 --key my-secret-token
 //!
 //! # Limit threads
-//! parano1d-miner --rpc http://127.0.0.1:9401 --threads 4
+//! parano1d-miner --rpc http://127.0.0.1:9501 --threads 4
 //! ```
 //!
 //! ## Template protocol
@@ -66,7 +66,7 @@ struct Cli {
     check_hardware: bool,
 
     /// JSON-RPC endpoint of the ParanO(1)d node or pool.
-    #[arg(long, default_value = "http://127.0.0.1:9401", value_name = "URL")]
+    #[arg(long, default_value = "http://127.0.0.1:9501", value_name = "URL")]
     rpc: String,
 
     /// Bearer token for pool/external RPC access.

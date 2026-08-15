@@ -12,6 +12,36 @@ pub const MAX_OBJECTS_PER_REQUEST: usize = 8;
 pub const MAX_OBJECT_RESPONSE_PAYLOAD_BYTES: usize =
     noid_chain::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES;
 
+/// Canonical response state for bounded bulk-serving protocols. `Busy` is
+/// deliberately distinct from `Unavailable`: it preserves the provider's
+/// exact object advertisement and asks the requester to retry later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataResponseStatus {
+    Ready,
+    Busy { retry_after_ms: u16 },
+}
+
+pub const MIN_BUSY_RETRY_MS: u16 = 100;
+pub const MAX_BUSY_RETRY_MS: u16 = 10_000;
+
+impl DataResponseStatus {
+    pub const fn busy_retry_after_ms(self) -> Option<u16> {
+        match self {
+            Self::Ready => None,
+            Self::Busy { retry_after_ms } => Some(retry_after_ms),
+        }
+    }
+
+    pub const fn is_canonical(self) -> bool {
+        match self {
+            Self::Ready => true,
+            Self::Busy { retry_after_ms } => {
+                retry_after_ms >= MIN_BUSY_RETRY_MS && retry_after_ms <= MAX_BUSY_RETRY_MS
+            }
+        }
+    }
+}
+
 const BODY_DIGEST_DOMAIN: &[u8] = b"NOID/P2P/OBJECT/BLOCK-BODY/V2";
 const TERMINAL_DIGEST_DOMAIN: &[u8] = b"NOID/P2P/OBJECT/HISTORY-TERMINAL/V2";
 const MANIFEST_DIGEST_DOMAIN: &[u8] = b"NOID/P2P/OBJECT/SNAPSHOT-MANIFEST/V2";
@@ -175,6 +205,7 @@ pub struct ObjectPayload {
 
 #[derive(Clone, Debug)]
 pub struct GetObjectsResponse {
+    pub status: DataResponseStatus,
     pub objects: Vec<ObjectPayload>,
     pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
@@ -182,7 +213,7 @@ pub struct GetObjectsResponse {
 
 impl PartialEq for GetObjectsResponse {
     fn eq(&self, other: &Self) -> bool {
-        self.objects == other.objects
+        self.status == other.status && self.objects == other.objects
     }
 }
 

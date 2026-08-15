@@ -797,6 +797,28 @@ fn decode_and_verify_segment<'a>(
     let mut exact = StreamingSparseRoot::new(u32::from(encoded_effective_log))
         .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
     for (local, slot) in sparse.entries() {
+        exact
+            .push_leaf(u32::from(local), slot_leaf_hash(slot))
+            .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
+    }
+    let actual_root = exact
+        .finish()
+        .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
+    if actual_root != descriptor.segment_root {
+        return Err(SnapshotStagingError::ExactSegmentRootMismatch {
+            segment_id: descriptor.segment_id,
+        });
+    }
+    // Only after the payload is bound to the immutable manifest root do
+    // semantic failures reject the generation rather than merely its source.
+    // This prevents cycling forever through peers that all serve the same
+    // content-addressed but semantically impossible segment.
+    if sparse.live_count() == 0 {
+        return Err(SnapshotStagingError::EmptyAdvertisedSegment {
+            segment_id: descriptor.segment_id,
+        });
+    }
+    for (local, slot) in sparse.entries() {
         let creation_id = slot.creation_id();
         if !crate::consensus::params::creation_id_within_boundary(
             creation_id,
@@ -822,22 +844,6 @@ fn decode_and_verify_segment<'a>(
                 alloc_counter: metadata.header.alloc_counter,
             });
         }
-        exact
-            .push_leaf(u32::from(local), slot_leaf_hash(slot))
-            .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
-    }
-    if sparse.live_count() == 0 {
-        return Err(SnapshotStagingError::EmptyAdvertisedSegment {
-            segment_id: descriptor.segment_id,
-        });
-    }
-    let actual_root = exact
-        .finish()
-        .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
-    if actual_root != descriptor.segment_root {
-        return Err(SnapshotStagingError::ExactSegmentRootMismatch {
-            segment_id: descriptor.segment_id,
-        });
     }
     Ok(sparse)
 }

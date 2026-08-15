@@ -126,7 +126,7 @@ impl HeaderInventoryRecord {
             cursor += 32;
             encoded[cursor..cursor + 4].copy_from_slice(&body.encoded_len.to_le_bytes());
         } else {
-            cursor += 32 + 4;
+            cursor += 32;
         }
         cursor += 4;
         if let Some(terminal) = self.terminal {
@@ -518,6 +518,29 @@ mod tests {
             .terminal
             .unwrap()
             .matches_bytes(accepted.history_step_terminal_bytes()));
+    }
+
+    #[test]
+    fn inventory_round_trip_allows_terminal_after_body_pruning() {
+        let accepted = bundle();
+        let announcement = HeaderAnnouncement::from_accepted_bundle(
+            &accepted,
+            ProviderFlags::new(true, true, false),
+        )
+        .unwrap();
+        let record = HeaderInventoryRecord::from_retained_objects(
+            announcement.header,
+            None,
+            Some(accepted.history_step_terminal_bytes()),
+        )
+        .unwrap();
+
+        assert!(record.body.is_none());
+        assert!(record.terminal.is_some());
+        assert_eq!(
+            HeaderInventoryRecord::decode(&record.encode().unwrap()).unwrap(),
+            record
+        );
     }
 
     #[test]

@@ -849,7 +849,14 @@ pub struct RpcHandler {
     /// intentionally not held during proving.
     pub wallet_operation_gate: Arc<tokio::sync::Mutex<()>>,
     /// Channel to the P2P layer for queries (peer count, etc.).
-    pub p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    pub p2p_cmd: noid_p2p::NetworkCommandSender,
+    /// Lock-free reactor heartbeat and queue snapshot. Status RPC remains
+    /// responsive even while the chain writer owns its commit lock.
+    pub p2p_health: tokio::sync::watch::Receiver<noid_p2p::P2PHealthSnapshot>,
+    /// Exact canonical-tip notification consumed by networking readiness.
+    /// A locally committed RPC block must revoke the previous parent's nonce
+    /// authorization synchronously rather than waiting for a polling tick.
+    pub canonical_tip_changes: tokio::sync::watch::Sender<noid_p2p::object_protocol::ChainPoint>,
     /// The same durable readiness watch consumed by the internal miner.
     pub initial_sync_ready: tokio::sync::watch::Receiver<bool>,
     /// Live mining gate and its authenticated-peer count.
@@ -921,11 +928,7 @@ impl RpcHandler {
         if *self.mining_network_ready.borrow() {
             Ok(())
         } else {
-            Err(rpc_err(format!(
-                "mining is waiting for authenticated peers ({}/{})",
-                *self.mining_confirmed_peers.borrow(),
-                self.mining_required_peers
-            )))
+            Err(rpc_err("mining is waiting for network synchronization"))
         }
     }
 
@@ -1371,6 +1374,7 @@ impl RpcHandler {
         let wallet_operation = self.wallet_operation_gate.lock().await;
         let chain = Arc::clone(&self.chain);
         let wallet = Arc::clone(&self.wallet);
+        let canonical_tip_changes = self.canonical_tip_changes.clone();
         let (committed, new_view) = tokio::task::spawn_blocking(move || {
             let mut ctx = chain.blocking_write();
             let committed = proved
@@ -1384,6 +1388,10 @@ impl RpcHandler {
                 );
             }
             let view = noid_mempool::ChainView::from_mdbx(&ctx);
+            canonical_tip_changes.send_replace(noid_p2p::object_protocol::ChainPoint::new(
+                committed.block().header.height,
+                block_id(&committed.block().header),
+            ));
             Ok::<_, String>((committed, view))
         })
         .await
@@ -1412,16 +1420,22 @@ impl RpcHandler {
         );
 
         let (_block, bundle) = committed.into_parts();
-        if let Err(error) = self
-            .p2p_cmd
-            .send(noid_p2p::NetworkCommand::AnnounceBlock { bundle })
-            .await
-        {
-            tracing::warn!(
-                height,
-                err = %error,
-                "failed to broadcast RPC-submitted block"
-            );
+        let mut command = noid_p2p::NetworkCommand::AnnounceBlock { bundle };
+        loop {
+            match self.p2p_cmd.try_send(command) {
+                Ok(()) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    command = returned;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::error!(
+                        height,
+                        "P2P command lanes closed before RPC-submitted block announcement"
+                    );
+                    break;
+                }
+            }
         }
 
         Ok(hex::encode(hash))
@@ -2071,6 +2085,8 @@ impl ParanoidApiServer for RpcHandler {
     }
 
     async fn get_node_status(&self) -> RpcResult<NodeStatus> {
+        let p2p = self.p2p_health.borrow().clone();
+        let heartbeat_age = p2p.updated_at.elapsed();
         Ok(NodeStatus {
             synced: *self.initial_sync_ready.borrow(),
             mining: self.internal_mining_enabled,
@@ -2081,6 +2097,15 @@ impl ParanoidApiServer for RpcHandler {
             backend: self.cpu_backend.clone(),
             available_threads: self.available_threads,
             worker_threads: self.worker_threads,
+            p2p_healthy: p2p.sequence > 0 && heartbeat_age <= std::time::Duration::from_secs(30),
+            p2p_heartbeat_age_ms: heartbeat_age.as_millis().min(u128::from(u64::MAX)) as u64,
+            p2p_connected_peers: p2p.connected_peers,
+            p2p_dispatchable_peers: p2p.dispatchable_peers,
+            p2p_relay_reservations: p2p.relay_reservations,
+            p2p_control_queue: p2p.control_queue,
+            p2p_header_queue: p2p.header_queue,
+            p2p_data_queue: p2p.data_queue,
+            p2p_pending_requests: p2p.pending_requests,
         })
     }
 
@@ -3074,7 +3099,9 @@ pub async fn start_rpc_server(
     mempool: AsyncMempool,
     wallet: Arc<dyn WalletOps + Send + Sync>,
     wallet_operation_gate: WalletOperationGate,
-    p2p_cmd: tokio::sync::mpsc::Sender<noid_p2p::NetworkCommand>,
+    p2p_cmd: noid_p2p::NetworkCommandSender,
+    p2p_health: tokio::sync::watch::Receiver<noid_p2p::P2PHealthSnapshot>,
+    canonical_tip_changes: tokio::sync::watch::Sender<noid_p2p::object_protocol::ChainPoint>,
     initial_sync_ready: tokio::sync::watch::Receiver<bool>,
     mining_network_ready: tokio::sync::watch::Receiver<bool>,
     mining_confirmed_peers: tokio::sync::watch::Receiver<usize>,
@@ -3117,6 +3144,8 @@ pub async fn start_rpc_server(
         wallet,
         wallet_operation_gate,
         p2p_cmd,
+        p2p_health,
+        canonical_tip_changes,
         initial_sync_ready,
         mining_network_ready,
         mining_confirmed_peers,
@@ -3142,7 +3171,7 @@ pub async fn start_rpc_server(
     // When mining_key is None it is a transparent pass-through.
     // When Some(key), all requests must carry `Authorization: Bearer <key>`.
     //
-    // Pool operators:  parano1d --rpc-listen 0.0.0.0:9401 --mining-key <secret>
+    // Pool operators:  parano1d --rpc-listen 0.0.0.0:9501 --mining-key <secret>
     // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
     let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
     let server = Server::builder()

@@ -257,7 +257,7 @@ jobs:
           name: canonical-matrix-pack
           path: .release-ci/download
 
-      - name: Authenticate the canonical matrix pack
+      - name: Unpack the preflight-approved matrix pack
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -270,42 +270,12 @@ jobs:
             -C .release-ci/pack
           test -d .release-ci/pack/history-step-pack-v1/v1
 
-      - name: Build the Windows pack authentication tool
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          source scripts/release_common.sh
-          release_build_pack_tools 0
-
-      - name: Verify the Windows pack authentication stack
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $tool = Join-Path $env:GITHUB_WORKSPACE "target\release-tools\release\noid_pack_pins.exe"
-          $bytes = [IO.File]::ReadAllBytes($tool)
-          $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
-          if ([Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4) -ne "PE`0`0") {
-            throw "noid_pack_pins.exe has no PE signature"
-          }
-          $optionalHeader = $peOffset + 24
-          if ([BitConverter]::ToUInt16($bytes, $optionalHeader) -ne 0x20b) {
-            throw "noid_pack_pins.exe is not PE32+"
-          }
-          $stackReserveOffset = $optionalHeader + 72
-          $requiredStack = [UInt64](64 * 1024 * 1024)
-          $stackReserve = [BitConverter]::ToUInt64($bytes, $stackReserveOffset)
-          if ($stackReserve -ne $requiredStack) {
-            throw "noid_pack_pins.exe stack reserve is $stackReserve bytes"
-          }
-
       - name: Build matrix-embedded native bundle
         shell: bash
         run: |
           bash ./scripts/build_release.sh \
             --pack .release-ci/pack/history-step-pack-v1 \
-            --output .release-ci/build \
-            --skip-tests
+            --output .release-ci/build
           test -s ".release-ci/build/$ARTIFACT_NAME"
           test -s ".release-ci/build/$GUI_ARTIFACT_NAME"
 

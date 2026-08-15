@@ -7,7 +7,7 @@ use std::{
     fmt,
     future::{ready, Ready},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
 };
@@ -20,9 +20,12 @@ use crate::network::NetworkEvent;
 // constrained by the process-wide inbound permits. Exact-object networking
 // will later reduce these to the smaller plan-level concurrency limits.
 const CONTROL_CAPACITY: usize = 1_024;
-const HEADER_CAPACITY: usize = 64;
-const LIVE_CAPACITY: usize = 272;
-const HISTORICAL_CAPACITY: usize = 96;
+const HEADER_REQUIRED_RESERVE: usize = 64;
+const HEADER_CAPACITY: usize = HEADER_REQUIRED_RESERVE * 2;
+// These bounds cover the sum of the corresponding request registries. A
+// required response therefore never needs an unbounded overflow task.
+const LIVE_CAPACITY: usize = 336;
+const HISTORICAL_CAPACITY: usize = 336;
 const BACKGROUND_CAPACITY: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +71,7 @@ pub(crate) struct RequiredEventSender {
     live: mpsc::Sender<NetworkEvent>,
     historical: mpsc::Sender<NetworkEvent>,
     background: mpsc::Sender<NetworkEvent>,
-    waiters: Arc<[AtomicUsize; 5]>,
+    fatal_dispatch_failure: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -102,6 +105,7 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
     let (live_tx, live_rx) = mpsc::channel(LIVE_CAPACITY);
     let (historical_tx, historical_rx) = mpsc::channel(HISTORICAL_CAPACITY);
     let (background_tx, background_rx) = mpsc::channel(BACKGROUND_CAPACITY);
+    let fatal_dispatch_failure = Arc::new(AtomicBool::new(false));
     (
         RequiredEventSender {
             control: control_tx,
@@ -109,7 +113,7 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
             live: live_tx,
             historical: historical_tx,
             background: background_tx,
-            waiters: Arc::new(std::array::from_fn(|_| AtomicUsize::new(0))),
+            fatal_dispatch_failure,
         },
         RequiredEventReceiver {
             control: control_rx,
@@ -124,40 +128,36 @@ pub(crate) fn channel() -> (RequiredEventSender, RequiredEventReceiver) {
 }
 
 impl RequiredEventSender {
-    /// Reliably enqueue an authoritative event without ever awaiting node-side
-    /// capacity in the swarm reactor.
-    ///
-    /// A full lane moves this one event into a detached waiter. The number of
-    /// such waiters is bounded by the request-correlation tables and transport
-    /// stream caps, while payload bytes remain held by their global permits.
-    /// Replaceable gossip must use `try_send` instead.
+    /// Enqueue an authoritative event without ever awaiting node-side
+    /// capacity in the swarm reactor. A full lane is an explicit invariant
+    /// failure; it never creates an untracked waiter task.
     pub(crate) fn send(&self, event: NetworkEvent) -> Ready<Result<(), DispatchError>> {
         let class = classify(&event);
-        let sender = match class {
-            EventClass::Control => self.control.clone(),
-            EventClass::Header => self.header.clone(),
-            EventClass::Live => self.live.clone(),
-            EventClass::Historical => self.historical.clone(),
-            EventClass::Background => self.background.clone(),
-        };
-        let result = match sender.try_send(event) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(event)) => {
-                let waiters = Arc::clone(&self.waiters);
-                waiters[class.index()].fetch_add(1, Ordering::Relaxed);
-                tokio::spawn(async move {
-                    let _ = sender.send(event).await;
-                    waiters[class.index()].fetch_sub(1, Ordering::Relaxed);
-                });
-                Ok(())
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => Err(DispatchError::Closed(class)),
-        };
+        let result = self.try_send_required(event, class);
+        if let Err(error) = &result {
+            self.fatal_dispatch_failure.store(true, Ordering::Release);
+            tracing::error!(?class, %error, "required network event dispatch failed");
+        }
         ready(result)
     }
 
     pub(crate) fn try_send(&self, event: NetworkEvent) -> Result<(), DispatchError> {
         let class = classify(&event);
+        // Replaceable gossip can use only the non-reserved half of the header
+        // lane. Correlated response/failure events keep a full 64-slot reserve.
+        if matches!(event, NetworkEvent::HeaderAnnouncement { .. })
+            && self.header.capacity() <= HEADER_REQUIRED_RESERVE
+        {
+            return Err(DispatchError::Full(EventClass::Header));
+        }
+        self.try_send_required(event, class)
+    }
+
+    fn try_send_required(
+        &self,
+        event: NetworkEvent,
+        class: EventClass,
+    ) -> Result<(), DispatchError> {
         let result = match class {
             EventClass::Control => self.control.try_send(event),
             EventClass::Header => self.header.try_send(event),
@@ -172,17 +172,20 @@ impl RequiredEventSender {
     }
 
     pub(crate) fn queue_depths(&self) -> EventQueueDepths {
-        let queued = |sender: &mpsc::Sender<NetworkEvent>, class: EventClass| {
+        let queued = |sender: &mpsc::Sender<NetworkEvent>| {
             sender.max_capacity().saturating_sub(sender.capacity())
-                + self.waiters[class.index()].load(Ordering::Relaxed)
         };
         EventQueueDepths {
-            control: queued(&self.control, EventClass::Control),
-            header: queued(&self.header, EventClass::Header),
-            live: queued(&self.live, EventClass::Live),
-            historical: queued(&self.historical, EventClass::Historical),
-            background: queued(&self.background, EventClass::Background),
+            control: queued(&self.control),
+            header: queued(&self.header),
+            live: queued(&self.live),
+            historical: queued(&self.historical),
+            background: queued(&self.background),
         }
+    }
+
+    pub(crate) fn has_fatal_dispatch_failure(&self) -> bool {
+        self.fatal_dispatch_failure.load(Ordering::Acquire)
     }
 }
 
@@ -275,69 +278,50 @@ fn classify(event: &NetworkEvent) -> EventClass {
         | NetworkEvent::HeadersRequestFailed { .. }
         | NetworkEvent::SnapshotHeadersBatch { .. }
         | NetworkEvent::SnapshotHeadersRequestFailed { .. } => EventClass::Header,
-        NetworkEvent::IncomingBlock { .. }
-        | NetworkEvent::RecentBlock { .. }
-        | NetworkEvent::RecentBlockUnavailable { .. }
-        | NetworkEvent::RecentBlockRequestFailed { .. }
-        | NetworkEvent::HistoryStepTerminal { .. }
+        NetworkEvent::HistoryStepTerminal { .. }
         | NetworkEvent::HistoryStepTerminalRequestFailed { .. }
+        | NetworkEvent::HistoryStepTerminalRequestBusy { .. }
         | NetworkEvent::ObjectsResponse { .. }
-        | NetworkEvent::ObjectsRequestFailed { .. } => EventClass::Live,
-        NetworkEvent::SnapshotBlockBodies { .. }
-        | NetworkEvent::StateManifest { .. }
+        | NetworkEvent::ObjectsRequestFailed { .. }
+        | NetworkEvent::ObjectsRequestBusy { .. } => EventClass::Live,
+        NetworkEvent::StateManifest { .. }
         | NetworkEvent::StateManifestRequestFailed { .. }
         | NetworkEvent::StateSegment { .. }
-        | NetworkEvent::StateSegmentRequestFailed { .. } => EventClass::Historical,
+        | NetworkEvent::StateSegmentRequestFailed { .. }
+        | NetworkEvent::StateSegmentRequestBusy { .. } => EventClass::Historical,
         NetworkEvent::NewTx { .. } | NetworkEvent::MempoolSyncResponse { .. } => {
             EventClass::Background
         }
-        // Block announcements use the replaceable gossip channel today. They
-        // move to the reserved header queue with the v2 header protocol.
-        NetworkEvent::BlockAnnouncement { .. } => EventClass::Header,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RecentBlockPayloadKind;
     use libp2p::PeerId;
 
     fn live(peer: PeerId, height: u64) -> NetworkEvent {
-        NetworkEvent::RecentBlockUnavailable {
+        NetworkEvent::HistoryStepTerminalRequestFailed {
+            token: height,
             from: peer,
             height,
-            payload_kind: RecentBlockPayloadKind::Complete,
+            block_hash: [0; 32],
+            kind: crate::network::RequestFailureKind::Timeout,
         }
     }
 
     #[tokio::test]
-    async fn reliable_send_is_immediate_and_survives_a_full_lane() {
-        let (tx, mut rx) = channel();
+    async fn required_send_is_immediate_and_bounded_by_the_lane() {
+        let (tx, _rx) = channel();
         let peer = PeerId::random();
         for height in 0..LIVE_CAPACITY {
             tx.try_send(live(peer, height as u64)).unwrap();
         }
-        tx.send(live(peer, u64::MAX)).await.unwrap();
-        assert_eq!(tx.queue_depths().live, LIVE_CAPACITY + 1);
-
-        for expected in 0..LIVE_CAPACITY {
-            assert!(matches!(
-                rx.recv().await,
-                Some(NetworkEvent::RecentBlockUnavailable { height, .. })
-                    if height == expected as u64
-            ));
-        }
-        assert!(matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-                .await
-                .unwrap(),
-            Some(NetworkEvent::RecentBlockUnavailable {
-                height: u64::MAX,
-                ..
-            })
-        ));
-        assert_eq!(tx.queue_depths().live, 0);
+        assert_eq!(
+            tx.send(live(peer, u64::MAX)).await,
+            Err(DispatchError::Full(EventClass::Live))
+        );
+        assert_eq!(tx.queue_depths().live, LIVE_CAPACITY);
     }
 
     #[tokio::test]
@@ -349,6 +333,7 @@ mod tests {
         }
         tx.send(NetworkEvent::PeerConnected {
             peer,
+            locally_selected: true,
             failure_domain: 1,
         })
         .await
@@ -366,6 +351,7 @@ mod tests {
         for height in 0..32 {
             tx.send(NetworkEvent::PeerConnected {
                 peer: PeerId::random(),
+                locally_selected: false,
                 failure_domain: height,
             })
             .await
@@ -378,6 +364,7 @@ mod tests {
             expected_tip_height: 10,
             expected_tip_hash: [1; 32],
             manifest_digest: [2; 32],
+            kind: crate::network::RequestFailureKind::Timeout,
         })
         .await
         .unwrap();
@@ -393,5 +380,62 @@ mod tests {
             }
         }
         assert!(found, "historical lane must receive its weighted turn");
+    }
+
+    #[test]
+    fn replaceable_header_gossip_cannot_consume_required_response_reserve() {
+        let (tx, _rx) = channel();
+        let peer = PeerId::random();
+        let header = noid_chain::consensus::genesis_header();
+        let announcement = crate::header_protocol::HeaderAnnouncement {
+            header,
+            body: crate::object_protocol::BlockBodyObjectId {
+                claim: crate::object_protocol::BlockBodyClaimId {
+                    height: header.height,
+                    block_hash: noid_chain::block_header::block_id(&header),
+                },
+                byte_digest: [1; 32],
+                encoded_len: 1,
+            },
+            terminal: crate::object_protocol::TerminalObjectId {
+                claim: crate::object_protocol::TerminalClaimId {
+                    height: header.height,
+                    semantic_header_id: noid_chain::block_header::semantic_header_id(&header),
+                    proof_class: 0,
+                },
+                byte_digest: [2; 32],
+                encoded_len: 1,
+            },
+            providers: crate::header_protocol::ProviderFlags::new(true, true, false),
+        };
+        for _ in 0..(HEADER_CAPACITY - HEADER_REQUIRED_RESERVE) {
+            tx.try_send(NetworkEvent::HeaderAnnouncement {
+                from: peer,
+                announcement,
+                source_has_objects: true,
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            tx.try_send(NetworkEvent::HeaderAnnouncement {
+                from: peer,
+                announcement,
+                source_has_objects: true,
+            }),
+            Err(DispatchError::Full(EventClass::Header))
+        );
+        assert_eq!(tx.queue_depths().header, HEADER_REQUIRED_RESERVE);
+        assert!(!tx.has_fatal_dispatch_failure());
+    }
+
+    #[tokio::test]
+    async fn failed_required_delivery_sets_the_reactor_fatal_flag() {
+        let (tx, _rx) = channel();
+        let peer = PeerId::random();
+        for height in 0..LIVE_CAPACITY {
+            tx.send(live(peer, height as u64)).await.unwrap();
+        }
+        assert!(tx.send(live(peer, u64::MAX)).await.is_err());
+        assert!(tx.has_fatal_dispatch_failure());
     }
 }

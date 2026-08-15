@@ -40,9 +40,13 @@ use crate::model::{
     WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 
-const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9401";
-const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9401";
-const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9400";
+const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9501";
+const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9501";
+const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9500";
+const LEGACY_DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9400";
+const LEGACY_DEFAULT_P2P_MULTIADDR: &str = "/ip4/0.0.0.0/tcp/9400";
+const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
+const NETWORK_STORAGE_SCHEMA: &[u8] = b"parano1d/testnet/network-storage/v1/";
 const STATE_SEGMENT_LOG: u32 = 16;
 const STATE_MAP_BUCKETS: usize = 256;
 const GENESIS_DIFFICULTY_LOG2: f64 = 238.0;
@@ -1000,8 +1004,6 @@ impl Backend {
                 enabled: mining_enabled,
                 ready: node_status.mining_ready,
                 isolated: node_status.isolated_mining,
-                confirmed_peers: node_status.mining_confirmed_peers,
-                required_peers: node_status.mining_required_peers,
                 selected_threads,
                 available_threads,
             },
@@ -1490,24 +1492,32 @@ impl BackendConfig {
             .ok()
             .filter(|bytes| bytes.len() <= 64 * 1024)
             .and_then(|bytes| serde_json::from_slice::<PersistedGuiSettings>(&bytes).ok());
+        // Keep the selected data directory long enough to find wallet.key,
+        // but do not carry any old GUI/network preferences into network-v7.
+        // The daemon creates this marker only after its wallet-only reset.
+        let data_dir = std::env::var_os("NOID_GUI_DATA_DIR")
+            .map(PathBuf::from)
+            .or_else(|| persisted.as_ref().map(|settings| settings.data_dir.clone()))
+            .unwrap_or_else(default_data_dir);
+        let reset_legacy_settings =
+            legacy_gui_settings_reset_pending(&data_dir, persisted.is_some());
+        if reset_legacy_settings {
+            let _ = std::fs::remove_file(&settings_path);
+        }
+        let persisted_preferences = (!reset_legacy_settings)
+            .then_some(persisted.as_ref())
+            .flatten();
         let rpc_url = std::env::var("NOID_RPC").unwrap_or_else(|_| DEFAULT_RPC_URL.into());
         let rpc_listen = std::env::var("NOID_GUI_RPC_LISTEN").unwrap_or_else(|_| {
             rpc_listen_from_url(&rpc_url)
                 .unwrap_or(DEFAULT_RPC_LISTEN)
                 .into()
         });
-        let p2p_listen = std::env::var("NOID_GUI_P2P_LISTEN")
-            .ok()
-            .or_else(|| {
-                persisted
-                    .as_ref()
-                    .map(|settings| settings.p2p_listen.clone())
-            })
-            .unwrap_or_else(|| DEFAULT_P2P_LISTEN.into());
-        let data_dir = std::env::var_os("NOID_GUI_DATA_DIR")
-            .map(PathBuf::from)
-            .or_else(|| persisted.as_ref().map(|settings| settings.data_dir.clone()))
-            .unwrap_or_else(default_data_dir);
+        let p2p_listen = std::env::var("NOID_GUI_P2P_LISTEN").unwrap_or_else(|_| {
+            persisted_preferences
+                .map(|settings| migrate_legacy_gui_p2p_listen(&settings.p2p_listen))
+                .unwrap_or_else(|| DEFAULT_P2P_LISTEN.into())
+        });
         let node_binary = std::env::var_os("NOID_GUI_NODE_BIN")
             .map(PathBuf::from)
             .unwrap_or_else(find_node_binary);
@@ -1521,12 +1531,12 @@ impl BackendConfig {
                     .map(str::to_owned)
                     .collect::<Vec<_>>()
             })
-            .or_else(|| persisted.as_ref().map(|settings| settings.seeds.clone()))
+            .or_else(|| persisted_preferences.map(|settings| settings.seeds.clone()))
             .unwrap_or_default();
         let log_level = std::env::var("NOID_GUI_LOG")
             .ok()
             .and_then(|level| parse_log_level(&level))
-            .or_else(|| persisted.as_ref().map(|settings| settings.log_level))
+            .or_else(|| persisted_preferences.map(|settings| settings.log_level))
             .unwrap_or_default();
         let language = std::env::var("NOID_GUI_LANGUAGE")
             .ok()
@@ -1538,7 +1548,7 @@ impl BackendConfig {
                     _ => None,
                 },
             )
-            .or_else(|| persisted.as_ref().and_then(|settings| settings.language));
+            .or_else(|| persisted_preferences.and_then(|settings| settings.language));
         let mock = std::env::var("NOID_GUI_MOCK")
             .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
         Self {
@@ -1554,6 +1564,35 @@ impl BackendConfig {
             mock,
         }
     }
+}
+
+fn migrate_legacy_gui_p2p_listen(listen: &str) -> String {
+    if matches!(
+        listen,
+        LEGACY_DEFAULT_P2P_LISTEN | LEGACY_DEFAULT_P2P_MULTIADDR
+    ) {
+        DEFAULT_P2P_LISTEN.into()
+    } else {
+        listen.into()
+    }
+}
+
+fn legacy_gui_settings_reset_pending(data_dir: &Path, settings_exist: bool) -> bool {
+    settings_exist && !gui_network_storage_epoch_is_current(data_dir)
+}
+
+fn gui_network_storage_epoch_is_current(data_dir: &Path) -> bool {
+    let Ok(marker) = std::fs::read(data_dir.join(NETWORK_STORAGE_EPOCH_MARKER_FILE)) else {
+        return false;
+    };
+    let Some(genesis_hex) = marker.strip_prefix(NETWORK_STORAGE_SCHEMA) else {
+        return false;
+    };
+    genesis_hex.len() == 65
+        && genesis_hex[64] == b'\n'
+        && genesis_hex[..64]
+            .iter()
+            .all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn parse_log_level(value: &str) -> Option<LogLevel> {
@@ -1989,8 +2028,6 @@ struct NodeStatus {
     synced: bool,
     mining: bool,
     mining_ready: bool,
-    mining_confirmed_peers: usize,
-    mining_required_peers: usize,
     isolated_mining: bool,
     backend: String,
     available_threads: usize,
@@ -3067,13 +3104,48 @@ mod tests {
     #[test]
     fn loopback_rpc_url_yields_a_daemon_listen_address() {
         assert_eq!(
-            rpc_listen_from_url("http://127.0.0.1:9401"),
-            Some("127.0.0.1:9401")
+            rpc_listen_from_url("http://127.0.0.1:9501"),
+            Some("127.0.0.1:9501")
         );
         assert_eq!(
             rpc_listen_from_url("http://127.0.0.1:9411/rpc"),
             Some("127.0.0.1:9411")
         );
+    }
+
+    #[test]
+    fn legacy_gui_default_p2p_listener_migrates_but_custom_port_does_not() {
+        assert_eq!(
+            migrate_legacy_gui_p2p_listen("0.0.0.0:9400"),
+            DEFAULT_P2P_LISTEN
+        );
+        assert_eq!(
+            migrate_legacy_gui_p2p_listen("/ip4/0.0.0.0/tcp/9400"),
+            DEFAULT_P2P_LISTEN
+        );
+        assert_eq!(
+            migrate_legacy_gui_p2p_listen("127.0.0.1:19400"),
+            "127.0.0.1:19400"
+        );
+    }
+
+    #[test]
+    fn gui_preferences_are_discarded_until_wallet_only_reset_completes() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(legacy_gui_settings_reset_pending(directory.path(), true));
+        assert!(!legacy_gui_settings_reset_pending(directory.path(), false));
+        std::fs::write(
+            directory.path().join(NETWORK_STORAGE_EPOCH_MARKER_FILE),
+            b"parano1d/network-storage/v3/530016417023d5e9e6a5f7e0b55b7734e11f9fcd28fbdfd3f731edf6814bafe2\n",
+        )
+        .unwrap();
+        assert!(legacy_gui_settings_reset_pending(directory.path(), true));
+        std::fs::write(
+            directory.path().join(NETWORK_STORAGE_EPOCH_MARKER_FILE),
+            b"parano1d/testnet/network-storage/v1/530016417023d5e9e6a5f7e0b55b7734e11f9fcd28fbdfd3f731edf6814bafe2\n",
+        )
+        .unwrap();
+        assert!(!legacy_gui_settings_reset_pending(directory.path(), true));
     }
 
     #[test]
@@ -3209,7 +3281,7 @@ mod tests {
             p2p_listen: "127.0.0.1:19400".into(),
             data_dir: directory.path().join("node-data"),
             node_binary: PathBuf::from("parano1d"),
-            seeds: vec!["seed-a.example:9400".into(), "dnsaddr:noid.network".into()],
+            seeds: vec!["seed-a.example:9500".into(), "dnsaddr:noid.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
             settings_path: settings_path.clone(),
@@ -3243,7 +3315,7 @@ mod tests {
         let decoded: PersistedGuiSettings = serde_json::from_str(
             r#"{
                 "data_dir": "/tmp/parano1d",
-                "p2p_listen": "127.0.0.1:9400",
+                "p2p_listen": "127.0.0.1:9500",
                 "seeds": [],
                 "log_level": "info"
             }"#,

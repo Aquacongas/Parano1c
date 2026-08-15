@@ -8,17 +8,17 @@
 //! ```text
 //! loop {
 //!   template + complete nonce-independent HistoryStep proof
-//!   all-core PoW search
+//!   bounded parallel PoW search
 //!   seal exact nonce/header into the prepared terminal
 //!   atomic commit + broadcast
 //! }
 //! ```
 //!
-//! Internal mining has one Rayon pool containing every host-visible CPU. CPU
+//! Internal mining has one Rayon pool below the host-visible CPU ceiling. CPU
 //! heavy phases reuse that same pool in order; there is no permanent one-core
 //! PoW reservation and no independent prover pool. Every process starts with
 //! a 25-page template budget and may jump directly to 255 pages only when
-//! complete proof-class timings support the 15-second target.
+//! complete proof-class timings support the 20-second target.
 //! External miner mode disables internal PoW, so the node can spend its CPUs on
 //! template and HistoryStep preparation, validation, RPC, and P2P while miners run elsewhere.
 //!
@@ -67,7 +67,7 @@ pub struct MinerConfig {
     /// This timer exists only for edge cases where both are silent.
     ///
     /// Must be > BLOCK_TIME to avoid firing during active proving and
-    /// inserting unnecessary coinbase blocks.  Default: 5 × BLOCK_TIME = 75s.
+    /// inserting unnecessary coinbase blocks. Default: 5 × BLOCK_TIME.
     pub refresh_interval_secs: u64,
 }
 
@@ -75,7 +75,7 @@ impl Default for MinerConfig {
     fn default() -> Self {
         Self {
             miner_address: Address([0u8; 32]),
-            refresh_interval_secs: 75, // 5 × BLOCK_TIME; real template changes are event-driven
+            refresh_interval_secs: noid_chain::consensus::params::BLOCK_TIME * 5,
         }
     }
 }
@@ -238,7 +238,7 @@ impl BlockMiner {
         tracing::debug!(
             pow_threads,
             history_step_threads,
-            "internal miner all-core PoW and HistoryStep pool configured"
+            "internal miner bounded PoW and HistoryStep pool configured"
         );
         let miner = Self {
             config,
@@ -369,6 +369,11 @@ impl BlockMiner {
                     Err(broadcast::error::TryRecvError::Closed) => unreachable!(),
                 }
             }
+            // Readiness may have become true before `run()` began polling its
+            // receivers. Mark those current values observed so an old true
+            // edge cannot later cancel valid work.
+            let _ = *self.proof_network_ready.borrow_and_update();
+            let _ = *self.nonce_network_ready.borrow_and_update();
 
             // --- Build template ---
             let now = std::time::SystemTime::now()
@@ -426,17 +431,73 @@ impl BlockMiner {
             let expected_parent_hash = block_id(&tmpl.parent);
             let prepare_runtime = Arc::clone(&self.history_step_runtime);
             let prepare_ghost = Arc::clone(&self.ghost_authorization);
-            let prepare_handle = tokio::task::spawn_blocking(move || {
+            let prepare_cancellation = Arc::new(AtomicBool::new(false));
+            let worker_cancellation = Arc::clone(&prepare_cancellation);
+            let mut prepare_handle = tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
                 let result = install_history_step_phase_cpu(|| {
-                    PreparedBlockAttempt::prepare(tmpl, &prepare_runtime, &prepare_ghost, now)
+                    PreparedBlockAttempt::prepare_cancellable(
+                        tmpl,
+                        &prepare_runtime,
+                        &prepare_ghost,
+                        now,
+                        &worker_cancellation,
+                    )
                 })
                 .map_err(|error| format!("HistoryStep preparation CPU phase: {error}"))
                 .and_then(|result| result);
                 (result, started.elapsed())
             });
-            let (attempt, prepare_elapsed) = match prepare_handle.await {
-                Ok((Ok(attempt), elapsed)) => (attempt, elapsed),
+            let prepare_result = loop {
+                tokio::select! {
+                    result = &mut prepare_handle => break result,
+                    template_change = self.template_changes.recv() => {
+                        prepare_cancellation.store(true, Ordering::Release);
+                        let _ = prepare_handle.await;
+                        match template_change {
+                            Ok(()) => tracing::debug!(height, "canonical/template change cancelled HistoryStep preparation"),
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                tracing::debug!(height, skipped, "lagged template change cancelled HistoryStep preparation");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => unreachable!(),
+                        }
+                        continue 'mining;
+                    }
+                    readiness = self.proof_network_ready.changed() => {
+                        match readiness {
+                            Ok(()) if !*self.proof_network_ready.borrow() => {
+                                prepare_cancellation.store(true, Ordering::Release);
+                                let _ = prepare_handle.await;
+                                tracing::info!(height, "miner: canonical sync authority cancelled HistoryStep preparation");
+                                continue 'mining;
+                            }
+                            Ok(()) => {}
+                            Err(_) => {
+                                prepare_cancellation.store(true, Ordering::Release);
+                                let _ = prepare_handle.await;
+                                break 'mining;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                        if self.stopped.load(Ordering::Acquire) {
+                            prepare_cancellation.store(true, Ordering::Release);
+                            let _ = prepare_handle.await;
+                            break 'mining;
+                        }
+                    }
+                }
+            };
+            let (attempt, prepare_elapsed) = match prepare_result {
+                Ok((Ok(Some(attempt)), elapsed)) => (attempt, elapsed),
+                Ok((Ok(None), elapsed)) => {
+                    tracing::debug!(
+                        height,
+                        prepare_ms = elapsed.as_millis(),
+                        "HistoryStep preparation cancelled before completion"
+                    );
+                    continue;
+                }
                 Ok((Err(error), elapsed)) => {
                     tracing::error!(
                         height,
@@ -587,6 +648,15 @@ impl BlockMiner {
                 "mining complete block"
             );
 
+            // `watch::Receiver::changed` is edge-triggered. Readiness may
+            // have become true while this miner was waiting to start or
+            // while the proof was being built; consume that already-observed
+            // version before entering the PoW select. Otherwise the stale
+            // true edge wakes the select immediately and throws away a valid
+            // proof even though network authorization never changed.
+            let _ = *self.proof_network_ready.borrow_and_update();
+            let _ = *self.nonce_network_ready.borrow_and_update();
+
             // Phase 2: all workers search the already-proven semantic header.
             // A winning nonce only seals the nonce-free HistoryStep terminal.
             let pow_header = attempt.pow_header(0);
@@ -632,7 +702,7 @@ impl BlockMiner {
                             // Count leading zeros of the difficulty target (MSB-first, LE).
                             // Matches block_work() in difficulty.rs — higher = harder.
                             // Genesis = 27lz. ASERT raises this when blocks arrive faster
-                            // than BLOCK_TIME (15s) and lowers it when they're slower.
+                            // than BLOCK_TIME and lowers it when they're slower.
                             let diff_lz = noid_chain::consensus::target_leading_zero_bits(
                                 &sealed_header.difficulty_target,
                             );

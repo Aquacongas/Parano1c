@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
 use noid_p2p::{
@@ -22,6 +23,13 @@ use super::{
     sync_plan::{SyncPlan, SyncPlanError, SyncPlanKind},
     types::{ChainPoint, FailureDomain, ObjectClaimId, PlanId},
 };
+
+fn current_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 #[derive(Clone, Debug)]
 pub struct SuffixOffer {
@@ -130,11 +138,15 @@ pub struct ExactObjectRequest {
 struct PendingRequest {
     peer: PeerId,
     objects: Vec<ObjectId>,
+    disconnected_at: Option<Instant>,
 }
+
+const DISCONNECTED_RESPONSE_GRACE: Duration = Duration::from_secs(70);
 
 #[derive(Debug)]
 struct ReceivedObject {
     object: ObjectId,
+    source: PeerId,
     bytes: Vec<u8>,
     _permit: Option<Arc<OwnedSemaphorePermit>>,
 }
@@ -145,7 +157,9 @@ struct ReceivedObject {
 pub struct FetchedSuffix {
     pub plan: SyncPlan,
     pub body_bytes: Vec<Vec<u8>>,
+    pub body_sources: Vec<PeerId>,
     pub terminal_bytes: Vec<u8>,
+    pub terminal_source: PeerId,
     _permits: Vec<Arc<OwnedSemaphorePermit>>,
 }
 
@@ -155,13 +169,17 @@ impl FetchedSuffix {
     ) -> (
         SyncPlan,
         Vec<Vec<u8>>,
+        Vec<PeerId>,
         Vec<u8>,
+        PeerId,
         Vec<Arc<OwnedSemaphorePermit>>,
     ) {
         (
             self.plan,
             self.body_bytes,
+            self.body_sources,
             self.terminal_bytes,
+            self.terminal_source,
             self._permits,
         )
     }
@@ -245,15 +263,20 @@ impl SuffixSync {
         peer: PeerId,
         failure_domain: FailureDomain,
         offer: SuffixOffer,
-    ) -> Result<(), SuffixSyncError> {
+    ) -> Result<usize, SuffixSyncError> {
         if offer.plan.id() != self.plan.id() {
             return Err(SuffixSyncError::PlanMismatch);
         }
+        let mut added = 0usize;
         for object in offer.objects {
-            self.fetcher
-                .advertise(object.claim(), peer, failure_domain, object)?;
+            if self
+                .fetcher
+                .advertise_new(object.claim(), peer, failure_domain, object)?
+            {
+                added = added.saturating_add(1);
+            }
         }
-        Ok(())
+        Ok(added)
     }
 
     /// Merge storage-backed availability for the already selected semantic
@@ -279,13 +302,14 @@ impl SuffixSync {
                 {
                     return Err(SuffixSyncError::ObjectClaimMismatch);
                 }
-                self.fetcher.advertise(
+                if self.fetcher.advertise_new(
                     ObjectClaimId::BlockBody(body.claim),
                     peer,
                     failure_domain,
                     ObjectId::BlockBody(body),
-                )?;
-                advertised = advertised.saturating_add(1);
+                )? {
+                    advertised = advertised.saturating_add(1);
+                }
             }
         }
         if let Some(terminal) = records.last().and_then(|record| record.terminal) {
@@ -298,13 +322,14 @@ impl SuffixSync {
             if required_terminal != ObjectClaimId::Terminal(terminal.claim) {
                 return Err(SuffixSyncError::ObjectClaimMismatch);
             }
-            self.fetcher.advertise(
+            if self.fetcher.advertise_new(
                 required_terminal,
                 peer,
                 failure_domain,
                 ObjectId::Terminal(terminal),
-            )?;
-            advertised = advertised.saturating_add(1);
+            )? {
+                advertised = advertised.saturating_add(1);
+            }
         }
         Ok(advertised)
     }
@@ -312,6 +337,7 @@ impl SuffixSync {
     /// Start all currently schedulable jobs and coalesce body requests by
     /// source. A terminal always occupies its own bounded request.
     pub fn schedule(&mut self, now_ms: u64) -> Vec<ExactObjectRequest> {
+        self.expire_disconnected_requests();
         let mut assignments = Vec::new();
         for claim in self.plan.required_objects() {
             if self.fetcher.state(*claim) != Some(FetchState::Wanted) {
@@ -359,6 +385,7 @@ impl SuffixSync {
             PendingRequest {
                 peer,
                 objects: objects.clone(),
+                disconnected_at: None,
             },
         );
         debug_assert!(previous.is_none());
@@ -375,7 +402,7 @@ impl SuffixSync {
         peer: PeerId,
         payloads: Vec<ObjectPayload>,
         permit: Option<Arc<OwnedSemaphorePermit>>,
-    ) -> Result<(), SuffixSyncError> {
+    ) -> Result<usize, SuffixSyncError> {
         let pending = self
             .pending
             .remove(&token)
@@ -386,7 +413,9 @@ impl SuffixSync {
             .collect::<Vec<_>>();
         if pending.peer != peer || pending.objects != response_objects {
             for object in pending.objects {
-                let _ = self.fetcher.fail_source(object.claim(), pending.peer);
+                let _ =
+                    self.fetcher
+                        .fail_source_at(object.claim(), pending.peer, current_time_ms());
             }
             return Err(SuffixSyncError::CorrelationMismatch);
         }
@@ -401,12 +430,11 @@ impl SuffixSync {
                 .as_ref()
                 .is_some_and(|bytes| !payload.object.matches_bytes(bytes))
         }) {
-            for object in pending.objects {
-                let _ = self.fetcher.mark_unavailable(object.claim(), peer);
-            }
+            self.fetcher.quarantine_source(peer);
             return Err(SuffixSyncError::ContentMismatch);
         }
 
+        let mut received = 0usize;
         for payload in payloads {
             let claim = payload.object.claim();
             let Some(bytes) = payload.bytes else {
@@ -419,15 +447,24 @@ impl SuffixSync {
                 claim,
                 ReceivedObject {
                     object: payload.object,
+                    source: peer,
                     bytes,
                     _permit: permit.clone(),
                 },
             );
+            received = received.saturating_add(1);
         }
-        Ok(())
+        Ok(received)
     }
 
-    pub fn request_failed(
+    /// Reject a provider across this immutable suffix after a response proves
+    /// that its exact-object service is malformed. Headers from that peer may
+    /// still be useful; only its object advertisements lose transport trust.
+    pub fn quarantine_provider(&mut self, peer: PeerId) {
+        self.fetcher.quarantine_source(peer);
+    }
+
+    pub fn request_unavailable(
         &mut self,
         token: u64,
         peer: PeerId,
@@ -439,19 +476,164 @@ impl SuffixSync {
             .ok_or(SuffixSyncError::UnknownToken)?;
         if pending.peer != peer || pending.objects != objects {
             for object in pending.objects {
-                let _ = self.fetcher.fail_source(object.claim(), pending.peer);
+                let _ =
+                    self.fetcher
+                        .fail_source_at(object.claim(), pending.peer, current_time_ms());
             }
             return Err(SuffixSyncError::CorrelationMismatch);
         }
         for object in pending.objects {
-            self.fetcher.fail_source(object.claim(), peer)?;
+            self.fetcher.mark_unavailable(object.claim(), peer)?;
+        }
+        Ok(())
+    }
+
+    pub fn reject_response_provider(
+        &mut self,
+        token: u64,
+        peer: PeerId,
+        objects: &[ObjectId],
+    ) -> Result<(), SuffixSyncError> {
+        let pending = self
+            .pending
+            .remove(&token)
+            .ok_or(SuffixSyncError::UnknownToken)?;
+        if pending.peer != peer || pending.objects != objects {
+            for object in pending.objects {
+                let _ =
+                    self.fetcher
+                        .fail_source_at(object.claim(), pending.peer, current_time_ms());
+            }
+            return Err(SuffixSyncError::CorrelationMismatch);
+        }
+        self.fetcher.quarantine_source(peer);
+        Ok(())
+    }
+
+    pub fn request_failed(
+        &mut self,
+        token: u64,
+        peer: PeerId,
+        objects: &[ObjectId],
+        now_ms: u64,
+    ) -> Result<(), SuffixSyncError> {
+        let pending = self
+            .pending
+            .remove(&token)
+            .ok_or(SuffixSyncError::UnknownToken)?;
+        if pending.peer != peer || pending.objects != objects {
+            for object in pending.objects {
+                let _ = self
+                    .fetcher
+                    .fail_source_at(object.claim(), pending.peer, now_ms);
+            }
+            return Err(SuffixSyncError::CorrelationMismatch);
+        }
+        for object in pending.objects {
+            self.fetcher.fail_source_at(object.claim(), peer, now_ms)?;
+        }
+        Ok(())
+    }
+
+    /// The serving peer is healthy and still advertises these exact objects,
+    /// but its bounded data plane is temporarily full. Preserve the immutable
+    /// selection and every verified object while delaying only this source.
+    pub fn request_busy(
+        &mut self,
+        token: u64,
+        peer: PeerId,
+        objects: &[ObjectId],
+        retry_at_ms: u64,
+    ) -> Result<(), SuffixSyncError> {
+        let pending = self
+            .pending
+            .remove(&token)
+            .ok_or(SuffixSyncError::UnknownToken)?;
+        if pending.peer != peer || pending.objects != objects {
+            for object in pending.objects {
+                let _ =
+                    self.fetcher
+                        .fail_source_at(object.claim(), pending.peer, current_time_ms());
+            }
+            return Err(SuffixSyncError::CorrelationMismatch);
+        }
+        for object in pending.objects {
+            self.fetcher
+                .busy_source(object.claim(), peer, retry_at_ms)?;
+        }
+        Ok(())
+    }
+
+    /// True when this immutable suffix still has missing objects but no
+    /// eligible source, request, locally received bytes, or late correlated
+    /// response. The caller may then perform bounded provider discovery and,
+    /// only after that fails, retire this transport plan without touching the
+    /// HeaderDAG or canonical database.
+    pub fn unfinished_transport_is_stalled(&self, now_ms: u64) -> bool {
+        self.fetcher.unfinished_transport_is_stalled(now_ms)
+    }
+
+    pub fn unfinished_transport_is_extinct(&self) -> bool {
+        self.fetcher.unfinished_transport_is_extinct()
+    }
+
+    /// Undo a request that never left the local process because the bounded
+    /// data lane was full. Unlike `request_failed`, this does not increment a
+    /// source failure or rotate away from a healthy provider.
+    pub fn defer_request(
+        &mut self,
+        token: u64,
+        peer: PeerId,
+        objects: &[ObjectId],
+    ) -> Result<(), SuffixSyncError> {
+        let pending = self
+            .pending
+            .remove(&token)
+            .ok_or(SuffixSyncError::UnknownToken)?;
+        if pending.peer != peer || pending.objects != objects {
+            for object in pending.objects {
+                let _ =
+                    self.fetcher
+                        .fail_source_at(object.claim(), pending.peer, current_time_ms());
+            }
+            return Err(SuffixSyncError::CorrelationMismatch);
+        }
+        for object in pending.objects {
+            self.fetcher.defer_source(object.claim(), peer)?;
         }
         Ok(())
     }
 
     pub fn disconnect(&mut self, peer: PeerId) {
-        self.pending.retain(|_, pending| pending.peer != peer);
+        let now = Instant::now();
+        for pending in self.pending.values_mut() {
+            if pending.peer == peer {
+                pending.disconnected_at.get_or_insert(now);
+            }
+        }
         self.fetcher.disconnect(peer);
+    }
+
+    fn expire_disconnected_requests(&mut self) {
+        let now = Instant::now();
+        let expired = self
+            .pending
+            .iter()
+            .filter_map(|(token, pending)| {
+                pending
+                    .disconnected_at
+                    .is_some_and(|at| now.duration_since(at) >= DISCONNECTED_RESPONSE_GRACE)
+                    .then_some(*token)
+            })
+            .collect::<Vec<_>>();
+        for token in expired {
+            if let Some(pending) = self.pending.remove(&token) {
+                for object in pending.objects {
+                    self.fetcher
+                        .forget_late_response(object.claim(), pending.peer, object);
+                }
+            }
+        }
     }
 
     pub fn is_complete(&self) -> bool {
@@ -468,7 +650,9 @@ impl SuffixSync {
             return Err(SuffixSyncError::Incomplete);
         }
         let mut body_bytes = Vec::with_capacity(self.plan.headers().len());
+        let mut body_sources = Vec::with_capacity(self.plan.headers().len());
         let mut terminal_bytes = None;
+        let mut terminal_source = None;
         let mut permits = Vec::new();
         for claim in self.plan.required_objects() {
             let received = self
@@ -482,8 +666,14 @@ impl SuffixSync {
                 permits.push(permit);
             }
             match received.object {
-                ObjectId::BlockBody(_) => body_bytes.push(received.bytes),
-                ObjectId::Terminal(_) => terminal_bytes = Some(received.bytes),
+                ObjectId::BlockBody(_) => {
+                    body_bytes.push(received.bytes);
+                    body_sources.push(received.source);
+                }
+                ObjectId::Terminal(_) => {
+                    terminal_bytes = Some(received.bytes);
+                    terminal_source = Some(received.source);
+                }
                 ObjectId::SnapshotManifest(_) | ObjectId::StateSegment(_) => {
                     return Err(SuffixSyncError::WrongPlanKind)
                 }
@@ -492,7 +682,9 @@ impl SuffixSync {
         Ok(FetchedSuffix {
             plan: self.plan,
             body_bytes,
+            body_sources,
             terminal_bytes: terminal_bytes.ok_or(SuffixSyncError::MissingTipTerminal)?,
+            terminal_source: terminal_source.ok_or(SuffixSyncError::MissingTipTerminal)?,
             _permits: permits,
         })
     }
@@ -623,8 +815,13 @@ mod tests {
             })
             .unwrap()
             .clone();
-        sync.request_failed(body_request.token, body_request.peer, &body_request.objects)
-            .unwrap();
+        sync.request_failed(
+            body_request.token,
+            body_request.peer,
+            &body_request.objects,
+            0,
+        )
+        .unwrap();
         let retried = sync.schedule(1);
         assert!(retried.iter().any(|request| {
             request.peer != body_request.peer
@@ -689,12 +886,47 @@ mod tests {
             .into_iter()
             .find(|request| request.objects.contains(&first_body))
             .unwrap();
-        sync.request_failed(request.token, request.peer, &request.objects)
+        let expected_retry_peer = if request.peer == first_peer {
+            second_peer
+        } else {
+            first_peer
+        };
+        sync.request_failed(request.token, request.peer, &request.objects, 0)
             .unwrap();
-        assert!(sync
-            .schedule(1)
-            .iter()
-            .any(|retry| { retry.peer == second_peer && retry.objects.contains(&first_body) }));
+        assert!(sync.schedule(1).iter().any(|retry| {
+            retry.peer == expected_retry_peer && retry.objects.contains(&first_body)
+        }));
+    }
+
+    #[test]
+    fn local_data_queue_backpressure_returns_every_object_to_wanted() {
+        let peer = PeerId::random();
+        let offer = offer(&[1, 2], 1);
+        let mut sync = SuffixSync::from_offer(peer, FailureDomain(1), offer).unwrap();
+        let requests = sync.schedule(0);
+        assert!(!requests.is_empty());
+        for request in &requests {
+            sync.defer_request(request.token, request.peer, &request.objects)
+                .unwrap();
+        }
+        let counts = sync.fetcher.counts();
+        assert_eq!(counts.in_flight, 0);
+        assert_eq!(counts.wanted, sync.plan.required_objects().len());
+        assert_eq!(sync.schedule(1).len(), requests.len());
+    }
+
+    #[test]
+    fn remote_busy_preserves_exact_objects_and_delays_the_source() {
+        let peer = PeerId::random();
+        let offer = offer(&[1], 1);
+        let mut sync = SuffixSync::from_offer(peer, FailureDomain(1), offer).unwrap();
+        let request = sync.schedule(10).pop().unwrap();
+        sync.request_busy(request.token, peer, &request.objects, 100)
+            .unwrap();
+        assert!(sync.schedule(99).is_empty());
+        let retry = sync.schedule(100).pop().unwrap();
+        assert_eq!(retry.peer, peer);
+        assert_eq!(retry.objects, request.objects);
     }
 
     #[test]
@@ -736,7 +968,130 @@ mod tests {
         assert!(sync.is_complete());
         let fetched = sync.into_fetched().unwrap();
         assert_eq!(fetched.body_bytes, expected_bodies);
+        assert_eq!(fetched.body_sources, vec![peer, peer]);
         assert_eq!(fetched.terminal_bytes, expected_terminal);
+        assert_eq!(fetched.terminal_source, peer);
+    }
+
+    #[test]
+    fn fetched_suffix_preserves_independent_body_and_terminal_sources() {
+        let body_peer = PeerId::random();
+        let terminal_peer = PeerId::random();
+        let mut complete = offer(&[1, 2], 1);
+        let mut bytes_by_object = HashMap::new();
+        for (index, object) in complete.objects.iter_mut().enumerate() {
+            let bytes = vec![0x50 + index as u8; 12 + index];
+            *object = match *object {
+                ObjectId::BlockBody(body) => {
+                    ObjectId::BlockBody(BlockBodyObjectId::from_bytes(body.claim, &bytes).unwrap())
+                }
+                ObjectId::Terminal(terminal) => ObjectId::Terminal(
+                    TerminalObjectId::from_bytes(terminal.claim, &bytes).unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            bytes_by_object.insert(*object, bytes);
+        }
+
+        let headers = complete.plan().headers().to_vec();
+        let mut terminal_records = headers
+            .iter()
+            .map(|header| HeaderInventoryRecord::header_only(header.header))
+            .collect::<Vec<_>>();
+        terminal_records.last_mut().unwrap().terminal =
+            complete.objects.last().copied().unwrap().into_terminal();
+        let terminal_offer =
+            SuffixOffer::live(complete.plan().base(), headers.clone(), &terminal_records).unwrap();
+
+        let mut body_records = headers
+            .iter()
+            .map(|header| HeaderInventoryRecord::header_only(header.header))
+            .collect::<Vec<_>>();
+        for (record, object) in body_records
+            .iter_mut()
+            .zip(&complete.objects[..headers.len()])
+        {
+            record.body = (*object).into_block_body();
+        }
+
+        let mut sync =
+            SuffixSync::from_offer(terminal_peer, FailureDomain(1), terminal_offer).unwrap();
+        sync.add_inventory(body_peer, FailureDomain(2), &headers, &body_records)
+            .unwrap();
+        for request in sync.schedule(0) {
+            let payloads = request
+                .objects
+                .iter()
+                .map(|object| ObjectPayload {
+                    object: *object,
+                    bytes: Some(bytes_by_object[object].clone()),
+                })
+                .collect();
+            sync.accept_response(request.token, request.peer, payloads, None)
+                .unwrap();
+        }
+
+        let fetched = sync.into_fetched().unwrap();
+        assert_eq!(fetched.body_sources, vec![body_peer, body_peer]);
+        assert_eq!(fetched.terminal_source, terminal_peer);
+    }
+
+    #[test]
+    fn queued_exact_response_survives_disconnect_event_overtake() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let mut offer = offer(&[1, 2], 1);
+        let mut bytes_by_object = HashMap::new();
+        for (index, object) in offer.objects.iter_mut().enumerate() {
+            let bytes = vec![0x60 + index as u8; 12 + index];
+            *object = match *object {
+                ObjectId::BlockBody(body) => {
+                    ObjectId::BlockBody(BlockBodyObjectId::from_bytes(body.claim, &bytes).unwrap())
+                }
+                ObjectId::Terminal(terminal) => ObjectId::Terminal(
+                    TerminalObjectId::from_bytes(terminal.claim, &bytes).unwrap(),
+                ),
+                _ => unreachable!(),
+            };
+            bytes_by_object.insert(*object, bytes);
+        }
+        let second_offer = offer.clone();
+        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer).unwrap();
+        sync.add_offer(second_peer, FailureDomain(2), second_offer)
+            .unwrap();
+        let queued = sync.schedule(0).pop().unwrap();
+        let disconnected = queued.peer;
+        let payloads = queued
+            .objects
+            .iter()
+            .map(|object| ObjectPayload {
+                object: *object,
+                bytes: Some(bytes_by_object[object].clone()),
+            })
+            .collect::<Vec<_>>();
+
+        sync.disconnect(disconnected);
+        let retry = sync
+            .schedule(1)
+            .into_iter()
+            .find(|request| {
+                request.peer != disconnected
+                    && request
+                        .objects
+                        .iter()
+                        .any(|object| queued.objects.contains(object))
+            })
+            .expect("failover begins without invalidating the queued old response");
+        assert_ne!(retry.peer, disconnected);
+
+        sync.accept_response(queued.token, disconnected, payloads, None)
+            .unwrap();
+        for object in queued.objects {
+            assert!(matches!(
+                sync.fetcher.state(object.claim()),
+                Some(FetchState::Verified { object: verified }) if verified == object
+            ));
+        }
     }
 
     #[test]
@@ -782,23 +1137,36 @@ mod tests {
             Err(SuffixSyncError::ContentMismatch)
         );
 
-        let replacement = sync
-            .schedule(1)
+        let replacements = sync.schedule(1);
+        assert!(
+            replacements
+                .iter()
+                .all(|candidate| candidate.peer != request.peer),
+            "a content-invalid provider is quarantined across the whole suffix"
+        );
+        let replacement = replacements
             .into_iter()
             .find(|candidate| candidate.objects.len() == 2)
             .expect("every claim from the consumed request is schedulable again");
-        assert_ne!(replacement.peer, request.peer);
         assert_eq!(replacement.objects, request.objects);
     }
 
     trait ObjectIdTestExt {
         fn into_block_body(self) -> Option<BlockBodyObjectId>;
+        fn into_terminal(self) -> Option<TerminalObjectId>;
     }
 
     impl ObjectIdTestExt for ObjectId {
         fn into_block_body(self) -> Option<BlockBodyObjectId> {
             match self {
                 ObjectId::BlockBody(body) => Some(body),
+                _ => None,
+            }
+        }
+
+        fn into_terminal(self) -> Option<TerminalObjectId> {
+            match self {
+                ObjectId::Terminal(terminal) => Some(terminal),
                 _ => None,
             }
         }

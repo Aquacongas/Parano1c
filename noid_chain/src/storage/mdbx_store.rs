@@ -457,7 +457,7 @@ const HISTORY_STEP_PROOF_OBJECT_PRUNE_LIMIT: usize = 32;
 /// is deliberately independent of finality and consensus validity.
 const BLOCK_BODY_OBJECT_RETENTION_DEPTH: u64 = HISTORY_STEP_PROOF_OBJECT_RETENTION_DEPTH;
 /// An active data-plane lease may extend retention, but never without bound.
-/// At the 15-second target this is about two hours of exact body availability.
+/// At the 20-second target this is about 2.8 hours of exact body availability.
 const BLOCK_BODY_OBJECT_MAX_PIN_DEPTH: u64 = 512;
 const BLOCK_BODY_OBJECT_PRUNE_LIMIT: usize = 8;
 const BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT: usize =
@@ -1729,6 +1729,51 @@ impl MdbxStore {
             None,
         )
         .is_none())
+    }
+
+    /// Cache a complete terminal that has already been verified for an exact
+    /// snapshot boundary. The capability type is constructed only by
+    /// `MdbxChainContext::verify_snapshot_boundary`; this method additionally
+    /// binds it to the canonical finalized chain in the same write
+    /// transaction before the bytes enter the independent proof-object store.
+    pub(crate) fn cache_verified_snapshot_boundary_proof(
+        &self,
+        boundary: &crate::storage::VerifiedSnapshotBoundary,
+    ) -> Result<(), StoreError> {
+        let header = *boundary.header();
+        let height = header.height;
+        let block_hash = crate::block_header::block_id(&header);
+
+        let txn = self.db.begin_rw_txn()?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let canonical_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        if canonical_raw.as_deref().and_then(decode_header) != Some(header) {
+            return Err(StoreError::Decode(
+                "verified snapshot proof boundary is not canonical",
+            ));
+        }
+
+        let consensus = txn.open_table(Some(T_CONSENSUS_META))?;
+        let meta_raw: Option<Vec<u8>> = txn.get(&consensus, KEY_CONSENSUS_META)?;
+        let meta =
+            meta_raw
+                .as_deref()
+                .and_then(decode_consensus_meta)
+                .ok_or(StoreError::Decode(
+                    "canonical consensus metadata is missing",
+                ))?;
+        if meta.finalized.height < height
+            || (meta.finalized.height == height && meta.finalized.hash != block_hash)
+        {
+            return Err(StoreError::Decode(
+                "verified snapshot proof boundary is not finalized",
+            ));
+        }
+
+        archive_history_step_proof_object(&txn, boundary.history_step_terminal_bytes())?;
+        prune_history_step_proof_objects(&txn, meta.tip_height)?;
+        txn.commit()?;
+        Ok(())
     }
 
     pub fn put_consensus_meta(&self, meta: &ConsensusMeta) -> Result<(), StoreError> {
@@ -4722,6 +4767,60 @@ mod tests {
                 "recursive suffix marker cannot enter the proof-object cache"
             ))
         ));
+    }
+
+    #[test]
+    fn verified_boundary_cache_rebinds_to_the_canonical_finalized_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let candidate = block(&genesis, 1, 7);
+        let mut meta = commit_accepted_test_block(&store, &candidate, &genesis_meta);
+        let block_hash = crate::hash_block_header(&candidate.header);
+        meta.finalized = FinalizedCheckpoint {
+            height: 1,
+            hash: block_hash,
+        };
+        store.put_consensus_meta(&meta).unwrap();
+
+        let semantic_id = crate::block_header::semantic_header_id(&candidate.header);
+        let terminal_bytes = terminal(1, semantic_id, 0);
+        let txn = store.db.begin_rw_txn().unwrap();
+        let proofs = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS)).unwrap();
+        txn.del(
+            &proofs,
+            history_step_proof_object_key(1, semantic_id, 0),
+            None,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert!(!store
+            .has_any_history_step_proof_object(1, semantic_id)
+            .unwrap());
+
+        let mut wrong_header = candidate.header;
+        wrong_header.state_root[0] ^= 1;
+        let wrong = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            wrong_header,
+            terminal(1, crate::block_header::semantic_header_id(&wrong_header), 0),
+        );
+        assert!(store
+            .cache_verified_snapshot_boundary_proof(&wrong)
+            .is_err());
+
+        let verified = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            candidate.header,
+            terminal_bytes.clone(),
+        );
+        store
+            .cache_verified_snapshot_boundary_proof(&verified)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_history_step_proof_object(1, semantic_id, 0)
+                .unwrap(),
+            Some(terminal_bytes)
+        );
     }
 
     #[test]

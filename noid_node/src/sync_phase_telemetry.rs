@@ -182,6 +182,7 @@ impl SnapshotSyncTelemetry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn record_suffix_block(
         &mut self,
         height: u64,

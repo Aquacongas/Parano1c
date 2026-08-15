@@ -12,6 +12,7 @@ pub mod header_dag;
 pub mod health;
 pub mod mining_readiness;
 pub mod object_fetcher;
+pub mod snapshot_sync;
 pub mod suffix_sync;
 pub mod sync_plan;
 pub mod topology;

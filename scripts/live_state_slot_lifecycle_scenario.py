@@ -81,10 +81,12 @@ def compact_metrics(label):
         None,
     )
     require(line is not None, f"{label} did not use compact segment summaries")
+    assert line is not None
     result = {}
     for field in ("active_segments", "active_slot_count"):
         match = re.search(rf"(?:^|\s){field}=(\d+)(?:\s|$)", line)
         require(match is not None, f"{label} compact log misses {field}: {line}")
+        assert match is not None
         result[field] = int(match.group(1))
     return result
 

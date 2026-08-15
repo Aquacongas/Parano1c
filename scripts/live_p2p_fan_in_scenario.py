@@ -2,9 +2,10 @@
 """Fresh high-fan-in P2P handshake test with one hub and many peers.
 
 Every process receives an empty data directory. Spokes are spawned before any
-of them is awaited, so their Identify, header probe, and symmetric mempool
-exchange hit the hub concurrently. This scenario does not mine or reuse chain
-state; mining/reorg coverage remains in its own live scenarios.
+of them is awaited, so their Identify, header probe, and bounded outbound
+mempool pull hit the hub concurrently. The inbound hub must not reciprocate
+bulk bootstrap work towards every spoke. This scenario does not mine or reuse
+chain state; mining/reorg coverage remains in its own live scenarios.
 """
 
 import datetime
@@ -27,7 +28,7 @@ BASE = Path(
     )
 )
 BASE_PORT = int(os.environ.get("NOID_LIVE_P2P_FAN_IN_BASE_PORT", "21000"))
-PEER_COUNT = int(os.environ.get("NOID_LIVE_P2P_FAN_IN_PEERS", "100"))
+PEER_COUNT = int(os.environ.get("NOID_LIVE_P2P_FAN_IN_PEERS", "96"))
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT
@@ -43,6 +44,7 @@ def log_text(label):
 def logged_peer_id(text):
     match = re.search(r"loaded persistent P2P identity peer=([^\s]+)", text)
     require(match is not None, "startup log has no persistent PeerId")
+    assert match is not None
     return match.group(1)
 
 
@@ -69,7 +71,6 @@ def exchanges_complete(hub_label, spoke_labels):
             marker in text
             for marker in (
                 "requesting mempool sync",
-                "serving mempool sync request",
                 "mempool sync response complete",
             )
         ):
@@ -83,11 +84,6 @@ def exchanges_complete(hub_label, spoke_labels):
     for peer_id in spoke_ids.values():
         if not any(
             peer_id in line and "serving mempool sync request" in line
-            for line in hub_lines
-        ):
-            return False
-        if not any(
-            peer_id in line and "mempool sync response complete" in line
             for line in hub_lines
         ):
             return False
@@ -124,7 +120,10 @@ def stop_all(nodes):
 
 def main():
     require(live.NODE_BIN.is_file(), f"release node is missing: {live.NODE_BIN}")
-    require(1 <= PEER_COUNT <= 120, "fan-in peers must be between 1 and inbound cap 120")
+    require(
+        1 <= PEER_COUNT <= 96,
+        "single-group fan-in peers must be between 1 and the 96-peer diversity cap",
+    )
     require(not BASE.exists(), f"run directory already exists: {BASE}")
 
     hub = Node("hub", BASE_PORT, BASE_PORT + 1)

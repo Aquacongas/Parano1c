@@ -4,7 +4,8 @@
 This is intentionally one isolated scenario. A release miner creates a new
 chain while snapshot generations advance in the background. The test waits
 for a full generation followed by a delta generation that is still inside the
-18-block serving suffix, freezes the source, and joins one empty release node.
+bounded 42-block object-serving window, freezes the source, and joins one
+empty release node.
 """
 
 import datetime
@@ -27,7 +28,7 @@ BASE = Path(
     )
 )
 BASE_PORT = int(os.environ.get("NOID_LIVE_INCREMENTAL_SNAPSHOT_BASE_PORT", "22900"))
-RETAINED_DEPTH = 18
+SERVING_DEPTH = 42
 MIN_SOURCE_HEIGHT = 21
 
 live.BASE = BASE
@@ -52,15 +53,32 @@ def snapshot_builds(text):
         if "assembled bounded disk snapshot generation" not in line:
             continue
         base = field(line, "incremental_base_height")
+        target = field(line, "target_height")
+        reused = field(line, "reused_segments")
+        rebuilt = field(line, "rebuilt_segments")
+        output = field(line, "output_segments")
+        require(
+            all(value is not None for value in (base, target, reused, rebuilt, output)),
+            f"snapshot build log is missing a field: {line}",
+        )
+        assert base is not None
+        assert target is not None
+        assert reused is not None
+        assert rebuilt is not None
+        assert output is not None
+        base_match = re.fullmatch(r"Some\((\d+)\)", base)
+        require(base == "None" or base_match is not None, f"invalid incremental base: {base}")
+        incremental_base = None
+        if base != "None":
+            assert base_match is not None
+            incremental_base = int(base_match.group(1))
         builds.append(
             {
-                "target_height": int(field(line, "target_height")),
-                "incremental_base_height": None
-                if base == "None"
-                else int(re.fullmatch(r"Some\((\d+)\)", base).group(1)),
-                "reused_segments": int(field(line, "reused_segments")),
-                "rebuilt_segments": int(field(line, "rebuilt_segments")),
-                "output_segments": int(field(line, "output_segments")),
+                "target_height": int(target),
+                "incremental_base_height": incremental_base,
+                "reused_segments": int(reused),
+                "rebuilt_segments": int(rebuilt),
+                "output_segments": int(output),
             }
         )
     return builds
@@ -75,7 +93,7 @@ def serveable_delta(miner, label):
     latest = builds[-1]
     if latest["incremental_base_height"] is None:
         return False
-    if height - latest["target_height"] > RETAINED_DEPTH:
+    if height - latest["target_height"] > SERVING_DEPTH:
         return False
     return {"tip": info, "builds": builds}
 
@@ -137,7 +155,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": live.sha256(live.NODE_BIN),
         "binary_size": live.NODE_BIN.stat().st_size,
-        "retained_depth": RETAINED_DEPTH,
+        "serving_depth": SERVING_DEPTH,
         "status": "running",
     }
     print(f"[run] {BASE}", flush=True)
@@ -173,7 +191,7 @@ def main():
         )
         latest = builds[-1]
         require(
-            source_height - latest["target_height"] <= RETAINED_DEPTH,
+            source_height - latest["target_height"] <= SERVING_DEPTH,
             f"latest snapshot is outside retained suffix: tip={source_height}, builds={builds}",
         )
 
@@ -213,14 +231,14 @@ def main():
         boundaries = [
             int(value)
             for value in re.findall(
-                r"snapshot boundary and disk tail fully applied snapshot_height=(\d+)",
+                r"snapshot boundary State installed snapshot_height=(\d+)",
                 receiver_log,
             )
         ]
         require(len(boundaries) == 1, f"receiver snapshot boundary count is wrong: {boundaries}")
         require(
-            source_height - boundaries[0] == RETAINED_DEPTH,
-            f"receiver did not apply the exact 18-block suffix: tip={source_height}, boundary={boundaries}",
+            0 < source_height - boundaries[0] <= SERVING_DEPTH,
+            f"receiver snapshot boundary is outside the serving window: tip={source_height}, boundary={boundaries}",
         )
         require(
             receiver_log.count("snapshot install completed") == 1,
@@ -229,11 +247,14 @@ def main():
         suffix_counts = [
             int(value)
             for value in re.findall(
-                r'phase="retained_suffix_apply"[^\n]* count=(\d+)',
+                r"header-first exact suffix application completed[^\n]* blocks=(\d+)",
                 receiver_log,
             )
         ]
-        require(suffix_counts == [RETAINED_DEPTH], f"disk-tail telemetry is wrong: {suffix_counts}")
+        require(
+            suffix_counts == [source_height - boundaries[0]],
+            f"post-snapshot exact suffix telemetry is wrong: {suffix_counts}",
+        )
 
         for label in labels:
             assert_clean(label, read_log(label))

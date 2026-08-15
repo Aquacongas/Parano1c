@@ -26,8 +26,8 @@ controls funds; the second does not.
 
 | Port | Bind | Use | Public |
 |---:|---|---|---|
-| TCP 9400 | `0.0.0.0` | libp2p | Yes |
-| TCP 9401 | `127.0.0.1` | JSON-RPC | No |
+| TCP 9500 | `0.0.0.0` | libp2p | Yes |
+| TCP 9501 | `127.0.0.1` | JSON-RPC | No |
 
 Remote external mining may use RPC only through a protected private or TLS
 transport. A bearer token authenticates requests but does not encrypt them.
@@ -36,8 +36,8 @@ transport. A bearer token authenticates requests but does not encrypt them.
 
 | Item | Value |
 |---|---|
-| Network magic | `NOID` |
-| libp2p protocol | `/noid/mainnet/1.0.0` |
+| Network magic | `NOIT` |
+| libp2p protocol | `/noid/testnet/530016417023d5e9/1` |
 | Transaction and block gossip | GossipSub |
 | Discovery | DNS seeds, Kademlia, mDNS |
 

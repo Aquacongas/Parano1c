@@ -9,7 +9,8 @@ use thiserror::Error;
 use super::{
     header_dag::ValidatedHeader,
     types::{
-        BlockBodyClaimId, ChainPoint, Hash32, ObjectClaimId, PlanId, SnapshotId, TerminalClaimId,
+        BlockBodyClaimId, ChainPoint, Hash32, ObjectClaimId, PlanId, SnapshotId, StateSegmentId,
+        TerminalClaimId,
     },
 };
 
@@ -46,6 +47,10 @@ pub enum SyncPlanError {
     InvalidReorgBase,
     #[error("a snapshot boundary and its terminal claim identify different heights")]
     SnapshotTerminalHeightMismatch,
+    #[error("a snapshot segment belongs to another immutable generation")]
+    SnapshotSegmentMismatch,
+    #[error("snapshot segment identifiers are not strictly increasing")]
+    SnapshotSegmentsNotCanonical,
 }
 
 /// A frozen graph of consensus objects required to reach one exact target.
@@ -99,14 +104,25 @@ impl SyncPlan {
     pub fn snapshot(
         snapshot: SnapshotId,
         boundary_terminal: TerminalClaimId,
+        segments: Vec<StateSegmentId>,
     ) -> Result<Self, SyncPlanError> {
         if snapshot.boundary.height != boundary_terminal.height {
             return Err(SyncPlanError::SnapshotTerminalHeightMismatch);
         }
-        let required_objects = vec![
+        if segments.iter().any(|segment| segment.snapshot != snapshot) {
+            return Err(SyncPlanError::SnapshotSegmentMismatch);
+        }
+        if !segments
+            .windows(2)
+            .all(|pair| pair[0].segment_id < pair[1].segment_id)
+        {
+            return Err(SyncPlanError::SnapshotSegmentsNotCanonical);
+        }
+        let mut required_objects = vec![
             ObjectClaimId::SnapshotManifest(snapshot),
             ObjectClaimId::Terminal(boundary_terminal),
         ];
+        required_objects.extend(segments.into_iter().map(ObjectClaimId::StateSegment));
         let id = derive_plan_id(
             SyncPlanKind::Snapshot,
             snapshot.boundary,
@@ -235,6 +251,16 @@ impl SyncPlan {
 
     pub fn required_objects(&self) -> &[ObjectClaimId] {
         &self.required_objects
+    }
+
+    /// Return whether `point` is on this plan's exact selected ancestry.
+    ///
+    /// This deliberately inspects only the source-independent plan. It lets
+    /// the runtime distinguish a moving tip on the same branch from a real
+    /// branch replacement without assigning authority to the peer that
+    /// announced either view.
+    pub fn contains_point(&self, point: ChainPoint) -> bool {
+        self.base == point || self.headers.iter().any(|header| header.point() == point)
     }
 }
 
@@ -401,10 +427,29 @@ mod tests {
             semantic_header_id: [4; 32],
             proof_class: 0,
         };
-        let plan = SyncPlan::snapshot(snapshot, terminal).unwrap();
+        let segments = vec![StateSegmentId {
+            snapshot,
+            segment_id: 7,
+            segment_root: [5; 32],
+            encoded_len: 64,
+        }];
+        let plan = SyncPlan::snapshot(snapshot, terminal, segments).unwrap();
         assert_eq!(plan.base(), boundary);
         assert_eq!(plan.target(), boundary);
         assert!(plan.headers().is_empty());
-        assert_eq!(plan.required_objects().len(), 2);
+        assert_eq!(plan.required_objects().len(), 3);
+    }
+
+    #[test]
+    fn longer_same_branch_plan_contains_the_pinned_target() {
+        let genesis = genesis_header();
+        let base = ChainPoint::new(0, block_id(&genesis));
+        let first = child(genesis, 1, 2);
+        let second = child(first.header, 2, 3);
+        let pinned = SyncPlan::live_suffix(base, vec![first], 0).unwrap();
+        let moving_tip = SyncPlan::live_suffix(base, vec![first, second], 0).unwrap();
+
+        assert!(moving_tip.contains_point(pinned.target()));
+        assert!(!pinned.contains_point(moving_tip.target()));
     }
 }

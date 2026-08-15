@@ -8,13 +8,13 @@
 /// ASERT adjusts PoW difficulty so all hardware converges to this target.
 /// Bounded below by `prove_block_time` on the miner's hardware; PoW is
 /// ordering-only, not security-critical.
-pub const BLOCK_TIME: u64 = 15;
+pub const BLOCK_TIME: u64 = 20;
 
 /// Number of blocks per ASERT epoch.
 pub const EPOCH_LENGTH: u64 = 6;
 
 /// ASERT halflife in seconds = EPOCH_LENGTH × BLOCK_TIME.
-pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 90s at BLOCK_TIME=15
+pub const HALFLIFE: u64 = EPOCH_LENGTH * BLOCK_TIME; // 120s at BLOCK_TIME=20
 
 /// Maximum seconds a block timestamp may exceed local wall clock.
 pub const MAX_FUTURE_DRIFT: u64 = 120;

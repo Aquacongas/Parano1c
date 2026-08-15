@@ -281,10 +281,7 @@ fn miner_controls(app: &App) -> iced::widget::Container<'_, Message> {
         }
         #[cfg(not(feature = "dev-genesis"))]
         {
-            text("Mining requires two authenticated peers.")
-                .size(12)
-                .color(theme::MUTED)
-                .into()
+            iced::widget::Space::new().height(Length::Shrink).into()
         }
     };
 

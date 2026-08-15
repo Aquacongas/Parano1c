@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Exact network-v3 profile advertised before a connection becomes usable.
+//! Exact network-v7 profile advertised before a connection becomes usable.
 
 use std::io;
 
@@ -18,19 +18,22 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 
 use crate::header_sync_codec::MAX_HEADERS_PER_BATCH;
 
-const PROFILE_ID_DOMAIN: &[u8] = b"NOID/P2P/NETWORK-PROFILE/V3";
-const REQUEST_MAGIC: [u8; 4] = *b"NPQ2";
-const RESPONSE_MAGIC: [u8; 4] = *b"NPS2";
+const PROFILE_ID_DOMAIN: &[u8] = b"NOID/P2P/NETWORK-PROFILE/V7";
+const REQUEST_MAGIC: [u8; 4] = *b"NPQ6";
+const RESPONSE_MAGIC: [u8; 4] = *b"NPS6";
 const REQUEST_BYTES: usize = 4 + 32;
-const PROFILE_BYTES: usize = 2 + 32 + 4 + 4 + 4 + 2 + 2 + 1 + 1;
+const PROFILE_BYTES: usize = 2 + 32 + 32 + 4 + 4 + 4 + 2 + 2 + 1 + 1;
 const RESPONSE_BYTES: usize = 4 + PROFILE_BYTES + 32;
 
-pub const NETWORK_WIRE_VERSION: u16 = 3;
+pub const NETWORK_WIRE_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkProfile {
     pub wire_version: u16,
     pub genesis_hash: [u8; 32],
+    /// Semantic identity of the preflight-authenticated HistoryStep class bank.
+    /// It is independent of a Git commit, branch, host, and build timestamp.
+    pub history_proof_bank_id: [u8; 32],
     pub max_block_bytes: u32,
     pub max_terminal_bytes: u32,
     pub max_segment_bytes: u32,
@@ -42,10 +45,11 @@ pub struct NetworkProfile {
 }
 
 impl NetworkProfile {
-    pub fn current() -> Self {
+    pub fn for_proof_bank(history_proof_bank_id: [u8; 32]) -> Self {
         let mut profile = Self {
             wire_version: NETWORK_WIRE_VERSION,
             genesis_hash: block_id(&genesis_header()),
+            history_proof_bank_id,
             max_block_bytes: u32::try_from(MAX_BLOCK_BYTES).expect("block cap fits u32"),
             max_terminal_bytes: u32::try_from(MAX_HISTORY_STEP_TERMINAL_BYTES)
                 .expect("terminal cap fits u32"),
@@ -62,8 +66,8 @@ impl NetworkProfile {
         profile
     }
 
-    pub fn is_current(self) -> bool {
-        self == Self::current() && self.profile_id == self.derive_id()
+    pub fn is_for_proof_bank(self, history_proof_bank_id: [u8; 32]) -> bool {
+        self == Self::for_proof_bank(history_proof_bank_id) && self.profile_id == self.derive_id()
     }
 
     fn derive_id(self) -> [u8; 32] {
@@ -76,6 +80,8 @@ impl NetworkProfile {
         encoded[cursor..cursor + 2].copy_from_slice(&self.wire_version.to_le_bytes());
         cursor += 2;
         encoded[cursor..cursor + 32].copy_from_slice(&self.genesis_hash);
+        cursor += 32;
+        encoded[cursor..cursor + 32].copy_from_slice(&self.history_proof_bank_id);
         cursor += 32;
         encoded[cursor..cursor + 4].copy_from_slice(&self.max_block_bytes.to_le_bytes());
         cursor += 4;
@@ -99,6 +105,8 @@ impl NetworkProfile {
         cursor += 2;
         let genesis_hash = encoded[cursor..cursor + 32].try_into().unwrap();
         cursor += 32;
+        let history_proof_bank_id = encoded[cursor..cursor + 32].try_into().unwrap();
+        cursor += 32;
         let max_block_bytes = u32::from_le_bytes(encoded[cursor..cursor + 4].try_into().unwrap());
         cursor += 4;
         let max_terminal_bytes =
@@ -116,6 +124,7 @@ impl NetworkProfile {
         Self {
             wire_version,
             genesis_hash,
+            history_proof_bank_id,
             max_block_bytes,
             max_terminal_bytes,
             max_segment_bytes,
@@ -250,6 +259,8 @@ mod tests {
     use futures::AsyncWriteExt;
     use libp2p::request_response::Codec;
 
+    const TEST_PROOF_BANK_ID: [u8; 32] = [0x5a; 32];
+
     async fn decode_response(bytes: &[u8]) -> io::Result<NetworkProfileResponse> {
         let mut codec = NetworkProfileCodec;
         let mut cursor = futures::io::Cursor::new(bytes.to_vec());
@@ -260,8 +271,8 @@ mod tests {
 
     #[tokio::test]
     async fn current_profile_round_trips_exactly() {
-        let profile = NetworkProfile::current();
-        assert!(profile.is_current());
+        let profile = NetworkProfile::for_proof_bank(TEST_PROOF_BANK_ID);
+        assert!(profile.is_for_proof_bank(TEST_PROOF_BANK_ID));
         let mut codec = NetworkProfileCodec;
         let mut encoded = futures::io::Cursor::new(Vec::new());
         codec
@@ -279,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn altered_profile_and_trailing_bytes_fail_closed() {
-        let profile = NetworkProfile::current();
+        let profile = NetworkProfile::for_proof_bank(TEST_PROOF_BANK_ID);
         let mut codec = NetworkProfileCodec;
         let mut encoded = futures::io::Cursor::new(Vec::new());
         codec
@@ -294,7 +305,7 @@ mod tests {
         wrong[10] ^= 1;
         assert!(decode_response(&wrong).await.is_err());
 
-        let profile = NetworkProfile::current();
+        let profile = NetworkProfile::for_proof_bank(TEST_PROOF_BANK_ID);
         let mut canonical = futures::io::Cursor::new(Vec::new());
         codec
             .write_response(
@@ -307,5 +318,13 @@ mod tests {
         let mut trailing = canonical.into_inner();
         trailing.push(0);
         assert!(decode_response(&trailing).await.is_err());
+    }
+
+    #[test]
+    fn proof_bank_identity_is_part_of_the_network_profile() {
+        let first = NetworkProfile::for_proof_bank([1; 32]);
+        let second = NetworkProfile::for_proof_bank([2; 32]);
+        assert_ne!(first.profile_id, second.profile_id);
+        assert!(!first.is_for_proof_bank([2; 32]));
     }
 }

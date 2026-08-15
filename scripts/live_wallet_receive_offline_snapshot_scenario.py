@@ -25,6 +25,7 @@ BASE_PORT = int(
 )
 FUNDING_HEIGHT = 4
 RETAINED_DEPTH = 18
+SNAPSHOT_BOUNDARY_INTERVAL = 6
 PAYMENT_MICRONOID = 350_000
 
 live.BASE = BASE
@@ -156,9 +157,15 @@ def main():
         )
         confirmation_height = int(confirmed["height"])
 
-        # At source_tip = confirmation + 18, the payment block itself is the
-        # finalized snapshot boundary and h+1..h+18 are the retained suffix.
-        source_tip_height = confirmation_height + RETAINED_DEPTH
+        # Snapshot publishers use deterministic six-block boundary buckets.
+        # Choose the first boundary whose authenticated State includes the
+        # payment, then leave one complete finality window above it.
+        snapshot_boundary_height = (
+            (confirmation_height + SNAPSHOT_BOUNDARY_INTERVAL - 1)
+            // SNAPSHOT_BOUNDARY_INTERVAL
+            * SNAPSHOT_BOUNDARY_INTERVAL
+        )
+        source_tip_height = snapshot_boundary_height + RETAINED_DEPTH
         mined_tip = live.wait_mined(sender, source_tip_height, timeout=1800)
         require(
             int(mined_tip["height"]) == source_tip_height,
@@ -204,20 +211,20 @@ def main():
         boundaries = [
             int(value)
             for value in re.findall(
-                r"snapshot boundary and disk tail fully applied snapshot_height=(\d+)",
+                r"snapshot boundary State installed snapshot_height=(\d+)",
                 recipient_log,
             )
         ]
         suffix_counts = [
             int(value)
             for value in re.findall(
-                r'phase="retained_suffix_apply"[^\n]* count=(\d+)',
+                r"header-first exact suffix application completed[^\n]* blocks=(\d+)",
                 recipient_log,
             )
         ]
         require(
-            boundaries == [confirmation_height],
-            f"payment block was not the exact snapshot boundary: {boundaries}",
+            boundaries == [snapshot_boundary_height],
+            f"payment was not included in the expected snapshot boundary: {boundaries}",
         )
         require(
             recipient_log.count("snapshot install completed") == 1,
@@ -233,7 +240,7 @@ def main():
         )
         require(
             re.search(
-                rf"wallet active address reloaded .*height={confirmation_height}.*utxos=1.*balance={PAYMENT_MICRONOID}.*reason=\"snapshot sync\"",
+                rf"wallet active address reloaded .*height={snapshot_boundary_height}.*utxos=1.*balance={PAYMENT_MICRONOID}.*reason=\"snapshot sync\"",
                 recipient_log,
             )
             is not None,
@@ -251,7 +258,7 @@ def main():
                 "send": sent,
                 "proof_and_admission_s": round(proof_s, 3),
                 "confirmed": confirmed,
-                "snapshot_boundary_height": confirmation_height,
+                "snapshot_boundary_height": snapshot_boundary_height,
                 "source_tip": mined_tip,
                 "recipient_startup_s": round(startup_s, 3),
                 "recipient_sync_s": round(sync_s, 3),

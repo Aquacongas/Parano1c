@@ -4,7 +4,7 @@
 //! Executable-embedded artifacts for the canonical `HistoryStep` class bank.
 //!
 //! An official node contains one pinned runtime-metadata artifact and two
-//! build-authenticated canonical matrix leaves.  This module owns only the
+//! preflight-authenticated canonical matrix leaves. This module owns only the
 //! matrix boundary. Every [`HistoryStepMatrixSource`] call returns an
 //! authenticated compact lease. Packed runtime images are derived once per
 //! release into a local cache directory; a fixed-size in-memory cache
@@ -247,8 +247,8 @@ pub fn history_step_runtime_image_file_name(class: CanonicalHistoryStepClassId) 
     HISTORY_STEP_RUNTIME_IMAGE_FILE_NAMES[class.index()]
 }
 
-/// One immutable canonical matrix leaf paired with the authority minted by
-/// the release build after it authenticated exactly these compressed bytes.
+/// One immutable canonical matrix leaf paired with authority minted by the
+/// explicit pack preflight before the release build stages these bytes.
 /// The binary carries only the compact canonical artifact; the hot packed
 /// runtime layout is derived once per release into a local cache directory.
 #[derive(Clone, Copy)]
@@ -261,8 +261,8 @@ pub struct EmbeddedHistoryStepMatrixLeaf {
 impl EmbeddedHistoryStepMatrixLeaf {
     /// # Safety
     ///
-    /// The compressed canonical bytes and seal must be emitted together by
-    /// the release build after authenticating the pinned canonical matrix.
+    /// The compressed canonical bytes and seal must come from one pack that
+    /// passed the explicit canonical-pack preflight.
     #[doc(hidden)]
     pub const unsafe fn from_release_build(
         class: CanonicalHistoryStepClassId,
@@ -348,9 +348,9 @@ pub struct EmbeddedHistoryStepMatrixSource {
 impl EmbeddedHistoryStepMatrixSource {
     /// # Safety
     ///
-    /// Every leaf must be the exact immutable canonical/seal tuple emitted by
-    /// the successful release build.  Runtime or filesystem bytes must not
-    /// enter this constructor.
+    /// Every leaf must be the exact immutable canonical/seal tuple accepted by
+    /// the pack preflight and staged by the release build. Runtime or
+    /// filesystem bytes must not enter this constructor.
     pub unsafe fn from_release_build(
         leaves: [EmbeddedHistoryStepMatrixLeaf; HISTORY_STEP_PACK_LEAF_COUNT],
     ) -> Result<Self, EmbeddedHistoryStepMatrixError> {
@@ -412,7 +412,7 @@ impl EmbeddedHistoryStepMatrixSource {
         if image.len() as u64 > MAX_RUNTIME_IMAGE_BYTES {
             return None;
         }
-        // SAFETY: the seal was minted by the release build for the embedded
+        // SAFETY: the seal was minted by the pack preflight for the embedded
         // canonical relation; the packed decode validates the image framing
         // against exactly that seal, and a value-tampered image can only
         // make this node reject or produce proofs the network rejects.
@@ -425,7 +425,7 @@ impl EmbeddedHistoryStepMatrixSource {
 
     /// Rebuild one packed image from the embedded canonical bytes, then
     /// persist it best-effort into the runtime cache.  The binary is the
-    /// trust root here: the release build already ran the complete
+    /// trust root here: the canonical-pack preflight already ran the complete
     /// `CompactFieldR1cs::open` (including the structural Poseidon pass)
     /// over exactly these bytes when it minted the seal, and anyone able to
     /// swap the embedded leaves can swap the embedded pins beside them — so
@@ -460,7 +460,7 @@ impl EmbeddedHistoryStepMatrixSource {
             });
         }
         // SAFETY: `canonical` is the exact decompressed embedded payload the
-        // release build paired with `build_seal` after running the complete
+        // pack preflight paired with `build_seal` after running the complete
         // `CompactFieldR1cs::open` over it.
         let relation = unsafe {
             CompactFieldR1cs::open_build_authenticated(

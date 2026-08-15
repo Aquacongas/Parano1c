@@ -9,13 +9,14 @@
 //! - Identify + Ping for peer management
 
 pub mod behaviour;
-pub mod block_sync_codec;
+mod command_dispatch;
 mod event_dispatch;
 pub mod header_protocol;
 pub mod header_sync_codec;
 pub mod history_step_codec;
 mod identity_store;
 mod inbound_budget;
+pub mod manifest_page_codec;
 pub mod mempool_sync_codec;
 pub mod network;
 pub mod network_profile;
@@ -25,11 +26,14 @@ mod outbound_budget;
 mod peer_diversity;
 pub mod peer_store;
 pub mod protocol;
+mod resource_profile;
 pub mod state_manifest_codec;
 pub mod state_segment_codec;
 
+pub use command_dispatch::NetworkCommandSender;
 pub use network::{
-    NetworkCommand, NetworkEvent, NetworkEventReceiver, NetworkEventRecvError, P2PNetwork,
-    RequestFailureKind,
+    NetworkCommand, NetworkEvent, NetworkEventReceiver, NetworkEventRecvError, P2PHealthSnapshot,
+    P2PNetwork, RequestFailureKind,
 };
 pub use protocol::{NetworkTopics, Topics};
+pub use resource_profile::BackgroundCapacity;

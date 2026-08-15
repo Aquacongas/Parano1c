@@ -72,7 +72,6 @@ tempfile = "3"
 static_assertions = "1.1"
 
 [build-dependencies]
-noid_poseidon2b = { path = "../noid_poseidon2b" }
 noid_recursive  = { path = "../noid_recursive" }
 noid_miner      = { path = "../noid_miner" }
 noid-ivc-core   = { path = "../noid_ivc_core" }

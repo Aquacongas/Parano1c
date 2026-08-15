@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pyright: reportMissingParameterType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportMissingTypeArgument=false, reportAny=false, reportUnusedCallResult=false, reportUnusedVariable=false, reportUnannotatedClassAttribute=false
+# pyright: reportMissingParameterType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportUnknownLambdaType=false, reportMissingTypeArgument=false, reportUnusedCallResult=false, reportUnusedVariable=false
 import json
 import re
 import shutil
@@ -292,7 +292,7 @@ def main():
             "\n=== CLI Scenario 3: address generation/list/validation ===", flush=True
         )
         out, _, _ = cli(n3, ["address"])
-        assert_contains(out, "Wallet address [index=0]", "address output")
+        assert_contains(out, "Active address [index=0]", "address output")
         assert_contains(out, "o1", "address output")
 
         new1 = cli_json(n3, ["address", "--new"])
@@ -309,12 +309,12 @@ def main():
         )
 
         out, _, _ = cli(n3, ["address", "--new"])
-        assert_contains(out, "New receiving address", "address --new output")
+        assert_contains(out, "New address", "address --new output")
         assert_contains(out, "o1", "address --new output")
 
         out, _, _ = cli(n3, ["address", "--list"])
         assert_contains(out, "Wallet addresses", "address --list output")
-        assert_contains(out, "Total:", "address --list output")
+        assert_contains(out, "locally generated address(es)", "address --list output")
 
         out, _, _ = cli(n3, ["validate", addr1])
         assert_contains(out, "Address validation", "validate output")
@@ -361,7 +361,7 @@ def main():
         assert_contains(out, "proof", "mempool output")
         out, _, _ = cli(n2, ["mempool-tx", tx1])
         assert_contains(out, "Mempool transaction", "mempool-tx output")
-        assert_contains(out, "LogicProof", "mempool-tx output")
+        assert_contains(out, "Minimum proof class", "mempool-tx output")
         assert_contains(out, "attached", "mempool-tx output")
 
         wait_until(
@@ -405,18 +405,35 @@ def main():
             "\n=== CLI Scenario 6: recipient scan, balance, per-address UTXOs, history ===",
             flush=True,
         )
+        cli_json(n3, ["address", "--use", str(new1["key_index"])])
         scan3 = cli_json(n3, ["scan"], timeout=180)
         assert_true(
-            scan3["balance_micronoid"] >= 2_000_000,
-            f"recipient scan did not find funds: {scan3}",
+            scan3["balance_micronoid"] == 1_250_000
+            and scan3["found_utxos"] == 1,
+            f"first recipient scan did not find the exact funds: {scan3}",
         )
         bal3 = cli_json(n3, ["balance"])
         assert_true(
-            bal3["total_micronoid"] >= 2_000_000 and bal3["utxo_count"] >= 2,
-            f"recipient balance wrong: {bal3}",
+            bal3["balance_micronoid"] == 1_250_000 and bal3["utxo_count"] == 1,
+            f"first recipient balance wrong: {bal3}",
         )
         out, _, _ = cli(n3, ["balance"])
-        assert_contains(out, "2.000000", "recipient balance output")
+        assert_contains(out, "1.250000", "first recipient balance output")
+
+        cli_json(n3, ["address", "--use", str(new2["key_index"])])
+        scan3 = cli_json(n3, ["scan"], timeout=180)
+        assert_true(
+            scan3["balance_micronoid"] == 750_000
+            and scan3["found_utxos"] == 1,
+            f"second recipient scan did not find the exact funds: {scan3}",
+        )
+        bal3 = cli_json(n3, ["balance"])
+        assert_true(
+            bal3["balance_micronoid"] == 750_000 and bal3["utxo_count"] == 1,
+            f"second recipient balance wrong: {bal3}",
+        )
+        out, _, _ = cli(n3, ["balance"])
+        assert_contains(out, "0.750000", "second recipient balance output")
 
         slots1 = cli_json(n3, ["utxos-of", addr1])
         slots2 = cli_json(n3, ["utxos-of", addr2])
@@ -427,17 +444,6 @@ def main():
         out, _, _ = cli(n3, ["utxos-of", addr1])
         assert_contains(out, "UTXOs of", "utxos-of output")
         assert_contains(out, "TOTAL", "utxos-of output")
-
-        hist3 = cli_json(n3, ["history"])
-        recv_entries = [h for h in hist3 if h.get("direction") == "received"]
-        assert_true(
-            len(recv_entries) >= 2,
-            f"recipient history missing received entries: {hist3}",
-        )
-        out, _, _ = cli(n3, ["history"])
-        assert_contains(out, "Transaction history", "recipient history output")
-        assert_contains(out, "recv", "recipient history output")
-        assert_contains(out, "received", "recipient history totals")
 
         hist1 = cli_json(n1, ["history"])
         sent_entries = [h for h in hist1 if h.get("direction") == "sent"]

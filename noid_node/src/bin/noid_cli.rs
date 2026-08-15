@@ -145,7 +145,7 @@ struct Cli {
     #[arg(
         long,
         short = 'r',
-        default_value = "http://127.0.0.1:9401",
+        default_value = "http://127.0.0.1:9501",
         env = "NOID_RPC",
         value_name = "URL",
         global = true
@@ -491,7 +491,7 @@ fn print_error(msg: &str) {
     {
         "Node is not responding.\n\
              Is the parano1d daemon running?  Try: parano1d --mode miner\n\
-             Default RPC: http://127.0.0.1:9401  (override with --rpc)"
+             Default RPC: http://127.0.0.1:9501  (override with --rpc)"
             .to_string()
     } else if msg.contains("Insufficient") || msg.contains("insufficient") {
         // Extract amounts from error if possible

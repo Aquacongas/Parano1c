@@ -96,25 +96,31 @@ pub(crate) struct PeerDiversity {
 }
 
 impl PeerDiversity {
+    pub(crate) fn public_group_for_peer(&self, peer: PeerId) -> Option<PublicNetworkGroup> {
+        self.connections
+            .values()
+            .filter_map(|connection| connection.as_ref())
+            .filter(|connection| connection.peer == peer)
+            .map(|connection| connection.group)
+            .min_by_key(|group| match group {
+                PublicNetworkGroup::Ipv4(prefix) => (0u8, u32::from(u16::from_be_bytes(*prefix))),
+                PublicNetworkGroup::Ipv6(prefix) => (1u8, u32::from_be_bytes(*prefix)),
+            })
+    }
+
     /// Stable coarse domain used by higher-level source scheduling. Public
     /// peers share their admitted IPv4 /16 or IPv6 /32; private/LAN peers fall
     /// back to their authenticated identity so local test clusters still
     /// provide independent sources.
     pub(crate) fn failure_domain(&self, peer: PeerId) -> u64 {
-        let public = self
-            .connections
-            .values()
-            .filter_map(|connection| connection.as_ref())
-            .filter(|connection| connection.peer == peer)
-            .map(|connection| match connection.group {
-                PublicNetworkGroup::Ipv4(prefix) => {
-                    0x1000_0000_0000_0000u64 | u64::from(u16::from_be_bytes(prefix))
-                }
-                PublicNetworkGroup::Ipv6(prefix) => {
-                    0x2000_0000_0000_0000u64 | u64::from(u32::from_be_bytes(prefix))
-                }
-            })
-            .min();
+        let public = self.public_group_for_peer(peer).map(|group| match group {
+            PublicNetworkGroup::Ipv4(prefix) => {
+                0x1000_0000_0000_0000u64 | u64::from(u16::from_be_bytes(prefix))
+            }
+            PublicNetworkGroup::Ipv6(prefix) => {
+                0x2000_0000_0000_0000u64 | u64::from(u32::from_be_bytes(prefix))
+            }
+        });
         public.unwrap_or_else(|| {
             // FNV-1a is sufficient here: this is scheduling diversity, not a
             // cryptographic identity. PeerId authentication happens earlier.
@@ -379,20 +385,20 @@ mod tests {
     #[test]
     fn public_network_groups_are_coarse_and_non_public_addresses_are_exempt() {
         assert_eq!(
-            public_ip(&addr("/ip4/8.8.4.4/tcp/9400")).map(PublicNetworkGroup::from_ip),
+            public_ip(&addr("/ip4/8.8.4.4/tcp/9500")).map(PublicNetworkGroup::from_ip),
             Some(PublicNetworkGroup::Ipv4([8, 8]))
         );
         assert_eq!(
-            public_ip(&addr("/ip6/2606:4700:4700::1111/tcp/9400")).map(PublicNetworkGroup::from_ip),
+            public_ip(&addr("/ip6/2606:4700:4700::1111/tcp/9500")).map(PublicNetworkGroup::from_ip),
             Some(PublicNetworkGroup::Ipv6([0x26, 0x06, 0x47, 0x00]))
         );
         for non_public in [
-            "/ip4/127.0.0.1/tcp/9400",
-            "/ip4/10.1.2.3/tcp/9400",
-            "/ip4/192.0.2.1/tcp/9400",
-            "/ip6/::1/tcp/9400",
-            "/ip6/fd00::1/tcp/9400",
-            "/ip6/2001:db8::1/tcp/9400",
+            "/ip4/127.0.0.1/tcp/9500",
+            "/ip4/10.1.2.3/tcp/9500",
+            "/ip4/192.0.2.1/tcp/9500",
+            "/ip6/::1/tcp/9500",
+            "/ip6/fd00::1/tcp/9500",
+            "/ip6/2001:db8::1/tcp/9500",
         ] {
             assert_eq!(public_ip(&addr(non_public)), None, "{non_public}");
         }
@@ -411,30 +417,30 @@ mod tests {
         let id5 = ConnectionId::new_unchecked(5);
 
         diversity
-            .try_admit(id1, first, &addr("/ip4/8.8.1.1/tcp/9400"), true)
+            .try_admit(id1, first, &addr("/ip4/8.8.1.1/tcp/9500"), true)
             .unwrap();
         diversity
-            .try_admit(id2, first, &addr("/ip4/8.8.2.2/tcp/9400"), true)
+            .try_admit(id2, first, &addr("/ip4/8.8.2.2/tcp/9500"), true)
             .expect("direct plus relay path for one identity stays usable");
         diversity
-            .try_admit(id3, second, &addr("/ip4/8.8.3.3/tcp/9400"), true)
+            .try_admit(id3, second, &addr("/ip4/8.8.3.3/tcp/9500"), true)
             .expect("a second identity in one provider group is tolerated");
         assert!(matches!(
-            diversity.try_admit(id4, third, &addr("/ip4/8.8.4.4/tcp/9400"), true),
+            diversity.try_admit(id4, third, &addr("/ip4/8.8.4.4/tcp/9500"), true),
             Err(DiversityRejection::OutboundGroupFull { .. })
         ));
         diversity
-            .try_admit(id4, third, &addr("/ip4/9.9.3.3/tcp/9400"), true)
+            .try_admit(id4, third, &addr("/ip4/9.9.3.3/tcp/9500"), true)
             .expect("a distinct /16 is independent");
 
         diversity.remove(id1);
         assert!(matches!(
-            diversity.try_admit(id5, third, &addr("/ip4/8.8.5.5/tcp/9400"), true),
+            diversity.try_admit(id5, third, &addr("/ip4/8.8.5.5/tcp/9500"), true),
             Err(DiversityRejection::OutboundGroupFull { .. })
         ));
         diversity.remove(id2);
         diversity
-            .try_admit(id5, third, &addr("/ip4/8.8.5.5/tcp/9400"), true)
+            .try_admit(id5, third, &addr("/ip4/8.8.5.5/tcp/9500"), true)
             .expect("the group is released after the final path closes");
     }
 
@@ -607,7 +613,7 @@ mod tests {
             .try_admit(
                 ConnectionId::new_unchecked(101),
                 first,
-                &addr("/ip4/8.8.1.1/tcp/9400"),
+                &addr("/ip4/8.8.1.1/tcp/9500"),
                 true,
             )
             .unwrap();
@@ -615,7 +621,7 @@ mod tests {
             .try_admit(
                 ConnectionId::new_unchecked(102),
                 second,
-                &addr("/ip4/8.8.2.2/tcp/9400"),
+                &addr("/ip4/8.8.2.2/tcp/9500"),
                 true,
             )
             .unwrap();
@@ -638,19 +644,19 @@ mod tests {
         let id1 = ConnectionId::new_unchecked(1);
         let id2 = ConnectionId::new_unchecked(2);
         let id3 = ConnectionId::new_unchecked(3);
-        let dns = addr("/dns4/seed.example/tcp/9400");
+        let dns = addr("/dns4/seed.example/tcp/9500");
 
         diversity.try_admit(id1, first, &dns, true).unwrap();
         diversity
-            .classify_outbound_dns_connection(id1, first, &addr("/ip4/8.8.1.1/tcp/9400"))
+            .classify_outbound_dns_connection(id1, first, &addr("/ip4/8.8.1.1/tcp/9500"))
             .unwrap();
         diversity.try_admit(id2, second, &dns, true).unwrap();
         diversity
-            .classify_outbound_dns_connection(id2, second, &addr("/ip4/8.8.2.2/tcp/9400"))
+            .classify_outbound_dns_connection(id2, second, &addr("/ip4/8.8.2.2/tcp/9500"))
             .unwrap();
         diversity.try_admit(id3, third, &dns, true).unwrap();
         assert!(matches!(
-            diversity.classify_outbound_dns_connection(id3, third, &addr("/ip4/8.8.3.3/tcp/9400"),),
+            diversity.classify_outbound_dns_connection(id3, third, &addr("/ip4/8.8.3.3/tcp/9500"),),
             Err(DiversityRejection::OutboundGroupFull { .. })
         ));
     }

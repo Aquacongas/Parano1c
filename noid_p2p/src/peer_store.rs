@@ -182,15 +182,15 @@ mod tests {
     use super::*;
 
     fn public_addr(ip: &str) -> Multiaddr {
-        format!("/ip4/{ip}/tcp/9400").parse().unwrap()
+        format!("/ip4/{ip}/tcp/9500").parse().unwrap()
     }
 
     #[test]
     fn inbound_or_private_addresses_never_enter_success_cache() {
         let mut cache = SuccessfulPeerCache::default();
         let peer = PeerId::random();
-        cache.record_success(peer, "/ip4/127.0.0.1/tcp/9400".parse().unwrap());
-        cache.record_success(peer, "/ip4/10.0.0.1/tcp/9400".parse().unwrap());
+        cache.record_success(peer, "/ip4/127.0.0.1/tcp/9500".parse().unwrap());
+        cache.record_success(peer, "/ip4/10.0.0.1/tcp/9500".parse().unwrap());
         assert_eq!(cache.entries().count(), 0);
         cache.record_success(peer, public_addr("8.8.8.8"));
         assert_eq!(cache.entries().count(), 1);
@@ -205,9 +205,9 @@ mod tests {
         let legacy = serde_json::json!([{
             "peer_id": peer.to_string(),
             "addrs": [
-                "/ip4/127.0.0.1/tcp/9400",
-                "/ip4/8.8.8.8/tcp/9400",
-                "/ip4/8.8.8.8/tcp/9400"
+                "/ip4/127.0.0.1/tcp/9500",
+                "/ip4/8.8.8.8/tcp/9500",
+                "/ip4/8.8.8.8/tcp/9500"
             ]
         }]);
         std::fs::write(

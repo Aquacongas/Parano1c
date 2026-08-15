@@ -26,7 +26,8 @@ pub use historical_state::{
     HistoricalStateError,
 };
 pub use mdbx_context::{
-    HistoryStepTerminalClaim, MdbxChainContext, MdbxContextError, VerifiedRecursiveSuffix,
+    verify_history_step_terminal_candidate, HistoryStepTerminalClaim, IndexedReorgSuffixError,
+    MdbxChainContext, MdbxContextError, VerifiedHistoryStepTerminal, VerifiedRecursiveSuffix,
     VerifiedReorgSuffix,
 };
 pub use mdbx_store::{

@@ -109,21 +109,37 @@ def assert_clean(label, text):
 
 
 def require_miner_caught_up(label, text, minimum_applied):
-    applied = text.count("applied P2P block")
+    legacy_applied = text.count("applied P2P block")
+    exact_applied = sum(
+        int(value)
+        for value in re.findall(
+            r"header-first exact suffix application completed[^\n]* blocks=(\d+)",
+            text,
+        )
+    )
+    applied = legacy_applied + exact_applied
     require(applied >= minimum_applied, f"{label} applied only {applied}/{minimum_applied} blocks")
     stale_work_cancelled = (
         "prepared template parent changed before PoW" in text
         or "new chain tip: cancelling PoW to rebuild" in text
+        or "canonical/template change cancelled HistoryStep preparation" in text
+        or "template input changed: cancelling PoW to rebuild" in text
         or "miner: sync ready, starting" in text
         or "miner: ready, starting" in text
     )
     require(stale_work_cancelled, f"{label} has no evidence of stale mining-work cancellation")
-    return {"applied_p2p_blocks": applied, "stale_work_cancelled": stale_work_cancelled}
+    return {
+        "applied_blocks": applied,
+        "exact_suffix_blocks": exact_applied,
+        "legacy_p2p_blocks": legacy_applied,
+        "stale_work_cancelled": stale_work_cancelled,
+    }
 
 
 def logged_peer_id(text):
     match = re.search(r"loaded persistent P2P identity peer=([^\s]+)", text)
     require(match is not None, "persistent PeerId is absent from startup log")
+    assert match is not None
     return match.group(1)
 
 
