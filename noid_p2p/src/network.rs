@@ -1223,9 +1223,11 @@ impl AutomaticPeerState {
                 }
                 PendingAutomaticDial::Peer { .. } => None,
             },
-            None => self.bootstrap.iter().find_map(|(addr, candidate)| {
-                (candidate.peer == Some(peer)).then(|| ManagedOutboundKind::Bootstrap(addr.clone()))
-            }),
+            // Kademlia and relay behaviours also open short-lived outbound
+            // transports. They are useful to the behaviour that owns them,
+            // but must not become maintained neighbours merely because the
+            // remote PeerId is already present in the candidate table.
+            None => None,
         };
         if matches!(&managed_kind, Some(ManagedOutboundKind::Bootstrap(_))) {
             // A seed may already exist in the successful-peer cache from an
@@ -1236,11 +1238,6 @@ impl AutomaticPeerState {
         }
         if outbound {
             self.outbound_connections.insert(connection_id, peer);
-            let managed_kind = managed_kind.or_else(|| {
-                self.peers
-                    .contains_key(&peer)
-                    .then_some(ManagedOutboundKind::Peer)
-            });
             if let Some(kind) = managed_kind {
                 self.locally_selected_peers.insert(peer);
                 // Keep up to the transport's two-path hard limit. A second
@@ -1273,19 +1270,7 @@ impl AutomaticPeerState {
         *self.outbound_counts.entry(peer).or_default() += 1;
     }
 
-    fn note_identified(&mut self, connection_id: libp2p::swarm::ConnectionId, peer: PeerId) {
-        if !self.managed_connections.contains_key(&connection_id)
-            && self.outbound_connections.get(&connection_id) == Some(&peer)
-        {
-            let kind = self.bootstrap.iter().find_map(|(addr, candidate)| {
-                (candidate.peer == Some(peer)).then(|| ManagedOutboundKind::Bootstrap(addr.clone()))
-            });
-            if let Some(kind) = kind {
-                self.track_managed_connection(connection_id, peer, kind);
-            } else if self.peers.contains_key(&peer) {
-                self.track_managed_connection(connection_id, peer, ManagedOutboundKind::Peer);
-            }
-        }
+    fn note_identified(&mut self, connection_id: libp2p::swarm::ConnectionId, _peer: PeerId) {
         if let Some(connection) = self.managed_connections.get_mut(&connection_id) {
             connection.identified = true;
         }
@@ -8976,6 +8961,24 @@ mod tests {
         let candidate = state.bootstrap.get(&addr).unwrap();
         assert_eq!(candidate.failures, 1);
         assert!(candidate.next_attempt > Instant::now());
+    }
+
+    #[test]
+    fn incidental_outbound_transport_is_not_promoted_to_a_managed_neighbour() {
+        let local = PeerId::random();
+        let peer = PeerId::random();
+        let connection_id = libp2p::swarm::ConnectionId::new_unchecked(2);
+        let mut state = AutomaticPeerState::new(local);
+        assert!(state.add_peer_candidate(local, peer, ["/ip4/8.8.8.8/tcp/9500".parse().unwrap()]));
+
+        // Kademlia owns this connection: no PendingAutomaticDial exists.
+        state.note_connection_established(connection_id, peer, true);
+        state.note_identified(connection_id, peer);
+
+        assert_eq!(state.outbound_connections.get(&connection_id), Some(&peer));
+        assert_eq!(state.outbound_peer_count(), 0);
+        assert!(!state.managed_connections.contains_key(&connection_id));
+        assert!(!state.is_locally_selected(peer));
     }
 
     #[test]

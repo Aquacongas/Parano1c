@@ -647,7 +647,7 @@ impl AppSnapshot {
                 backend: "STARTING".into(),
                 synced: false,
                 terminal_verified: false,
-                state_root: "waiting-for-local-node".into(),
+                state_root: "local-node-starting".into(),
             },
             addresses: vec![AddressSnapshot {
                 key_index: 0,

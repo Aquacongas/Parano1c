@@ -3238,7 +3238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_node_log_is_an_empty_waiting_state() {
+    async fn missing_node_log_returns_an_empty_state() {
         let directory = tempfile::tempdir().unwrap();
         let tail = read_node_log_tail(&directory.path().join("missing.log"), 64 * 1024, 80)
             .await

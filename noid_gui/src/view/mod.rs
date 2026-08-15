@@ -715,7 +715,7 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
     } else if app.snapshot.mining.enabled && app.snapshot.mining.ready {
         ("MINING ON", theme::ACCENT)
     } else if app.snapshot.mining.enabled {
-        ("WAITING", theme::WARNING)
+        ("SYNCING TIP", theme::WARNING)
     } else {
         ("MINING OFF", theme::DIM)
     };
@@ -1543,7 +1543,7 @@ fn node_log_terminal(app: &App) -> Element<'_, Message> {
     } else if app.node_log_error.is_some() {
         ("READ ERROR", theme::DANGER)
     } else if app.node_log.is_empty() {
-        ("WAITING FOR OUTPUT", theme::DIM)
+        ("NO OUTPUT", theme::DIM)
     } else {
         ("LIVE", theme::ACCENT)
     };
@@ -1565,7 +1565,7 @@ fn node_log_terminal(app: &App) -> Element<'_, Message> {
     }
 
     let output = text_editor(&app.node_log)
-        .placeholder(translate("Waiting for parano1d-node.log output…"))
+        .placeholder(translate("No parano1d-node.log output yet…"))
         .on_action(Message::EditNodeLog)
         .font(theme::TECH_FONT)
         .size(12)
