@@ -38,19 +38,20 @@ def mined_block(node, height):
     page = rpc(node.rpc_port, "walletMinedBlocks", [1, 50])
     return next(
         (block for block in page["blocks"] if int(block["height"]) == int(height)),
-        False,
+        None,
     )
 
 
 def wait_payout(node, height, key_index, timeout=900):
+    def matching_payout():
+        block = mined_block(node, height)
+        if block is None or int(block["payout_key_index"]) != key_index:
+            return False
+        return block
+
     return live.wait_value(
         f"block {height} pays address {key_index}",
-        lambda: (
-            block
-            if (block := mined_block(node, height))
-            and int(block["payout_key_index"]) == key_index
-            else False
-        ),
+        matching_payout,
         timeout=timeout,
         interval=0.25,
     )
@@ -70,7 +71,7 @@ def main():
     (RUN_PARENT / "LAST_WALLET_PAYOUT_SWITCH_RUN").write_text(str(BASE) + "\n")
 
     node = Node("wallet-miner", BASE_PORT, BASE_PORT + 1)
-    summary = {
+    summary: dict[str, object] = {
         "run_dir": str(BASE),
         "binary_sha256": live.sha256(live.NODE_BIN),
         "status": "running",
@@ -79,6 +80,8 @@ def main():
 
     try:
         node.start("01-live-miner-address-switch", mode="miner", genesis=True)
+        require(node.proc is not None, "miner process did not start")
+        assert node.proc is not None
         miner_pid = node.proc.pid
         address0 = active(node)
         require(int(address0["key_index"]) == 0, f"unexpected first address: {address0}")

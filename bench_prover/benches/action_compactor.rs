@@ -70,6 +70,11 @@ fn main() {
                 kinds.push(true);
             }
         }
+        // The stable action surface always reserves two fixed development-
+        // payout mint candidates. Height 7 is not a payout boundary, so both
+        // rows are present but gated off.
+        pattern.extend([false, false]);
+        kinds.extend([true, true]);
         assert_eq!(pattern.len(), class.action_candidate_capacity());
         assert_eq!(
             pattern.iter().filter(|&&live| live).count(),

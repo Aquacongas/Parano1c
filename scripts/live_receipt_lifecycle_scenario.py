@@ -37,7 +37,10 @@ BASE = Path(
 BASE_PORT = int(os.environ.get("NOID_LIVE_RECEIPT_BASE_PORT", "22900"))
 PAYMENT_MICRONOID = int(os.environ.get("NOID_LIVE_RECEIPT_PAYMENT", "1000000"))
 FUNDING_HEIGHT = int(os.environ.get("NOID_LIVE_RECEIPT_FUNDING_HEIGHT", "3"))
-RECENT_BLOCK_RETENTION_DEPTH = 18
+# Full bodies remain serveable beyond the 18-block authenticated suffix so a
+# peer can recover a moving non-final branch.  Receipt independence must be
+# tested only after that complete operational serving window has elapsed.
+RETAINED_BLOCK_SERVING_DEPTH = 42
 CLI_BIN = ROOT / "target" / "release" / "parano1d-cli"
 
 live.BASE = BASE
@@ -349,7 +352,7 @@ def main():
             "post-restart verification",
         )
 
-        prune_height = tx_height + RECENT_BLOCK_RETENTION_DEPTH + 1
+        prune_height = tx_height + RETAINED_BLOCK_SERVING_DEPTH + 1
         live.wait_mined(sender_node, prune_height, timeout=1800)
         wait_value(
             "independent verifier reaches pruning horizon",

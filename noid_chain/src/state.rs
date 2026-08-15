@@ -145,7 +145,7 @@ impl StreamingSparseRoot {
 
 /// Compact two-level exact-state root cache.
 ///
-/// At mainnet depth 24 this is 256 segment roots plus 255 upper nodes (under
+/// At production depth 24 this is 256 segment roots plus 255 upper nodes (under
 /// 17 KiB), independent of the number of live UTXOs.  It deliberately stores
 /// no slot leaves and no full Merkle paths.
 #[derive(Debug, Clone)]
@@ -375,7 +375,7 @@ pub enum SparseUtxoBuildError {
 }
 
 impl ChainState {
-    /// Fresh mainnet-sized state: `2^STATE_LOG_SLOTS` empty slots.
+    /// Fresh production-sized state: `2^STATE_LOG_SLOTS` empty slots.
     pub fn new() -> Self {
         Self::with_log_slots(STATE_LOG_SLOTS)
     }
@@ -1298,6 +1298,7 @@ mod tests {
 
     #[test]
     fn development_payout_uses_the_normal_allocator_namespace() {
+        use crate::consensus::development_allocation::TARGET_BLOCKS_PER_DAY;
         use crate::consensus::params::is_coinbase_creation_id;
 
         let mut state = ChainState::with_log_slots(8);
@@ -1316,7 +1317,7 @@ mod tests {
             validity_bitmap: output_bitmap_bit(0),
             is_coinbase: true,
         };
-        apply_tx_at(&mut state, &miner, 5_760).unwrap();
+        apply_tx_at(&mut state, &miner, TARGET_BLOCKS_PER_DAY).unwrap();
 
         let payout = TxBody {
             epoch_anchor: [9u8; 32],
@@ -1338,7 +1339,7 @@ mod tests {
             validity_bitmap: output_bitmap_bit(0) | output_bitmap_bit(1),
             is_coinbase: true,
         };
-        apply_tx_at(&mut state, &payout, 5_760).unwrap();
+        apply_tx_at(&mut state, &payout, TARGET_BLOCKS_PER_DAY).unwrap();
 
         assert_eq!(state.state.slot(5).creation_id(), 2);
         assert_eq!(state.state.slot(6).creation_id(), 3);

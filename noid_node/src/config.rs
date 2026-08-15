@@ -18,13 +18,21 @@ pub struct NodeConfig {
 pub struct NetworkConfig {
     /// P2P listen address.
     /// Config file: HOST:PORT or libp2p multiaddr ("/ip4/...").
-    /// CLI flag: --p2p-listen HOST:PORT  (e.g. 0.0.0.0:9400)
-    /// Defaults to the compiled network's P2P port (9400 on mainnet).
+    /// CLI flag: --p2p-listen HOST:PORT  (e.g. 0.0.0.0:9500)
+    /// Defaults to the compiled network's P2P port (9500 on testnet).
     pub listen: Option<String>,
     /// Bootstrap seed peers.
-    /// Config file: list of HOST:PORT strings (e.g. ["1.2.3.4:9400"]).
+    /// Config file: list of HOST:PORT strings (e.g. ["1.2.3.4:9500"]).
     /// CLI flag: --seed HOST:PORT  (repeat for multiple seeds).
     pub seeds: Vec<String>,
+    /// Public TCP addresses at which this node is reachable.
+    ///
+    /// Most wallets leave this empty. Public nodes behind an unspecified
+    /// listen socket (for example `0.0.0.0:9500`) set the externally reachable
+    /// IP here so Identify and Circuit Relay v2 can advertise a usable path.
+    /// Config file: list of IP:PORT strings or libp2p multiaddrs.
+    #[serde(default)]
+    pub public_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,7 +47,7 @@ pub struct StorageConfig {
 pub struct RpcConfig {
     /// JSON-RPC listen address.
     /// Defaults to the compiled network's local RPC address
-    /// (127.0.0.1:9401 on mainnet).
+    /// (127.0.0.1:9501 on testnet).
     pub listen: Option<String>,
 }
 
@@ -57,6 +65,7 @@ impl Default for NodeConfig {
             network: NetworkConfig {
                 listen: None, // determined by --network at runtime
                 seeds: vec![],
+                public_addresses: vec![],
             },
             storage: StorageConfig {
                 backend: "mdbx".into(),

@@ -13,9 +13,15 @@
 use noid_poseidon2b::primitives::Address;
 
 use super::emission::block_reward;
+use super::params::BLOCK_TIME;
 
-/// Four 15-second target blocks per minute.
-pub const TARGET_BLOCKS_PER_DAY: u64 = 5_760;
+/// Target blocks in one wall-clock day at the consensus block interval.
+pub const TARGET_BLOCKS_PER_DAY: u64 = 24 * 60 * 60 / BLOCK_TIME;
+
+const _: () = assert!(
+    (24_u64 * 60 * 60).is_multiple_of(BLOCK_TIME),
+    "BLOCK_TIME must divide one day exactly"
+);
 
 /// Three 365-day target-time years, excluding built-in genesis height zero.
 pub const DEVELOPMENT_ALLOCATION_END_HEIGHT: u64 = TARGET_BLOCKS_PER_DAY * 365 * 3;

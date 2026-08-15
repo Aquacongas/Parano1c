@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pyright: reportMissingParameterType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportAny=false
+# pyright: reportMissingParameterType=false, reportUnknownParameterType=false, reportUnknownVariableType=false, reportUnknownMemberType=false, reportUnknownArgumentType=false
 """Live multi-node slot/mempool/wallet UX test.
 
 Covers:
@@ -362,9 +362,11 @@ def main():
             send = rpc(
                 n1.rpc_url, "walletSend", [dst.address(), amount, 0], timeout=240
             )
-            tx_hashes.append(send["tx_hash"])
+            tx_hash = send.get("tx_hash") or send.get("txid")
+            assert_true(tx_hash, f"walletSend omitted transaction id: {send}")
+            tx_hashes.append(tx_hash)
             print(
-                f"[send funding] A->{dst.name} amount={amount} tx={send['tx_hash'][:12]} fee={send['fee_micronoid']}",
+                f"[send funding] A->{dst.name} amount={amount} tx={tx_hash[:12]} fee={send['fee_micronoid']}",
                 flush=True,
             )
             wait_until(
@@ -373,7 +375,7 @@ def main():
                 timeout=120,
                 interval=2,
             )
-            wait_tx_confirmed(nodes, send["tx_hash"])
+            wait_tx_confirmed(nodes, tx_hash)
             wait_until(
                 "mempools drain after funding",
                 lambda: all(n.mempool_size() == 0 for n in nodes),
@@ -424,7 +426,8 @@ def main():
                     [dst.address(), amount, 0],
                     timeout=240,
                 )
-                tx_hash = send["tx_hash"]
+                tx_hash = send.get("tx_hash") or send.get("txid")
+                assert_true(tx_hash, f"walletSend omitted transaction id: {send}")
                 tx_hashes.append(tx_hash)
                 print(
                     f"[send r{r}] {src.name}->{dst.name} amount={amount} tx={tx_hash[:12]} fee={send['fee_micronoid']} hints={hints_before[:3]}",

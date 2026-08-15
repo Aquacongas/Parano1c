@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Live isolated-mining override and ordinary-peer quorum scenario."""
+"""Live isolated-mining override and ordinary single-peer gate scenario."""
 
 import datetime
 import json
@@ -21,6 +21,7 @@ BASE = Path(
 )
 BASE_PORT = int(os.environ.get("NOID_LIVE_MINING_GATE_BASE_PORT", "23600"))
 NO_PEER_HOLD_SECONDS = 35
+PEER_LOSS_HOLD_SECONDS = 25
 
 live.BASE = BASE
 Node = live.Node
@@ -57,21 +58,42 @@ def normal_gate(node, ready):
     return False
 
 
+def wait_mined_without_gate_drop(node, target, timeout=900):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        info = node.info()
+        height = int(info["height"])
+        if height != last:
+            print(f"[continuous-mine] {node.name} height={height}/{target}", flush=True)
+            last = height
+        require(
+            bool(node_status(node)["mining_ready"]),
+            f"ordinary canonical child closed the mining gate at height {height}",
+        )
+        if height >= target:
+            return info
+        time.sleep(0.1)
+    raise live.LiveForkReorgError(
+        f"{node.name} did not continuously mine h{target}; last={last}"
+    )
+
+
 def main():
     require(live.NODE_BIN.is_file(), f"release node is missing: {live.NODE_BIN}")
     require(not BASE.exists(), f"run directory already exists: {BASE}")
-    ports = tuple(BASE_PORT + offset for offset in (0, 1, 10, 11, 20, 21))
+    ports = tuple(BASE_PORT + offset for offset in (0, 1, 10, 11))
     for port in ports:
         require(live.port_is_free(port), f"port occupied: {port}")
     (BASE / "logs").mkdir(parents=True)
 
     miner = Node("miner", BASE_PORT, BASE_PORT + 1)
     wallet_a = Node("wallet-a", BASE_PORT + 10, BASE_PORT + 11)
-    wallet_b = Node("wallet-b", BASE_PORT + 20, BASE_PORT + 21)
     summary = {
         "run_dir": str(BASE),
         "binary_sha256": live.sha256(live.NODE_BIN),
         "no_peer_hold_seconds": NO_PEER_HOLD_SECONDS,
+        "peer_loss_hold_seconds": PEER_LOSS_HOLD_SECONDS,
         "status": "running",
     }
     error = None
@@ -109,49 +131,65 @@ def main():
 
         miner.start("04-prefix-server")
         wallet_a.start("05-wallet-a-sync", seeds=[miner.seed])
-        wallet_b.start("06-wallet-b-sync", seeds=[miner.seed])
         shared_tip = live.wait_value(
-            "two ordinary wallet nodes share the canonical tip",
-            lambda: exact_tip((miner, wallet_a, wallet_b)),
+            "ordinary wallet and miner share the canonical tip",
+            lambda: exact_tip((miner, wallet_a)),
             timeout=180,
         )
         require(
-            int(node_status(wallet_a)["mining"]) == 0
-            and int(node_status(wallet_b)["mining"]) == 0,
-            "a quorum peer unexpectedly runs a miner",
+            int(node_status(wallet_a)["mining"]) == 0,
+            "the wallet peer unexpectedly runs a miner",
         )
         miner.stop()
 
         miner.start(
-            "07-normal-miner-two-wallet-peers",
+            "06-normal-miner-one-wallet-peer",
             mode="miner",
-            seeds=[wallet_a.seed, wallet_b.seed],
+            seeds=[wallet_a.seed],
         )
         ready = live.wait_value(
-            "two ordinary wallet peers open the mining gate",
+            "one ordinary wallet peer opens the mining gate",
             lambda: normal_gate(miner, True),
             timeout=120,
         )
         require(
             int(ready["mining_confirmed_peers"])
             >= int(ready["mining_required_peers"])
-            == 2,
-            f"unexpected mining quorum: {ready}",
+            == 1,
+            f"unexpected mining gate: {ready}",
         )
         normal_h3 = live.wait_mined(miner, 3, timeout=900)
+        normal_h4 = wait_mined_without_gate_drop(miner, 4, timeout=900)
 
-        wallet_b.stop()
+        wallet_a.stop()
         paused = live.wait_value(
-            "losing one wallet peer pauses normal mining",
+            "losing the only wallet peer pauses normal mining",
             lambda: normal_gate(miner, False),
             timeout=60,
         )
+        paused_height = miner.height()
+        time.sleep(PEER_LOSS_HOLD_SECONDS)
+        require(
+            miner.height() == paused_height,
+            "miner produced a block after losing its only network peer",
+        )
 
-        wallet_b.start("08-wallet-b-reconnect", seeds=[miner.seed])
+        wallet_a.start("07-wallet-a-reconnect", seeds=[miner.seed])
         resumed = live.wait_value(
-            "reconnected wallet peer restores the quorum",
+            "reconnected wallet peer restores mining",
             lambda: normal_gate(miner, True),
             timeout=120,
+        )
+        resumed_h5 = wait_mined_without_gate_drop(miner, 5, timeout=900)
+
+        miner_log = miner.log_text()
+        completed_proofs = {
+            height: miner_log.count(f"mining complete block height={height}")
+            for height in (3, 4, 5)
+        }
+        require(
+            completed_proofs[3] == 1 and completed_proofs[4] == 1,
+            f"unchanged frontier rebuilt a completed proof: {completed_proofs}",
         )
 
         for log_path in sorted((BASE / "logs").glob("*.log")):
@@ -167,20 +205,24 @@ def main():
                 "isolated_h1": isolated_h1,
                 "isolated_restart_h2": isolated_h2,
                 "shared_tip": shared_tip,
-                "ordinary_peer_quorum": ready,
+                "ordinary_peer_gate": ready,
                 "normal_mining_h3": normal_h3,
+                "continuous_mining_h4": normal_h4,
                 "after_peer_loss": paused,
+                "paused_height": paused_height,
                 "after_peer_reconnect": resumed,
+                "resumed_mining_h5": resumed_h5,
+                "completed_proofs": completed_proofs,
             }
         )
-        print("[PASS] isolated override and ordinary-peer mining quorum", flush=True)
+        print("[PASS] isolated override and ordinary single-peer mining gate", flush=True)
     except Exception as caught:
         error = caught
         summary["status"] = "failed"
         summary["error"] = str(caught)
         print(f"[FAIL] {caught}", flush=True)
     finally:
-        for node in (wallet_b, wallet_a, miner):
+        for node in (wallet_a, miner):
             try:
                 node.stop()
             except Exception as cleanup_error:

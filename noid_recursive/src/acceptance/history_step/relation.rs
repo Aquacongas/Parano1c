@@ -56,6 +56,7 @@ impl core::fmt::Display for HistoryStepSidecarOperation {
 
 #[derive(Debug)]
 pub enum HistoryStepError {
+    Cancelled,
     Input(HistoryStepInputError),
     Bank(HistoryStepBankError),
     Region(RegionSidecarError),
@@ -110,6 +111,7 @@ fn auxiliary_sidecar_error(label: &str, error: RegionSidecarError) -> VerifyErro
 impl core::fmt::Display for HistoryStepError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Cancelled => f.write_str("HistoryStep proving was cancelled"),
             Self::Input(error) => write!(f, "HistoryStep input: {error}"),
             Self::Bank(error) => write!(f, "HistoryStep bank: {error}"),
             Self::Region(error) => write!(f, "HistoryStep sidecar: {error:?}"),
@@ -1453,11 +1455,83 @@ pub fn prove_built_history_step(
     })
 }
 
+/// Cooperative-cancellation twin of [`prove_built_history_step`]. The flag
+/// is sampled between the expensive transcript phases; if it remains clear,
+/// the resulting proof is byte-identical to the ordinary path.
+pub fn prove_built_history_step_cancellable(
+    runtime: &HistoryStepRuntime,
+    built: &BuiltHistoryStep,
+    cancellation: &std::sync::atomic::AtomicBool,
+) -> Result<HistoryStepProof, HistoryStepError> {
+    if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(HistoryStepError::Cancelled);
+    }
+    validate_built_against_bank(runtime, built, &built.matrix)?;
+    let bank = runtime.bank();
+    let entry = bank.entry(built.class_id);
+    macro_rules! prove_with_matrix {
+        ($prove:path, $matrix:expr) => {{
+            let parent_plan = built.preparations.recursion.certified_c1_prover_plan()?;
+            let direct_block_plan = built.preparations.direct_block.certified_c1_prover_plan()?;
+            let mut challenger = FsLaneChallenger::new_c1(HISTORY_STEP_PROOF_DOMAIN);
+            $prove(
+                $matrix,
+                &built.witness,
+                &built.pcs_params,
+                &built.spec,
+                &built.io,
+                &entry.post_commit_digest(),
+                cancellation,
+                &mut challenger,
+                |context| -> Result<JointC1RegionSidecarProof, RegionSidecarError> {
+                    let (proof, claims) = crate::region_sidecar::prove_joint_c1_region_sidecar(
+                        &parent_plan,
+                        &direct_block_plan,
+                        context.witness(),
+                        context,
+                    )?;
+                    context.append_c1_claims(claims);
+                    Ok(proof)
+                },
+            )
+            .map_err(|_| HistoryStepError::Cancelled)
+        }};
+    }
+    let (field_proof, sidecar, commitment, _) = match &built.matrix {
+        HistoryStepMatrixLease::Resident(matrix) => prove_with_matrix!(
+            prove_field_c1_with_public_io_and_post_commit_context_cancellable,
+            matrix.as_ref()
+        ),
+        HistoryStepMatrixLease::Compact(matrix) => prove_with_matrix!(
+            prove_field_compact_c1_with_public_io_and_post_commit_context_cancellable,
+            matrix.as_ref()
+        ),
+    }?;
+    Ok(HistoryStepProof {
+        field_proof,
+        commitment,
+        io: built.io.clone(),
+        sidecar: sidecar?,
+    })
+}
+
 pub fn prove_built_history_step_terminal(
     runtime: &HistoryStepRuntime,
     built: &BuiltHistoryStep,
 ) -> Result<HistoryStepTerminal, HistoryStepError> {
     let proof = prove_built_history_step(runtime, built)?;
+    HistoryStepTerminal::from_proof(runtime, built.class_id, proof)
+}
+
+pub fn prove_built_history_step_terminal_cancellable(
+    runtime: &HistoryStepRuntime,
+    built: &BuiltHistoryStep,
+    cancellation: &std::sync::atomic::AtomicBool,
+) -> Result<HistoryStepTerminal, HistoryStepError> {
+    let proof = prove_built_history_step_cancellable(runtime, built, cancellation)?;
+    if cancellation.load(std::sync::atomic::Ordering::Acquire) {
+        return Err(HistoryStepError::Cancelled);
+    }
     HistoryStepTerminal::from_proof(runtime, built.class_id, proof)
 }
 

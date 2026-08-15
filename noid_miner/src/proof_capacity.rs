@@ -91,11 +91,12 @@ mod tests {
         let mut capacity = AdaptiveProofCapacity::default();
         assert_eq!(capacity.page_limit(), 25);
 
-        capacity.observe_preparation(BlockProofClass::B25, millis(3_751));
+        let predicted_b255_boundary = (target_prepare_ms() / class_work_ratio()).round() as u64;
+        capacity.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary + 1));
         assert_eq!(capacity.page_limit(), 25);
 
         let mut exact_boundary = AdaptiveProofCapacity::default();
-        exact_boundary.observe_preparation(BlockProofClass::B25, millis(3_750));
+        exact_boundary.observe_preparation(BlockProofClass::B25, millis(predicted_b255_boundary));
         assert_eq!(exact_boundary.page_limit(), 255);
         assert!(matches!(capacity.page_limit(), 25 | 255));
     }
@@ -120,7 +121,10 @@ mod tests {
         capacity.observe_preparation(BlockProofClass::B25, millis(3_000));
         assert_eq!(capacity.page_limit(), 255);
 
-        capacity.observe_preparation(BlockProofClass::B255, millis(15_001));
+        capacity.observe_preparation(
+            BlockProofClass::B255,
+            millis(target_prepare_ms() as u64 + 1),
+        );
         assert_eq!(capacity.page_limit(), 25);
 
         capacity.observe_preparation(BlockProofClass::B25, millis(1_000));

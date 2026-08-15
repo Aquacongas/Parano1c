@@ -13,28 +13,23 @@ DEFAULT_RELEASE_DIR="$RELEASE_ROOT_DIR/target/release-builds/$BUILD_ID"
 LAST_RELEASE_FILE="$RELEASE_ROOT_DIR/target/release-builds/LAST_RELEASE"
 PACK_DIR=
 RELEASE_DIR=
-SKIP_TESTS=${NOID_RELEASE_SKIP_TESTS:-0}
-
 usage() {
   cat <<'EOF'
-Usage: ./scripts/build_release.sh --pack PACK_DIR [--output RELEASE_DIR] [--skip-tests]
+Usage: ./scripts/build_release.sh --pack PACK_DIR [--output RELEASE_DIR]
 
-Authenticate one existing canonical HistoryStep pack, embed it into the node,
-run the release gates, and build two native deliverables for the current host:
+Embed one already authenticated canonical HistoryStep pack into the node and
+build two native deliverables for the current host:
 the operator bundle (node, CLI, external miner) and the independently
 installable GUI wallet (GUI plus its private node). This command never
-regenerates matrices.
+regenerates or re-authenticates matrices. Source checks and tests are separate
+pre-build gates.
 
 Options:
   --pack DIR       Canonical HistoryStep pack root (required).
   --output DIR     Fresh output directory. Defaults under target/release-builds/.
-  --skip-tests     Build and smoke-test only. Intended for secondary platform
-                   release jobs after the primary job passes source validation.
   -h, --help       Show this help.
 
 Environment:
-  NOID_RELEASE_SKIP_TESTS=1       Equivalent to --skip-tests.
-  NOID_RELEASE_TOOL_TARGET_DIR    Override the pack-tool Cargo target directory.
   NOID_MACOS_SIGN_IDENTITY        Optional Developer ID identity; defaults to
                                   an ad-hoc macOS application signature.
   SOURCE_DATE_EPOCH               Archive timestamp on GNU tar hosts (default 0).
@@ -56,10 +51,6 @@ while (( $# > 0 )); do
       RELEASE_DIR=$2
       shift 2
       ;;
-    --skip-tests)
-      SKIP_TESTS=1
-      shift
-      ;;
     -h|--help)
       usage
       exit 0
@@ -75,9 +66,6 @@ done
   usage >&2
   release_die "--pack is required"
 }
-[[ $SKIP_TESTS == 0 || $SKIP_TESTS == 1 ]] || \
-  release_die "NOID_RELEASE_SKIP_TESTS must be 0 or 1"
-
 PACK_DIR=$(release_absolute_from_root "$PACK_DIR")
 PACK_DIR=$(release_canonical_directory "$PACK_DIR")
 if [[ -z $RELEASE_DIR ]]; then
@@ -200,9 +188,7 @@ cd "$RELEASE_ROOT_DIR"
 unset CARGO_BUILD_TARGET CARGO_ENCODED_RUSTFLAGS RUSTFLAGS
 unset NOID_HISTORY_STEP_PACK_DIR
 unset NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST
-unset NOID_HISTORY_STEP_PACK_LEAF_DIGESTS
 unset TAR_OPTIONS GZIP GZIP_OPT
-# shellcheck disable=SC2031 # The pack-tool helper uses an intentional subshell.
 export CARGO_TARGET_DIR="$RELEASE_ROOT_DIR/target"
 
 printf 'ParanO(1)d self-contained release build\n'
@@ -217,30 +203,14 @@ printf '  GUI package:  %s\n' "$GUI_ARTIFACT_NAME"
 printf '  rustc:        %s\n' "$(rustc --version)"
 printf '  cargo:        %s\n' "$(cargo --version)"
 
-CURRENT_STAGE='pack tool build'
-release_build_pack_tools 0
+CURRENT_STAGE='pack metadata load'
+release_validate_pack_layout "$PACK_DIR" 1
+release_read_pin_file "$PACK_DIR/pins.env"
+RELEASE_METADATA_DIGEST=$RELEASE_FILE_METADATA_DIGEST
 
-CURRENT_STAGE='pack authentication'
-printf '\n==> Authenticating the canonical HistoryStep pack\n'
-release_authenticate_pack "$PACK_DIR" 0
-
-# shellcheck disable=SC2031 # The pack-tool helper uses an intentional subshell.
 export RUSTFLAGS="$RELEASE_RUSTFLAGS"
 export NOID_HISTORY_STEP_PACK_DIR="$PACK_DIR"
 export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="$RELEASE_METADATA_DIGEST"
-export NOID_HISTORY_STEP_PACK_LEAF_DIGESTS="$RELEASE_LEAF_DIGESTS"
-
-CURRENT_STAGE='format check'
-printf '\n==> Checking formatting\n'
-cargo fmt --all -- --check
-
-if [[ $SKIP_TESTS == 1 ]]; then
-  printf '\n==> Skipping repeated workspace check; source gates must already be green\n'
-else
-  CURRENT_STAGE='workspace check'
-  printf '\n==> Checking the release workspace for %s\n' "$HOST_TRIPLE"
-  cargo check --locked --release --workspace --all-targets --target "$HOST_TRIPLE"
-fi
 
 CURRENT_STAGE='self-contained binary build'
 printf '\n==> Building matrix-embedded native binaries\n'
@@ -249,14 +219,6 @@ cargo build --locked --release --target "$HOST_TRIPLE" \
   -p noid-extminer --bin parano1d-miner
 cargo build --locked --release --target "$HOST_TRIPLE" \
   -p noid_gui --bin parano1d-gui
-
-if [[ $SKIP_TESTS == 1 ]]; then
-  printf '\n==> Skipping repeated release tests; source gates must already be green\n'
-else
-  CURRENT_STAGE='release test suite'
-  printf '\n==> Running complete native workspace tests in release mode\n'
-  cargo test --locked --release --workspace --target "$HOST_TRIPLE"
-fi
 
 TARGET_BIN_DIR="$CARGO_TARGET_DIR/$HOST_TRIPLE/release"
 for binary in parano1d parano1d-cli parano1d-miner; do

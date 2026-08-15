@@ -21,7 +21,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NODE_BIN = ROOT / "target" / "release" / "parano1d"
+NODE_BIN = Path(
+    os.environ.get("NOID_LIVE_NODE_BIN", str(ROOT / "target" / "release" / "parano1d"))
+).resolve()
 RUN_PARENT = ROOT / "target" / "live-tests"
 STAMP = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 BASE = Path(
@@ -144,6 +146,8 @@ class Node:
         return started
 
     def wait_ready(self, label, started, timeout=300):
+        require(self.proc is not None, f"{label} has no process")
+        assert self.proc is not None
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
@@ -202,6 +206,7 @@ class Node:
 
     def log_text(self):
         require(self.log_path is not None, f"{self.name} has no log")
+        assert self.log_path is not None
         return self.log_path.read_text(errors="replace")
 
 

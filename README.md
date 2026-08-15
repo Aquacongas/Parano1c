@@ -241,19 +241,19 @@ an invalid `HistoryStep` acceptable.
 The miner proves the nonce-independent block first, then searches a fixed
 Poseidon2b header with a 128-bit nonce. ASERT targets the complete interval
 between accepted blocks, including proof preparation, nonce search and
-propagation, at a 15-second mean. Cumulative work selects the chain. An external
+propagation, at a 20-second mean. Cumulative work selects the chain. An external
 miner receives an immutable, single-use template and returns only a nonce; it
 cannot alter the transactions or state root.
 
-## Mainnet Profile
+## Public Testnet Profile
 
 | Parameter | Value |
 |---|---:|
-| Mean block target | 15 seconds |
+| Mean block target | 20 seconds |
 | Default miner class | B25, `m=22`, up to 25 effective page positions |
 | Large miner class | B255, `m=24`, up to 255 effective page positions |
 | Maximum logical transactions per block | 255 |
-| Maximum one-page throughput | 17 TPS |
+| Maximum one-page throughput | 12.75 TPS |
 | Maximum inputs in one transaction | 1,020 |
 | Maximum outputs in one transaction | 256 |
 | Recent block / reorg suffix | 18 blocks |
@@ -310,7 +310,7 @@ An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
 ```sh
-parano1d --seed <host>:9400
+parano1d --seed <host>:9500
 ```
 
 External nonce search keeps transaction selection and proving inside the node:
@@ -320,7 +320,7 @@ parano1d --extminer --mining-key <token>
 parano1d-miner --key <token>
 ```
 
-Default ports are `9400` for P2P and `127.0.0.1:9401` for JSON-RPC. First start
+Default ports are `9500` for P2P and `127.0.0.1:9501` for JSON-RPC. First start
 creates `~/.parano1d/parano1d.toml`, the MDBX state and the built-in wallet
 under `~/.parano1d/data/`.
 

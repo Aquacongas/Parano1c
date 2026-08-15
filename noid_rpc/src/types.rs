@@ -548,11 +548,11 @@ pub struct NodeStatus {
     pub synced: bool,
     /// Whether this process owns the built-in miner.
     pub mining: bool,
-    /// Whether block production currently has the required network quorum.
+    /// Whether block production may safely extend the current synchronized tip.
     pub mining_ready: bool,
-    /// Authenticated peers which have confirmed or advanced the canonical tip.
+    /// Compatible peers which have confirmed or advanced the canonical tip.
     pub mining_confirmed_peers: usize,
-    /// Confirmed peers required for ordinary block production.
+    /// Confirmed peers required for ordinary block production (currently one).
     pub mining_required_peers: usize,
     /// Explicit isolated/genesis mode bypasses the peer quorum.
     pub isolated_mining: bool,
@@ -562,6 +562,23 @@ pub struct NodeStatus {
     pub available_threads: usize,
     /// Workers in the single shared proof/mining pool.
     pub worker_threads: usize,
+    /// The P2P reactor has published a heartbeat within its bounded window.
+    pub p2p_healthy: bool,
+    /// Age of the latest lock-free P2P heartbeat.
+    pub p2p_heartbeat_age_ms: u64,
+    /// Raw established peer identities visible to the swarm.
+    pub p2p_connected_peers: usize,
+    /// Profile-authenticated peers safe for exact-object dispatch.
+    pub p2p_dispatchable_peers: usize,
+    /// Active Circuit Relay v2 reservations held by this node.
+    pub p2p_relay_reservations: usize,
+    /// Reserved control/header queue pressure, independent from bulk data.
+    pub p2p_control_queue: usize,
+    pub p2p_header_queue: usize,
+    /// Combined bulk command/event queue pressure.
+    pub p2p_data_queue: usize,
+    /// Correlated outbound requests awaiting a terminal event.
+    pub p2p_pending_requests: usize,
 }
 
 /// Current UTXO state dimensions and fill metrics.

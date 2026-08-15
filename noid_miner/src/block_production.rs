@@ -92,6 +92,36 @@ impl PreparedBlockAttempt {
         ghost: &PreparedGhost,
         local_time: u64,
     ) -> Result<Self, String> {
+        Self::prepare_inner(template, runtime, ghost, local_time, None)?.ok_or_else(|| {
+            "uncancellable HistoryStep preparation was unexpectedly cancelled".to_string()
+        })
+    }
+
+    /// Prepare a block while allowing a canonical-tip change to stop work at
+    /// transcript-safe phase boundaries. `Ok(None)` is an expected local
+    /// cancellation, not a proving failure.
+    pub fn prepare_cancellable(
+        template: BlockTemplate,
+        runtime: &HistoryStepRuntime,
+        ghost: &PreparedGhost,
+        local_time: u64,
+        cancellation: &std::sync::atomic::AtomicBool,
+    ) -> Result<Option<Self>, String> {
+        Self::prepare_inner(template, runtime, ghost, local_time, Some(cancellation))
+    }
+
+    fn prepare_inner(
+        template: BlockTemplate,
+        runtime: &HistoryStepRuntime,
+        ghost: &PreparedGhost,
+        local_time: u64,
+        cancellation: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<Option<Self>, String> {
+        let cancelled =
+            || cancellation.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire));
+        if cancelled() {
+            return Ok(None);
+        }
         let BlockTemplate {
             inner,
             parent,
@@ -114,6 +144,9 @@ impl PreparedBlockAttempt {
             .try_fold(0usize, |total, bytes| total.checked_add(bytes.len()))
             .ok_or_else(|| "prepared authorization byte weight overflow".to_string())?;
         let authorization_proofs = decode_template_authorizations(authorization_bytes)?;
+        if cancelled() {
+            return Ok(None);
+        }
         let start_accumulator =
             accumulator_from_header_boundary(&parent, &parent_tx_epoch_anchor_header);
         let parent_terminal = match (parent.height, parent_history_step_terminal_bytes) {
@@ -129,6 +162,9 @@ impl PreparedBlockAttempt {
             ),
             (_, None) => return Err("non-genesis parent HistoryStep terminal is missing".into()),
         };
+        if cancelled() {
+            return Ok(None);
+        }
 
         let block = inner.into_block(0);
         let payload_weight = block
@@ -174,6 +210,9 @@ impl PreparedBlockAttempt {
             }
         }
         .map_err(|error| error.to_string())?;
+        if cancelled() {
+            return Ok(None);
+        }
 
         // The relation is nonce-free: finish the exact template (every native
         // check except PoW) and prove the complete HistoryStep before any
@@ -184,16 +223,40 @@ impl PreparedBlockAttempt {
                 let (block, built, end) = $witness
                     .finish_template(runtime)
                     .map_err(|error| error.to_string())?;
-                let terminal =
-                    noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
-                        runtime, &built,
+                if cancelled() {
+                    return Ok(None);
+                }
+                let terminal = match cancellation {
+                    Some(cancellation) => {
+                        match noid_recursive::acceptance::history_step::prove_built_history_step_terminal_cancellable(
+                            runtime,
+                            &built,
+                            cancellation,
+                        ) {
+                            Ok(terminal) => terminal,
+                            Err(noid_recursive::acceptance::history_step::HistoryStepError::Cancelled) => {
+                                return Ok(None);
+                            }
+                            Err(error) => return Err(error.to_string()),
+                        }
+                    }
+                    None => noid_recursive::acceptance::history_step::prove_built_history_step_terminal(
+                        runtime,
+                        &built,
                     )
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.to_string())?,
+                };
+                if cancelled() {
+                    return Ok(None);
+                }
                 let terminal_bytes =
                     noid_recursive::acceptance::history_step::encode_history_step_terminal(
                         runtime, &terminal,
                     )
                     .map_err(|error| error.to_string())?;
+                if cancelled() {
+                    return Ok(None);
+                }
                 (block, terminal_bytes, end)
             }};
         }
@@ -206,7 +269,7 @@ impl PreparedBlockAttempt {
             .checked_add(terminal_bytes.len())
             .ok_or_else(|| "prepared HistoryStep retained-byte weight overflow".to_string())?;
 
-        Ok(Self {
+        Ok(Some(Self {
             block,
             terminal_bytes,
             end_accumulator,
@@ -217,7 +280,7 @@ impl PreparedBlockAttempt {
             payload_weight,
             retained_bytes,
             state_commit: prepared_state_commit,
-        })
+        }))
     }
 
     pub fn pow_header(&self, nonce: u128) -> noid_chain::BlockHeader {

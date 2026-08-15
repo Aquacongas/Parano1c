@@ -6,8 +6,9 @@
 //!
 //! Block production is a sequence of CPU-heavy phases, not a permanent CPU
 //! split: all workers search PoW, then the same workers prove HistoryStep. The
-//! process therefore owns exactly one fixed Rayon pool sized to the complete
-//! host-visible CPU budget. Inbound verification also enters that pool, so no
+//! process therefore owns exactly one fixed Rayon pool. An internal miner
+//! leaves a small host-visible CPU reserve for networking, RPC and storage;
+//! inbound verification also enters the shared pool, so no
 //! caller can activate a second full worker set.
 //!
 //! A local wallet proof and its admission verification are latency-sensitive
@@ -39,17 +40,41 @@ thread_local! {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProcessCpuBudgetMode {
     /// Prover and external-miner nodes do not enter the internal PoW phase.
-    /// The one process pool still contains every host-visible CPU.
+    /// The one process pool may contain every host-visible CPU.
     ProofOnly,
-    /// Internal mining enables the all-core PoW phase.
+    /// Internal mining enables PoW within the protocol-safe worker ceiling.
     InternalMiner,
+}
+
+/// Logical CPUs kept outside the proof/PoW Rayon pool so the daemon continues
+/// to drain headers, serve peers, answer RPC and commit storage while mining.
+/// This is scheduler capacity, not hard CPU affinity: the OS may run any node
+/// task on any core.
+pub const fn mining_protocol_thread_reserve(available_threads: usize) -> usize {
+    match available_threads {
+        0 | 1 => 0,
+        2..=7 => 1,
+        _ => 2,
+    }
+}
+
+/// Production ceiling for internal proof and PoW workers.
+pub const fn internal_miner_thread_ceiling(available_threads: usize) -> usize {
+    let usable =
+        available_threads.saturating_sub(mining_protocol_thread_reserve(available_threads));
+    if usable == 0 {
+        1
+    } else {
+        usable
+    }
 }
 
 /// Immutable worker-count plan for one process and its sequential phases.
 ///
 /// Phase capacities are intentionally not additive. For an internal miner on
-/// 12 visible CPUs this reports one 12-worker pool, a 12-worker PoW phase, and
-/// a 12-worker HistoryStep phase. Those phases reuse the same workers.
+/// 12 visible CPUs this reports one 10-worker pool, a 10-worker PoW phase, and
+/// a 10-worker HistoryStep phase. Those phases reuse the same workers while
+/// two logical CPUs remain schedulable for protocol work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ProcessCpuBudgetPlan {
     pub available_threads: usize,
@@ -90,20 +115,23 @@ pub enum ProcessCpuBudgetError {
     },
 }
 
-/// Calculate the fixed all-core phase plan without constructing any threads.
+/// Calculate the fixed phase plan without constructing any threads.
 ///
 pub fn plan_process_cpu_budget(
     available_threads: usize,
     mode: ProcessCpuBudgetMode,
 ) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
-    plan_process_cpu_budget_with_threads(available_threads, available_threads, mode)
+    let worker_threads = match mode {
+        ProcessCpuBudgetMode::ProofOnly => available_threads,
+        ProcessCpuBudgetMode::InternalMiner => internal_miner_thread_ceiling(available_threads),
+    };
+    plan_process_cpu_budget_with_threads(available_threads, worker_threads, mode)
 }
 
 /// Calculate a fixed phase plan with an explicit worker limit.
 ///
 /// The host-visible count remains part of the plan for truthful UI and logs;
-/// every CPU-heavy phase reuses exactly `worker_threads` workers. The default
-/// planner above continues to select every available thread.
+/// every CPU-heavy phase reuses exactly `worker_threads` workers.
 pub fn plan_process_cpu_budget_with_threads(
     available_threads: usize,
     worker_threads: usize,
@@ -336,7 +364,7 @@ impl ProcessCpuBudget {
             pool_queue_ms,
             nested_same_pool,
             first_phase_entry,
-            "CPU phase entered shared all-core Rayon pool"
+            "CPU phase entered shared bounded Rayon pool"
         );
         operation()
     }
@@ -356,6 +384,29 @@ fn host_available_threads() -> usize {
         .max(1)
 }
 
+fn select_process_worker_threads(
+    available: usize,
+    mode: ProcessCpuBudgetMode,
+    requested_threads: Option<usize>,
+) -> Result<usize, ProcessCpuBudgetError> {
+    if available == 0 {
+        return Err(ProcessCpuBudgetError::NoAvailableThreads);
+    }
+    if let Some(requested) = requested_threads {
+        if requested == 0 || requested > available {
+            return Err(ProcessCpuBudgetError::InvalidThreadCount {
+                requested,
+                available,
+            });
+        }
+    }
+    let ceiling = match mode {
+        ProcessCpuBudgetMode::ProofOnly => available,
+        ProcessCpuBudgetMode::InternalMiner => internal_miner_thread_ceiling(available),
+    };
+    Ok(requested_threads.unwrap_or(ceiling).min(ceiling))
+}
+
 /// Configure the fixed process pool exactly once. Repeating the same plan is
 /// idempotent; attempting to change it after any worker can have started is a
 /// startup error. The pool uses every CPU visible through the process affinity
@@ -368,17 +419,24 @@ pub fn configure_process_cpu_budget(
 }
 
 /// Configure the process pool with an optional startup worker limit.
-/// `None` preserves the default all-visible-CPU behavior.
+/// `None` uses every visible CPU for a proof-only node and the protocol-safe
+/// ceiling for an internal miner. Explicit miner requests are capped at the
+/// same ceiling so a local tuning choice cannot starve the P2P reactor.
 pub fn configure_process_cpu_budget_with_threads(
     mode: ProcessCpuBudgetMode,
     requested_threads: Option<usize>,
 ) -> Result<ProcessCpuBudgetPlan, ProcessCpuBudgetError> {
     let available = host_available_threads();
-    let requested = plan_process_cpu_budget_with_threads(
-        available,
-        requested_threads.unwrap_or(available),
-        mode,
-    )?;
+    let worker_threads = select_process_worker_threads(available, mode, requested_threads)?;
+    if requested_threads.is_some_and(|requested| requested > worker_threads) {
+        tracing::info!(
+            requested_threads = requested_threads.unwrap_or(worker_threads),
+            admitted_threads = worker_threads,
+            protocol_reserve = available.saturating_sub(worker_threads),
+            "mining CPU request capped to preserve node networking capacity"
+        );
+    }
+    let requested = plan_process_cpu_budget_with_threads(available, worker_threads, mode)?;
     if let Some(active) = PROCESS_CPU_BUDGET.get() {
         return if active.plan == requested {
             Ok(active.plan)
@@ -409,7 +467,7 @@ pub fn configure_process_cpu_budget_with_threads(
         history_step_phase_threads = requested.history_step_phase_threads,
         inbound_verifier_threads = requested.inbound_verifier_threads,
         admitted_rayon_threads = requested.admitted_rayon_threads(),
-        "single all-core process CPU pool configured for sequential phases"
+        "single bounded process CPU pool configured for sequential phases"
     );
     Ok(requested)
 }
@@ -512,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn twelve_threads_are_reused_whole_by_each_phase_and_never_summed() {
+    fn twelve_thread_miner_reserves_two_for_protocol_work() {
         assert_eq!(
             plan_process_cpu_budget(12, ProcessCpuBudgetMode::ProofOnly).unwrap(),
             ProcessCpuBudgetPlan {
@@ -529,14 +587,43 @@ mod tests {
             default_plan,
             ProcessCpuBudgetPlan {
                 available_threads: 12,
-                shared_pool_threads: 12,
-                pow_phase_threads: 12,
-                history_step_phase_threads: 12,
-                inbound_verifier_threads: 12,
+                shared_pool_threads: 10,
+                pow_phase_threads: 10,
+                history_step_phase_threads: 10,
+                inbound_verifier_threads: 10,
             }
         );
-        assert_eq!(default_plan.admitted_rayon_threads(), 12);
+        assert_eq!(default_plan.admitted_rayon_threads(), 10);
         assert_ne!(default_plan.pow_phase_threads, 1);
+    }
+
+    #[test]
+    fn miner_protocol_reserve_scales_for_small_and_large_hosts() {
+        assert_eq!(internal_miner_thread_ceiling(1), 1);
+        assert_eq!(internal_miner_thread_ceiling(2), 1);
+        assert_eq!(internal_miner_thread_ceiling(4), 3);
+        assert_eq!(internal_miner_thread_ceiling(7), 6);
+        assert_eq!(internal_miner_thread_ceiling(8), 6);
+        assert_eq!(internal_miner_thread_ceiling(12), 10);
+        assert_eq!(internal_miner_thread_ceiling(32), 30);
+    }
+
+    #[test]
+    fn explicit_all_core_mining_request_is_capped_but_validated() {
+        assert_eq!(
+            select_process_worker_threads(12, ProcessCpuBudgetMode::InternalMiner, Some(12))
+                .unwrap(),
+            10
+        );
+        assert_eq!(
+            select_process_worker_threads(12, ProcessCpuBudgetMode::InternalMiner, Some(7))
+                .unwrap(),
+            7
+        );
+        assert!(matches!(
+            select_process_worker_threads(12, ProcessCpuBudgetMode::InternalMiner, Some(13)),
+            Err(ProcessCpuBudgetError::InvalidThreadCount { .. })
+        ));
     }
 
     #[test]
@@ -563,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn every_cpu_phase_uses_one_twelve_worker_pool() {
+    fn every_cpu_phase_uses_one_protocol_safe_worker_pool() {
         let plan = plan_process_cpu_budget(12, ProcessCpuBudgetMode::InternalMiner).unwrap();
         let budget = ProcessCpuBudget::build(plan).unwrap();
 
@@ -579,23 +666,23 @@ mod tests {
 
         assert_eq!(
             budget.install_phase(ProcessCpuPhase::Pow, rayon::current_num_threads),
-            12
+            10
         );
         assert_eq!(
             budget.install_phase(ProcessCpuPhase::HistoryStep, rayon::current_num_threads),
-            12
+            10
         );
         assert_eq!(
             budget.install_phase(ProcessCpuPhase::InboundVerify, rayon::current_num_threads),
-            12
+            10
         );
         assert_eq!(
             budget.install_phase(ProcessCpuPhase::WalletProof, rayon::current_num_threads),
-            12
+            10
         );
         assert_eq!(
             budget.install_phase(ProcessCpuPhase::WalletVerify, rayon::current_num_threads),
-            12
+            10
         );
     }
 

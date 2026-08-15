@@ -6,10 +6,11 @@ hide the local wallet -> mempool -> miner -> canonical block path.  Network
 propagation is covered by a separate live scenario. Environment parameters
 select the input/page shape, but every invocation remains one fresh scenario.
 
-The miner uses its default all-visible-CPU budget. The wallet submission must
-enter the same fixed pool through the local-only WalletProof and WalletVerify
-phases and finish inside the GUI's 120-second RPC boundary; a second Rayon
-worker set would violate this scenario.
+The miner uses the default bounded CPU budget, reserving one or two visible
+CPUs for networking and RPC. The wallet submission must enter that same fixed
+pool through the local-only WalletProof and WalletVerify phases and finish
+inside the GUI's 120-second RPC boundary; a second Rayon worker set would
+violate this scenario.
 """
 
 import datetime
@@ -178,6 +179,7 @@ class Node:
 
     def log_text(self):
         require(self.log_path is not None, "node has no log")
+        assert self.log_path is not None
         return self.log_path.read_text(errors="replace")
 
 
@@ -289,9 +291,12 @@ def main():
             MINE_TO_HEIGHT, timeout=max(300, MINE_TO_HEIGHT * 45)
         )
         node_status = rpc("getNodeStatus")
+        available_threads = int(node_status["available_threads"])
+        reserved_threads = 2 if available_threads >= 8 else 1 if available_threads >= 2 else 0
+        expected_worker_threads = max(1, available_threads - reserved_threads)
         require(
-            node_status["worker_threads"] == node_status["available_threads"],
-            f"scenario did not saturate the visible CPU budget: {node_status}",
+            int(node_status["worker_threads"]) == expected_worker_threads,
+            f"miner did not preserve the expected network CPU reserve: {node_status}",
         )
         scan = rpc("walletScan", timeout=120)
         before = rpc("walletGetBalance")
@@ -391,6 +396,7 @@ def main():
         miner_text = node.log_text()
         accepted = accepted_block_for_height(miner_text, confirmation_height)
         require(accepted is not None, f"no accepted-block log for h{confirmation_height}")
+        assert accepted is not None
         expected_physical_txs = 1 + EXPECTED_PAGES
         require(
             accepted["txs"] == expected_physical_txs,
@@ -399,18 +405,19 @@ def main():
         )
         require("wallet_send deterministic plan ready" in miner_text, "wallet plan missing from log")
         wallet_phase = re.search(
-            r'CPU phase entered shared all-core Rayon pool '
+            r'CPU phase entered shared bounded Rayon pool '
             r'phase="WalletProof" phase_threads=(\d+) shared_pool_threads=(\d+)',
             miner_text,
         )
         require(wallet_phase is not None, "wallet proof bypassed the shared process CPU pool")
+        assert wallet_phase is not None
         require(
             int(wallet_phase.group(1)) == int(node_status["worker_threads"])
             and int(wallet_phase.group(2)) == int(node_status["worker_threads"]),
             f"wallet proof used the wrong CPU budget: {wallet_phase.group(0)}",
         )
         verification_phase = re.search(
-            r'CPU phase entered shared all-core Rayon pool '
+            r'CPU phase entered shared bounded Rayon pool '
             r'phase="WalletVerify" phase_threads=(\d+) shared_pool_threads=(\d+) '
             r"pool_queue_ms=(\d+)",
             miner_text[wallet_phase.end() :],
@@ -419,6 +426,7 @@ def main():
             verification_phase is not None,
             "wallet submission did not enter shared-pool admission verification",
         )
+        assert verification_phase is not None
         require(
             int(verification_phase.group(1)) == int(node_status["worker_threads"])
             and int(verification_phase.group(2)) == int(node_status["worker_threads"]),

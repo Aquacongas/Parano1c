@@ -1,40 +1,37 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Allocation-bounded compressed framing for canonical header batches.
+//! Allocation-bounded compressed framing for header inventory batches.
 //!
 //! The generic libp2p CBOR codec buffers as many as ten MiB before decoding
 //! attacker-controlled sequence lengths.  Header sync has a much smaller
-//! consensus surface: at most 4,096 headers, each exactly
-//! [`noid_chain::BLOCK_HEADER_WIRE_SIZE`] bytes. This codec checks the count,
-//! compressed length, frame length, declared content size and zstd window
-//! before decompression. The decompressed payload is the unchanged canonical
-//! header stream consumed by the existing validation and storage path.
+//! consensus surface: at most 4,096 fixed-size records. Each record contains
+//! one unchanged canonical header and bounded exact-object availability. This
+//! codec checks the count, compressed length, frame length, declared content
+//! size and zstd window before decompression.
 
 use std::io;
 
+use crate::header_protocol::{HeaderInventoryRecord, HEADER_INVENTORY_RECORD_BYTES};
+use crate::protocol::{GetHeadersRequest, GetHeadersResponse};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
-use noid_chain::{BlockHeader, BLOCK_HEADER_WIRE_SIZE};
 
-use crate::protocol::{GetHeadersRequest, GetHeadersResponse};
-
-const REQUEST_MAGIC: [u8; 4] = *b"NHQ3";
-const RESPONSE_MAGIC: [u8; 4] = *b"NHB3";
+const REQUEST_MAGIC: [u8; 4] = *b"NHQ4";
+const RESPONSE_MAGIC: [u8; 4] = *b"NHB4";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
-const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 2 + 4;
+const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 4 + 8 + 32;
+const RESPONSE_HAS_SNAPSHOT_BOUNDARY: u8 = 1;
 const HEADER_COMPRESSION_LEVEL: i32 = 1;
-const HEADER_ZSTD_WINDOW_LOG_MAX: u32 = 20;
-/// Fixed bytes preceding the canonical header payload in one response.
+const HEADER_ZSTD_WINDOW_LOG_MAX: u32 = 21;
+/// Fixed bytes preceding the compressed inventory payload in one response.
 pub const HEADER_RESPONSE_PREFIX_BYTES: usize = RESPONSE_HEADER_BYTES;
-/// Maximum compressed-framing header batch.
-///
-/// At the canonical 212-byte header size this keeps the decompressed payload
-/// below 0.83 MiB while avoiding a network round trip for every 512 headers.
+/// Maximum compressed-framing header inventory batch.
 pub const MAX_HEADERS_PER_BATCH: usize = 4_096;
-/// Maximum canonical bytes produced by one compressed response.
-pub const MAX_UNCOMPRESSED_HEADER_BYTES: usize = MAX_HEADERS_PER_BATCH * BLOCK_HEADER_WIRE_SIZE;
+/// Maximum fixed-record bytes produced by one compressed response.
+pub const MAX_UNCOMPRESSED_HEADER_BYTES: usize =
+    MAX_HEADERS_PER_BATCH * HEADER_INVENTORY_RECORD_BYTES;
 
 const _: () = assert!(
     MAX_UNCOMPRESSED_HEADER_BYTES <= (1usize << HEADER_ZSTD_WINDOW_LOG_MAX),
@@ -64,7 +61,7 @@ impl request_response::Codec for HeaderSyncCodec {
         if encoded[..4] != REQUEST_MAGIC {
             return Err(invalid_data("invalid header-sync request magic/version"));
         }
-        if encoded[14..16] != [0, 0] {
+        if encoded[14] > 1 || encoded[15] != 0 {
             return Err(invalid_data("non-zero header-sync request reserved bytes"));
         }
         let count = u16::from_le_bytes(encoded[12..14].try_into().expect("fixed count"));
@@ -75,6 +72,7 @@ impl request_response::Codec for HeaderSyncCodec {
                 encoded[4..12].try_into().expect("fixed start height"),
             ),
             count,
+            include_inventory: encoded[14] == 1,
         })
     }
 
@@ -91,13 +89,32 @@ impl request_response::Codec for HeaderSyncCodec {
         if header[..4] != RESPONSE_MAGIC {
             return Err(invalid_data("invalid header-sync response magic/version"));
         }
-        if header[6..8] != [0, 0] {
-            return Err(invalid_data("non-zero header-sync response reserved bytes"));
+        if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[7] != 0 {
+            return Err(invalid_data(
+                "invalid header-sync response flags/reserved byte",
+            ));
         }
         let count = u16::from_le_bytes(header[4..6].try_into().expect("fixed count"));
         validate_count(count)?;
         let compressed_len =
             u32::from_le_bytes(header[8..12].try_into().expect("fixed compressed length")) as usize;
+        let snapshot_height =
+            u64::from_le_bytes(header[12..20].try_into().expect("fixed snapshot height"));
+        let snapshot_hash: [u8; 32] = header[20..52].try_into().expect("fixed snapshot hash");
+        let snapshot_boundary = if header[6] & RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 {
+            if snapshot_height == 0 || snapshot_hash == [0; 32] {
+                return Err(invalid_data("invalid advertised snapshot boundary"));
+            }
+            Some(crate::object_protocol::ChainPoint::new(
+                snapshot_height,
+                snapshot_hash,
+            ))
+        } else {
+            if snapshot_height != 0 || snapshot_hash != [0; 32] {
+                return Err(invalid_data("noncanonical missing snapshot boundary"));
+            }
+            None
+        };
         let canonical_len = canonical_payload_len(count)?;
         validate_compressed_len(canonical_len, compressed_len)?;
 
@@ -115,17 +132,20 @@ impl request_response::Codec for HeaderSyncCodec {
         let payload = decompress_canonical_headers(&compressed, canonical_len)?;
 
         let count = usize::from(count);
-        let mut headers = Vec::new();
-        headers.try_reserve_exact(count).map_err(|_| {
+        let mut records = Vec::new();
+        records.try_reserve_exact(count).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
         })?;
-        for encoded in payload.chunks_exact(BLOCK_HEADER_WIRE_SIZE) {
-            headers.push(
-                BlockHeader::from_bytes(encoded)
-                    .map_err(|_| invalid_data("header decode failed"))?,
+        for encoded in payload.chunks_exact(HEADER_INVENTORY_RECORD_BYTES) {
+            records.push(
+                HeaderInventoryRecord::decode(encoded)
+                    .map_err(|_| invalid_data("header inventory decode failed"))?,
             );
         }
-        Ok(GetHeadersResponse { headers })
+        Ok(GetHeadersResponse {
+            records,
+            snapshot_boundary,
+        })
     }
 
     async fn write_request<T>(
@@ -142,6 +162,7 @@ impl request_response::Codec for HeaderSyncCodec {
         encoded[..4].copy_from_slice(&REQUEST_MAGIC);
         encoded[4..12].copy_from_slice(&request.start_height.to_le_bytes());
         encoded[12..14].copy_from_slice(&request.count.to_le_bytes());
+        encoded[14] = request.include_inventory as u8;
         io.write_all(&encoded).await
     }
 
@@ -154,7 +175,7 @@ impl request_response::Codec for HeaderSyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let count = u16::try_from(response.headers.len())
+        let count = u16::try_from(response.records.len())
             .map_err(|_| invalid_data("header batch count does not fit u16"))?;
         validate_count(count)?;
         let canonical_len = canonical_payload_len(count)?;
@@ -162,8 +183,12 @@ impl request_response::Codec for HeaderSyncCodec {
         canonical.try_reserve_exact(canonical_len).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
         })?;
-        for header in response.headers {
-            canonical.extend_from_slice(&header.to_bytes());
+        for record in response.records {
+            canonical.extend_from_slice(
+                &record
+                    .encode()
+                    .map_err(|_| invalid_data("invalid outgoing header inventory"))?,
+            );
         }
         let compressed =
             zstd::bulk::compress(&canonical, HEADER_COMPRESSION_LEVEL).map_err(|error| {
@@ -179,6 +204,14 @@ impl request_response::Codec for HeaderSyncCodec {
         response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
         response_header[4..6].copy_from_slice(&count.to_le_bytes());
         response_header[8..12].copy_from_slice(&compressed_len.to_le_bytes());
+        if let Some(boundary) = response.snapshot_boundary {
+            if boundary.height == 0 || boundary.hash == [0; 32] {
+                return Err(invalid_data("invalid outgoing snapshot boundary"));
+            }
+            response_header[6] = RESPONSE_HAS_SNAPSHOT_BOUNDARY;
+            response_header[12..20].copy_from_slice(&boundary.height.to_le_bytes());
+            response_header[20..52].copy_from_slice(&boundary.hash);
+        }
         io.write_all(&response_header).await?;
         io.write_all(&compressed).await
     }
@@ -195,7 +228,7 @@ fn validate_count(count: u16) -> io::Result<()> {
 
 fn canonical_payload_len(count: u16) -> io::Result<usize> {
     usize::from(count)
-        .checked_mul(BLOCK_HEADER_WIRE_SIZE)
+        .checked_mul(HEADER_INVENTORY_RECORD_BYTES)
         .filter(|len| *len <= MAX_UNCOMPRESSED_HEADER_BYTES)
         .ok_or_else(|| invalid_data("header batch canonical length exceeds the fixed cap"))
 }
@@ -261,11 +294,12 @@ fn invalid_data(message: &str) -> io::Error {
 mod tests {
     use futures::io::Cursor;
     use libp2p::request_response::Codec;
+    use noid_chain::BlockHeader;
 
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/headers/3")
+        StreamProtocol::new("/noid/test/sync/headers/4")
     }
 
     fn response_header(count: u16, compressed_len: usize) -> Vec<u8> {
@@ -289,6 +323,10 @@ mod tests {
         header
     }
 
+    fn fixture_record(height: u64, marker: u8) -> HeaderInventoryRecord {
+        HeaderInventoryRecord::header_only(fixture_header(height, marker))
+    }
+
     fn framed_response(count: u16, canonical: &[u8]) -> Vec<u8> {
         let compressed = compress(canonical);
         let mut encoded = response_header(count, compressed.len());
@@ -301,6 +339,7 @@ mod tests {
         let request = GetHeadersRequest {
             start_height: 41,
             count: MAX_HEADERS_PER_BATCH as u16,
+            include_inventory: true,
         };
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
@@ -315,6 +354,7 @@ mod tests {
             .unwrap();
         assert_eq!(decoded.start_height, 41);
         assert_eq!(decoded.count, MAX_HEADERS_PER_BATCH as u16);
+        assert!(decoded.include_inventory);
 
         let mut oversized = wire.into_inner();
         oversized[12..14].copy_from_slice(&((MAX_HEADERS_PER_BATCH as u16) + 1).to_le_bytes());
@@ -339,8 +379,10 @@ mod tests {
 
     #[tokio::test]
     async fn response_round_trip_restores_exact_canonical_headers() {
+        let snapshot_boundary = crate::object_protocol::ChainPoint::new(42, [0xA5; 32]);
         let response = GetHeadersResponse {
-            headers: vec![fixture_header(1, 0x11), fixture_header(2, 0x22)],
+            records: vec![fixture_record(1, 0x11), fixture_record(2, 0x22)],
+            snapshot_boundary: Some(snapshot_boundary),
         };
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
@@ -353,14 +395,15 @@ mod tests {
             wire.get_ref().len(),
             RESPONSE_HEADER_BYTES + compressed_len as usize
         );
-        assert!(wire.get_ref().len() < RESPONSE_HEADER_BYTES + 2 * BLOCK_HEADER_WIRE_SIZE);
+        assert!(wire.get_ref().len() < RESPONSE_HEADER_BYTES + 2 * HEADER_INVENTORY_RECORD_BYTES);
         wire.set_position(0);
         let decoded = HeaderSyncCodec
             .read_response(&protocol(), &mut wire)
             .await
             .unwrap();
-        assert_eq!(decoded.headers[0], fixture_header(1, 0x11));
-        assert_eq!(decoded.headers[1], fixture_header(2, 0x22));
+        assert_eq!(decoded.records[0], fixture_record(1, 0x11));
+        assert_eq!(decoded.records[1], fixture_record(2, 0x22));
+        assert_eq!(decoded.snapshot_boundary, Some(snapshot_boundary));
     }
 
     #[tokio::test]
@@ -371,7 +414,8 @@ mod tests {
                 &protocol(),
                 &mut wire,
                 GetHeadersResponse {
-                    headers: vec![fixture_header(1, 1); MAX_HEADERS_PER_BATCH + 1],
+                    records: vec![fixture_record(1, 1); MAX_HEADERS_PER_BATCH + 1],
+                    snapshot_boundary: None,
                 },
             )
             .await
@@ -382,7 +426,7 @@ mod tests {
 
     #[tokio::test]
     async fn compressed_length_cap_fires_before_payload_read_or_reserve() {
-        let canonical_len = BLOCK_HEADER_WIRE_SIZE;
+        let canonical_len = HEADER_INVENTORY_RECORD_BYTES;
         let oversized = zstd::zstd_safe::compress_bound(canonical_len) + 1;
         let error = HeaderSyncCodec
             .read_response(&protocol(), &mut Cursor::new(response_header(1, oversized)))
@@ -394,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_rejects_zstd_content_size_that_disagrees_with_count() {
-        let one_header = vec![0x33; BLOCK_HEADER_WIRE_SIZE];
+        let one_header = vec![0x33; HEADER_INVENTORY_RECORD_BYTES];
         let error = HeaderSyncCodec
             .read_response(
                 &protocol(),
@@ -408,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn response_rejects_multiple_zstd_frames_inside_declared_payload() {
-        let canonical = vec![0x44; BLOCK_HEADER_WIRE_SIZE];
+        let canonical = vec![0x44; HEADER_INVENTORY_RECORD_BYTES];
         let mut compressed = compress(&canonical);
         compressed.extend_from_slice(&compress(&[]));
         assert!(compressed.len() <= zstd::zstd_safe::compress_bound(canonical.len()));
@@ -425,13 +469,20 @@ mod tests {
 
     #[tokio::test]
     async fn maximum_batch_round_trip_stays_exact_and_bounded() {
-        let headers = (0..MAX_HEADERS_PER_BATCH)
-            .map(|height| fixture_header(height as u64, height as u8))
+        let records = (0..MAX_HEADERS_PER_BATCH)
+            .map(|height| fixture_record(height as u64, height as u8))
             .collect::<Vec<_>>();
-        let expected = headers.clone();
+        let expected = records.clone();
         let mut wire = Cursor::new(Vec::new());
         HeaderSyncCodec
-            .write_response(&protocol(), &mut wire, GetHeadersResponse { headers })
+            .write_response(
+                &protocol(),
+                &mut wire,
+                GetHeadersResponse {
+                    records,
+                    snapshot_boundary: None,
+                },
+            )
             .await
             .unwrap();
         assert!(
@@ -444,7 +495,7 @@ mod tests {
             .read_response(&protocol(), &mut wire)
             .await
             .unwrap();
-        assert_eq!(decoded.headers, expected);
+        assert_eq!(decoded.records, expected);
     }
 
     #[tokio::test]

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Fresh public-address live test for same-IP inbound Sybil fan-in.
 
-Ten fresh PeerIds concurrently dial one public-looking target from the same
+Forty fresh PeerIds concurrently dial one public-looking target from the same
 network-namespace source IP. Their advertised listen addresses remain private,
 so Kademlia cannot turn the rejected inbound attempts into outbound dials. The
-target must retain at most eight identities and explicitly reject the rest.
+target must retain at most 32 identities and explicitly reject the rest.
 """
 
 import datetime
@@ -29,7 +29,8 @@ BASE = Path(
 )
 BASE_PORT = int(os.environ.get("NOID_LIVE_INBOUND_SYBIL_BASE_PORT", "21700"))
 TARGET_IP = "11.1.0.1"
-ATTACKER_COUNT = 10
+ATTACKER_COUNT = 40
+MAX_SAME_IP_PEERS = 32
 
 live.BASE = BASE
 live.BASE_PORT = BASE_PORT
@@ -113,15 +114,22 @@ def main():
 
         live.wait_value(
             "excess same-IP PeerIds are rejected",
-            lambda: text(target_label).count("InboundIpFull") >= ATTACKER_COUNT - 8,
+            lambda: text(target_label).count("InboundIpFull")
+            >= ATTACKER_COUNT - MAX_SAME_IP_PEERS,
             timeout=90,
         )
         time.sleep(3)
         target_log = text(target_label)
         rejected = target_log.count("InboundIpFull")
         target_peers = int(rpc(target.rpc_port, "getPeerCount"))
-        require(rejected >= ATTACKER_COUNT - 8, f"too few inbound rejections: {rejected}")
-        require(target_peers <= 8, f"same public IP occupied {target_peers} peer slots")
+        require(
+            rejected >= ATTACKER_COUNT - MAX_SAME_IP_PEERS,
+            f"too few inbound rejections: {rejected}",
+        )
+        require(
+            target_peers <= MAX_SAME_IP_PEERS,
+            f"same public IP occupied {target_peers} peer slots",
+        )
         require(target_peers >= 1, "all inbound peers were lost")
         require("P2P network error" not in target_log, "target P2P task failed")
         summary.update(

@@ -4,7 +4,7 @@
 The script re-executes itself in an unprivileged network namespace, assigns
 public-looking addresses to loopback, and disables mDNS. Three peers share an
 IPv4 /16 while a fourth is in another /16. The target must retain the distinct
-peer and close one excess same-group outbound connection.
+peer and one same-group peer in its two-anchor bootstrap fanout.
 """
 
 import datetime
@@ -128,8 +128,8 @@ def main():
         )
 
         live.wait_value(
-            "one duplicate outbound /16 is rejected",
-            lambda: "OutboundGroupFull" in text(labels[target.name]),
+            "two bootstrap anchors connect",
+            lambda: int(rpc(target.rpc_port, "getPeerCount")) >= 2,
             timeout=60,
         )
         live.wait_value(
@@ -139,26 +139,23 @@ def main():
         )
         time.sleep(3)
         target_log = text(labels[target.name])
-        group_rejections = target_log.count("OutboundGroupFull")
         target_peers = int(rpc(target.rpc_port, "getPeerCount"))
         same_group_live = sum(
             int(rpc(node.rpc_port, "getPeerCount")) >= 1 for node in (same_a, same_b, same_c)
         )
-        require(group_rejections >= 1, "target recorded no same-/16 rejection")
-        require(target_peers >= 2, f"target lost the diverse peer set: {target_peers}")
-        require(same_group_live >= 2, "fewer than two same-group seeds remained reachable")
+        require(target_peers == 2, f"target did not retain two bootstrap anchors: {target_peers}")
+        require(same_group_live == 1, f"bootstrap anchors share one /16: {same_group_live}")
         require("P2P network error" not in target_log, "target P2P task failed")
         summary.update(
             {
                 "status": "passed",
-                "outbound_group_rejections": group_rejections,
                 "target_peer_count": target_peers,
                 "same_group_servers_connected": same_group_live,
                 "distinct_server_peer_count": int(rpc(distinct.rpc_port, "getPeerCount")),
             }
         )
         print(
-            f"[PASS] public outbound peers are /16-diverse; rejections={group_rejections}",
+            "[PASS] two bootstrap anchors selected from distinct /16 groups",
             flush=True,
         )
     except Exception as caught:

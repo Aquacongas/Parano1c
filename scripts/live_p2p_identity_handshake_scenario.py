@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fresh LAN discovery, persistent PeerId, and symmetric mempool handshake test."""
+"""Fresh LAN discovery, persistent PeerId, and bounded mempool handshake test."""
 
 import datetime
 import json
@@ -35,23 +35,22 @@ def log_text(label):
 def peer_id(text):
     match = re.search(r"loaded persistent P2P identity peer=([^\s]+)", text)
     require(match is not None, "startup log has no persistent PeerId")
+    assert match is not None
     return match.group(1)
 
 
-def symmetric_mempool_exchange(left_label, right_label):
+def mempool_exchange(left_label, right_label):
     left = log_text(left_label)
     right = log_text(right_label)
-    if all(
-        marker in text
-        for text in (left, right)
-        for marker in (
-            "requesting mempool sync",
-            "serving mempool sync request",
-            "mempool sync response complete",
-        )
-    ):
-        return True
-    return False
+    return (
+        "requesting mempool sync" in left
+        and "mempool sync response complete" in left
+        and "serving mempool sync request" in right
+    ) or (
+        "requesting mempool sync" in right
+        and "mempool sync response complete" in right
+        and "serving mempool sync request" in left
+    )
 
 
 def assert_clean(label, text):
@@ -98,8 +97,8 @@ def main():
             timeout=120,
         )
         live.wait_value(
-            "fresh peers complete symmetric empty-mempool exchange",
-            lambda: symmetric_mempool_exchange(
+            "fresh peers complete one bounded empty-mempool exchange",
+            lambda: mempool_exchange(
                 "01-a-fresh-no-seed", "02-b-fresh-no-seed"
             ),
             timeout=60,
@@ -128,8 +127,8 @@ def main():
             timeout=120,
         )
         live.wait_value(
-            "restarted peers complete symmetric empty-mempool exchange",
-            lambda: symmetric_mempool_exchange(
+            "restarted peers complete one bounded empty-mempool exchange",
+            lambda: mempool_exchange(
                 "03-a-restart-no-seed", "04-b-restart-no-seed"
             ),
             timeout=60,
@@ -162,7 +161,7 @@ def main():
                 "mdns_discovery": True,
             }
         )
-        print("[PASS] persistent PeerId, LAN discovery, and symmetric mempool handshake", flush=True)
+        print("[PASS] persistent PeerId, LAN discovery, and bounded mempool handshake", flush=True)
     except Exception as caught:
         error = caught
         summary["status"] = "failed"

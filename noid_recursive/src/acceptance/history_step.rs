@@ -25,7 +25,9 @@ use noid_ivc_core::verifier::{
 };
 use noid_ivc_prover::field_prover::{
     prove_field_c1_with_public_io_and_post_commit_context,
+    prove_field_c1_with_public_io_and_post_commit_context_cancellable,
     prove_field_compact_c1_with_public_io_and_post_commit_context,
+    prove_field_compact_c1_with_public_io_and_post_commit_context_cancellable,
 };
 
 use super::block_slots::{
@@ -81,11 +83,12 @@ pub use relation::{
     assemble_history_step_base, assemble_history_step_recursive,
     derive_history_step_direct_block_vk, derive_history_step_runtime_parts,
     pin_history_step_class_bank, prepare_history_step_for_pow, prove_built_history_step_terminal,
-    prove_history_step, verify_history_step_terminal, AcceptedHistoryStepTerminal,
-    BuiltHistoryStep, FrozenHistoryStep, HistoryStepError, HistoryStepMatrixSource,
-    HistoryStepMatrixSourceError, HistoryStepParent, HistoryStepParentTranscriptLayout,
-    HistoryStepRuntime, HistoryStepRuntimeParts, HistoryStepSidecarOperation, HistoryStepTerminal,
-    PreparedHistoryStepForPow, HISTORY_STEP_WIRE_VERSION,
+    prove_built_history_step_terminal_cancellable, prove_history_step,
+    verify_history_step_terminal, AcceptedHistoryStepTerminal, BuiltHistoryStep, FrozenHistoryStep,
+    HistoryStepError, HistoryStepMatrixSource, HistoryStepMatrixSourceError, HistoryStepParent,
+    HistoryStepParentTranscriptLayout, HistoryStepRuntime, HistoryStepRuntimeParts,
+    HistoryStepSidecarOperation, HistoryStepTerminal, PreparedHistoryStepForPow,
+    HISTORY_STEP_WIRE_VERSION,
 };
 pub use runtime_parts_codec::{
     HISTORY_STEP_RUNTIME_PARTS_COMPACT_MAX_BYTES, HISTORY_STEP_RUNTIME_PARTS_COMPACT_VERSION,

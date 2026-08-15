@@ -33,8 +33,8 @@ pub fn splitmix64(state: &mut u64) -> u64 {
 /// # Rationale for zone-based allocation
 ///
 /// Naive uniform splitmix64 would send each new UTXO to a DIFFERENT segment,
-/// materialising all 256 segments (768 MB) after just 256 blocks (~4 hours
-/// at mainnet 15s/block). With zone-based allocation, sequential slots within
+/// materialising all 256 segments (768 MB) after just 256 blocks (~1.4 hours
+/// at the production 20s/block target). With zone-based allocation, sequential slots within
 /// one zone land in the SAME segment, so memory grows as:
 ///
 ///   ceil(alloc_counter / ZONE_CAPACITY) segments × 3 MB

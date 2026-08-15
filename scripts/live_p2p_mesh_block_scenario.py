@@ -58,18 +58,11 @@ def all_headers_match(reference, peers, through_height):
     return [header["hash"] for header in expected]
 
 
-def initial_mempool_exchange_complete(labels):
-    return all(
-        all(
-            marker in log_text(label)
-            for marker in (
-                "requesting mempool sync",
-                "serving mempool sync request",
-                "mempool sync response complete",
-            )
-        )
-        for label in labels
-    )
+def peer_mesh_ready(peers, minimum_connections):
+    counts = [int(rpc(peer.rpc_port, "getPeerCount")) for peer in peers]
+    if all(count >= minimum_connections for count in counts):
+        return {"minimum": min(counts), "maximum": max(counts)}
+    return False
 
 
 def assert_clean(label, text):
@@ -108,9 +101,16 @@ def main():
     require(TARGET_HEIGHT >= 1, "target height must be positive")
     require(not BASE.exists(), f"run directory already exists: {BASE}")
 
-    hub = Node("hub-miner", BASE_PORT, BASE_PORT + 1)
+    # mDNS advertises LAN addresses, so listeners must not be loopback-only.
+    # Explicit bootstrap still uses 127.0.0.1 through Node.seed.
+    hub = Node("hub-miner", BASE_PORT, BASE_PORT + 1, p2p_host="0.0.0.0")
     peers = [
-        Node(f"peer-{index:02d}", BASE_PORT + 100 + index * 2, BASE_PORT + 101 + index * 2)
+        Node(
+            f"peer-{index:02d}",
+            BASE_PORT + 100 + index * 2,
+            BASE_PORT + 101 + index * 2,
+            p2p_host="0.0.0.0",
+        )
         for index in range(PEER_COUNT)
     ]
     for node in (hub, *peers):
@@ -152,13 +152,19 @@ def main():
             lambda: int(rpc(hub.rpc_port, "getPeerCount")) >= PEER_COUNT,
             timeout=120,
         )
-        live.wait_value(
-            "initial control-plane exchanges settle",
-            lambda: initial_mempool_exchange_complete(peer_labels),
+        initial_mesh = live.wait_value(
+            "every peer establishes direct non-hub connections",
+            lambda: peer_mesh_ready(peers, 4),
             timeout=120,
         )
         identity_hash = live.sha256(hub.data_dir / "p2p_identity.key")
         hub.stop()
+
+        hubless_mesh = live.wait_value(
+            "peer mesh remains connected while the bootstrap hub is offline",
+            lambda: peer_mesh_ready(peers, 2),
+            timeout=120,
+        )
 
         # The same durable PeerId returns in miner mode. Existing peers must
         # reconnect while fresh blocks are being produced.
@@ -192,16 +198,17 @@ def main():
 
         peer_logs = {label: log_text(label) for label in peer_labels}
         gossip_receivers = sum(
-            "received complete block bundle via gossip" in text
-            or "received block announcement" in text
+            "exact direct-child suffix admitted" in text
+            or "HeaderDAG-selected exact suffix plan admitted" in text
             for text in peer_logs.values()
         )
         require(
             gossip_receivers == PEER_COUNT,
-            f"only {gossip_receivers}/{PEER_COUNT} peers observed block gossip",
+            f"only {gossip_receivers}/{PEER_COUNT} peers admitted header-first block gossip",
         )
         applied_counts = {
-            label: text.count("applied P2P block") for label, text in peer_logs.items()
+            label: text.count("header-first exact suffix application completed")
+            for label, text in peer_logs.items()
         }
         require(
             all(count >= final_height for count in applied_counts.values()),
@@ -220,6 +227,8 @@ def main():
                 "status": "passed",
                 "converged_tip": converged,
                 "canonical_headers": canonical_headers,
+                "initial_mesh": initial_mesh,
+                "hubless_mesh": hubless_mesh,
                 "gossip_receivers": gossip_receivers,
                 "min_applied_p2p_blocks": min(applied_counts.values()),
                 "max_applied_p2p_blocks": max(applied_counts.values()),

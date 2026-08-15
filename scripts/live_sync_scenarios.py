@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Clean release-binary sync suite: fresh -> gap 5 -> gap 19.
+"""Clean release-binary sync suite: exact catch-up and deep snapshot recovery.
 
 Every run starts from empty primary and secondary data directories.  The
-three catch-up phases are one sync scenario because together they exercise
-both sides of the 18-block retained-suffix boundary.
+catch-up phases exercise the 42-block exact-object serving window and the
+snapshot path immediately beyond it.
 """
 
 import datetime
@@ -201,6 +201,7 @@ class Node:
 
     def log_text(self):
         require(self.log_path is not None, f"{self.name} has no active log")
+        assert self.log_path is not None
         return self.log_path.read_text(errors="replace")
 
 
@@ -260,7 +261,7 @@ def sync_counts(text):
         "snapshot_boundaries": [
             int(value)
             for value in re.findall(
-                r"snapshot boundary and disk tail fully applied snapshot_height=(\d+)",
+                r"snapshot boundary State installed[^\n]* snapshot_height=(\d+)",
                 text,
             )
         ],
@@ -278,6 +279,19 @@ def sync_counts(text):
                 text,
             )
         ],
+        "exact_suffixes": text.count(
+            "header-first exact suffix application completed"
+        ),
+        "exact_suffix_blocks": [
+            int(value)
+            for value in re.findall(
+                r"header-first exact suffix application completed[^\n]* blocks=(\d+)",
+                text,
+            )
+        ],
+        "exact_suffix_terminal_verifications": text.count(
+            "exact suffix terminal verified outside the chain writer"
+        ),
         "manifest_requests": text.count("requesting state manifest"),
         "suffix_measurements": [
             int(value)
@@ -393,15 +407,19 @@ def main():
         assert_no_sync_failures("fresh-h5", short_secondary.log_text())
         require(fresh_short["snapshot_installs"] == 0, f"fresh h5 used snapshot: {fresh_short}")
         require(
-            fresh_short["compact_suffix_blocks"] == [5],
-            f"fresh h5 compact suffix is not exactly five blocks: {fresh_short}",
+            fresh_short["exact_suffix_blocks"] == [5],
+            f"fresh h5 exact suffix is not exactly five blocks: {fresh_short}",
+        )
+        require(
+            fresh_short["exact_suffix_terminal_verifications"] == 1,
+            f"fresh h5 did not verify exactly one terminal: {fresh_short}",
         )
         require(
             fresh_short["applied_p2p_blocks"] == 0,
             f"fresh h5 unexpectedly downloaded per-block terminals: {fresh_short}",
         )
         compare_hashes(primary, short_secondary, 0, 5)
-        summary["phases"]["fresh_short_compact_sync"] = {
+        summary["phases"]["fresh_short_exact_sync"] = {
             "source_height": 5,
             "source_startup_s": round(startup, 3),
             "elapsed_s": round(elapsed, 3),
@@ -410,8 +428,9 @@ def main():
         short_secondary.stop()
         primary.stop()
 
-        # Continue the same clean chain to exactly h19. At this tip the
-        # finalized snapshot boundary is h1 and the retained suffix is h2..h19.
+        # At h19 no positive six-block snapshot boundary exists yet. A fresh
+        # node must therefore use one exact suffix rather than loop forever on
+        # an empty manifest.
         summary["phases"]["short_tip_to_snapshot_tip_mining"] = mine_phase(
             primary, "04-primary-h5-to-h19-mining", 5, 14, genesis=True
         )
@@ -428,13 +447,18 @@ def main():
         elapsed = time.monotonic() - started
         fresh = sync_counts(secondary.log_text())
         assert_no_sync_failures("fresh", secondary.log_text())
-        require(fresh["snapshot_installs"] == 1, f"fresh snapshot count: {fresh}")
-        require(fresh["snapshot_boundaries"] == [1], f"fresh boundary is not h=1: {fresh}")
-        require(fresh["applied_p2p_blocks"] == 0, f"fresh tail escaped staging: {fresh}")
-        require(fresh["suffix_measurements"] == [18], f"fresh suffix telemetry is wrong: {fresh}")
-        require(fresh["post_snapshot_suffix_requests"] == 0, f"fresh tail needed a second pass: {fresh}")
+        require(fresh["snapshot_installs"] == 0, f"fresh h19 used snapshot: {fresh}")
+        require(
+            fresh["exact_suffix_blocks"] == [19],
+            f"fresh h19 exact suffix is not exactly 19 blocks: {fresh}",
+        )
+        require(
+            fresh["exact_suffix_terminal_verifications"] == 1,
+            f"fresh h19 did not verify exactly one terminal: {fresh}",
+        )
+        require(fresh["applied_p2p_blocks"] == 0, f"fresh h19 used legacy blocks: {fresh}")
         compare_hashes(primary, secondary, 0, 19)
-        summary["phases"]["fresh_sync"] = {
+        summary["phases"]["fresh_pre_boundary_exact_sync"] = {
             "source_height": 19,
             "source_startup_s": round(startup, 3),
             "elapsed_s": round(elapsed, 3),
@@ -456,15 +480,19 @@ def main():
         assert_no_sync_failures("gap5", secondary.log_text())
         require(gap5["snapshot_installs"] == 0, f"gap5 unexpectedly used snapshot: {gap5}")
         require(
-            gap5["compact_suffix_blocks"] == [5],
-            f"gap5 compact suffix is not exactly five blocks: {gap5}",
+            gap5["exact_suffix_blocks"] == [5],
+            f"gap5 exact suffix is not exactly five blocks: {gap5}",
+        )
+        require(
+            gap5["exact_suffix_terminal_verifications"] == 1,
+            f"gap5 did not verify exactly one terminal: {gap5}",
         )
         require(
             gap5["applied_p2p_blocks"] == 0,
             f"gap5 unexpectedly downloaded per-block terminals: {gap5}",
         )
         compare_hashes(primary, secondary, 0, 24)
-        summary["phases"]["gap5_compact_sync"] = {
+        summary["phases"]["gap5_exact_sync"] = {
             "from_height": 19,
             "to_height": 24,
             "gap": 5,
@@ -486,13 +514,18 @@ def main():
         elapsed = time.monotonic() - started
         gap19 = sync_counts(secondary.log_text())
         assert_no_sync_failures("gap19", secondary.log_text())
-        require(gap19["snapshot_installs"] == 1, f"gap19 did not use one snapshot: {gap19}")
-        require(gap19["snapshot_boundaries"] == [25], f"gap19 boundary is not h=25: {gap19}")
-        require(gap19["applied_p2p_blocks"] == 0, f"gap19 tail escaped staging: {gap19}")
-        require(gap19["suffix_measurements"] == [18], f"gap19 suffix telemetry is wrong: {gap19}")
-        require(gap19["post_snapshot_suffix_requests"] == 0, f"gap19 tail needed a second pass: {gap19}")
+        require(gap19["snapshot_installs"] == 0, f"gap19 unexpectedly used snapshot: {gap19}")
+        require(
+            gap19["exact_suffix_blocks"] == [19],
+            f"gap19 exact suffix is not exactly 19 blocks: {gap19}",
+        )
+        require(
+            gap19["exact_suffix_terminal_verifications"] == 1,
+            f"gap19 did not verify exactly one terminal: {gap19}",
+        )
+        require(gap19["applied_p2p_blocks"] == 0, f"gap19 used legacy blocks: {gap19}")
         compare_hashes(primary, secondary, 0, 43)
-        summary["phases"]["gap19_snapshot_sync"] = {
+        summary["phases"]["gap19_exact_sync"] = {
             "from_height": 24,
             "to_height": 43,
             "gap": 19,
@@ -500,8 +533,45 @@ def main():
             "elapsed_s": round(elapsed, 3),
             **gap19,
         }
+
+        # A node left at h5 now falls 43 blocks behind. This is the first gap
+        # outside the guaranteed exact-object window and must use one snapshot
+        # at h30 followed by one exact 18-block suffix to h48.
+        secondary.stop()
+        primary.stop()
+        summary["phases"]["deep_gap_mining"] = mine_phase(
+            primary, "13-primary-h43-to-h48-mining", 43, 5, genesis=True
+        )
+        info, startup = primary.start("14-primary-h48-source")
+        require(int(info["height"]) == 48, f"deep source height is {info['height']}, expected 48")
+        started = time.monotonic()
+        short_secondary.start("15-secondary-h5-deep-gap", seeds=[primary.seed])
+        wait_converged(primary, short_secondary, timeout=600)
+        elapsed = time.monotonic() - started
+        deep = sync_counts(short_secondary.log_text())
+        assert_no_sync_failures("deep-gap", short_secondary.log_text())
+        require(deep["snapshot_installs"] == 1, f"deep gap snapshot count: {deep}")
+        require(deep["snapshot_boundaries"] == [30], f"deep boundary is not h=30: {deep}")
+        require(
+            deep["exact_suffix_blocks"] == [18],
+            f"deep post-snapshot suffix is not exactly 18 blocks: {deep}",
+        )
+        require(
+            deep["exact_suffix_terminal_verifications"] == 1,
+            f"deep suffix did not verify exactly one tip terminal: {deep}",
+        )
+        require(deep["applied_p2p_blocks"] == 0, f"deep gap used legacy blocks: {deep}")
+        compare_hashes(primary, short_secondary, 0, 48)
+        summary["phases"]["deep_snapshot_then_exact_sync"] = {
+            "from_height": 5,
+            "to_height": 48,
+            "gap": 43,
+            "source_startup_s": round(startup, 3),
+            "elapsed_s": round(elapsed, 3),
+            **deep,
+        }
         summary["status"] = "passed"
-        print("[PASS] clean fresh -> gap5 -> gap19 sync suite", flush=True)
+        print("[PASS] exact-window and deep-snapshot sync suite", flush=True)
     except Exception as caught:
         error = caught
         summary["status"] = "failed"

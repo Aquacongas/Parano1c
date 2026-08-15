@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Network configuration: mainnet constants.
+//! Network configuration for the public v2 testnet.
 //!
 //! Every network participant shares these magic bytes, ports, protocol ID,
 //! and gossipsub topics. libp2p protocol IDs prevent cross-network connections.
@@ -10,13 +10,13 @@
 //!
 //! | Network  | P2P   | RPC   |
 //! |----------|-------|-------|
-//! | Mainnet  | 9400  | 9401  |
+//! | Testnet  | 9500  | 9501  |
 //!
 //! # Magic bytes
 //!
 //! | Network  | Magic (ASCII) |
 //! |----------|---------------|
-//! | Mainnet  | 0x4E4F4944 "NOID" |
+//! | Testnet  | 0x4E4F4954 "NOIT" |
 
 use std::str::FromStr;
 
@@ -26,22 +26,23 @@ use std::str::FromStr;
 
 /// Which network this node participates in.
 ///
-/// Only mainnet is supported. Attempting to parse any other string returns
+/// Only the public testnet is supported by this release. Attempting to parse
+/// any other string returns
 /// an error at startup so misconfigured nodes fail fast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum NetworkKind {
-    /// Production mainnet. Real NOID, real economic value.
+    /// Public testnet. Balances and rewards have no mainnet value.
     #[default]
-    Mainnet,
+    Testnet,
 }
 
 impl NetworkKind {
     pub fn as_str(&self) -> &'static str {
-        "mainnet"
+        "testnet"
     }
 
     pub fn is_mainnet(&self) -> bool {
-        true
+        false
     }
 }
 
@@ -55,9 +56,9 @@ impl FromStr for NetworkKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
-            "mainnet" => Ok(Self::Mainnet),
+            "testnet" => Ok(Self::Testnet),
             other => Err(format!(
-                "unknown network '{other}'; only 'mainnet' is supported"
+                "unknown network '{other}'; only 'testnet' is supported"
             )),
         }
     }
@@ -96,32 +97,29 @@ pub struct NetworkConfig {
 }
 
 impl NetworkConfig {
-    pub fn mainnet() -> Self {
+    pub fn testnet() -> Self {
         Self {
-            kind: NetworkKind::Mainnet,
-            magic: [0x4E, 0x4F, 0x49, 0x44], // "NOID"
-            default_p2p_port: 9400,
-            default_rpc_port: 9401,
-            // Bind peer admission and GossipSub meshes to the canonical
-            // v1.0.0 genesis (block ID prefix 530016417023d5e9). Withdrawn
-            // pre-launch binaries used a different genesis and namespace;
-            // they may complete Noise transport, but Identify closes them
-            // before they become sync-ready and their gossip topics do not
-            // intersect the canonical network.
-            p2p_protocol_id: "/noid/mainnet/530016417023d5e9/1",
-            topic_blocks: "/noid/mainnet/530016417023d5e9/blocks/1",
-            topic_txs: "/noid/mainnet/530016417023d5e9/txs/1",
+            kind: NetworkKind::Testnet,
+            magic: [0x4E, 0x4F, 0x49, 0x54], // "NOIT"
+            default_p2p_port: 9500,
+            default_rpc_port: 9501,
+            // The v2 public testnet is intentionally isolated from every
+            // withdrawn launch binary and from the future mainnet. The exact
+            // authenticated profile handshake adds a second fail-closed gate.
+            p2p_protocol_id: "/noid/testnet/530016417023d5e9/1",
+            topic_blocks: "/noid/testnet/530016417023d5e9/blocks/1",
+            topic_txs: "/noid/testnet/530016417023d5e9/txs/1",
             // DNS seeds — two formats supported:
             //
-            // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9400
+            // 1. Bare hostname  → dialled as /dns4/<host>/tcp/9500
             //    Simple A-record setup.  Works immediately once the domain
             //    points to a live node.  No PeerID verification.
             //
             // 2. "dnsaddr:<hostname>" → dialled as /dnsaddr/<hostname>
             //    Resolves _dnsaddr.<hostname> TXT records.  Each TXT entry
             //    encodes a full multiaddr including PeerID, e.g.:
-            //      _dnsaddr.noid.network TXT
-            //        "dnsaddr=/ip4/1.2.3.4/tcp/9400/p2p/12D3KooW..."
+            //      _dnsaddr.parano1d.org TXT
+            //        "dnsaddr=/ip4/1.2.3.4/tcp/9500/p2p/12D3KooW..."
             //    Connection is cryptographically verified against PeerID.
             //    This is the libp2p standard (used by IPFS, Filecoin).
             //    Add one TXT record per seed node; DNS round-robins them.
@@ -130,16 +128,16 @@ impl NetworkConfig {
             // Each hostname creates an independent startup dial; unresolved
             // future seeds fail independently without delaying usable seeds.
             dns_seeds: &[
-                "seed1.noid.network", // A record: primary miner/seed
-                "seed2.noid.network", // A record: primary seed
-                "seed3.noid.network", // A record: primary seed
-                "seed4.noid.network", // A record: independent seed
+                "seed1.parano1d.org",
+                "seed2.parano1d.org",
+                "seed3.parano1d.org",
+                "seed4.parano1d.org",
             ],
         }
     }
 
     pub fn for_kind(_kind: NetworkKind) -> Self {
-        Self::mainnet()
+        Self::testnet()
     }
 
     /// Default P2P listen address as a libp2p multiaddr string.
@@ -162,50 +160,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mainnet_magic_is_noid() {
-        assert_eq!(NetworkConfig::mainnet().magic, [0x4E, 0x4F, 0x49, 0x44]);
+    fn testnet_magic_is_noit() {
+        assert_eq!(NetworkConfig::testnet().magic, [0x4E, 0x4F, 0x49, 0x54]);
     }
 
     #[test]
-    fn mainnet_ports() {
-        let m = NetworkConfig::mainnet();
-        assert_eq!(m.default_p2p_port, 9400);
-        assert_eq!(m.default_rpc_port, 9401);
+    fn testnet_ports() {
+        let m = NetworkConfig::testnet();
+        assert_eq!(m.default_p2p_port, 9500);
+        assert_eq!(m.default_rpc_port, 9501);
     }
 
     #[test]
-    fn mainnet_protocol_id() {
-        let mainnet = NetworkConfig::mainnet();
-        assert_eq!(mainnet.p2p_protocol_id, "/noid/mainnet/530016417023d5e9/1");
+    fn testnet_protocol_id() {
+        let testnet = NetworkConfig::testnet();
+        assert_eq!(testnet.p2p_protocol_id, "/noid/testnet/530016417023d5e9/1");
         assert_eq!(
-            mainnet.topic_blocks,
-            "/noid/mainnet/530016417023d5e9/blocks/1"
+            testnet.topic_blocks,
+            "/noid/testnet/530016417023d5e9/blocks/1"
         );
-        assert_eq!(mainnet.topic_txs, "/noid/mainnet/530016417023d5e9/txs/1");
+        assert_eq!(testnet.topic_txs, "/noid/testnet/530016417023d5e9/txs/1");
     }
 
     #[test]
-    fn mainnet_has_live_individual_dns_seeds() {
+    fn testnet_has_live_individual_dns_seeds() {
         assert_eq!(
-            NetworkConfig::mainnet().dns_seeds,
+            NetworkConfig::testnet().dns_seeds,
             &[
-                "seed1.noid.network",
-                "seed2.noid.network",
-                "seed3.noid.network",
-                "seed4.noid.network",
+                "seed1.parano1d.org",
+                "seed2.parano1d.org",
+                "seed3.parano1d.org",
+                "seed4.parano1d.org",
             ]
         );
     }
 
     #[test]
-    fn parse_mainnet() {
-        let k: NetworkKind = "mainnet".parse().unwrap();
-        assert_eq!(k.to_string(), "mainnet");
+    fn parse_testnet() {
+        let k: NetworkKind = "testnet".parse().unwrap();
+        assert_eq!(k.to_string(), "testnet");
+        assert!(!k.is_mainnet());
     }
 
     #[test]
     fn parse_unknown_fails() {
         assert!("devnet".parse::<NetworkKind>().is_err());
-        assert!("testnet".parse::<NetworkKind>().is_err());
+        assert!("mainnet".parse::<NetworkKind>().is_err());
     }
 }

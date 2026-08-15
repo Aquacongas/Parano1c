@@ -122,12 +122,14 @@ def main():
 
         sink_after_direct = log_text(sink_label)
         require(
-            sink_after_direct.count("applied P2P block") == DIRECT_TIP,
-            "direct catch-up did not apply exactly h1..h2",
+            sink_after_direct.count("header-first exact suffix application completed") == 1
+            and "target_height=2 height=2 blocks=2" in sink_after_direct,
+            "direct catch-up did not atomically apply exact h1..h2",
         )
         require(
-            "requesting state manifest" not in sink_after_direct,
-            "caught-up direct suffix requested a snapshot manifest",
+            "requesting state segment" not in sink_after_direct
+            and "snapshot install completed" not in sink_after_direct,
+            "caught-up direct suffix entered the State snapshot path",
         )
         require(
             "requested recent block unavailable" not in sink_after_direct,
@@ -156,16 +158,18 @@ def main():
 
         sink_final = log_text(sink_label)
         require(
-            sink_final.count("applied P2P block") == GOSSIP_TIP,
-            "sink did not apply exactly three source blocks",
+            sink_final.count("header-first exact suffix application completed") == 2,
+            "sink did not complete the h1..h2 and h3 exact suffix plans",
         )
         require(
-            "received complete block bundle via gossip height=3" in sink_final,
-            "h3 did not exercise complete-block gossip",
+            "exact direct-child suffix admitted" in sink_final
+            and "target_height=3 height=3 blocks=1" in sink_final,
+            "h3 did not exercise header-first direct-child gossip",
         )
         require(
-            "requesting state manifest" not in sink_final,
-            "live caught-up gossip requested a snapshot manifest",
+            "requesting state segment" not in sink_final
+            and "snapshot install completed" not in sink_final,
+            "live caught-up gossip entered the State snapshot path",
         )
         require(
             "requested recent block unavailable" not in sink_final,

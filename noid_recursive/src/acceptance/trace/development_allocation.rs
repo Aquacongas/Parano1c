@@ -17,7 +17,7 @@ use super::{
 const HEIGHT_BITS: usize = 64;
 const PAYOUT_QUOTIENT_BITS: usize = 52;
 const PAYOUT_REMAINDER_BITS: usize = 13;
-const _: () = assert!(TARGET_BLOCKS_PER_DAY == (1 << 12) + (1 << 10) + (1 << 9) + (1 << 7));
+const _: () = assert!(TARGET_BLOCKS_PER_DAY == (1 << 12) + (1 << 7) + (1 << 6) + (1 << 5));
 
 pub struct DevelopmentAllocationTrace {
     pub active: LinExpr,
@@ -86,9 +86,9 @@ fn payout_boundary(b: &mut FieldR1csBuilder, height: &LinExpr, native_height: u6
 
     let terms = [
         shifted_integer_from_bits(&quotient_bits, 12),
-        shifted_integer_from_bits(&quotient_bits, 10),
-        shifted_integer_from_bits(&quotient_bits, 9),
         shifted_integer_from_bits(&quotient_bits, 7),
+        shifted_integer_from_bits(&quotient_bits, 6),
+        shifted_integer_from_bits(&quotient_bits, 5),
     ];
     let mut product = terms[0].clone();
     for term in &terms[1..] {

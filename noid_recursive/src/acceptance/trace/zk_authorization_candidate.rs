@@ -3177,17 +3177,23 @@ mod tests {
     }
 
     fn build_k2_raw_slice_tile_fixture() -> BuiltRawSliceTileFixture {
-        let native0 = native_candidate(0x2A11_0000);
-        let native1 = native_candidate(0x2A11_0001);
         let schedules = ZkAuthCapsuleDuplexSchedules::selected();
         let owner_layout = schedules.owner_layout();
         let main_layout = schedules.main_layout();
         let mut b = FieldR1csBuilder::new();
-        let public = alloc_selected_statement(&mut b, &native0);
-        let left =
-            alloc_raw_slice_tile_fixture_slices(&mut b, &native0, &owner_layout, &main_layout);
-        let right =
-            alloc_raw_slice_tile_fixture_slices(&mut b, &native1, &owner_layout, &main_layout);
+        // Each native fixture is deliberately large. Keep only one on the
+        // test-thread stack at a time; the allocated witness slices outlive it.
+        let (public, left) = {
+            let native = native_candidate(0x2A11_0000);
+            let public = alloc_selected_statement(&mut b, &native);
+            let slices =
+                alloc_raw_slice_tile_fixture_slices(&mut b, &native, &owner_layout, &main_layout);
+            (public, slices)
+        };
+        let right = {
+            let native = native_candidate(0x2A11_0001);
+            alloc_raw_slice_tile_fixture_slices(&mut b, &native, &owner_layout, &main_layout)
+        };
 
         let owner_a = std::array::from_fn(|lane| {
             concatenate_slices(&mut b, left.owner_a[lane], right.owner_a[lane])
@@ -3311,6 +3317,19 @@ mod tests {
 
     #[test]
     fn k2_private_per_tile_fixture_checks_only_one_tile_and_rejects_cross_tile_splices() {
+        // This test deliberately materializes a synthetic two-tile witness and
+        // two full tampered copies at once.  The fixture is test-only, but it is
+        // larger than libtest's default worker stack in debug builds.
+        std::thread::Builder::new()
+            .name("zk-auth-k2-fixture".to_owned())
+            .stack_size(64 * 1024 * 1024)
+            .spawn(run_k2_private_per_tile_fixture_checks)
+            .expect("spawn K2 fixture test")
+            .join()
+            .expect("K2 fixture test panicked");
+    }
+
+    fn run_k2_private_per_tile_fixture_checks() {
         let honest = build_k2_raw_slice_tile_fixture();
         assert_eq!(honest.trace_rows, ZK_AUTH_RAW_SLICE_TILE_TRACE_ROWS);
         assert_ne!(

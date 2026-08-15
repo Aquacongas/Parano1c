@@ -438,6 +438,28 @@ impl SnapshotStagingSession {
         result
     }
 
+    /// Validate and atomically stage one independently authenticated segment
+    /// without invalidating segments that were already accepted. This is used
+    /// by the multi-source snapshot fetcher: one peer supplying bad bytes must
+    /// cost only that exact object, not the verified progress obtained from
+    /// other peers.
+    ///
+    /// `accept_segment_inner` publishes only after the complete payload has
+    /// passed its descriptor, length, canonical encoding and subtree-root
+    /// checks. Therefore an error leaves the session's received set and every
+    /// previously published segment unchanged.
+    pub fn accept_segment_recoverable(
+        &mut self,
+        segment_id: u16,
+        response_effective_log: u8,
+        encoded: &[u8],
+    ) -> Result<(), SnapshotStagingError> {
+        if self.closed || self.directory.is_none() {
+            return Err(SnapshotStagingError::SessionClosed);
+        }
+        self.accept_segment_inner(segment_id, response_effective_log, encoded)
+    }
+
     fn accept_segment_inner(
         &mut self,
         segment_id: u16,
@@ -775,6 +797,28 @@ fn decode_and_verify_segment<'a>(
     let mut exact = StreamingSparseRoot::new(u32::from(encoded_effective_log))
         .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
     for (local, slot) in sparse.entries() {
+        exact
+            .push_leaf(u32::from(local), slot_leaf_hash(slot))
+            .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
+    }
+    let actual_root = exact
+        .finish()
+        .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
+    if actual_root != descriptor.segment_root {
+        return Err(SnapshotStagingError::ExactSegmentRootMismatch {
+            segment_id: descriptor.segment_id,
+        });
+    }
+    // Only after the payload is bound to the immutable manifest root do
+    // semantic failures reject the generation rather than merely its source.
+    // This prevents cycling forever through peers that all serve the same
+    // content-addressed but semantically impossible segment.
+    if sparse.live_count() == 0 {
+        return Err(SnapshotStagingError::EmptyAdvertisedSegment {
+            segment_id: descriptor.segment_id,
+        });
+    }
+    for (local, slot) in sparse.entries() {
         let creation_id = slot.creation_id();
         if !crate::consensus::params::creation_id_within_boundary(
             creation_id,
@@ -800,22 +844,6 @@ fn decode_and_verify_segment<'a>(
                 alloc_counter: metadata.header.alloc_counter,
             });
         }
-        exact
-            .push_leaf(u32::from(local), slot_leaf_hash(slot))
-            .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
-    }
-    if sparse.live_count() == 0 {
-        return Err(SnapshotStagingError::EmptyAdvertisedSegment {
-            segment_id: descriptor.segment_id,
-        });
-    }
-    let actual_root = exact
-        .finish()
-        .map_err(|_| SnapshotStagingError::ExactRootConstruction)?;
-    if actual_root != descriptor.segment_root {
-        return Err(SnapshotStagingError::ExactSegmentRootMismatch {
-            segment_id: descriptor.segment_id,
-        });
     }
     Ok(sparse)
 }
@@ -1264,6 +1292,29 @@ mod tests {
             session.accept_segment(0, 3, &encoded),
             Err(SnapshotStagingError::SessionClosed)
         ));
+    }
+
+    #[test]
+    fn recoverable_rejection_keeps_session_for_an_exact_source_retry() {
+        let parent = tempfile::tempdir().unwrap();
+        let (metadata, descriptor, encoded) = fixture();
+        let mut session =
+            SnapshotStagingSession::new(parent.path(), metadata, vec![descriptor]).unwrap();
+        let directory = session.staging_directory().unwrap().to_path_buf();
+        let mut corrupted = encoded.clone();
+        let last = corrupted.last_mut().expect("fixture payload is non-empty");
+        *last ^= 1;
+
+        assert!(session
+            .accept_segment_recoverable(0, 3, &corrupted)
+            .is_err());
+        assert!(directory.exists());
+        assert_eq!(session.received_count(), 0);
+
+        session
+            .accept_segment_recoverable(0, 3, &encoded)
+            .expect("the same exact object from another source is accepted");
+        session.finalize().expect("recovered session finalizes");
     }
 
     #[test]

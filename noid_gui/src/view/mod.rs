@@ -181,9 +181,12 @@ fn wallet_setup(app: &App, compact: bool, narrow: bool) -> Element<'_, Message> 
     .size(HEADER_WORDMARK_SIZE)
     .line_height(1.0)
     .font(theme::BRAND_REGULAR_FONT);
+    let identity = row![brand, network_version_label()]
+        .spacing(9)
+        .align_y(Alignment::Center);
     let header = container(
         row![
-            brand,
+            identity,
             Space::new().width(Length::Fill),
             column![
                 text("FIRST RUN").size(12).color(theme::CYAN),
@@ -705,22 +708,16 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
         crate::app::BackendState::Online if network.synced => ("SYNCED", theme::ACCENT),
         crate::app::BackendState::Online => ("SYNCING", theme::WARNING),
     };
-    let mining_status = if app.node_action_in_flight {
-        ("SWITCHING".into(), theme::WARNING)
+    let mining_status: (&str, iced::Color) = if app.node_action_in_flight {
+        ("SWITCHING", theme::WARNING)
     } else if app.snapshot.mining.enabled && app.snapshot.mining.isolated {
-        ("ISOLATED".into(), theme::WARNING)
+        ("ISOLATED", theme::WARNING)
     } else if app.snapshot.mining.enabled && app.snapshot.mining.ready {
-        ("MINING ON".into(), theme::ACCENT)
+        ("MINING ON", theme::ACCENT)
     } else if app.snapshot.mining.enabled {
-        (
-            format!(
-                "WAITING {}/{}",
-                app.snapshot.mining.confirmed_peers, app.snapshot.mining.required_peers
-            ),
-            theme::WARNING,
-        )
+        ("WAITING", theme::WARNING)
     } else {
-        ("MINING OFF".into(), theme::DIM)
+        ("MINING OFF", theme::DIM)
     };
 
     let wordmark = rich_text([
@@ -731,6 +728,9 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
     .size(HEADER_WORDMARK_SIZE)
     .line_height(1.0)
     .font(theme::BRAND_REGULAR_FONT);
+    let identity = row![wordmark, network_version_label()]
+        .spacing(9)
+        .align_y(Alignment::Center);
 
     let network_status = container(
         row![
@@ -760,7 +760,7 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
 
     container(
         row![
-            wordmark,
+            identity,
             iced::widget::Space::new().width(Length::Fill),
             network_status,
             mining_status,
@@ -773,6 +773,17 @@ fn header(app: &App, _compact: bool) -> Element<'_, Message> {
     .align_y(Alignment::Center)
     .width(Length::Fill)
     .style(theme::top_bar)
+    .into()
+}
+
+fn network_version_label() -> Element<'static, Message> {
+    container(
+        text(concat!("testnet v", env!("CARGO_PKG_VERSION")))
+            .size(10)
+            .font(theme::TECH_FONT)
+            .color(theme::DIM),
+    )
+    .padding(Padding::ZERO.top(2))
     .into()
 }
 
@@ -1657,7 +1668,7 @@ fn node_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
 }
 
 fn network_settings_group(app: &App) -> iced::widget::Container<'_, Message> {
-    let listen = text_input("0.0.0.0:9400", &app.settings_p2p_listen)
+    let listen = text_input("0.0.0.0:9500", &app.settings_p2p_listen)
         .on_input(Message::SettingsP2pListenChanged)
         .size(14)
         .padding([8, 10])

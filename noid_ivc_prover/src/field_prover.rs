@@ -17,6 +17,21 @@ use noid_ivc_core::public_io::{
     bind_public_io_c1,
 };
 use noid_ivc_core::zerocheck;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Cooperative cancellation of a locally authored proof. Cancellation is
+/// checked only between transcript phases, so a phase is either completed or
+/// its partial values are dropped before control returns to the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProverCancelled;
+
+impl core::fmt::Display for ProverCancelled {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("prover cancelled")
+    }
+}
+
+impl std::error::Error for ProverCancelled {}
 
 #[derive(Clone, Copy)]
 enum FreshLincheckCaptureRequest {
@@ -219,9 +234,11 @@ pub fn prove_field_c1<Ch: Challenger>(
         pcs_params,
         None,
         false,
+        None,
         challenger,
         |_, _, _| ((), (Vec::new(), Vec::new())),
-    );
+    )
+    .expect("an uncancellable C1 proof cannot be cancelled");
     debug_assert!(capture.is_none());
     (proof, commitment, claim)
 }
@@ -261,9 +278,11 @@ pub fn prove_field_compact_c1<Ch: Challenger>(
         pcs_params,
         None,
         false,
+        None,
         challenger,
         |_, _, _| ((), (Vec::new(), Vec::new())),
-    );
+    )
+    .expect("an uncancellable compact C1 proof cannot be cancelled");
     debug_assert!(capture.is_none());
     (proof, commitment, claim)
 }
@@ -285,9 +304,11 @@ pub fn prove_field_c1_capturing_fresh<Ch: Challenger>(
         pcs_params,
         None,
         true,
+        None,
         challenger,
         |_, _, _| ((), (Vec::new(), Vec::new())),
-    );
+    )
+    .expect("an uncancellable captured C1 proof cannot be cancelled");
     (
         proof,
         commitment,
@@ -313,9 +334,11 @@ pub fn prove_field_compact_c1_capturing_fresh<Ch: Challenger>(
         pcs_params,
         None,
         true,
+        None,
         challenger,
         |_, _, _| ((), (Vec::new(), Vec::new())),
-    );
+    )
+    .expect("an uncancellable captured compact C1 proof cannot be cancelled");
     (
         proof,
         commitment,
@@ -349,6 +372,7 @@ where
         pcs_params,
         Some((spec, io)),
         false,
+        None,
         challenger,
         |witness, commitment, challenger| {
             bind_post_commit_class(challenger, post_commit_class_digest);
@@ -357,7 +381,8 @@ where
             let auxiliary = post_commit(&mut context);
             (auxiliary, context.finish_c1())
         },
-    );
+    )
+    .expect("an uncancellable public-IO C1 proof cannot be cancelled");
     debug_assert!(capture.is_none());
     (proof, auxiliary, commitment, claim)
 }
@@ -386,6 +411,7 @@ where
         pcs_params,
         Some((spec, io)),
         false,
+        None,
         challenger,
         |witness, commitment, challenger| {
             bind_post_commit_class(challenger, post_commit_class_digest);
@@ -394,9 +420,92 @@ where
             let auxiliary = post_commit(&mut context);
             (auxiliary, context.finish_c1())
         },
-    );
+    )
+    .expect("an uncancellable public-IO compact C1 proof cannot be cancelled");
     debug_assert!(capture.is_none());
     (proof, auxiliary, commitment, claim)
+}
+
+/// Cancellable production twin of
+/// [`prove_field_c1_with_public_io_and_post_commit_context`]. The transcript
+/// and returned proof are identical when the cancellation flag stays clear.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_c1_with_public_io_and_post_commit_context_cancellable<Ch, Aux, PostCommit>(
+    r1cs: &FieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    cancellation: &AtomicBool,
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> Result<(C1FieldR1csProof, Aux, Commitment, C1R1csClaim), ProverCancelled>
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&mut FieldPostCommitProverContext<'_, Ch>) -> Aux,
+{
+    let (proof, auxiliary, commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        Some((spec, io)),
+        false,
+        Some(cancellation),
+        challenger,
+        |witness, commitment, challenger| {
+            bind_post_commit_class(challenger, post_commit_class_digest);
+            let mut context =
+                FieldPostCommitProverContext::new(witness, commitment, r1cs.m, challenger);
+            let auxiliary = post_commit(&mut context);
+            (auxiliary, context.finish_c1())
+        },
+    )?;
+    debug_assert!(capture.is_none());
+    Ok((proof, auxiliary, commitment, claim))
+}
+
+/// Compact-matrix cancellable twin of
+/// [`prove_field_compact_c1_with_public_io_and_post_commit_context`].
+#[allow(clippy::too_many_arguments)]
+pub fn prove_field_compact_c1_with_public_io_and_post_commit_context_cancellable<
+    Ch,
+    Aux,
+    PostCommit,
+>(
+    r1cs: &CompactFieldR1cs,
+    witness: &[F128],
+    pcs_params: &PcsParams,
+    spec: &PublicIoSpec,
+    io: &[F128],
+    post_commit_class_digest: &[u8; 32],
+    cancellation: &AtomicBool,
+    challenger: &mut Ch,
+    post_commit: PostCommit,
+) -> Result<(C1FieldR1csProof, Aux, Commitment, C1R1csClaim), ProverCancelled>
+where
+    Ch: Challenger,
+    PostCommit: FnOnce(&mut FieldPostCommitProverContext<'_, Ch>) -> Aux,
+{
+    let total_vars = r1cs.shape().m;
+    let (proof, auxiliary, commitment, claim, capture) = prove_field_c1_inner(
+        r1cs,
+        witness,
+        pcs_params,
+        Some((spec, io)),
+        false,
+        Some(cancellation),
+        challenger,
+        |witness, commitment, challenger| {
+            bind_post_commit_class(challenger, post_commit_class_digest);
+            let mut context =
+                FieldPostCommitProverContext::new(witness, commitment, total_vars, challenger);
+            let auxiliary = post_commit(&mut context);
+            (auxiliary, context.finish_c1())
+        },
+    )?;
+    debug_assert!(capture.is_none());
+    Ok((proof, auxiliary, commitment, claim))
 }
 
 fn prove_field_c1_inner<R, Ch, Aux, PostCommit>(
@@ -405,15 +514,19 @@ fn prove_field_c1_inner<R, Ch, Aux, PostCommit>(
     pcs_params: &PcsParams,
     public_io: Option<(&PublicIoSpec, &[F128])>,
     capture_fresh: bool,
+    cancellation: Option<&AtomicBool>,
     challenger: &mut Ch,
     post_commit: PostCommit,
-) -> (
-    C1FieldR1csProof,
-    Aux,
-    Commitment,
-    C1R1csClaim,
-    Option<lincheck::c1::C1LocallyAuthoredFreshLincheckCapture>,
-)
+) -> Result<
+    (
+        C1FieldR1csProof,
+        Aux,
+        Commitment,
+        C1R1csClaim,
+        Option<lincheck::c1::C1LocallyAuthoredFreshLincheckCapture>,
+    ),
+    ProverCancelled,
+>
 where
     R: FieldProverRelation,
     Ch: Challenger,
@@ -423,6 +536,14 @@ where
         &mut Ch,
     ) -> (Aux, (Vec<QuirkyDirectClaim>, Vec<C1QuirkyDirectClaim>)),
 {
+    let check_cancelled = || {
+        if cancellation.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            Err(ProverCancelled)
+        } else {
+            Ok(())
+        }
+    };
+    check_cancelled()?;
     let timing = std::env::var_os("NOIDH_FIELD_PROVE_TIMING").is_some();
     let mut phase = std::time::Instant::now();
     let lap = |label: &str, phase: &mut std::time::Instant| {
@@ -446,6 +567,7 @@ where
 
     let (commitment, prover_data) = pcs::commit(witness, pcs_params);
     lap("PCS commit", &mut phase);
+    check_cancelled()?;
     bind_statement_field_parts_c1(challenger, &r1cs.field_statement_digest(), &commitment);
 
     let io_claims = match public_io {
@@ -456,18 +578,22 @@ where
         None => Vec::new(),
     };
     lap("statement and public IO", &mut phase);
+    check_cancelled()?;
     let (auxiliary, (auxiliary_claims, auxiliary_c1_claims)) =
         post_commit(witness, &commitment, challenger);
     lap("post-commit auxiliary", &mut phase);
+    check_cancelled()?;
 
     let a = r1cs.apply_a_relation(witness);
     let b = r1cs.apply_b_relation(witness);
     lap("apply A/B", &mut phase);
+    check_cancelled()?;
     let (zerocheck_proof, zerocheck_claim) =
         zerocheck::field_c1::prove(&a, &b, witness, shape.m, challenger);
     drop(a);
     drop(b);
     lap("zerocheck", &mut phase);
+    check_cancelled()?;
 
     let inner_rest_len = shape.k_log - shape.k_skip;
     let lincheck_point = lincheck::c1::C1QuirkyPoint {
@@ -503,6 +629,7 @@ where
         (proof, claim, None)
     };
     lap("lincheck", &mut phase);
+    check_cancelled()?;
 
     let ab = C1ZClaim {
         point: lincheck::c1::C1QuirkyPoint {
@@ -546,8 +673,9 @@ where
     let pcs_open =
         pcs::open_batch_quirky_direct_c1(witness, &prover_data, &commitment, &claims, challenger);
     lap("PCS open", &mut phase);
+    check_cancelled()?;
 
-    (
+    Ok((
         C1FieldR1csProof {
             zerocheck: zerocheck_proof,
             lincheck: lincheck_proof,
@@ -557,7 +685,7 @@ where
         commitment,
         C1R1csClaim { ab, c },
         fresh_capture,
-    )
+    ))
 }
 
 /// [`prove_field`] with a public-IO envelope: right after the statement

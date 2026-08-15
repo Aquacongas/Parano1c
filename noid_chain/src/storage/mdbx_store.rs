@@ -62,6 +62,12 @@ const T_SEGMENTS: &str = "segments";
 const T_SEGMENT_SUMMARIES: &str = "segment_summaries";
 const T_STATE_META: &str = "state_meta";
 const T_RECENT_BLOCKS: &str = "recent";
+/// Content-addressable cache of complete block bodies, independent of the
+/// canonical height row. Snapshot and reorg plans may outlive the moving
+/// retained-height window, and displaced branch bodies remain useful exact
+/// objects until this bounded operational cache expires.
+/// Key: `height_be[8] || block_id[32]`.
+const T_BLOCK_BODY_OBJECTS: &str = "block_body_objects";
 /// Transaction index for receipt lookup. Key: canonical logical txid (32B).
 /// Value: `(height, logical_position)` (12B), with coinbase at position zero.
 const T_TX_INDEX: &str = "tx_index";
@@ -70,6 +76,12 @@ const T_TX_INDEX: &str = "tx_index";
 /// can natively re-verify the exact accepted history step.
 /// Key: height (u64 LE). Value: serialized terminal package bytes.
 const T_HISTORY_STEP_TERMINALS: &str = "history_step_terminals";
+/// Content-addressable cache of complete recursive terminals, independent of
+/// the canonical height row. One-terminal suffix application may place local
+/// authorization markers at intermediate canonical heights, while recently
+/// displaced or boundary proofs must remain serveable to other nodes.
+/// Key: `height_be[8] || semantic_header_id[32] || proof_class[1]`.
+const T_HISTORY_STEP_PROOF_OBJECTS: &str = "history_step_proof_objects";
 /// Owner UTXO index. Key: `owner[32] || slot_be[4]`. Value:
 /// `packed_value_le[16]`. `packed_value` contains both the amount and the
 /// allocation-counter creation id, so an index lookup can be checked exactly
@@ -79,7 +91,7 @@ const T_HISTORY_STEP_TERMINALS: &str = "history_step_terminals";
 /// `commit_block`.
 const T_OWNER_INDEX: &str = "owner_idx";
 const T_RETENTION_META: &str = "retention_meta";
-const N_TABLES: u64 = 15;
+const N_TABLES: u64 = 17;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -149,6 +161,7 @@ impl From<SnapshotStagingError> for StoreError {
 #[derive(Clone)]
 pub struct MdbxStore {
     db: Arc<Database<NoWriteMap>>,
+    block_body_object_retention_floor: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One owned, already native-validated header record from a sealed snapshot
@@ -229,6 +242,25 @@ impl MdbxHistoricalReadSnapshot<'_> {
         block_hash: [u8; 32],
     ) -> Result<Option<Vec<u8>>, StoreError> {
         read_history_step_terminal(&self.txn, height, block_hash)
+    }
+
+    /// Read a complete recent terminal independently of the canonical height
+    /// row. One-terminal suffix admission intentionally stores compact local
+    /// markers at intermediate heights; snapshot export may use only the
+    /// separately retained full proof object for such a boundary.
+    pub(super) fn get_any_history_step_proof_object(
+        &self,
+        height: u64,
+        semantic_id: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        for proof_class in 0..crate::history_step::HISTORY_STEP_CLASS_COUNT {
+            if let Some(bytes) =
+                read_history_step_proof_object(&self.txn, height, semantic_id, proof_class)?
+            {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
     }
 
     /// Read one canonical retained block body from this same pinned MVCC view.
@@ -358,11 +390,50 @@ pub(crate) struct StagedAcceptedBlockCommit {
 #[derive(Clone, Copy)]
 pub(crate) enum AcceptedBlockCommit<'a> {
     Complete(&'a crate::AcceptedBlockBundle),
+    /// A complete accepted unit supplied as exact borrowed objects.
+    ///
+    /// This is used by the v2 object pipeline after a body and its terminal
+    /// have been fetched independently.  Storage validates the same binding
+    /// as `Complete`; the variant only avoids rebuilding/copying a roughly
+    /// one-megabyte terminal into an `AcceptedBlockBundle`.
+    CompleteObjects {
+        block_bytes: &'a [u8],
+        terminal_bytes: &'a [u8],
+    },
     RecursiveSuffix {
         block_bytes: &'a [u8],
         authority_tip_height: u64,
         authority_tip_hash: [u8; 32],
     },
+}
+
+impl<'a> AcceptedBlockCommit<'a> {
+    pub(crate) fn block_bytes(self) -> &'a [u8] {
+        match self {
+            Self::Complete(bundle) => bundle.block_bytes(),
+            Self::CompleteObjects { block_bytes, .. }
+            | Self::RecursiveSuffix { block_bytes, .. } => block_bytes,
+        }
+    }
+
+    fn complete_terminal(self) -> Option<&'a [u8]> {
+        match self {
+            Self::Complete(bundle) => Some(bundle.history_step_terminal_bytes()),
+            Self::CompleteObjects { terminal_bytes, .. } => Some(terminal_bytes),
+            Self::RecursiveSuffix { .. } => None,
+        }
+    }
+
+    fn recursive_authority(self) -> Option<(u64, [u8; 32])> {
+        match self {
+            Self::RecursiveSuffix {
+                authority_tip_height,
+                authority_tip_hash,
+                ..
+            } => Some((authority_tip_height, authority_tip_hash)),
+            Self::Complete(_) | Self::CompleteObjects { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +447,21 @@ const VERIFIED_SUFFIX_AUTHORITY_BYTES: usize = 4 + 8 + 32 + 8 + 32;
 const RECURSIVE_SUFFIX_MARKER_MAGIC: [u8; 4] = *b"RSM1";
 const RECURSIVE_SUFFIX_MARKER_BYTES: usize =
     crate::history_step::HISTORY_STEP_TERMINAL_BINDING_BYTES + 4 + 8 + 32;
+const HISTORY_STEP_PROOF_OBJECT_KEY_BYTES: usize = 8 + 32 + 1;
+const BLOCK_BODY_OBJECT_KEY_BYTES: usize = 8 + 32;
+/// Operational proof availability window. This is not a consensus retention
+/// rule and may be increased without changing block or proof validity.
+const HISTORY_STEP_PROOF_OBJECT_RETENTION_DEPTH: u64 = 128;
+const HISTORY_STEP_PROOF_OBJECT_PRUNE_LIMIT: usize = 32;
+/// Bodies and terminals use the same operational availability horizon. This
+/// is deliberately independent of finality and consensus validity.
+const BLOCK_BODY_OBJECT_RETENTION_DEPTH: u64 = HISTORY_STEP_PROOF_OBJECT_RETENTION_DEPTH;
+/// An active data-plane lease may extend retention, but never without bound.
+/// At the 20-second target this is about 2.8 hours of exact body availability.
+const BLOCK_BODY_OBJECT_MAX_PIN_DEPTH: u64 = 512;
+const BLOCK_BODY_OBJECT_PRUNE_LIMIT: usize = 8;
+const BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT: usize =
+    crate::consensus::wire_limits::MAX_BLOCK_BYTES * 2;
 /// Bound numeric maintenance work even after a large snapshot jump.
 const RETAINED_PAYLOAD_PRUNE_HEIGHT_LIMIT: usize = 16;
 /// One retained block plus terminal is bounded by the canonical wire caps.
@@ -469,6 +555,172 @@ fn recursive_suffix_marker_authority(
         u64::from_le_bytes(bytes[prefix_len + 4..prefix_len + 12].try_into().ok()?);
     let authority_hash = bytes[prefix_len + 12..prefix_len + 44].try_into().ok()?;
     (authority_height >= height).then_some((authority_height, authority_hash))
+}
+
+fn history_step_proof_object_key(
+    height: u64,
+    semantic_id: [u8; 32],
+    proof_class: u8,
+) -> [u8; HISTORY_STEP_PROOF_OBJECT_KEY_BYTES] {
+    let mut key = [0u8; HISTORY_STEP_PROOF_OBJECT_KEY_BYTES];
+    // Big endian keeps the operational cache ordered by height so bounded
+    // pruning never scans the complete table.
+    key[..8].copy_from_slice(&height.to_be_bytes());
+    key[8..40].copy_from_slice(&semantic_id);
+    key[40] = proof_class;
+    key
+}
+
+fn block_body_object_key(height: u64, block_hash: [u8; 32]) -> [u8; BLOCK_BODY_OBJECT_KEY_BYTES] {
+    let mut key = [0u8; BLOCK_BODY_OBJECT_KEY_BYTES];
+    key[..8].copy_from_slice(&height.to_be_bytes());
+    key[8..].copy_from_slice(&block_hash);
+    key
+}
+
+fn archive_block_body_object(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    expected_height: u64,
+    expected_hash: [u8; 32],
+    block_bytes: &[u8],
+) -> Result<(), StoreError> {
+    if block_bytes.is_empty() || block_bytes.len() > crate::consensus::wire_limits::MAX_BLOCK_BYTES
+    {
+        return Err(StoreError::Decode(
+            "archived block body length is outside hard bounds",
+        ));
+    }
+    let block = crate::Block::from_bytes(block_bytes)
+        .map_err(|_| StoreError::Decode("archived block body is malformed"))?;
+    if block.header.height != expected_height
+        || crate::block_header::block_id(&block.header) != expected_hash
+    {
+        return Err(StoreError::Decode(
+            "archived block body does not match its object key",
+        ));
+    }
+    let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+    txn.put(
+        &table,
+        block_body_object_key(expected_height, expected_hash),
+        block_bytes,
+        WriteFlags::empty(),
+    )?;
+    Ok(())
+}
+
+fn archive_history_step_proof_object(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    terminal_bytes: &[u8],
+) -> Result<(), StoreError> {
+    if terminal_bytes.len() > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        return Err(StoreError::Decode(
+            "archived HistoryStep terminal exceeds hard bounds",
+        ));
+    }
+    let metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(terminal_bytes)
+        .map_err(|_| StoreError::Decode("archived HistoryStep terminal metadata is malformed"))?;
+    if recursive_suffix_marker_authority(
+        terminal_bytes,
+        metadata.terminal_height(),
+        metadata.terminal_hash(),
+        Some(metadata.current_class_slot()),
+    )
+    .is_some()
+    {
+        return Err(StoreError::Decode(
+            "recursive suffix marker cannot enter the proof-object cache",
+        ));
+    }
+    let table = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS))?;
+    txn.put(
+        &table,
+        history_step_proof_object_key(
+            metadata.terminal_height(),
+            metadata.terminal_hash(),
+            metadata.class_id(),
+        ),
+        terminal_bytes,
+        WriteFlags::empty(),
+    )?;
+    Ok(())
+}
+
+fn prune_history_step_proof_objects(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    current_height: u64,
+) -> Result<(), StoreError> {
+    let cutoff = current_height.saturating_sub(HISTORY_STEP_PROOF_OBJECT_RETENTION_DEPTH);
+    let table = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS))?;
+    let deletions = {
+        let mut cursor = txn.cursor(&table)?;
+        let mut item: Option<(Vec<u8>, ObjectLength)> = cursor.first()?;
+        let mut keys = Vec::new();
+        while let Some((key, _)) = item {
+            if key.len() != HISTORY_STEP_PROOF_OBJECT_KEY_BYTES {
+                return Err(StoreError::Decode(
+                    "invalid HistoryStep proof-object key length",
+                ));
+            }
+            let height = u64::from_be_bytes(key[..8].try_into().unwrap());
+            if height >= cutoff || keys.len() == HISTORY_STEP_PROOF_OBJECT_PRUNE_LIMIT {
+                break;
+            }
+            keys.push(key);
+            item = cursor.next()?;
+        }
+        keys
+    };
+    for key in deletions {
+        txn.del(&table, key, None)?;
+    }
+    Ok(())
+}
+
+fn prune_block_body_objects(
+    txn: &Transaction<'_, RW, NoWriteMap>,
+    current_height: u64,
+    retention_floor: Option<u64>,
+) -> Result<(), StoreError> {
+    let mut cutoff = current_height.saturating_sub(BLOCK_BODY_OBJECT_RETENTION_DEPTH);
+    if let Some(floor) = retention_floor {
+        let bounded_floor =
+            floor.max(current_height.saturating_sub(BLOCK_BODY_OBJECT_MAX_PIN_DEPTH));
+        cutoff = cutoff.min(bounded_floor.saturating_add(1));
+    }
+    let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+    let deletions = {
+        let mut cursor = txn.cursor(&table)?;
+        let mut item: Option<(Vec<u8>, ObjectLength)> = cursor.first()?;
+        let mut keys = Vec::new();
+        let mut bytes = 0usize;
+        while let Some((key, ObjectLength(value_len))) = item {
+            if key.len() != BLOCK_BODY_OBJECT_KEY_BYTES {
+                return Err(StoreError::Decode("invalid block-body object key length"));
+            }
+            let height = u64::from_be_bytes(key[..8].try_into().unwrap());
+            if height >= cutoff || keys.len() == BLOCK_BODY_OBJECT_PRUNE_LIMIT {
+                break;
+            }
+            if !keys.is_empty()
+                && bytes
+                    .checked_add(value_len)
+                    .is_none_or(|total| total > BLOCK_BODY_OBJECT_PRUNE_BYTE_LIMIT)
+            {
+                break;
+            }
+            bytes = bytes.checked_add(value_len).ok_or(StoreError::Decode(
+                "block-body prune byte accounting overflow",
+            ))?;
+            keys.push(key);
+            item = cursor.next()?;
+        }
+        keys
+    };
+    for key in deletions {
+        txn.del(&table, key, None)?;
+    }
+    Ok(())
 }
 
 fn recursive_suffix_marker_has_durable_authority(
@@ -760,6 +1012,53 @@ fn read_history_step_terminal(
     if !history_step_terminal_prefix_matches(&bytes, height, semantic_id) {
         return Err(StoreError::Decode(
             "HistoryStep terminal does not match its canonical boundary",
+        ));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_history_step_proof_object(
+    txn: &Transaction<'_, RO, NoWriteMap>,
+    height: u64,
+    semantic_id: [u8; 32],
+    proof_class: u8,
+) -> Result<Option<Vec<u8>>, StoreError> {
+    if proof_class >= crate::history_step::HISTORY_STEP_CLASS_COUNT {
+        return Ok(None);
+    }
+    let table = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS))?;
+    let key = history_step_proof_object_key(height, semantic_id, proof_class);
+    let Some(ObjectLength(length)) = txn.get(&table, &key)? else {
+        return Ok(None);
+    };
+    if length == 0 || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES {
+        return Err(StoreError::Decode(
+            "HistoryStep proof-object length exceeds hard bounds",
+        ));
+    }
+    let bytes: Vec<u8> = txn
+        .get(&table, &key)?
+        .ok_or(StoreError::Decode("HistoryStep proof object disappeared"))?;
+    if bytes.len() != length {
+        return Err(StoreError::Decode(
+            "HistoryStep proof-object length changed during read",
+        ));
+    }
+    let metadata = crate::history_step::HistoryStepTerminalMetadata::decode_prefix(&bytes)
+        .map_err(|_| StoreError::Decode("HistoryStep proof-object metadata is malformed"))?;
+    if metadata.terminal_height() != height
+        || metadata.terminal_hash() != semantic_id
+        || metadata.class_id() != proof_class
+        || recursive_suffix_marker_authority(
+            &bytes,
+            height,
+            semantic_id,
+            Some(proof_class as usize),
+        )
+        .is_some()
+    {
+        return Err(StoreError::Decode(
+            "HistoryStep proof object does not match its key",
         ));
     }
     Ok(Some(bytes))
@@ -1167,15 +1466,20 @@ impl MdbxStore {
             T_SEGMENT_SUMMARIES,
             T_STATE_META,
             T_RECENT_BLOCKS,
+            T_BLOCK_BODY_OBJECTS,
             T_TX_INDEX,
             T_HISTORY_STEP_TERMINALS,
+            T_HISTORY_STEP_PROOF_OBJECTS,
             T_OWNER_INDEX,
             T_RETENTION_META,
         ] {
             txn.create_table(Some(name), TableFlags::empty())?;
         }
         txn.commit()?;
-        let store = Self { db: Arc::new(db) };
+        let store = Self {
+            db: Arc::new(db),
+            block_body_object_retention_floor: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
         Ok(store)
     }
 
@@ -1189,6 +1493,14 @@ impl MdbxStore {
         Ok(MdbxHistoricalReadSnapshot {
             txn: self.db.begin_ro_txn()?,
         })
+    }
+
+    /// Pin content-addressed bodies above one active snapshot boundary. This
+    /// is an operational serving lease, not consensus state. `None` restores
+    /// the ordinary bounded retention window.
+    pub fn set_block_body_object_retention_floor(&self, floor: Option<u64>) {
+        self.block_body_object_retention_floor
+            .store(floor.unwrap_or(0), std::sync::atomic::Ordering::Release);
     }
 
     pub fn get_chain_tip(&self) -> Result<Option<(u64, [u8; 32])>, StoreError> {
@@ -1322,6 +1634,59 @@ impl MdbxStore {
         read_history_step_terminal(&txn, height, block_hash)
     }
 
+    /// Load a complete recent recursive terminal by semantic identity,
+    /// independently of which branch is currently canonical.
+    pub fn get_history_step_proof_object(
+        &self,
+        height: u64,
+        semantic_id: [u8; 32],
+        proof_class: u8,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        read_history_step_proof_object(&txn, height, semantic_id, proof_class)
+    }
+
+    /// Load the canonical class for a recent semantic terminal when the
+    /// caller has a header but not the body-derived class selector.
+    pub fn get_any_history_step_proof_object(
+        &self,
+        height: u64,
+        semantic_id: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        for proof_class in 0..crate::history_step::HISTORY_STEP_CLASS_COUNT {
+            if let Some(bytes) =
+                read_history_step_proof_object(&txn, height, semantic_id, proof_class)?
+            {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn has_any_history_step_proof_object(
+        &self,
+        height: u64,
+        semantic_id: [u8; 32],
+    ) -> Result<bool, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let table = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS))?;
+        for proof_class in 0..crate::history_step::HISTORY_STEP_CLASS_COUNT {
+            let key = history_step_proof_object_key(height, semantic_id, proof_class);
+            if let Some(ObjectLength(length)) = txn.get(&table, &key)? {
+                if length == 0
+                    || length > crate::consensus::wire_limits::MAX_HISTORY_STEP_TERMINAL_BYTES
+                {
+                    return Err(StoreError::Decode(
+                        "HistoryStep proof-object length exceeds hard bounds",
+                    ));
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Check whether the exact canonical boundary has a retained HistoryStep
     /// terminal without loading the terminal payload.
     pub fn has_history_step_terminal_at(
@@ -1364,6 +1729,51 @@ impl MdbxStore {
             None,
         )
         .is_none())
+    }
+
+    /// Cache a complete terminal that has already been verified for an exact
+    /// snapshot boundary. The capability type is constructed only by
+    /// `MdbxChainContext::verify_snapshot_boundary`; this method additionally
+    /// binds it to the canonical finalized chain in the same write
+    /// transaction before the bytes enter the independent proof-object store.
+    pub(crate) fn cache_verified_snapshot_boundary_proof(
+        &self,
+        boundary: &crate::storage::VerifiedSnapshotBoundary,
+    ) -> Result<(), StoreError> {
+        let header = *boundary.header();
+        let height = header.height;
+        let block_hash = crate::block_header::block_id(&header);
+
+        let txn = self.db.begin_rw_txn()?;
+        let headers = txn.open_table(Some(T_HEADERS))?;
+        let canonical_raw: Option<Vec<u8>> = txn.get(&headers, &u64_key(height))?;
+        if canonical_raw.as_deref().and_then(decode_header) != Some(header) {
+            return Err(StoreError::Decode(
+                "verified snapshot proof boundary is not canonical",
+            ));
+        }
+
+        let consensus = txn.open_table(Some(T_CONSENSUS_META))?;
+        let meta_raw: Option<Vec<u8>> = txn.get(&consensus, KEY_CONSENSUS_META)?;
+        let meta =
+            meta_raw
+                .as_deref()
+                .and_then(decode_consensus_meta)
+                .ok_or(StoreError::Decode(
+                    "canonical consensus metadata is missing",
+                ))?;
+        if meta.finalized.height < height
+            || (meta.finalized.height == height && meta.finalized.hash != block_hash)
+        {
+            return Err(StoreError::Decode(
+                "verified snapshot proof boundary is not finalized",
+            ));
+        }
+
+        archive_history_step_proof_object(&txn, boundary.history_step_terminal_bytes())?;
+        prune_history_step_proof_objects(&txn, meta.tip_height)?;
+        txn.commit()?;
+        Ok(())
     }
 
     pub fn put_consensus_meta(&self, meta: &ConsensusMeta) -> Result<(), StoreError> {
@@ -1542,6 +1952,32 @@ impl MdbxStore {
         let txn = self.db.begin_ro_txn()?;
         let tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         Ok(txn.get(&tbl, &u64_key(height))?)
+    }
+
+    /// Read one bounded content-addressed block body independently of the
+    /// canonical height row. The caller still validates its expected byte
+    /// digest; this lookup only fixes the exact height/header identity.
+    pub fn get_block_body_object(
+        &self,
+        height: u64,
+        block_hash: [u8; 32],
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let txn = self.db.begin_ro_txn()?;
+        let table = txn.open_table(Some(T_BLOCK_BODY_OBJECTS))?;
+        let bytes: Option<Vec<u8>> = txn.get(&table, &block_body_object_key(height, block_hash))?;
+        let Some(bytes) = bytes else {
+            return Ok(None);
+        };
+        let block = crate::Block::from_bytes(&bytes)
+            .map_err(|_| StoreError::Decode("cached block-body object is malformed"))?;
+        if block.header.height != height
+            || crate::block_header::block_id(&block.header) != block_hash
+        {
+            return Err(StoreError::Decode(
+                "cached block-body object does not match its key",
+            ));
+        }
+        Ok(Some(bytes))
     }
 
     /// Encode one canonical NAB1 block + HistoryStep terminal from a single
@@ -2184,6 +2620,7 @@ impl MdbxStore {
             T_RECENT_BLOCKS,
             T_TX_INDEX,
             T_HISTORY_STEP_TERMINALS,
+            T_HISTORY_STEP_PROOF_OBJECTS,
             T_OWNER_INDEX,
             T_RETENTION_META,
         ] {
@@ -2203,6 +2640,7 @@ impl MdbxStore {
             boundary.history_step_terminal_bytes(),
             WriteFlags::empty(),
         )?;
+        archive_history_step_proof_object(&txn, boundary.history_step_terminal_bytes())?;
         let segment_tbl = txn.open_table(Some(T_SEGMENTS))?;
         let summary_tbl = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
         let owner_tbl = txn.open_table(Some(T_OWNER_INDEX))?;
@@ -2364,6 +2802,7 @@ impl MdbxStore {
             ),
             WriteFlags::empty(),
         )?;
+        prune_history_step_proof_objects(&txn, tip_header.height)?;
         txn.commit()?;
         Ok(hot_state)
     }
@@ -2585,6 +3024,10 @@ impl MdbxStore {
                         None,
                     )
                 }
+                AcceptedBlockCommit::CompleteObjects {
+                    block_bytes,
+                    terminal_bytes,
+                } => (block_bytes, Some(terminal_bytes), None),
                 AcceptedBlockCommit::RecursiveSuffix {
                     block_bytes,
                     authority_tip_height,
@@ -2865,6 +3308,7 @@ impl MdbxStore {
             let height_key = u64_key(header.height);
             let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
             txn.put(&recent_tbl, height_key, block_bytes, WriteFlags::empty())?;
+            archive_block_body_object(&txn, header.height, *hash, block_bytes)?;
             let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
             txn.put(
                 &terminal_tbl,
@@ -2873,6 +3317,7 @@ impl MdbxStore {
                 WriteFlags::empty(),
             )?;
             if recursive_authority.is_none() {
+                archive_history_step_proof_object(&txn, terminal_bytes.as_ref())?;
                 let retention = txn.open_table(Some(T_RETENTION_META))?;
                 let _ = txn.del(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY, None);
             }
@@ -3053,7 +3498,7 @@ impl MdbxStore {
         final_dirty_segments: &[(u16, u8, Option<&SegmentColumns>)],
         final_dirty_segment_summaries: &[(u16, u32, [u8; 32])],
         reverted_tx_hashes: &[TxBodyHash],
-        replacement_bundles: &[crate::AcceptedBlockBundle],
+        replacement_objects: &[AcceptedBlockCommit<'_>],
         replacement: &[StagedAcceptedBlockCommit],
         circulating_supply_micronoid: u128,
         consensus_meta: &ConsensusMeta,
@@ -3078,24 +3523,32 @@ impl MdbxStore {
         {
             return Err(StoreError::Decode("invalid staged reorg tip"));
         }
-        if replacement_bundles.len() != replacement.len() {
-            return Err(StoreError::Decode("staged reorg bundle count mismatch"));
+        if replacement_objects.len() != replacement.len() {
+            return Err(StoreError::Decode("staged reorg object count mismatch"));
         }
         let mut expected_height = ancestor_height.saturating_add(1);
-        for (bundle, staged) in replacement_bundles.iter().zip(replacement) {
-            let block = crate::Block::from_bytes(bundle.block_bytes())
+        for (accepted, staged) in replacement_objects.iter().copied().zip(replacement) {
+            let block = crate::Block::from_bytes(accepted.block_bytes())
                 .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
             if staged.header.height != expected_height
                 || block.header != staged.header
                 || staged.hash != crate::hash_block_header(&staged.header)
-                || bundle.height() != staged.header.height
-                || bundle.block_hash() != staged.hash
                 || match crate::block::try_compute_logical_txids(&block.transactions) {
                     Ok(txids) => txids != staged.undo_log.tx_hashes,
                     Err(_) => true,
                 }
             {
                 return Err(StoreError::Decode("invalid staged reorg block"));
+            }
+            if let Some((authority_height, authority_hash)) = accepted.recursive_authority() {
+                if staged.header.height >= authority_height
+                    || authority_height != final_header.height
+                    || authority_hash != *final_hash
+                {
+                    return Err(StoreError::Decode(
+                        "staged reorg marker has the wrong recursive authority",
+                    ));
+                }
             }
             expected_height = expected_height
                 .checked_add(1)
@@ -3113,6 +3566,13 @@ impl MdbxStore {
                 return Err(StoreError::Decode("empty staged reorg changed height"));
             }
             _ => {}
+        }
+        if let Some(last) = replacement_objects.last().copied() {
+            if last.complete_terminal().is_none() {
+                return Err(StoreError::Decode(
+                    "staged reorg tip is missing its complete terminal",
+                ));
+            }
         }
 
         let txn = self.db.begin_rw_txn()?;
@@ -3301,6 +3761,18 @@ impl MdbxStore {
             let _ = txn.del(&h2h_tbl, hash.as_slice(), None);
         }
 
+        // Preserve displaced, previously canonical bodies as exact objects
+        // before their height-indexed rows are replaced. They remain useful
+        // for another peer's in-flight plan and are bounded by object-cache
+        // retention rather than by fork choice.
+        let old_recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
+        for (height, hash) in &old_headers {
+            let bytes: Option<Vec<u8>> = txn.get(&old_recent_tbl, &u64_key(*height))?;
+            if let Some(bytes) = bytes {
+                archive_block_body_object(&txn, *height, *hash, &bytes)?;
+            }
+        }
+
         macro_rules! truncate_reorg_suffix {
             ($name:expr) => {{
                 let table = txn.open_table(Some($name))?;
@@ -3337,12 +3809,9 @@ impl MdbxStore {
         let undo_tbl = txn.open_table(Some(T_UNDO_LOGS))?;
         let recent_tbl = txn.open_table(Some(T_RECENT_BLOCKS))?;
         let terminal_tbl = txn.open_table(Some(T_HISTORY_STEP_TERMINALS))?;
-        for (index, (bundle, staged)) in replacement_bundles.iter().zip(replacement).enumerate() {
-            let block = crate::Block::from_bytes(bundle.block_bytes())
+        for (accepted, staged) in replacement_objects.iter().copied().zip(replacement) {
+            let block = crate::Block::from_bytes(accepted.block_bytes())
                 .map_err(|_| StoreError::Decode("staged reorg block is malformed"))?;
-            if index != 0 {
-                validate_history_step_parent_boundary_in_rw_txn(&txn, &staged.header)?;
-            }
             let height_key = u64_key(staged.header.height);
             txn.put(
                 &hdr_tbl,
@@ -3389,14 +3858,14 @@ impl MdbxStore {
             txn.put(
                 &recent_tbl,
                 height_key,
-                bundle.block_bytes(),
+                accepted.block_bytes(),
                 WriteFlags::empty(),
             )?;
-            txn.put(
-                &terminal_tbl,
-                height_key,
-                bundle.history_step_terminal_bytes(),
-                WriteFlags::empty(),
+            archive_block_body_object(
+                &txn,
+                staged.header.height,
+                staged.hash,
+                accepted.block_bytes(),
             )?;
             if staged.header.height != 0 {
                 let expected_class = block
@@ -3407,15 +3876,41 @@ impl MdbxStore {
                     .ok_or(StoreError::Decode(
                         "staged reorg transaction count has no canonical HistoryStep tier",
                     ))?;
-                if !history_step_terminal_matches_class(
-                    bundle.history_step_terminal_bytes(),
-                    staged.header.height,
-                    crate::block_header::semantic_header_id(&staged.header),
-                    expected_class,
-                ) {
-                    return Err(StoreError::Decode(
-                        "staged reorg terminal class does not match its block",
-                    ));
+                let terminal_bytes: Cow<'_, [u8]> =
+                    if let Some(terminal) = accepted.complete_terminal() {
+                        if !history_step_terminal_matches_class(
+                            terminal,
+                            staged.header.height,
+                            crate::block_header::semantic_header_id(&staged.header),
+                            expected_class,
+                        ) {
+                            return Err(StoreError::Decode(
+                                "staged reorg terminal class does not match its block",
+                            ));
+                        }
+                        Cow::Borrowed(terminal)
+                    } else {
+                        let (authority_tip_height, authority_tip_hash) = accepted
+                            .recursive_authority()
+                            .ok_or(StoreError::Decode("staged reorg authorization is missing"))?;
+                        Cow::Owned(
+                            encode_recursive_suffix_marker(
+                                &staged.header,
+                                expected_class,
+                                authority_tip_height,
+                                authority_tip_hash,
+                            )?
+                            .to_vec(),
+                        )
+                    };
+                txn.put(
+                    &terminal_tbl,
+                    height_key,
+                    terminal_bytes.as_ref(),
+                    WriteFlags::empty(),
+                )?;
+                if accepted.complete_terminal().is_some() {
+                    archive_history_step_proof_object(&txn, terminal_bytes.as_ref())?;
                 }
             }
             let logical_txids = crate::block::try_compute_logical_txids(&block.transactions)
@@ -3439,8 +3934,16 @@ impl MdbxStore {
         for (height, marker) in marker_rebindings {
             txn.put(&terminal_tbl, u64_key(height), marker, WriteFlags::empty())?;
         }
-        if let Some(first) = replacement.first() {
-            validate_history_step_parent_boundary_in_rw_txn(&txn, &first.header)?;
+        // Validate every parent only after all replacement objects have been
+        // installed in this uncommitted transaction. Intermediate markers in
+        // a one-terminal reorg point at the replacement tip, so their durable
+        // authority becomes visible only when that final terminal row exists.
+        for staged in replacement {
+            validate_history_step_parent_boundary_in_rw_txn(&txn, &staged.header)?;
+        }
+        if !replacement.is_empty() {
+            let retention = txn.open_table(Some(T_RETENTION_META))?;
+            let _ = txn.del(&retention, KEY_VERIFIED_SUFFIX_AUTHORITY, None);
         }
 
         txn.put(
@@ -3515,6 +4018,15 @@ impl MdbxStore {
         // delete count. The watermark and deletions commit atomically.
         let txn = self.db.begin_rw_txn()?;
         prune_retained_payloads_bounded(&txn, current_height)?;
+        prune_history_step_proof_objects(&txn, current_height)?;
+        let object_retention_floor = match self
+            .block_body_object_retention_floor
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            0 => None,
+            floor => Some(floor),
+        };
+        prune_block_body_objects(&txn, current_height, object_retention_floor)?;
         txn.commit()?;
 
         // --- Prune undo_logs older than UNDO_RETENTION_DEPTH ---
@@ -3547,8 +4059,10 @@ impl MdbxStore {
             T_SEGMENT_SUMMARIES,
             T_STATE_META,
             T_RECENT_BLOCKS,
+            T_BLOCK_BODY_OBJECTS,
             T_TX_INDEX,
             T_HISTORY_STEP_TERMINALS,
+            T_HISTORY_STEP_PROOF_OBJECTS,
             T_OWNER_INDEX,
             T_RETENTION_META,
         ];
@@ -4174,8 +4688,174 @@ mod tests {
             store.get_recent_accepted_block_bundle_bounded(1).unwrap(),
             Some(bundle.encode())
         );
+        assert_eq!(
+            store.get_block_body_object(1, hash).unwrap(),
+            Some(block.to_bytes())
+        );
         assert!(store.has_history_step_terminal_at(1, hash).unwrap());
+        let semantic_id = crate::block_header::semantic_header_id(&block.header);
+        assert_eq!(
+            store
+                .get_history_step_proof_object(1, semantic_id, 0)
+                .unwrap()
+                .as_deref(),
+            Some(bundle.history_step_terminal_bytes())
+        );
         assert_eq!(store.get_chain_tip().unwrap(), Some((1, hash)));
+
+        // Canonical height rows may later become recursive markers or be
+        // displaced by a reorg. The independent recent proof object remains
+        // available by its semantic identity.
+        let txn = store.db.begin_rw_txn().unwrap();
+        let terminals = txn.open_table(Some(T_HISTORY_STEP_TERMINALS)).unwrap();
+        txn.del(&terminals, u64_key(1), None).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.get_history_step_terminal_at(1, hash).unwrap(), None);
+        assert_eq!(
+            store
+                .get_any_history_step_proof_object(1, semantic_id)
+                .unwrap()
+                .as_deref(),
+            Some(bundle.history_step_terminal_bytes())
+        );
+
+        // Snapshot export must use the same independent object store. A
+        // compact canonical marker (or displaced height row) cannot make an
+        // otherwise complete boundary falsely unavailable.
+        let exports = tempfile::tempdir().unwrap();
+        let generation =
+            crate::storage::export_snapshot_generation(&store, exports.path(), 1, None).unwrap();
+        assert_eq!(
+            generation.read_boundary_terminal().unwrap(),
+            bundle.history_step_terminal_bytes()
+        );
+    }
+
+    #[test]
+    fn active_snapshot_floor_pins_exact_block_objects_beyond_normal_retention() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, _) = commit_genesis(&store);
+        let body = block(&genesis, 2, 0x42);
+        let hash = crate::hash_block_header(&body.header);
+        let encoded = body.to_bytes();
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        archive_block_body_object(&txn, 2, hash, &encoded).unwrap();
+        prune_block_body_objects(&txn, 200, Some(1)).unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.get_block_body_object(2, hash).unwrap(), Some(encoded));
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        prune_block_body_objects(&txn, 200, None).unwrap();
+        txn.commit().unwrap();
+        assert!(store.get_block_body_object(2, hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn proof_object_cache_rejects_recursive_markers() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, _) = commit_genesis(&store);
+        let candidate = block(&genesis, 1, 7);
+        let marker = encode_recursive_suffix_marker(&candidate.header, 0, 2, [0xA5; 32]).unwrap();
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        assert!(matches!(
+            archive_history_step_proof_object(&txn, &marker),
+            Err(StoreError::Decode(
+                "recursive suffix marker cannot enter the proof-object cache"
+            ))
+        ));
+    }
+
+    #[test]
+    fn verified_boundary_cache_rebinds_to_the_canonical_finalized_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (genesis, genesis_meta) = commit_genesis(&store);
+        let candidate = block(&genesis, 1, 7);
+        let mut meta = commit_accepted_test_block(&store, &candidate, &genesis_meta);
+        let block_hash = crate::hash_block_header(&candidate.header);
+        meta.finalized = FinalizedCheckpoint {
+            height: 1,
+            hash: block_hash,
+        };
+        store.put_consensus_meta(&meta).unwrap();
+
+        let semantic_id = crate::block_header::semantic_header_id(&candidate.header);
+        let terminal_bytes = terminal(1, semantic_id, 0);
+        let txn = store.db.begin_rw_txn().unwrap();
+        let proofs = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS)).unwrap();
+        txn.del(
+            &proofs,
+            history_step_proof_object_key(1, semantic_id, 0),
+            None,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert!(!store
+            .has_any_history_step_proof_object(1, semantic_id)
+            .unwrap());
+
+        let mut wrong_header = candidate.header;
+        wrong_header.state_root[0] ^= 1;
+        let wrong = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            wrong_header,
+            terminal(1, crate::block_header::semantic_header_id(&wrong_header), 0),
+        );
+        assert!(store
+            .cache_verified_snapshot_boundary_proof(&wrong)
+            .is_err());
+
+        let verified = crate::storage::VerifiedSnapshotBoundary::new_verified(
+            candidate.header,
+            terminal_bytes.clone(),
+        );
+        store
+            .cache_verified_snapshot_boundary_proof(&verified)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_history_step_proof_object(1, semantic_id, 0)
+                .unwrap(),
+            Some(terminal_bytes)
+        );
+    }
+
+    #[test]
+    fn proof_object_cache_prunes_by_bounded_height_window() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let old = terminal(1, [1; 32], 0);
+        let retained = terminal(100, [2; 32], 0);
+        let tip = terminal(200, [3; 32], 0);
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        archive_history_step_proof_object(&txn, &old).unwrap();
+        archive_history_step_proof_object(&txn, &retained).unwrap();
+        archive_history_step_proof_object(&txn, &tip).unwrap();
+        prune_history_step_proof_objects(&txn, 200).unwrap();
+        txn.commit().unwrap();
+
+        assert_eq!(
+            store.get_history_step_proof_object(1, [1; 32], 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .get_history_step_proof_object(100, [2; 32], 0)
+                .unwrap()
+                .as_deref(),
+            Some(retained.as_slice())
+        );
+        assert_eq!(
+            store
+                .get_history_step_proof_object(200, [3; 32], 0)
+                .unwrap()
+                .as_deref(),
+            Some(tip.as_slice())
+        );
     }
 
     #[test]

@@ -465,6 +465,28 @@ pub fn export_snapshot_generation(
     target_height: u64,
     previous: Option<&SnapshotGeneration>,
 ) -> Result<SnapshotGeneration, SnapshotGenerationError> {
+    export_snapshot_generation_inner(store, export_root, target_height, previous, true)
+}
+
+/// Export an immutable State boundary without capturing the moving live
+/// suffix. Network v6 installs this boundary and then obtains a separately
+/// frozen exact suffix selected by the header DAG.
+pub fn export_snapshot_boundary_generation(
+    store: &MdbxStore,
+    export_root: &Path,
+    target_height: u64,
+    previous: Option<&SnapshotGeneration>,
+) -> Result<SnapshotGeneration, SnapshotGenerationError> {
+    export_snapshot_generation_inner(store, export_root, target_height, previous, false)
+}
+
+fn export_snapshot_generation_inner(
+    store: &MdbxStore,
+    export_root: &Path,
+    target_height: u64,
+    previous: Option<&SnapshotGeneration>,
+    include_bridge: bool,
+) -> Result<SnapshotGeneration, SnapshotGenerationError> {
     // One MVCC transaction pins all source metadata and segment bytes. Mining
     // may advance concurrently without making a long export internally mixed.
     let snapshot = store.historical_read_snapshot()?;
@@ -722,11 +744,19 @@ pub fn export_snapshot_generation(
     let (boundary_terminal_len, boundary_terminal_digest) = if target_height == 0 {
         (0, [0; 32])
     } else {
-        let terminal = snapshot
-            .get_history_step_terminal_at(target_height, target_hash)?
-            .ok_or(SnapshotGenerationError::MissingBoundaryTerminal(
-                target_height,
-            ))?;
+        let canonical_terminal =
+            snapshot.get_history_step_terminal_at(target_height, target_hash)?;
+        let terminal = match canonical_terminal {
+            Some(terminal) => terminal,
+            None => snapshot
+                .get_any_history_step_proof_object(
+                    target_height,
+                    crate::block_header::semantic_header_id(&target_header),
+                )?
+                .ok_or(SnapshotGenerationError::MissingBoundaryTerminal(
+                    target_height,
+                ))?,
+        };
         if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
             return Err(SnapshotGenerationError::InvalidPayload(
                 "snapshot boundary terminal length is outside bounds",
@@ -745,7 +775,12 @@ pub fn export_snapshot_generation(
         (terminal_len, terminal_digest)
     };
 
-    let bridge_span = tip_height.saturating_sub(target_height);
+    let (bridge_tip_height, bridge_tip_hash) = if include_bridge {
+        (tip_height, tip_hash)
+    } else {
+        (target_height, target_hash)
+    };
+    let bridge_span = bridge_tip_height.saturating_sub(target_height);
     if bridge_span > RECENT_BLOCK_RETENTION_DEPTH {
         return Err(SnapshotGenerationError::Corrupt(
             "snapshot bridge exceeds recent block retention",
@@ -755,7 +790,7 @@ pub fn export_snapshot_generation(
     fs::create_dir(&bridge_directory)?;
     let mut bridge = Vec::with_capacity(bridge_span as usize);
     let mut expected_parent = target_hash;
-    for height in target_height.saturating_add(1)..=tip_height {
+    for height in target_height.saturating_add(1)..=bridge_tip_height {
         let encoded = snapshot
             .get_recent_block(height)?
             .ok_or(SnapshotGenerationError::MissingBridgeBlock(height))?;
@@ -796,9 +831,24 @@ pub fn export_snapshot_generation(
     let (bridge_terminal_len, bridge_terminal_digest) = if bridge_span == 0 {
         (0, [0; 32])
     } else {
-        let terminal = snapshot
-            .get_history_step_terminal_at(tip_height, tip_hash)?
-            .ok_or(SnapshotGenerationError::MissingBridgeTerminal(tip_height))?;
+        let bridge_tip_header = if include_bridge {
+            tip_header
+        } else {
+            target_header
+        };
+        let canonical_terminal =
+            snapshot.get_history_step_terminal_at(bridge_tip_height, bridge_tip_hash)?;
+        let terminal = match canonical_terminal {
+            Some(terminal) => terminal,
+            None => snapshot
+                .get_any_history_step_proof_object(
+                    bridge_tip_height,
+                    crate::block_header::semantic_header_id(&bridge_tip_header),
+                )?
+                .ok_or(SnapshotGenerationError::MissingBridgeTerminal(
+                    bridge_tip_height,
+                ))?,
+        };
         if terminal.is_empty() || terminal.len() > MAX_HISTORY_STEP_TERMINAL_BYTES {
             return Err(SnapshotGenerationError::InvalidPayload(
                 "snapshot bridge terminal length is outside bounds",
@@ -826,11 +876,11 @@ pub fn export_snapshot_generation(
         effective_log_segment_size: effective_log,
         boundary_terminal_len,
         boundary_terminal_digest,
-        bridge_tip_height: tip_height,
-        bridge_tip_hash: tip_hash,
+        bridge_tip_height,
+        bridge_tip_hash,
         bridge_cumulative_chainwork: snapshot
-            .get_chain_work(tip_height)?
-            .ok_or(SnapshotGenerationError::MissingChainwork(tip_height))?,
+            .get_chain_work(bridge_tip_height)?
+            .ok_or(SnapshotGenerationError::MissingChainwork(bridge_tip_height))?,
         bridge_terminal_len,
         bridge_terminal_digest,
         bridge,
@@ -1818,6 +1868,21 @@ mod tests {
         );
         assert_eq!(second.manifest().target_height, 1);
         assert_eq!(second.manifest().state_root, child.state_root);
+
+        let boundary_only =
+            export_snapshot_boundary_generation(&store, exports.path(), 1, Some(&first)).unwrap();
+        assert_eq!(boundary_only.manifest().target_height, 1);
+        assert_eq!(boundary_only.manifest().bridge_tip_height, 1);
+        assert_eq!(boundary_only.manifest().bridge_tip_hash, child_hash);
+        assert!(boundary_only.manifest().bridge.is_empty());
+        assert_eq!(
+            boundary_only.read_boundary_terminal().unwrap(),
+            child_terminal
+        );
+        assert_eq!(
+            boundary_only.read_bridge_terminal().unwrap(),
+            child_terminal
+        );
 
         let mut changed_state = state.clone();
         let changed_slot = SlotValue::from_parts(12, 1, Block128(0x22), Block128(0x33));

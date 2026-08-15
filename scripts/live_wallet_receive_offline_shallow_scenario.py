@@ -4,6 +4,7 @@
 import datetime
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -199,17 +200,25 @@ def main():
         )
 
         recipient_log = log_text(recipient_label)
+        suffix_blocks = [
+            int(value)
+            for value in re.findall(
+                r"header-first exact suffix application completed[^\n]* blocks=(\d+)",
+                recipient_log,
+            )
+        ]
         require(
-            recipient_log.count("applied P2P block") == source_tip_height,
-            "recipient did not apply the complete direct suffix",
+            suffix_blocks == [source_tip_height],
+            f"recipient did not apply one complete direct suffix: {suffix_blocks}",
         )
         require(
             "snapshot install completed" not in recipient_log,
             "shallow offline recipient unexpectedly used O(1) snapshot",
         )
         require(
-            "requesting state manifest" not in recipient_log,
-            "shallow offline recipient requested a state manifest",
+            "requesting manifest page" not in recipient_log
+            and "snapshot segment queued" not in recipient_log,
+            "shallow offline recipient entered the State data plane",
         )
         for label in labels:
             assert_clean(label, log_text(label))

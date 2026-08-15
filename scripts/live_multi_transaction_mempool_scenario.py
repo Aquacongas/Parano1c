@@ -179,6 +179,7 @@ class Node:
 
     def log_text(self):
         require(self.log_path is not None, f"{self.name} has no log")
+        assert self.log_path is not None
         return self.log_path.read_text(errors="replace")
 
 

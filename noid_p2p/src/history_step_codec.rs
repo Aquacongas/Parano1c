@@ -15,14 +15,15 @@ use noid_chain::{
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
+    object_protocol::DataResponseStatus,
     outbound_budget::OutboundResponseBudget,
     protocol::{GetHistoryStepTerminalRequest, GetHistoryStepTerminalResponse},
 };
 
 const REQUEST_MAGIC: [u8; 4] = *b"NTR1";
 const REQUEST_BYTES: usize = 4 + 8 + 32;
-const RESPONSE_MAGIC: [u8; 4] = *b"NTS1";
-const RESPONSE_HEADER_BYTES: usize = 4 + 4 + 8 + 32;
+const RESPONSE_MAGIC: [u8; 4] = *b"NTS2";
+const RESPONSE_HEADER_BYTES: usize = 4 + 4 + 8 + 32 + 1 + 1 + 2;
 const NONE_LEN: u32 = u32::MAX;
 
 #[derive(Debug, Clone)]
@@ -78,7 +79,7 @@ impl request_response::Codec for HistoryStepTerminalCodec {
     {
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
         io.read_exact(&mut header).await?;
-        let (terminal_len, height, block_hash) = parse_response_header(&header)?;
+        let (terminal_len, height, block_hash, status) = parse_response_header(&header)?;
         let payload_len = decoded_len(terminal_len);
         let inbound_memory_permit = self.acquire_inbound(payload_len).await?;
         let terminal_bytes = read_optional(io, terminal_len).await?;
@@ -89,6 +90,7 @@ impl request_response::Codec for HistoryStepTerminalCodec {
         Ok(GetHistoryStepTerminalResponse {
             height,
             block_hash,
+            status,
             terminal_bytes,
             inbound_memory_permit,
             outbound_memory_permit: None,
@@ -123,10 +125,17 @@ impl request_response::Codec for HistoryStepTerminalCodec {
         let GetHistoryStepTerminalResponse {
             height,
             block_hash,
+            status,
             terminal_bytes,
             inbound_memory_permit,
             outbound_memory_permit,
         } = response;
+        if !status.is_canonical() {
+            return Err(invalid_data("non-canonical HistoryStep response status"));
+        }
+        if matches!(status, DataResponseStatus::Busy { .. }) && terminal_bytes.is_some() {
+            return Err(invalid_data("busy HistoryStep response carries a terminal"));
+        }
         if let Some(terminal) = terminal_bytes.as_deref() {
             validate_terminal_envelope(terminal, height)?;
         }
@@ -144,6 +153,10 @@ impl request_response::Codec for HistoryStepTerminalCodec {
         header[4..8].copy_from_slice(&terminal_len.to_le_bytes());
         header[8..16].copy_from_slice(&height.to_le_bytes());
         header[16..48].copy_from_slice(&block_hash);
+        if let DataResponseStatus::Busy { retry_after_ms } = status {
+            header[48] = 1;
+            header[50..52].copy_from_slice(&retry_after_ms.to_le_bytes());
+        }
         io.write_all(&header).await?;
         if let Some(bytes) = terminal_bytes {
             io.write_all(&bytes).await?;
@@ -182,7 +195,9 @@ impl HistoryStepTerminalCodec {
     }
 }
 
-fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<(u32, u64, [u8; 32])> {
+fn parse_response_header(
+    header: &[u8; RESPONSE_HEADER_BYTES],
+) -> io::Result<(u32, u64, [u8; 32], DataResponseStatus)> {
     if header[..4] != RESPONSE_MAGIC {
         return Err(invalid_data(
             "invalid HistoryStep terminal response magic/version",
@@ -192,7 +207,22 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<(u3
     validate_length(terminal_len)?;
     let height = u64::from_le_bytes(header[8..16].try_into().unwrap());
     let block_hash = header[16..48].try_into().unwrap();
-    Ok((terminal_len, height, block_hash))
+    if header[49] != 0 {
+        return Err(invalid_data("non-zero HistoryStep response reserved byte"));
+    }
+    let retry_after_ms = u16::from_le_bytes(header[50..52].try_into().unwrap());
+    let status = match header[48] {
+        0 if retry_after_ms == 0 => DataResponseStatus::Ready,
+        1 => DataResponseStatus::Busy { retry_after_ms },
+        _ => return Err(invalid_data("invalid HistoryStep response status")),
+    };
+    if !status.is_canonical() {
+        return Err(invalid_data("non-canonical HistoryStep response status"));
+    }
+    if matches!(status, DataResponseStatus::Busy { .. }) && terminal_len != NONE_LEN {
+        return Err(invalid_data("busy HistoryStep response carries a terminal"));
+    }
+    Ok((terminal_len, height, block_hash, status))
 }
 
 fn validate_length(terminal_len: u32) -> io::Result<()> {
@@ -343,6 +373,7 @@ mod tests {
         let response = GetHistoryStepTerminalResponse {
             height: 77,
             block_hash: [0xA5; 32],
+            status: DataResponseStatus::Ready,
             terminal_bytes: Some(terminal(77, [0x5A; 32], 1)),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
@@ -362,6 +393,37 @@ mod tests {
         let terminal = decoded.terminal_bytes.unwrap();
         assert_eq!(terminal[9..41], [0x5A; 32]);
         assert_eq!(terminal[42], 1);
+    }
+
+    #[tokio::test]
+    async fn busy_response_is_distinct_from_terminal_unavailability() {
+        let response = GetHistoryStepTerminalResponse {
+            height: 77,
+            block_hash: [0xA5; 32],
+            status: DataResponseStatus::Busy {
+                retry_after_ms: 900,
+            },
+            terminal_bytes: None,
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        HistoryStepTerminalCodec::default()
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        wire.set_position(0);
+        let decoded = HistoryStepTerminalCodec::default()
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.status,
+            DataResponseStatus::Busy {
+                retry_after_ms: 900
+            }
+        );
+        assert!(decoded.terminal_bytes.is_none());
     }
 
     #[tokio::test]

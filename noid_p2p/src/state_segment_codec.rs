@@ -22,14 +22,15 @@ use noid_chain::storage::encoded_segment_len_for_live_count;
 
 use crate::{
     inbound_budget::process_global_inbound_budget,
+    object_protocol::DataResponseStatus,
     outbound_budget::OutboundResponseBudget,
     protocol::{GetStateSegmentRequest, GetStateSegmentResponse},
 };
 
-const REQUEST_MAGIC: [u8; 4] = *b"NSR4";
-const RESPONSE_MAGIC: [u8; 4] = *b"NSS4";
-const REQUEST_HEADER_BYTES: usize = 48;
-const RESPONSE_HEADER_BYTES: usize = 52;
+const REQUEST_MAGIC: [u8; 4] = *b"NSR5";
+const RESPONSE_MAGIC: [u8; 4] = *b"NSS6";
+const REQUEST_HEADER_BYTES: usize = 80;
+const RESPONSE_HEADER_BYTES: usize = 86;
 const NONE_LEN: u32 = u32::MAX;
 #[derive(Debug, Clone)]
 pub struct StateSegmentCodec {
@@ -100,6 +101,11 @@ impl request_response::Codec for StateSegmentCodec {
                 "non-zero state-segment request reserved bytes",
             ));
         }
+        if header[48..80] == [0; 32] {
+            return Err(invalid_data(
+                "state-segment request has no manifest identity",
+            ));
+        }
         ensure_eof(io).await?;
         Ok(GetStateSegmentRequest {
             segment_id: u16::from_le_bytes(header[4..6].try_into().expect("fixed segment id")),
@@ -107,6 +113,7 @@ impl request_response::Codec for StateSegmentCodec {
                 header[8..16].try_into().expect("fixed tip height"),
             ),
             expected_tip_hash: header[16..48].try_into().expect("fixed tip hash"),
+            manifest_digest: header[48..80].try_into().expect("fixed manifest digest"),
         })
     }
 
@@ -139,6 +146,8 @@ impl request_response::Codec for StateSegmentCodec {
             segment_id: fields.segment_id,
             expected_tip_height: fields.expected_tip_height,
             expected_tip_hash: fields.expected_tip_hash,
+            manifest_digest: fields.manifest_digest,
+            status: fields.status,
             eff_log: fields.eff_log,
             data,
             inbound_memory_permit,
@@ -160,6 +169,7 @@ impl request_response::Codec for StateSegmentCodec {
         header[4..6].copy_from_slice(&request.segment_id.to_le_bytes());
         header[8..16].copy_from_slice(&request.expected_tip_height.to_le_bytes());
         header[16..48].copy_from_slice(&request.expected_tip_hash);
+        header[48..80].copy_from_slice(&request.manifest_digest);
         io.write_all(&header).await
     }
 
@@ -176,11 +186,19 @@ impl request_response::Codec for StateSegmentCodec {
             segment_id,
             expected_tip_height,
             expected_tip_hash,
+            manifest_digest,
+            status,
             eff_log,
             data,
             inbound_memory_permit,
             outbound_memory_permit,
         } = response;
+        if !status.is_canonical() {
+            return Err(invalid_data("non-canonical state-segment response status"));
+        }
+        if matches!(status, DataResponseStatus::Busy { .. }) && data.is_some() {
+            return Err(invalid_data("busy state-segment response carries data"));
+        }
         let encoded_len = optional_len(data.as_deref())?;
         validate_response_length(eff_log, encoded_len)?;
         let payload_len = decoded_len(encoded_len);
@@ -199,6 +217,11 @@ impl request_response::Codec for StateSegmentCodec {
         header[8..16].copy_from_slice(&expected_tip_height.to_le_bytes());
         header[16..48].copy_from_slice(&expected_tip_hash);
         header[48..52].copy_from_slice(&encoded_len.to_le_bytes());
+        header[52..84].copy_from_slice(&manifest_digest);
+        if let DataResponseStatus::Busy { retry_after_ms } = status {
+            header[7] = 1;
+            header[84..86].copy_from_slice(&retry_after_ms.to_le_bytes());
+        }
         io.write_all(&header).await?;
         if let Some(bytes) = data {
             io.write_all(&bytes).await?;
@@ -212,18 +235,15 @@ struct ResponseHeaderFields {
     segment_id: u16,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
+    manifest_digest: [u8; 32],
     eff_log: u8,
     encoded_len: u32,
+    status: DataResponseStatus,
 }
 
 fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<ResponseHeaderFields> {
     if header[..4] != RESPONSE_MAGIC {
         return Err(invalid_data("invalid state-segment response magic/version"));
-    }
-    if header[7] != 0 {
-        return Err(invalid_data(
-            "non-zero state-segment response reserved byte",
-        ));
     }
     let segment_id = u16::from_le_bytes(header[4..6].try_into().expect("fixed segment id"));
     let eff_log = header[6];
@@ -231,13 +251,35 @@ fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<Res
         u64::from_le_bytes(header[8..16].try_into().expect("fixed tip height"));
     let expected_tip_hash = header[16..48].try_into().expect("fixed tip hash");
     let encoded_len = u32::from_le_bytes(header[48..52].try_into().expect("fixed length"));
+    let manifest_digest = header[52..84].try_into().expect("fixed manifest digest");
+    let retry_after_ms = u16::from_le_bytes(header[84..86].try_into().unwrap());
+    let status = match header[7] {
+        0 if retry_after_ms == 0 => DataResponseStatus::Ready,
+        1 => DataResponseStatus::Busy { retry_after_ms },
+        _ => return Err(invalid_data("invalid state-segment response status")),
+    };
+    if !status.is_canonical() {
+        return Err(invalid_data("non-canonical state-segment response status"));
+    }
+    if manifest_digest == [0; 32] {
+        return Err(invalid_data(
+            "state-segment response has no manifest identity",
+        ));
+    }
     validate_response_length(eff_log, encoded_len)?;
+    if matches!(status, DataResponseStatus::Busy { .. })
+        && (encoded_len != NONE_LEN || eff_log != 0)
+    {
+        return Err(invalid_data("busy state-segment response carries data"));
+    }
     Ok(ResponseHeaderFields {
         segment_id,
         expected_tip_height,
         expected_tip_hash,
+        manifest_digest,
         eff_log,
         encoded_len,
+        status,
     })
 }
 
@@ -314,7 +356,7 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/segment/4")
+        StreamProtocol::new("/noid/test/sync/segment/5")
     }
 
     fn response_header(eff_log: u8, encoded_len: u32) -> Vec<u8> {
@@ -325,6 +367,7 @@ mod tests {
         header[8..16].copy_from_slice(&77u64.to_le_bytes());
         header[16..48].copy_from_slice(&[0xA5; 32]);
         header[48..52].copy_from_slice(&encoded_len.to_le_bytes());
+        header[52..84].copy_from_slice(&[0xB6; 32]);
         header
     }
 
@@ -343,6 +386,7 @@ mod tests {
             segment_id: 0x1234,
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
         };
         let mut wire = Cursor::new(Vec::new());
         StateSegmentCodec::default()
@@ -358,6 +402,7 @@ mod tests {
         assert_eq!(decoded.segment_id, 0x1234);
         assert_eq!(decoded.expected_tip_height, 77);
         assert_eq!(decoded.expected_tip_hash, [0xA5; 32]);
+        assert_eq!(decoded.manifest_digest, [0xB6; 32]);
 
         let mut noncanonical = wire.into_inner();
         noncanonical[6] = 1;
@@ -404,6 +449,8 @@ mod tests {
             segment_id: 7,
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Ready,
             eff_log: 10,
             data: Some(vec![0x5a; len]),
             inbound_memory_permit: None,
@@ -423,7 +470,42 @@ mod tests {
         assert_eq!(decoded.segment_id, 7);
         assert_eq!(decoded.expected_tip_height, 77);
         assert_eq!(decoded.expected_tip_hash, [0xA5; 32]);
+        assert_eq!(decoded.manifest_digest, [0xB6; 32]);
         assert_eq!(decoded.data.unwrap(), vec![0x5a; len]);
+    }
+
+    #[tokio::test]
+    async fn busy_response_is_not_decoded_as_unavailable() {
+        let response = GetStateSegmentResponse {
+            segment_id: 7,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Busy {
+                retry_after_ms: 800,
+            },
+            eff_log: 0,
+            data: None,
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        wire.set_position(0);
+        let decoded = StateSegmentCodec::default()
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.status,
+            DataResponseStatus::Busy {
+                retry_after_ms: 800
+            }
+        );
+        assert!(decoded.data.is_none());
     }
 
     #[tokio::test]
@@ -491,6 +573,8 @@ mod tests {
             segment_id: 3,
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Ready,
             eff_log: 6,
             data: Some(vec![0x33; len]),
             inbound_memory_permit: None,

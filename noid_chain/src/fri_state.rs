@@ -32,7 +32,7 @@ use noid_fri_binius::{
 use noid_poseidon2b::native::compress;
 use noid_poseidon2b::native::compression::Poseidon2bSponge;
 
-/// Genesis `log_slots` for mainnet: 16 777 216 slots at block 0. Not a
+/// Genesis `log_slots` for the public network: 16 777 216 slots at block 0. Not a
 /// proof-wide constant: accepted blocks bind the header-declared `log_slots`
 /// (see `noid_tx::public::PublicInputs::log_slots` and `MAX_LOG_SLOTS`),
 /// which may grow to at most `32` via the expansion trigger.
