@@ -38,6 +38,7 @@ struct Source {
     object: ObjectId,
     failure_domain: FailureDomain,
     failures: u32,
+    busy_responses: u32,
     /// A remote `Busy` response is transport backpressure, not evidence that
     /// the advertised immutable object disappeared. Keep the source, but do
     /// not immediately recreate a synchronized retry wave against it.
@@ -47,11 +48,14 @@ struct Source {
 #[derive(Clone, Copy, Debug, Default)]
 struct SourceHistory {
     failures: u32,
+    busy_responses: u32,
     retry_after_ms: u64,
 }
 
 const SOURCE_FAILURE_BACKOFF_BASE_MS: u64 = 1_000;
 const SOURCE_FAILURE_BACKOFF_MAX_MS: u64 = 60_000;
+const SOURCE_BUSY_BACKOFF_BASE_MS: u64 = 250;
+const SOURCE_BUSY_BACKOFF_MAX_MS: u64 = 4_000;
 /// A source that repeatedly fails an actual transport request is exhausted for
 /// the current immutable plan.  A fresh plan may admit it again; `Busy` and
 /// local queue pressure never consume this budget.
@@ -182,6 +186,8 @@ impl ObjectFetcher {
                 object,
                 failure_domain,
                 failures: previous.map_or(history.failures, |source| source.failures),
+                busy_responses: previous
+                    .map_or(history.busy_responses, |source| source.busy_responses),
                 retry_after_ms: previous
                     .map_or(history.retry_after_ms, |source| source.retry_after_ms),
             },
@@ -271,6 +277,7 @@ impl ObjectFetcher {
         job.last_progress_ms = Some(now_ms);
         if let Some(source) = job.sources.get_mut(&peer) {
             source.failures = 0;
+            source.busy_responses = 0;
             source.retry_after_ms = 0;
         }
         job.source_history.insert(peer, SourceHistory::default());
@@ -341,6 +348,7 @@ impl ObjectFetcher {
                 peer,
                 SourceHistory {
                     failures: source.failures,
+                    busy_responses: source.busy_responses,
                     retry_after_ms: source.retry_after_ms,
                 },
             );
@@ -429,11 +437,19 @@ impl ObjectFetcher {
     ) -> Result<(), FetchError> {
         let job = self.jobs.get_mut(&claim).ok_or(FetchError::UnknownClaim)?;
         let source = job.sources.get_mut(&peer).ok_or(FetchError::NoSource)?;
-        source.retry_after_ms = source.retry_after_ms.max(retry_at_ms);
+        source.busy_responses = source.busy_responses.saturating_add(1);
+        let shift = source.busy_responses.saturating_sub(1).min(16);
+        let additional_delay = SOURCE_BUSY_BACKOFF_BASE_MS
+            .saturating_mul(1u64 << shift)
+            .min(SOURCE_BUSY_BACKOFF_MAX_MS);
+        source.retry_after_ms = source
+            .retry_after_ms
+            .max(retry_at_ms.saturating_add(additional_delay));
         job.source_history.insert(
             peer,
             SourceHistory {
                 failures: source.failures,
+                busy_responses: source.busy_responses,
                 retry_after_ms: source.retry_after_ms,
             },
         );
@@ -1111,11 +1127,15 @@ mod tests {
         assert_eq!(assignment.peer, peer);
         fetcher.busy_source(claim, peer, 100).unwrap();
         assert_eq!(fetcher.state(claim), Some(FetchState::Wanted));
-        assert!(fetcher.unfinished_transport_is_stalled(99));
+        assert!(fetcher.unfinished_transport_is_stalled(349));
         assert!(!fetcher.unfinished_transport_is_extinct());
-        assert_eq!(fetcher.start_primary(claim, 99), Err(FetchError::NoSource));
-        assert_eq!(fetcher.start_primary(claim, 100).unwrap().peer, peer);
+        assert_eq!(fetcher.start_primary(claim, 349), Err(FetchError::NoSource));
+        assert_eq!(fetcher.start_primary(claim, 350).unwrap().peer, peer);
+        fetcher.busy_source(claim, peer, 400).unwrap();
+        assert_eq!(fetcher.start_primary(claim, 899), Err(FetchError::NoSource));
+        assert_eq!(fetcher.start_primary(claim, 900).unwrap().peer, peer);
         assert_eq!(fetcher.jobs[&claim].sources[&peer].failures, 0);
+        assert_eq!(fetcher.jobs[&claim].sources[&peer].busy_responses, 2);
     }
 
     #[test]

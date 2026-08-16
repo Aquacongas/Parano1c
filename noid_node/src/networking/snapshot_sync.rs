@@ -589,7 +589,7 @@ mod tests {
                 .unwrap();
         let request = sync.schedule(10, 1).pop().unwrap();
         sync.request_busy(peer, request.segment, 100).unwrap();
-        assert!(sync.schedule(99, 1).is_empty());
-        assert_eq!(sync.schedule(100, 1).pop(), Some(request));
+        assert!(sync.schedule(349, 1).is_empty());
+        assert_eq!(sync.schedule(350, 1).pop(), Some(request));
     }
 }

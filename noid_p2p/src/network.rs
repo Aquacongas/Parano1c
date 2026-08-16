@@ -166,8 +166,7 @@ impl DataPlaneServingAdmission {
         let global_outstanding_slots = background_capacity.global_data_outstanding();
         let metadata_outstanding_slots = background_capacity.state_metadata_outstanding();
         let live_slots = global_slots.saturating_sub(state_slots);
-        let live_outstanding_slots =
-            global_outstanding_slots.saturating_sub(state_outstanding_slots);
+        let live_outstanding_slots = background_capacity.live_data_outstanding();
         let per_peer_slots = background_capacity.per_peer_data_slots();
         let per_peer_outstanding_slots = background_capacity.per_peer_data_outstanding();
         assert!(state_slots > 0 && live_slots > 0);
@@ -6724,7 +6723,12 @@ async fn handle_swarm_event(
                 height = request.height,
                 "received HistoryStep terminal request"
             );
-            let Some(serving_lease) = data_plane_serving.lease(peer, DataPlaneClass::Live) else {
+            // Snapshot-boundary proofs are cold-sync data.  Charging them to
+            // the Live class allowed a wave of new wallets to occupy every
+            // recent body/terminal slot on a miner.  State admission remains
+            // bounded independently, while Live capacity stays available for
+            // propagation of the current winning tip.
+            let Some(serving_lease) = data_plane_serving.lease(peer, DataPlaneClass::State) else {
                 let retry_after_ms = data_plane_busy_retry_ms(*swarm.local_peer_id(), peer);
                 let response = GetHistoryStepTerminalResponse {
                     height: request.height,
@@ -9221,24 +9225,23 @@ mod tests {
     }
 
     #[test]
-    fn miner_keeps_serving_with_a_smaller_background_budget() {
+    fn miner_prioritizes_live_propagation_with_smaller_background_budgets() {
         let full = DataPlaneServingAdmission::new(BackgroundCapacity::Full);
         let mining = DataPlaneServingAdmission::new(BackgroundCapacity::MiningReserved);
-        assert_eq!(mining.global_slots * 2, full.global_slots);
+        assert_eq!(mining.global_slots, full.global_slots);
         assert_eq!(
             mining.global_outstanding_slots * 2,
             full.global_outstanding_slots
         );
         assert_eq!(mining.state_slots * 2, full.state_slots);
-        assert_eq!(mining.live_slots * 2, full.live_slots);
+        assert!(mining.live_slots > full.live_slots);
         assert_eq!(
             mining.state_outstanding_slots * 2,
             full.state_outstanding_slots
         );
-        assert_eq!(
-            mining.live_outstanding_slots * 2,
-            full.live_outstanding_slots
-        );
+        assert!(mining.live_outstanding_slots > full.live_outstanding_slots);
+        assert_eq!(full.live_outstanding_slots, full.live_slots * 2);
+        assert_eq!(mining.live_outstanding_slots, mining.live_slots * 2);
         assert!(full.state_slots < full.global_slots);
         assert!(mining.global_slots > 0);
         assert!(mining.per_peer_slots > 0);

@@ -20,7 +20,11 @@ impl BackgroundCapacity {
     pub(crate) const fn global_data_slots(self) -> usize {
         match self {
             Self::Full => 8,
-            Self::MiningReserved => 4,
+            // A miner is the first complete source for its newly accepted
+            // body and terminal. Snapshot work remains reduced below, but
+            // live propagation must not be throttled to three streams while
+            // dozens of followers are waiting for the same tip.
+            Self::MiningReserved => 8,
         }
     }
 
@@ -35,6 +39,21 @@ impl BackgroundCapacity {
         match self {
             Self::Full => 64,
             Self::MiningReserved => 32,
+        }
+    }
+
+    /// Keep recent body/terminal serving deliberately shallow.  A deep live
+    /// FIFO hides overload from requesters: dozens of nodes can believe that
+    /// the same producer is making progress while only a few terminal streams
+    /// are actually active.  Two waves are enough to absorb short scheduling
+    /// jitter; later callers receive Busy and can use newly discovered exact
+    /// providers instead of waiting behind the complete fan-in.
+    pub(crate) const fn live_data_outstanding(self) -> usize {
+        match self {
+            Self::Full => 12,
+            // MiningReserved has one State slot, leaving seven active Live
+            // slots. Keep exactly two waves and return Busy after that.
+            Self::MiningReserved => 14,
         }
     }
 
@@ -120,14 +139,15 @@ mod tests {
     use super::{relay_018_per_peer_config, BackgroundCapacity};
 
     #[test]
-    fn mining_keeps_nonzero_service_with_half_the_bulk_capacity() {
+    fn mining_prioritizes_live_propagation_and_reduces_background_work() {
         let full = BackgroundCapacity::Full;
         let mining = BackgroundCapacity::MiningReserved;
-        assert_eq!(mining.global_data_slots() * 2, full.global_data_slots());
+        assert_eq!(mining.global_data_slots(), full.global_data_slots());
         assert_eq!(
             mining.global_data_outstanding() * 2,
             full.global_data_outstanding()
         );
+        assert!(mining.live_data_outstanding() > full.live_data_outstanding());
         assert_eq!(
             mining.relay_max_reservations() * 2,
             full.relay_max_reservations()

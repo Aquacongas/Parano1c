@@ -24,6 +24,12 @@ use super::{
     types::{ChainPoint, FailureDomain, ObjectClaimId, PlanId},
 };
 
+/// A recursive terminal is roughly one MiB.  If its primary stream has made
+/// no progress for this long and another failure domain advertises the exact
+/// bytes, issue one bounded hedge instead of waiting behind a producer's
+/// serving FIFO.  Bodies are at most ~83 KiB and remain single-source.
+const TERMINAL_HEDGE_NO_PROGRESS_MS: u64 = 4_000;
+
 fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -365,6 +371,17 @@ impl SuffixSync {
                 assignments.push(assignment);
             }
         }
+        for claim in self.plan.required_objects() {
+            if !matches!(claim, ObjectClaimId::Terminal(_)) {
+                continue;
+            }
+            if let Ok(assignment) =
+                self.fetcher
+                    .start_hedge(*claim, now_ms, TERMINAL_HEDGE_NO_PROGRESS_MS)
+            {
+                assignments.push(assignment);
+            }
+        }
 
         let mut body_groups: Vec<(PeerId, Vec<ObjectId>, usize)> = Vec::new();
         let mut requests = Vec::new();
@@ -455,6 +472,16 @@ impl SuffixSync {
         let mut received = 0usize;
         for payload in payloads {
             let claim = payload.object.claim();
+            // The other leg of a bounded hedge may complete after the exact
+            // object was already authenticated.  Consume that correlation as
+            // a harmless duplicate rather than treating an honest provider
+            // as an inactive source.
+            if matches!(
+                self.fetcher.state(claim),
+                Some(FetchState::Verified { object }) if object == payload.object
+            ) {
+                continue;
+            }
             let Some(bytes) = payload.bytes else {
                 self.fetcher.mark_unavailable(claim, peer)?;
                 continue;
@@ -941,10 +968,93 @@ mod tests {
         let request = sync.schedule(10).pop().unwrap();
         sync.request_busy(request.token, peer, &request.objects, 100)
             .unwrap();
-        assert!(sync.schedule(99).is_empty());
-        let retry = sync.schedule(100).pop().unwrap();
+        assert!(sync.schedule(349).is_empty());
+        let retry = sync.schedule(350).pop().unwrap();
         assert_eq!(retry.peer, peer);
         assert_eq!(retry.objects, request.objects);
+    }
+
+    #[test]
+    fn stalled_terminal_uses_one_distinct_domain_hedge() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let offer = offer(&[1], 1);
+        let terminal = *offer.objects().last().unwrap();
+        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer.clone()).unwrap();
+        sync.add_offer(second_peer, FailureDomain(2), offer)
+            .unwrap();
+
+        let primary = sync
+            .schedule(0)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .expect("tip terminal receives a primary request");
+        assert!(sync.schedule(TERMINAL_HEDGE_NO_PROGRESS_MS - 1).is_empty());
+
+        let hedge = sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .expect("stalled terminal receives one bounded hedge");
+        assert_ne!(hedge.peer, primary.peer);
+        assert!(sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS.saturating_mul(2))
+            .is_empty());
+    }
+
+    #[test]
+    fn terminal_hedge_never_duplicates_one_failure_domain() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let offer = offer(&[1], 1);
+        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(7), offer.clone()).unwrap();
+        sync.add_offer(second_peer, FailureDomain(7), offer)
+            .unwrap();
+        let _primary = sync.schedule(0);
+        assert!(sync.schedule(TERMINAL_HEDGE_NO_PROGRESS_MS).is_empty());
+    }
+
+    #[test]
+    fn late_primary_after_terminal_hedge_is_a_harmless_duplicate() {
+        let first_peer = PeerId::random();
+        let second_peer = PeerId::random();
+        let mut offer = offer(&[1], 1);
+        let terminal_bytes = vec![0xA5; 97];
+        let terminal = match *offer.objects().last().unwrap() {
+            ObjectId::Terminal(terminal) => ObjectId::Terminal(
+                TerminalObjectId::from_bytes(terminal.claim, &terminal_bytes).unwrap(),
+            ),
+            _ => panic!("suffix offer must end in a terminal"),
+        };
+        *offer.objects.last_mut().unwrap() = terminal;
+        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer.clone()).unwrap();
+        sync.add_offer(second_peer, FailureDomain(2), offer)
+            .unwrap();
+        let primary = sync
+            .schedule(0)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .unwrap();
+        let hedge = sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .unwrap();
+
+        let payload = || ObjectPayload {
+            object: terminal,
+            bytes: Some(terminal_bytes.clone()),
+        };
+        assert_eq!(
+            sync.accept_response(hedge.token, hedge.peer, vec![payload()], None)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sync.accept_response(primary.token, primary.peer, vec![payload()], None)
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

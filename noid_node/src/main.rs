@@ -2171,9 +2171,15 @@ async fn main() -> anyhow::Result<()> {
     }
     if !p2p_task.is_finished() {
         p2p_task.abort();
+        // Complete reactor cancellation before dropping its required-event
+        // receiver. Otherwise a disconnect event already being emitted can
+        // race the receiver abort and report a false fatal dispatch error
+        // during an ordinary RPC/Ctrl-C shutdown.
+        let _ = (&mut p2p_task).await;
     }
     if !p2p_event_task.is_finished() {
         p2p_event_task.abort();
+        let _ = (&mut p2p_event_task).await;
     }
     tracing::info!("goodbye — MDBX flushed on drop");
     if let Some(error) = fatal_runtime_error {
@@ -11993,7 +11999,7 @@ async fn handle_p2p_events(
                 .is_some_and(|sync| sync.unfinished_transport_is_extinct());
             if let Some(sync) = active_suffix_sync.as_ref() {
                 if now.saturating_duration_since(last_exact_inventory_probe)
-                    >= Duration::from_secs(2)
+                    >= EXACT_INVENTORY_PROBE_INTERVAL
                 {
                     let base = sync.plan().base();
                     let target = sync.plan().target();
@@ -12002,17 +12008,26 @@ async fn handle_p2p_events(
                         .saturating_sub(base.height)
                         .saturating_add(1)
                         .min(512) as u16;
-                    let excluded = std::collections::HashSet::new();
+                    let excluded = rejected_suffix_object_peers.clone();
                     let candidates = rotating_manifest_peers(
                         &manifest_peers,
                         &excluded,
                         None,
                         false,
                         &mut exact_inventory_probe_cursor,
-                        2,
+                        EXACT_INVENTORY_PROBE_LANES,
                     );
                     let mut dispatched = 0usize;
                     for peer in candidates {
+                        let request_key = (peer, base.height, count);
+                        let recently_requested = recent_header_fetches
+                            .get(&request_key)
+                            .is_some_and(|requested| {
+                                requested.elapsed() < EXACT_INVENTORY_RETRY_TTL
+                            });
+                        if recently_requested {
+                            continue;
+                        }
                         if try_dispatch_header_fetch(
                             &p2p_cmd,
                             &mut fetch_in_progress,
@@ -12034,6 +12049,13 @@ async fn handle_p2p_events(
                         }
                     }
                 }
+            }
+            // Drive retry/hedge timers even when no new inventory response is
+            // needed.  In particular, an already known alternate terminal
+            // provider must become usable after the four-second no-progress
+            // threshold without waiting for an unrelated network event.
+            if let Some(sync) = active_suffix_sync.as_mut() {
+                dispatch_exact_suffix_requests(sync, &p2p_cmd);
             }
 
             // Header gossip can arrive through a peer which has not fetched
