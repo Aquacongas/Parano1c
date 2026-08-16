@@ -7827,6 +7827,12 @@ async fn handle_p2p_events(
                     )
                 };
                 mining_peer_quorum.reconcile_canonical_tip(height, hash, prev_hash);
+                // Local commits arrive through this watch channel (including blocks
+                // submitted by an external miner).  They advance the canonical tip
+                // just as surely as an exact-suffix or snapshot commit, so stale-gap
+                // recovery must measure from this commit rather than an older
+                // network-applied tip.
+                last_tip_advance = Instant::now();
                 let _ = template_changes.send(());
                 external_mining_attempts.invalidate_for_tip(height, hash);
                 tracing::debug!(
