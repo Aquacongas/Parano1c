@@ -347,6 +347,7 @@ fn mined_blocks(app: &App) -> iced::widget::Container<'_, Message> {
         iced::widget::Space::new().width(Length::Fill),
         legend("FULL BLOCK", theme::ACCENT),
         legend("HEADER", theme::DIM),
+        legend("ORPHANED", theme::WARNING),
     ]
     .spacing(9)
     .align_y(Alignment::Center);
@@ -444,7 +445,9 @@ fn mined_block_row<'a>(
     block: &'a MinedBlockSnapshot,
     alternate: bool,
 ) -> Element<'a, Message> {
-    let available = if block.full_block_available {
+    let available = if !block.canonical {
+        ("ORPHANED · NO REWARD".into(), theme::WARNING)
+    } else if block.full_block_available {
         (
             format!("FULL · {} conf", block.confirmations),
             theme::ACCENT,
@@ -463,15 +466,24 @@ fn mined_block_row<'a>(
         .width(Length::Fixed(92.0))
         .padding([6, 8])
         .style(|_, status| theme::button(ButtonKind::Ghost, status));
-    if !app.block_details_loading {
+    if block.canonical && !app.block_details_loading {
         open = open.on_press(Message::OpenBlockDetails(block.height));
     }
+    let reward = block
+        .canonical
+        .then(|| format!("{} ①", block.reward()))
+        .unwrap_or_else(|| "—".into());
+    let identity_color = if block.canonical {
+        theme::CYAN
+    } else {
+        theme::WARNING
+    };
 
     container(
         row![
-            table_cell(block.height.to_string(), 2, theme::CYAN),
+            table_cell(block.height.to_string(), 2, identity_color),
             table_cell(format_age(block.timestamp), 3, theme::MUTED),
-            table_cell(format!("{} ①", block.reward()), 4, theme::TEXT),
+            table_cell(reward, 4, theme::TEXT),
             table_cell(
                 format!("[{}] {payout_label}", block.payout_key_index),
                 3,

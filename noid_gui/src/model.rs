@@ -374,6 +374,7 @@ pub struct MinedBlockSnapshot {
     pub timestamp: u64,
     pub reward_micronoid: u64,
     pub payout_key_index: u32,
+    pub canonical: bool,
     pub confirmations: u64,
     pub full_block_available: bool,
 }
@@ -384,6 +385,9 @@ impl MinedBlockSnapshot {
     }
 
     pub fn short_hash(&self) -> String {
+        if self.block_hash.is_empty() {
+            return "UNKNOWN".into();
+        }
         if self.block_hash.len() <= 20 {
             return self.block_hash.clone();
         }
@@ -831,6 +835,7 @@ fn preview_mined_blocks(page: u32) -> MinedBlocksSnapshot {
                 timestamp: 1_784_732_200u64.saturating_sub(u64::from(index) * 15),
                 reward_micronoid: 50_000_000,
                 payout_key_index: 0,
+                canonical: true,
                 confirmations,
                 full_block_available: confirmations <= 18,
             }

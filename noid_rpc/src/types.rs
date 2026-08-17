@@ -218,7 +218,7 @@ pub struct WalletReceiptsPage {
     pub receipts: Vec<WalletReceiptInfo>,
 }
 
-/// One canonical block whose coinbase was paid to this local wallet.
+/// One block mined by this local wallet and its current canonical status.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalletMinedBlockInfo {
     pub height: u64,
@@ -229,6 +229,8 @@ pub struct WalletMinedBlockInfo {
     pub reward_noid: f64,
     pub payout_address: String,
     pub payout_key_index: u32,
+    /// True only while the exact locally mined block remains canonical.
+    pub canonical: bool,
     /// Tip-inclusive confirmation count on the current canonical chain.
     pub confirmations: u64,
     /// Exact truth from retained storage, not an inferred height comparison.

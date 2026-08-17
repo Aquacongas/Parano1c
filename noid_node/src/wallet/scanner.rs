@@ -129,6 +129,7 @@ pub fn update_wallet_artifacts_from_block(
     active_index: u32,
     block: &Block,
 ) {
+    let block_hash = noid_chain::block_id(&block.header);
     let stream = noid_chain::validate_block_page_stream(&block.transactions)
         .expect("accepted block has a canonical PagedSpend stream");
     let block_tx_hashes: Vec<[u8; 32]> = noid_chain::try_compute_logical_txids(&block.transactions)
@@ -163,6 +164,7 @@ pub fn update_wallet_artifacts_from_block(
         if received > 0 {
             history.push(TxHistoryEntry {
                 tx_hash: system_hash,
+                block_hash: Some(block_hash),
                 height: block.header.height,
                 direction: TxDirection::Received,
                 is_coinbase: system_index == 0,
@@ -209,6 +211,7 @@ pub fn update_wallet_artifacts_from_block(
         }
         history.push(TxHistoryEntry {
             tx_hash,
+            block_hash: Some(block_hash),
             height: block.header.height,
             direction: TxDirection::Received,
             is_coinbase: false,
@@ -243,6 +246,7 @@ pub fn update_active_wallet_from_block(
 ) -> Result<(), String> {
     let height = block.header.height;
     let timestamp = block.header.timestamp;
+    let block_hash = noid_chain::block_id(&block.header);
 
     // Derive the complete map before mutating wallet state. Consensus-valid
     // blocks always satisfy this relation; rejecting the update here avoids
@@ -299,6 +303,7 @@ pub fn update_active_wallet_from_block(
                 );
                 history.push(TxHistoryEntry {
                     tx_hash: system_hash,
+                    block_hash: Some(block_hash),
                     height,
                     direction: TxDirection::Received,
                     is_coinbase: system_index == 0,
@@ -385,6 +390,7 @@ pub fn update_active_wallet_from_block(
                 let net_sent = sent_from_wallet.saturating_sub(received_by_wallet);
                 history.push(TxHistoryEntry {
                     tx_hash,
+                    block_hash: Some(block_hash),
                     height,
                     direction: TxDirection::Sent,
                     is_coinbase: false,
@@ -397,6 +403,7 @@ pub fn update_active_wallet_from_block(
             } else if received_by_wallet > 0 {
                 history.push(TxHistoryEntry {
                     tx_hash,
+                    block_hash: Some(block_hash),
                     height,
                     direction: TxDirection::Received,
                     is_coinbase: false,
@@ -556,6 +563,10 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert!(history[0].is_coinbase);
         assert!(!history[1].is_coinbase);
+        let expected_block_hash = noid_chain::block_id(&block.header);
+        assert!(history
+            .iter()
+            .all(|entry| entry.block_hash == Some(expected_block_hash)));
     }
 
     #[test]
@@ -686,6 +697,7 @@ mod tests {
         let mut utxos = HashMap::new();
         let mut history = vec![TxHistoryEntry {
             tx_hash: outgoing_hash,
+            block_hash: None,
             height: 0,
             direction: TxDirection::Sent,
             is_coinbase: false,
@@ -724,6 +736,7 @@ mod tests {
         let mut utxos = HashMap::new();
         let mut history = vec![TxHistoryEntry {
             tx_hash: outgoing_hash,
+            block_hash: None,
             height: 0,
             direction: TxDirection::Sent,
             is_coinbase: false,
@@ -762,6 +775,7 @@ mod tests {
         let mut utxos = HashMap::new();
         let mut history = vec![TxHistoryEntry {
             tx_hash: outgoing_hash,
+            block_hash: None,
             height: 0,
             direction: TxDirection::Sent,
             is_coinbase: false,
@@ -798,6 +812,7 @@ mod tests {
         let block = block(vec![coinbase, outgoing], 2);
         let mut history = vec![TxHistoryEntry {
             tx_hash: outgoing_hash,
+            block_hash: None,
             height: 0,
             direction: TxDirection::Sent,
             is_coinbase: false,

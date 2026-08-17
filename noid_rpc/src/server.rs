@@ -57,6 +57,21 @@ fn rpc_err(msg: impl Into<String>) -> ErrorObject<'static> {
     ErrorObject::owned(-32000, msg.into(), None::<()>)
 }
 
+fn mined_record_is_canonical(
+    recorded_block_hash: Option<[u8; 32]>,
+    recorded_timestamp: u64,
+    recorded_payout_address: &str,
+    canonical_header: &noid_chain::block_header::BlockHeader,
+) -> bool {
+    recorded_block_hash.map_or_else(
+        || {
+            recorded_timestamp == canonical_header.timestamp
+                && recorded_payout_address == canonical_header.miner_address.to_bech32()
+        },
+        |mined_hash| mined_hash == block_id(canonical_header),
+    )
+}
+
 fn discover_contiguous_funded_prefix<E>(
     expected_next_index: u32,
     candidates: &[(u32, [u8; 32])],
@@ -2470,28 +2485,42 @@ impl ParanoidApiServer for RpcHandler {
         for record in slice.blocks {
             let header = chain
                 .get_header_from_store(record.height)
-                .map_err(|error| rpc_err(error.to_string()))?
-                .ok_or_else(|| {
-                    rpc_err(format!(
-                        "mined block header {} is missing from canonical storage",
-                        record.height
-                    ))
-                })?;
-            let full_block_available = chain
-                .store
-                .get_recent_block(record.height)
-                .map_err(|error| rpc_err(error.to_string()))?
-                .is_some();
+                .map_err(|error| rpc_err(error.to_string()))?;
+            // New history records bind the exact mined header. For legacy
+            // records, a timestamp or payout mismatch is still definitive
+            // evidence that another block won at this height; matching legacy
+            // metadata is the best migration-safe identity available. A
+            // missing canonical height is also definitive non-canonical state.
+            let canonical = header.as_ref().is_some_and(|header| {
+                mined_record_is_canonical(
+                    record.block_hash,
+                    record.timestamp,
+                    &record.payout_address,
+                    header,
+                )
+            });
+            let displayed_hash = record
+                .block_hash
+                .or_else(|| header.as_ref().filter(|_| canonical).map(block_id));
+            let full_block_available = canonical
+                && chain
+                    .store
+                    .get_recent_block(record.height)
+                    .map_err(|error| rpc_err(error.to_string()))?
+                    .is_some();
             blocks.push(WalletMinedBlockInfo {
                 height: record.height,
-                block_hash: hex::encode(block_id(&header)),
+                block_hash: displayed_hash.map(hex::encode).unwrap_or_default(),
                 coinbase_txid: hex::encode(record.coinbase_txid),
                 timestamp: record.timestamp,
                 reward_micronoid: record.reward_micronoid,
                 reward_noid: crate::types::micronoid_to_noid(record.reward_micronoid),
                 payout_address: record.payout_address,
                 payout_key_index: record.payout_key_index,
-                confirmations: tip.saturating_sub(record.height).saturating_add(1),
+                canonical,
+                confirmations: canonical
+                    .then(|| tip.saturating_sub(record.height).saturating_add(1))
+                    .unwrap_or(0),
                 full_block_available,
             });
         }
@@ -2849,6 +2878,50 @@ fn parse_address_param(s: &str) -> RpcResult<noid_poseidon2b::primitives::Addres
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mined_block_identity_marks_exact_and_legacy_reorganizations() {
+        let header = noid_chain::consensus::genesis_header();
+        let payout = header.miner_address.to_bech32();
+        let exact_hash = block_id(&header);
+
+        assert!(mined_record_is_canonical(
+            Some(exact_hash),
+            header.timestamp,
+            &payout,
+            &header,
+        ));
+        let mut displaced_hash = exact_hash;
+        displaced_hash[0] ^= 1;
+        assert!(!mined_record_is_canonical(
+            Some(displaced_hash),
+            header.timestamp,
+            &payout,
+            &header,
+        ));
+
+        // Old history files have no block hash. Matching immutable metadata
+        // keeps their canonical display, while either mismatch is sufficient
+        // to mark a displaced local block without inventing confirmations.
+        assert!(mined_record_is_canonical(
+            None,
+            header.timestamp,
+            &payout,
+            &header,
+        ));
+        assert!(!mined_record_is_canonical(
+            None,
+            header.timestamp.saturating_add(1),
+            &payout,
+            &header,
+        ));
+        assert!(!mined_record_is_canonical(
+            None,
+            header.timestamp,
+            &noid_poseidon2b::primitives::Address([1; 32]).to_bech32(),
+            &header,
+        ));
+    }
 
     #[test]
     fn imported_address_discovery_stops_at_the_first_empty_owner() {

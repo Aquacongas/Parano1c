@@ -1020,6 +1020,7 @@ impl Backend {
                         timestamp: block.timestamp,
                         reward_micronoid: block.reward_micronoid,
                         payout_key_index: block.payout_key_index,
+                        canonical: block.canonical,
                         confirmations: block.confirmations,
                         full_block_available: block.full_block_available,
                     })
@@ -2424,6 +2425,7 @@ struct RpcMinedBlock {
     #[allow(dead_code)]
     payout_address: String,
     payout_key_index: u32,
+    canonical: bool,
     confirmations: u64,
     full_block_available: bool,
 }

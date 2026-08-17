@@ -56,6 +56,7 @@ pub struct WalletAddressDiscoveryPreview {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WalletMinedBlockRecord {
     pub coinbase_txid: [u8; 32],
+    pub block_hash: Option<[u8; 32]>,
     pub height: u64,
     pub timestamp: u64,
     pub reward_micronoid: u64,

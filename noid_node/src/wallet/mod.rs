@@ -142,10 +142,12 @@ pub fn update_for_accepted_block(
     });
 
     let mut history_changed = wallet.history.len() != history_count_before;
+    let confirmed_block_hash = noid_chain::block_id(&block.header);
     for txid in noid_chain::try_compute_logical_txids(&block.transactions)
         .map_err(|error| format!("accepted block logical txids: {error}"))?
     {
-        history_changed |= wallet.confirm_pending_tx(&txid.0, block.header.height);
+        history_changed |=
+            wallet.confirm_pending_tx(&txid.0, block.header.height, confirmed_block_hash);
     }
     for tx in &block.transactions {
         let output_slots: Vec<u32> = tx
@@ -378,6 +380,12 @@ pub fn install_reorg_snapshot_and_artifacts(
         if !reclaimed.contains(&entry.tx_hash) {
             return true;
         }
+        // A locally mined block remains part of the wallet's mining record
+        // after it loses a reorganization. Its exact block hash lets RPC and
+        // GUI report ORPHANED without pretending the reward is spendable.
+        if entry.is_coinbase {
+            return true;
+        }
         if replacement.contains(&entry.tx_hash) && entry.direction == state::TxDirection::Sent {
             // Preserve the local source-account tag so the replacement-chain
             // confirmation can produce a receipt at its new height.
@@ -397,8 +405,13 @@ pub fn install_reorg_snapshot_and_artifacts(
             active_index,
             block,
         );
+        let confirmed_block_hash = noid_chain::block_id(&block.header);
         for transaction in &block.transactions {
-            let _ = wallet.confirm_pending_tx(&transaction.txid().0, block.header.height);
+            let _ = wallet.confirm_pending_tx(
+                &transaction.txid().0,
+                block.header.height,
+                confirmed_block_hash,
+            );
             let output_slots: Vec<u32> = transaction
                 .body
                 .live_outputs()
@@ -665,6 +678,7 @@ impl WalletOps for WalletHandle {
             .filter_map(|entry| {
                 Some(WalletMinedBlockRecord {
                     coinbase_txid: entry.tx_hash,
+                    block_hash: entry.block_hash,
                     height: entry.height,
                     timestamp: entry.timestamp,
                     reward_micronoid: entry.amount_micronoid,
@@ -1673,6 +1687,7 @@ mod tests {
             let active = wallet.active_address();
             wallet.history.push(state::TxHistoryEntry {
                 tx_hash,
+                block_hash: None,
                 height: 7,
                 direction: state::TxDirection::Sent,
                 is_coinbase: false,
@@ -1699,6 +1714,7 @@ mod tests {
             wallet.record_pending_send([1; 32], 10, [2; 32]).unwrap();
             wallet.history.push(state::TxHistoryEntry {
                 tx_hash: [3; 32],
+                block_hash: None,
                 height: 7,
                 direction: state::TxDirection::Received,
                 is_coinbase: false,
@@ -1724,6 +1740,7 @@ mod tests {
             for (height, key_index, is_coinbase) in [(3, 0, true), (5, 1, false), (7, 2, true)] {
                 wallet.history.push(state::TxHistoryEntry {
                     tx_hash: [height as u8; 32],
+                    block_hash: None,
                     height,
                     direction: state::TxDirection::Received,
                     is_coinbase,
@@ -1913,6 +1930,7 @@ mod tests {
             wallet.save_receipts().unwrap();
             wallet.history.push(state::TxHistoryEntry {
                 tx_hash: orphan_hash,
+                block_hash: None,
                 height: 9,
                 direction: state::TxDirection::Sent,
                 is_coinbase: false,
@@ -1952,6 +1970,62 @@ mod tests {
             !reloaded.receipts.contains_key(&orphan_hash),
             "orphan receipt must not return after restart"
         );
+    }
+
+    #[test]
+    fn reorg_preserves_displaced_coinbase_as_mining_history() {
+        let (dir, handle) = handle_with_utxos(&[111]);
+        let coinbase_txid = [0x67; 32];
+        let displaced_block_hash = [0x68; 32];
+        let owner = {
+            let mut guard = handle.inner.lock().unwrap();
+            let wallet = guard.as_mut().unwrap();
+            let owner = wallet.active_address();
+            wallet.history.push(state::TxHistoryEntry {
+                tx_hash: coinbase_txid,
+                block_hash: Some(displaced_block_hash),
+                height: 9,
+                direction: state::TxDirection::Received,
+                is_coinbase: true,
+                amount_micronoid: 45_000_000,
+                peer_address: None,
+                timestamp: 8,
+                own_address: Some(owner.to_bech32()),
+                own_key_index: Some(wallet.active_index),
+            });
+            owner
+        };
+
+        install_reorg_snapshot_and_artifacts(
+            &handle.inner,
+            0,
+            1,
+            owner.0,
+            empty_snapshot(owner.0),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[noid_poseidon2b::primitives::TxBodyHash(coinbase_txid)],
+            &[],
+        )
+        .unwrap();
+
+        let guard = handle.inner.lock().unwrap();
+        let wallet = guard.as_ref().unwrap();
+        let entry = wallet
+            .history
+            .iter()
+            .find(|entry| entry.tx_hash == coinbase_txid)
+            .expect("displaced coinbase must remain visible");
+        assert!(entry.is_coinbase);
+        assert_eq!(entry.block_hash, Some(displaced_block_hash));
+        drop(guard);
+
+        let reloaded = state::WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        assert!(reloaded.history.iter().any(|entry| {
+            entry.tx_hash == coinbase_txid
+                && entry.block_hash == Some(displaced_block_hash)
+                && entry.is_coinbase
+        }));
     }
 
     #[test]

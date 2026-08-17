@@ -42,6 +42,12 @@ pub enum TxDirection {
 pub struct TxHistoryEntry {
     /// Transaction body hash (32 bytes).
     pub tx_hash: [u8; 32],
+    /// Exact block which confirmed this entry. Older wallet-history files did
+    /// not persist it, so `None` is retained as a migration-safe legacy value.
+    /// New coinbase records use this identity to distinguish a canonical
+    /// reward from a locally mined block later displaced by a reorganization.
+    #[serde(default)]
+    pub block_hash: Option<[u8; 32]>,
     /// Block height at which this tx was confirmed.
     pub height: u64,
     /// Whether we sent or received in this tx.
@@ -341,6 +347,7 @@ impl WalletState {
             .as_secs();
         self.history.push(TxHistoryEntry {
             tx_hash,
+            block_hash: None,
             height: 0, // updated to real height when block is confirmed
             direction: TxDirection::Sent,
             is_coinbase: false,
@@ -369,10 +376,16 @@ impl WalletState {
     /// Update the height of a pending (height=0) tx once it is confirmed.
     /// The block-level caller persists the complete history once after all
     /// transactions have been applied, avoiding one fsync per transaction.
-    pub fn confirm_pending_tx(&mut self, tx_hash: &[u8; 32], confirmed_height: u64) -> bool {
+    pub fn confirm_pending_tx(
+        &mut self,
+        tx_hash: &[u8; 32],
+        confirmed_height: u64,
+        confirmed_block_hash: [u8; 32],
+    ) -> bool {
         for entry in self.history.iter_mut() {
             if &entry.tx_hash == tx_hash && entry.height == 0 {
                 entry.height = confirmed_height;
+                entry.block_hash = Some(confirmed_block_hash);
                 self.history_dirty = true;
                 return true;
             }
@@ -935,7 +948,7 @@ pub type SharedWallet = Arc<Mutex<Option<WalletState>>>;
 mod tests {
 
     #[test]
-    fn legacy_history_without_coinbase_marker_remains_readable() {
+    fn legacy_history_without_new_markers_remains_readable() {
         let json = r#"{
             "tx_hash":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],
             "height":7,
@@ -948,6 +961,7 @@ mod tests {
         }"#;
         let entry: TxHistoryEntry = serde_json::from_str(json).unwrap();
         assert!(!entry.is_coinbase);
+        assert!(entry.block_hash.is_none());
     }
 
     #[test]
@@ -1334,6 +1348,7 @@ mod tests {
         target.active_index = 4;
         target.history.push(TxHistoryEntry {
             tx_hash: [0x21; 32],
+            block_hash: None,
             height: 3,
             direction: TxDirection::Sent,
             is_coinbase: false,
@@ -1444,6 +1459,7 @@ mod tests {
         wallet.next_index = 7;
         wallet.history.push(TxHistoryEntry {
             tx_hash: [0x11; 32],
+            block_hash: None,
             height: 9,
             direction: TxDirection::Sent,
             is_coinbase: false,

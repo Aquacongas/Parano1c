@@ -198,26 +198,6 @@ fn translate_localized(language: Language, source: &str) -> String {
             Language::English => source.to_owned(),
         };
     }
-    if let Some(value) = source
-        .strip_prefix("FULL · ")
-        .and_then(|value| value.strip_suffix(" conf"))
-    {
-        return match language {
-            Language::Russian => format!("ПОЛНЫЙ · {value} подтв."),
-            Language::Chinese => format!("完整数据 · {value} 次确认"),
-            Language::English => source.to_owned(),
-        };
-    }
-    if let Some(value) = source
-        .strip_prefix("HEADER · ")
-        .and_then(|value| value.strip_suffix(" conf"))
-    {
-        return match language {
-            Language::Russian => format!("ЗАГОЛОВОК · {value} подтв."),
-            Language::Chinese => format!("仅区块头 · {value} 次确认"),
-            Language::English => source.to_owned(),
-        };
-    }
     if let Some(value) = source.strip_prefix("EDIT ADDRESS ") {
         return match language {
             Language::Russian => format!("ИЗМЕНИТЬ АДРЕС {value}"),
@@ -817,10 +797,6 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
         "BLOCK HASH" => ("ХЕШ БЛОКА", "区块哈希"),
         "AGE" => ("ВОЗРАСТ", "时间"),
         "HASH" => ("ХЕШ", "哈希"),
-        "FULL" => ("ПОЛНЫЙ", "完整数据"),
-        "CANONICAL" => ("КАНОНИЧЕСКИЙ", "规范链"),
-        "HEADER" => ("ЗАГОЛОВОК", "区块头"),
-        "FULL DATA" => ("ПОЛНЫЕ ДАННЫЕ", "完整数据"),
         "RECENT TRANSACTIONS" => ("НЕДАВНИЕ ТРАНЗАКЦИИ", "近期交易"),
         "RECENT TX" => ("НЕДАВНИЕ TX", "近期交易"),
         "RECENT ADDRESS ACTIVITY" => ("НЕДАВНЯЯ АКТИВНОСТЬ АДРЕСА", "地址近期活动"),
@@ -885,10 +861,6 @@ fn exact_translation(source: &str) -> Option<(&'static str, &'static str)> {
             "ПОЛНЫЕ ДАННЫЕ ДОСТУПНЫ В 18-БЛОЧНОМ ОКНЕ УЗЛА",
             "完整区块数据遵循节点的 18 区块保留窗口",
         ),
-        "FULL BLOCK" => ("ПОЛНЫЙ БЛОК", "完整区块"),
-        "HEADER ONLY" => ("ТОЛЬКО ЗАГОЛОВОК", "仅区块头"),
-        "FULL BLOCK · RETAINED" => ("ПОЛНЫЙ БЛОК · СОХРАНЁН", "完整区块 · 保留中"),
-        "HEADER · BODY NOT RETAINED" => ("ЗАГОЛОВОК · ТЕЛО НЕ ХРАНИТСЯ", "区块头 · 正文已过期"),
         "PARENT" => ("РОДИТЕЛЬ", "父区块"),
         "STATE ROOT" => ("КОРЕНЬ СОСТОЯНИЯ", "状态根"),
         "TX ROOT" => ("КОРЕНЬ TX", "交易根"),
@@ -1187,7 +1159,9 @@ mod tests {
     #[test]
     fn formatted_statuses_keep_values_and_localize_meaning() {
         activate(Language::Russian);
-        assert_eq!(translate("FULL · 7 conf"), "ПОЛНЫЙ · 7 подтв.");
+        assert_eq!(translate("FULL · 7 conf"), "FULL · 7 conf");
+        assert_eq!(translate("HEADER · 7 conf"), "HEADER · 7 conf");
+        assert_eq!(translate("ORPHANED · NO REWARD"), "ORPHANED · NO REWARD");
         assert_eq!(translate("12m ago"), "12 мин назад");
         assert_eq!(
             translate("75 → 12 outputs · 63 slots freed"),
