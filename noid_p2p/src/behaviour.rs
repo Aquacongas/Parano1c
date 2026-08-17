@@ -74,7 +74,7 @@ pub struct NodeBehaviour {
     /// Fixed header announcements and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Exact network-v7 profile handshake. A transport is never exposed to
+    /// Exact network-v8 profile handshake. A transport is never exposed to
     /// consensus/sync until this profile matches byte-for-byte.
     pub network_profile_sync: request_response::Behaviour<NetworkProfileCodec>,
 
@@ -293,9 +293,9 @@ impl NodeBehaviour {
 
         let chain_sync = request_response::Behaviour::new(
             [(
-                // v4 carries canonical headers plus optional exact retained-
-                // object inventory in one bounded zstd frame.
-                StreamProtocol::try_from_owned(format!("{}/sync/headers/4", protocol_id))?,
+                // v5 adds a canonical Busy response so header preparation
+                // never forms an unbounded queue behind State/data work.
+                StreamProtocol::try_from_owned(format!("{}/sync/headers/5", protocol_id))?,
                 ProtocolSupport::Full,
             )],
             request_response::Config::default()
@@ -383,8 +383,18 @@ impl NodeBehaviour {
         let kad_protocol = StreamProtocol::try_from_owned(format!("{}/kad/1.0.0", protocol_id))?;
         let mut kad_cfg = kad::Config::new(kad_protocol);
         kad_cfg
-            // Refresh the routing table every 5 minutes.
+            // Discovery is paced by the outer topology controller. The
+            // library default additionally starts a complete multi-bucket
+            // bootstrap every five minutes; that duplicates the bounded
+            // random lookup below and can create a relay circuit wave.
+            .set_periodic_bootstrap_interval(None)
             .set_replication_factor(std::num::NonZeroUsize::new(20).unwrap())
+            // One probe at a time is enough because every fresh node already
+            // has two independent bootstrap paths. It also lets the outer
+            // topology controller stop the lookup as soon as two ordinary
+            // neighbours complete the four-peer mesh, before a relay wave can
+            // fan out to the rest of the returned routing table.
+            .set_parallelism(std::num::NonZeroUsize::new(1).unwrap())
             .set_query_timeout(Duration::from_secs(60))
             // Only insert peers into the routing table when we have an
             // established connection (not from hearsay in FIND_NODE responses).

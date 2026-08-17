@@ -13,15 +13,18 @@
 use std::io;
 
 use crate::header_protocol::{HeaderInventoryRecord, HEADER_INVENTORY_RECORD_BYTES};
+use crate::object_protocol::DataResponseStatus;
 use crate::protocol::{GetHeadersRequest, GetHeadersResponse};
 use async_trait::async_trait;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 
-const REQUEST_MAGIC: [u8; 4] = *b"NHQ4";
-const RESPONSE_MAGIC: [u8; 4] = *b"NHB4";
+const REQUEST_MAGIC: [u8; 4] = *b"NHQ5";
+const RESPONSE_MAGIC: [u8; 4] = *b"NHB5";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
-const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 4 + 8 + 32;
+// magic + count + flags + status + retry + reserved + compressed length +
+// snapshot height + snapshot hash
+const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 2 + 2 + 4 + 8 + 32;
 const RESPONSE_HAS_SNAPSHOT_BOUNDARY: u8 = 1;
 const HEADER_COMPRESSION_LEVEL: i32 = 1;
 const HEADER_ZSTD_WINDOW_LOG_MAX: u32 = 21;
@@ -89,18 +92,44 @@ impl request_response::Codec for HeaderSyncCodec {
         if header[..4] != RESPONSE_MAGIC {
             return Err(invalid_data("invalid header-sync response magic/version"));
         }
-        if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[7] != 0 {
+        if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[10..12] != [0, 0] {
             return Err(invalid_data(
-                "invalid header-sync response flags/reserved byte",
+                "invalid header-sync response flags/reserved bytes",
             ));
         }
         let count = u16::from_le_bytes(header[4..6].try_into().expect("fixed count"));
         validate_count(count)?;
+        let retry_after_ms = u16::from_le_bytes(header[8..10].try_into().expect("fixed retry"));
+        let status = match header[7] {
+            0 if retry_after_ms == 0 => DataResponseStatus::Ready,
+            1 => DataResponseStatus::Busy { retry_after_ms },
+            _ => return Err(invalid_data("invalid header-sync response status")),
+        };
+        if !status.is_canonical() {
+            return Err(invalid_data("non-canonical header-sync response status"));
+        }
         let compressed_len =
-            u32::from_le_bytes(header[8..12].try_into().expect("fixed compressed length")) as usize;
+            u32::from_le_bytes(header[12..16].try_into().expect("fixed compressed length"))
+                as usize;
         let snapshot_height =
-            u64::from_le_bytes(header[12..20].try_into().expect("fixed snapshot height"));
-        let snapshot_hash: [u8; 32] = header[20..52].try_into().expect("fixed snapshot hash");
+            u64::from_le_bytes(header[16..24].try_into().expect("fixed snapshot height"));
+        let snapshot_hash: [u8; 32] = header[24..56].try_into().expect("fixed snapshot hash");
+        if matches!(status, DataResponseStatus::Busy { .. }) {
+            if count != 0
+                || header[6] != 0
+                || compressed_len != 0
+                || snapshot_height != 0
+                || snapshot_hash != [0; 32]
+            {
+                return Err(invalid_data("busy header-sync response carries data"));
+            }
+            ensure_eof(io).await?;
+            return Ok(GetHeadersResponse {
+                status,
+                records: Vec::new(),
+                snapshot_boundary: None,
+            });
+        }
         let snapshot_boundary = if header[6] & RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 {
             if snapshot_height == 0 || snapshot_hash == [0; 32] {
                 return Err(invalid_data("invalid advertised snapshot boundary"));
@@ -143,6 +172,7 @@ impl request_response::Codec for HeaderSyncCodec {
             );
         }
         Ok(GetHeadersResponse {
+            status,
             records,
             snapshot_boundary,
         })
@@ -175,7 +205,31 @@ impl request_response::Codec for HeaderSyncCodec {
     where
         T: AsyncWrite + Unpin + Send,
     {
-        let count = u16::try_from(response.records.len())
+        let GetHeadersResponse {
+            status,
+            records,
+            snapshot_boundary,
+        } = response;
+        if !status.is_canonical() {
+            return Err(invalid_data("non-canonical header-sync response status"));
+        }
+        if matches!(status, DataResponseStatus::Busy { .. }) {
+            if !records.is_empty() || snapshot_boundary.is_some() {
+                return Err(invalid_data("busy header-sync response carries data"));
+            }
+            let mut response_header = [0u8; RESPONSE_HEADER_BYTES];
+            response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
+            response_header[7] = 1;
+            response_header[8..10].copy_from_slice(
+                &status
+                    .busy_retry_after_ms()
+                    .expect("busy status has a retry interval")
+                    .to_le_bytes(),
+            );
+            io.write_all(&response_header).await?;
+            return Ok(());
+        }
+        let count = u16::try_from(records.len())
             .map_err(|_| invalid_data("header batch count does not fit u16"))?;
         validate_count(count)?;
         let canonical_len = canonical_payload_len(count)?;
@@ -183,7 +237,7 @@ impl request_response::Codec for HeaderSyncCodec {
         canonical.try_reserve_exact(canonical_len).map_err(|_| {
             io::Error::new(io::ErrorKind::OutOfMemory, "header batch allocation failed")
         })?;
-        for record in response.records {
+        for record in records {
             canonical.extend_from_slice(
                 &record
                     .encode()
@@ -203,14 +257,14 @@ impl request_response::Codec for HeaderSyncCodec {
         let mut response_header = [0u8; RESPONSE_HEADER_BYTES];
         response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
         response_header[4..6].copy_from_slice(&count.to_le_bytes());
-        response_header[8..12].copy_from_slice(&compressed_len.to_le_bytes());
-        if let Some(boundary) = response.snapshot_boundary {
+        response_header[12..16].copy_from_slice(&compressed_len.to_le_bytes());
+        if let Some(boundary) = snapshot_boundary {
             if boundary.height == 0 || boundary.hash == [0; 32] {
                 return Err(invalid_data("invalid outgoing snapshot boundary"));
             }
             response_header[6] = RESPONSE_HAS_SNAPSHOT_BOUNDARY;
-            response_header[12..20].copy_from_slice(&boundary.height.to_le_bytes());
-            response_header[20..52].copy_from_slice(&boundary.hash);
+            response_header[16..24].copy_from_slice(&boundary.height.to_le_bytes());
+            response_header[24..56].copy_from_slice(&boundary.hash);
         }
         io.write_all(&response_header).await?;
         io.write_all(&compressed).await
@@ -299,14 +353,14 @@ mod tests {
     use super::*;
 
     fn protocol() -> StreamProtocol {
-        StreamProtocol::new("/noid/test/sync/headers/4")
+        StreamProtocol::new("/noid/test/sync/headers/5")
     }
 
     fn response_header(count: u16, compressed_len: usize) -> Vec<u8> {
         let mut encoded = vec![0u8; RESPONSE_HEADER_BYTES];
         encoded[..4].copy_from_slice(&RESPONSE_MAGIC);
         encoded[4..6].copy_from_slice(&count.to_le_bytes());
-        encoded[8..12].copy_from_slice(&(compressed_len as u32).to_le_bytes());
+        encoded[12..16].copy_from_slice(&(compressed_len as u32).to_le_bytes());
         encoded
     }
 
@@ -381,6 +435,7 @@ mod tests {
     async fn response_round_trip_restores_exact_canonical_headers() {
         let snapshot_boundary = crate::object_protocol::ChainPoint::new(42, [0xA5; 32]);
         let response = GetHeadersResponse {
+            status: DataResponseStatus::Ready,
             records: vec![fixture_record(1, 0x11), fixture_record(2, 0x22)],
             snapshot_boundary: Some(snapshot_boundary),
         };
@@ -390,7 +445,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&wire.get_ref()[..4], &RESPONSE_MAGIC);
-        let compressed_len = u32::from_le_bytes(wire.get_ref()[8..12].try_into().unwrap());
+        let compressed_len = u32::from_le_bytes(wire.get_ref()[12..16].try_into().unwrap());
         assert_eq!(
             wire.get_ref().len(),
             RESPONSE_HEADER_BYTES + compressed_len as usize
@@ -401,6 +456,7 @@ mod tests {
             .read_response(&protocol(), &mut wire)
             .await
             .unwrap();
+        assert_eq!(decoded.status, DataResponseStatus::Ready);
         assert_eq!(decoded.records[0], fixture_record(1, 0x11));
         assert_eq!(decoded.records[1], fixture_record(2, 0x22));
         assert_eq!(decoded.snapshot_boundary, Some(snapshot_boundary));
@@ -414,6 +470,7 @@ mod tests {
                 &protocol(),
                 &mut wire,
                 GetHeadersResponse {
+                    status: DataResponseStatus::Ready,
                     records: vec![fixture_record(1, 1); MAX_HEADERS_PER_BATCH + 1],
                     snapshot_boundary: None,
                 },
@@ -479,6 +536,7 @@ mod tests {
                 &protocol(),
                 &mut wire,
                 GetHeadersResponse {
+                    status: DataResponseStatus::Ready,
                     records,
                     snapshot_boundary: None,
                 },
@@ -496,6 +554,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(decoded.records, expected);
+    }
+
+    #[tokio::test]
+    async fn busy_response_is_payload_free_and_round_trips() {
+        let response = GetHeadersResponse {
+            status: DataResponseStatus::Busy {
+                retry_after_ms: 700,
+            },
+            records: Vec::new(),
+            snapshot_boundary: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        HeaderSyncCodec
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref().len(), RESPONSE_HEADER_BYTES);
+        wire.set_position(0);
+        let decoded = HeaderSyncCodec
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.status,
+            DataResponseStatus::Busy {
+                retry_after_ms: 700
+            }
+        );
+        assert!(decoded.records.is_empty());
+        assert!(decoded.snapshot_boundary.is_none());
+    }
+
+    #[tokio::test]
+    async fn writer_rejects_busy_response_with_headers() {
+        let mut wire = Cursor::new(Vec::new());
+        let error = HeaderSyncCodec
+            .write_response(
+                &protocol(),
+                &mut wire,
+                GetHeadersResponse {
+                    status: DataResponseStatus::Busy {
+                        retry_after_ms: 700,
+                    },
+                    records: vec![fixture_record(1, 1)],
+                    snapshot_boundary: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(wire.get_ref().is_empty());
     }
 
     #[tokio::test]

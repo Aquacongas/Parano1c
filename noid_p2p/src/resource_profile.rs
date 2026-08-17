@@ -101,19 +101,19 @@ impl BackgroundCapacity {
 
     pub(crate) const fn relay_max_reservations(self) -> usize {
         match self {
-            // The swarm accepts at most 128 inbound connections. Relay
-            // reservations may consume only one quarter of that budget so
-            // direct sync, discovery and ordinary wallet traffic always keep
-            // independent admission capacity.
-            Self::Full => 32,
-            Self::MiningReserved => 16,
+            // The swarm accepts at most 128 inbound connections. A public
+            // full node may devote half to bounded relay reachability while
+            // retaining 64 direct slots. Miners contribute less relay
+            // capacity so proving and live-object propagation stay primary.
+            Self::Full => 64,
+            Self::MiningReserved => 32,
         }
     }
 
     pub(crate) const fn relay_max_circuits(self) -> usize {
         match self {
-            Self::Full => 16,
-            Self::MiningReserved => 8,
+            Self::Full => 64,
+            Self::MiningReserved => 16,
         }
     }
 
@@ -152,6 +152,9 @@ mod tests {
             mining.relay_max_reservations() * 2,
             full.relay_max_reservations()
         );
+        assert_eq!(full.relay_max_reservations(), 64);
+        assert_eq!(full.relay_max_circuits(), 64);
+        assert_eq!(mining.relay_max_circuits(), 16);
         assert_eq!(mining.state_data_slots() * 2, full.state_data_slots());
         assert_eq!(
             mining.state_data_outstanding() * 2,

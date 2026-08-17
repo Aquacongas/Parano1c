@@ -53,6 +53,9 @@ pub struct GetHeadersRequest {
 /// inventory decoded by the allocation-bounded header-sync codec.
 #[derive(Debug, Clone)]
 pub struct GetHeadersResponse {
+    /// `Busy` is bounded control-plane backpressure. It never carries headers
+    /// and does not invalidate the responding peer as an exact source.
+    pub status: DataResponseStatus,
     pub records: Vec<HeaderInventoryRecord>,
     /// Exact deterministic finalized boundary whose complete terminal and
     /// snapshot generation this responding peer can currently serve. This is

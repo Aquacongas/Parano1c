@@ -305,6 +305,18 @@ def sync_counts(text):
     }
 
 
+def wait_sync_counts(node, predicate, timeout=30):
+    """Wait until completion telemetry catches up with the committed RPC tip."""
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        last = sync_counts(node.log_text())
+        if predicate(last):
+            return last
+        time.sleep(0.1)
+    raise LiveSyncError(f"sync completion telemetry timeout; last={last}")
+
+
 SYNC_FAILURES = (
     "HistoryStep terminal request failed",
     "HistoryStep terminal response failed",
@@ -548,7 +560,14 @@ def main():
         short_secondary.start("15-secondary-h5-deep-gap", seeds=[primary.seed])
         wait_converged(primary, short_secondary, timeout=600)
         elapsed = time.monotonic() - started
-        deep = sync_counts(short_secondary.log_text())
+        # The chain commit becomes visible through RPC immediately before the
+        # completion event is formatted. On a fast 18-block atomic suffix this
+        # gap is observable, so do not classify a successful commit from a
+        # transiently incomplete log snapshot.
+        deep = wait_sync_counts(
+            short_secondary,
+            lambda counts: counts["exact_suffix_blocks"] == [18],
+        )
         assert_no_sync_failures("deep-gap", short_secondary.log_text())
         require(deep["snapshot_installs"] == 1, f"deep gap snapshot count: {deep}")
         require(deep["snapshot_boundaries"] == [30], f"deep boundary is not h=30: {deep}")

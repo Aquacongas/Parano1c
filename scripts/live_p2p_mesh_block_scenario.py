@@ -4,6 +4,7 @@
 import datetime
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -207,7 +208,13 @@ def main():
             f"only {gossip_receivers}/{PEER_COUNT} peers admitted header-first block gossip",
         )
         applied_counts = {
-            label: text.count("header-first exact suffix application completed")
+            label: sum(
+                int(value)
+                for value in re.findall(
+                    r"header-first exact suffix application completed[^\n]* blocks=(\d+)",
+                    text,
+                )
+            )
             for label, text in peer_logs.items()
         }
         require(

@@ -30,11 +30,13 @@ Nodes combine three discovery sources:
 Successful peer addresses are persisted and reused. The peer store keeps up to
 500 peers and limits the number of remembered addresses for any one peer.
 
-The automatic connection manager targets 12 outbound peer identities. DNS
-seeds provide the initial neighbours; as stable ordinary peers become
-available through discovery, seed connections are replaced without first
-dropping below the target. Seeds are therefore bootstrap anchors, not a
-permanent exclusive topology.
+The automatic topology manager maintains a four-neighbour GossipSub mesh. This
+is a connectivity floor, not a cap on the node's total peer count: inbound,
+direct, LAN and relay-backed peers may increase it further. DNS seeds provide
+the first two independent paths; as stable ordinary peers become available
+through discovery, seed connections are replaced without first dropping below
+the target. Seeds are therefore bootstrap anchors, not a permanent exclusive
+topology.
 
 DNS records point to network endpoints, not chain state. Changing software or
 resetting a node does not require changing its DNS name if the public address

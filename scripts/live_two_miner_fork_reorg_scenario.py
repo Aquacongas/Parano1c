@@ -65,7 +65,7 @@ def port_is_free(port):
             return False
 
 
-def rpc(port, method, params=None, timeout=15):
+def rpc(port, method, params=None, timeout=15, host="127.0.0.1"):
     payload = json.dumps(
         {
             "jsonrpc": "2.0",
@@ -75,7 +75,7 @@ def rpc(port, method, params=None, timeout=15):
         }
     ).encode()
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}",
+        f"http://{host}:{port}",
         data=payload,
         headers={"content-type": "application/json"},
     )
@@ -90,11 +90,21 @@ def rpc(port, method, params=None, timeout=15):
 
 
 class Node:
-    def __init__(self, name, p2p_port, rpc_port, p2p_host="127.0.0.1"):
+    def __init__(
+        self,
+        name,
+        p2p_port,
+        rpc_port,
+        p2p_host="127.0.0.1",
+        rpc_host="127.0.0.1",
+        command_prefix=(),
+    ):
         self.name = name
         self.p2p_port = p2p_port
         self.rpc_port = rpc_port
         self.p2p_host = p2p_host
+        self.rpc_host = rpc_host
+        self.command_prefix = tuple(command_prefix)
         self.root = BASE / name
         self.data_dir = self.root / "data"
         self.config = self.root / "parano1d.toml"
@@ -117,6 +127,7 @@ class Node:
         self.log_path = BASE / "logs" / f"{label}.log"
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         args = [
+            *self.command_prefix,
             str(NODE_BIN),
             "--mode",
             mode,
@@ -127,7 +138,7 @@ class Node:
             "--p2p-listen",
             f"{self.p2p_host}:{self.p2p_port}",
             "--rpc-listen",
-            f"127.0.0.1:{self.rpc_port}",
+            f"{self.rpc_host}:{self.rpc_port}",
             "--disable-dns-seeds",
             "--log",
             "debug",
@@ -162,7 +173,7 @@ class Node:
         raise LiveForkReorgError(f"{label} RPC startup timeout")
 
     def info(self, timeout=15):
-        return rpc(self.rpc_port, "getChainInfo", timeout=timeout)
+        return rpc(self.rpc_port, "getChainInfo", timeout=timeout, host=self.rpc_host)
 
     def height(self):
         return int(self.info()["height"])
@@ -171,7 +182,7 @@ class Node:
         if self.proc is None or self.proc.poll() is not None or self.stopping:
             return
         try:
-            rpc(self.rpc_port, "stop", timeout=5)
+            rpc(self.rpc_port, "stop", timeout=5, host=self.rpc_host)
         except LiveForkReorgError as error:
             print(f"[stop-request] {self.name}: {error}", flush=True)
         self.stopping = True
