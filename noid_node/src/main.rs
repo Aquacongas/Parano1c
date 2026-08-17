@@ -281,18 +281,35 @@ const DIRECT_SYNC_HEADER_REQUEST_CAP: u64 = 512;
 /// base and can keep the selected tip frozen just below the snapshot-routing
 /// threshold.
 fn unresolved_tip_probe_range(
-    local_height: u64,
+    base_height: u64,
     selected_height: u64,
     forward_headers: u16,
 ) -> (u64, u16) {
     let selected_span = selected_height
-        .saturating_sub(local_height)
+        .saturating_sub(base_height)
         .saturating_add(1);
     let count = selected_span
         .saturating_add(u64::from(forward_headers))
         .min(DIRECT_SYNC_HEADER_REQUEST_CAP)
         .max(1) as u16;
-    (local_height, count)
+    (base_height, count)
+}
+
+fn unresolved_selected_tip_probe_range(
+    dag: &noid_node::networking::header_dag::HeaderDag,
+    committed_tip: noid_node::networking::ChainPoint,
+    forward_headers: u16,
+) -> Result<(u64, u16), noid_node::networking::header_dag::HeaderDagError> {
+    let (base, _) = dag.selected_path_from(committed_tip)?;
+    Ok(unresolved_tip_probe_range(
+        base.height,
+        dag.best_tip().height,
+        forward_headers,
+    ))
+}
+
+fn snapshot_rebase_discovery_range(finalized_height: u64, target_height: u64) -> (u64, u16) {
+    unresolved_tip_probe_range(finalized_height, target_height, 0)
 }
 
 fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
@@ -3391,6 +3408,7 @@ fn prepare_snapshot_header_sync(
     rebase_base: Option<(u64, [u8; 32])>,
 ) -> Result<PendingSnapshotHeaderSync, SnapshotHeaderPrepareError> {
     let target_height = manifest.tip_height;
+    let allow_nonfinal_rebase = rebase_base.is_some();
     let after_target = target_height.checked_add(1).ok_or_else(|| {
         SnapshotHeaderPrepareError::Fatal(
             "snapshot target height has no representable successor".to_owned(),
@@ -3437,6 +3455,8 @@ fn prepare_snapshot_header_sync(
     let create_staging = || {
         if base.header.height == target_height {
             SnapshotHeaderStaging::create_at_canonical_boundary(&path, store, base)
+        } else if allow_nonfinal_rebase {
+            SnapshotHeaderStaging::create_at_nonfinal_rebase_boundary(&path, store, base)
         } else {
             SnapshotHeaderStaging::create(&path, store, base)
         }
@@ -4246,6 +4266,45 @@ fn record_validated_headers(
     Ok(())
 }
 
+/// A provider response may repeat headers which already entered HeaderDAG
+/// through an earlier header-only announcement. Preserve its exact object
+/// inventory even when the control-plane planner consequently classifies the
+/// batch as already known/behind. Unknown headers still require the native
+/// validation path before they may receive any availability hints.
+fn advertise_inventory_for_known_headers(
+    dag: &mut noid_node::networking::header_dag::HeaderDag,
+    peer: libp2p::PeerId,
+    records: &[noid_p2p::header_protocol::HeaderInventoryRecord],
+) -> Result<usize, noid_node::networking::header_dag::HeaderDagError> {
+    let known_inventory = records
+        .iter()
+        .filter(|record| record.body.is_some() || record.terminal.is_some())
+        .filter(|record| {
+            let hash = noid_chain::block_id(&record.header);
+            dag.get(&hash)
+                .is_some_and(|known| known.header == record.header)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if known_inventory.is_empty() {
+        return Ok(0);
+    }
+    dag.advertise_inventory(peer, &known_inventory)
+}
+
+fn header_inventory_validation_anchor(
+    canonical: Option<noid_node::networking::ChainPoint>,
+    validated_dag: Option<noid_node::networking::ChainPoint>,
+) -> Option<noid_node::networking::ChainPoint> {
+    // If the response includes a canonical point, replay the bounded branch
+    // from that point even when every later header is already present in the
+    // DAG. This turns a later exact-inventory response into a fresh data plan
+    // instead of incorrectly classifying it as Behind. A DAG-only anchor is
+    // still required for a continuation whose canonical base is outside the
+    // bounded response.
+    canonical.or(validated_dag)
+}
+
 fn header_dag_has_unresolved_better_tip(
     dag: &noid_node::networking::header_dag::HeaderDag,
     canonical_tip: noid_node::networking::ChainPoint,
@@ -4312,11 +4371,13 @@ async fn plan_header_inventory(
             .filter(|known| known.header == record.header)
             .map(ValidatedHeader::point)
     });
-    let ancestor = canonical_ancestors
+    let canonical_ancestor = canonical_ancestors
         .into_iter()
         .map(|(height, hash)| ChainPoint::new(height, hash))
-        .chain(dag_ancestors)
+        .filter(|point| point.height >= header_dag.finalized().height)
         .max_by_key(|point| point.height);
+    let dag_ancestor = dag_ancestors.max_by_key(|point| point.height);
+    let ancestor = header_inventory_validation_anchor(canonical_ancestor, dag_ancestor);
 
     let Some(ancestor) = ancestor else {
         let oldest = records.first().map_or(0, |record| record.header.height);
@@ -4607,9 +4668,10 @@ fn admit_exact_suffix_offer(
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_exact_suffix_offer, classify_snapshot_finalization_error,
-        classify_snapshot_session_prepare_error, competing_suffix_wins, embedded_seed_multiaddrs,
-        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
+        admit_exact_suffix_offer, advertise_inventory_for_known_headers,
+        classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
+        competing_suffix_wins, embedded_seed_multiaddrs, gap_requires_snapshot_sync,
+        header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
         initial_sync_may_skip_peer_confirmation, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
         merge_active_suffix_inventory, migrate_legacy_default_ports, mining_quorum_probe_due,
@@ -4620,14 +4682,16 @@ mod tests {
         resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
         seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
-        snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
-        steady_tip_probe_due, terminal_alternate_peer, terminal_transport_can_retry_same_peer,
-        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
-        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        MiningPeerQuorum, NodeConfig, SnapshotFinalizationOutcome, SnapshotHeaderBoundary,
-        SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
-        SnapshotSegmentFailureScope, SnapshotSessionPrepareError, SuffixAdmission,
-        TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
+        source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
+        terminal_alternate_peer, terminal_transport_can_retry_same_peer,
+        unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
+        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
+        validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
+        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotSegmentFailureScope,
+        SnapshotSessionPrepareError, SuffixAdmission, TerminalRequestRace,
+        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
         SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
@@ -4820,15 +4884,6 @@ mod tests {
         dag.insert(first).unwrap();
         dag.insert(second).unwrap();
         dag.advertise_inventory(
-            body_peer,
-            &[HeaderInventoryRecord {
-                header: first_header,
-                body: Some(first_body),
-                terminal: None,
-            }],
-        )
-        .unwrap();
-        dag.advertise_inventory(
             tip_peer,
             &[HeaderInventoryRecord {
                 header: second_header,
@@ -4839,6 +4894,30 @@ mod tests {
         .unwrap();
 
         let headers = vec![first, second];
+
+        // The competing headers can arrive first through gossip/header-only
+        // inventory. A later exact response for those already validated
+        // headers must enrich the DAG even though header planning will call
+        // the repeated batch Behind.
+        assert_eq!(
+            source_independent_suffix_offer(&dag, tip_peer, base, base, headers.clone())
+                .unwrap_err(),
+            noid_node::networking::suffix_sync::SuffixSyncError::MissingBodySource
+        );
+        assert_eq!(
+            advertise_inventory_for_known_headers(
+                &mut dag,
+                body_peer,
+                &[HeaderInventoryRecord {
+                    header: first_header,
+                    body: Some(first_body),
+                    terminal: None,
+                }],
+            )
+            .unwrap(),
+            1
+        );
+
         let (terminal_peer, offer, inventories) =
             source_independent_suffix_offer(&dag, body_peer, base, base, headers.clone()).unwrap();
         assert_eq!(terminal_peer, tip_peer);
@@ -5814,6 +5893,77 @@ mod tests {
     }
 
     #[test]
+    fn repeated_known_branch_revalidates_from_the_canonical_anchor() {
+        use noid_node::networking::ChainPoint;
+
+        let canonical = ChainPoint::new(7_819, [0x19; 32]);
+        let known_selected_tip = ChainPoint::new(7_835, [0x35; 32]);
+        assert_eq!(
+            header_inventory_validation_anchor(Some(canonical), Some(known_selected_tip)),
+            Some(canonical)
+        );
+        assert_eq!(
+            header_inventory_validation_anchor(None, Some(known_selected_tip)),
+            Some(known_selected_tip)
+        );
+    }
+
+    #[test]
+    fn snapshot_parent_mismatch_discovers_from_finalized_not_local_tip() {
+        assert_eq!(snapshot_rebase_discovery_range(7_802, 7_848), (7_802, 47));
+    }
+
+    #[test]
+    fn unresolved_reorg_probe_starts_at_the_common_ancestor() {
+        use noid_chain::block_header::block_id;
+        use noid_node::networking::{
+            header_dag::{HeaderDag, ValidatedHeader},
+            ChainPoint,
+        };
+
+        let genesis = noid_chain::consensus::genesis_header();
+        let base = ChainPoint::new(0, block_id(&genesis));
+        let base_work = [0u8; 32];
+
+        let mut local_header = genesis;
+        local_header.height = 1;
+        local_header.prev_block_hash = base.hash;
+        local_header.timestamp += 1;
+        local_header.nonce = 11;
+        let local_work = noid_chain::add_work(
+            &base_work,
+            &noid_chain::block_work(&local_header.difficulty_target),
+        );
+        let local = ValidatedHeader::new_after_consensus_checks(local_header, local_work);
+
+        let mut competing_header = local_header;
+        competing_header.nonce = 12;
+        let competing_first =
+            ValidatedHeader::new_after_consensus_checks(competing_header, local_work);
+        let mut competing_tip_header = competing_header;
+        competing_tip_header.height = 2;
+        competing_tip_header.prev_block_hash = competing_first.hash;
+        competing_tip_header.timestamp += 1;
+        competing_tip_header.nonce = 13;
+        let competing_tip_work = noid_chain::add_work(
+            &local_work,
+            &noid_chain::block_work(&competing_tip_header.difficulty_target),
+        );
+        let competing_tip =
+            ValidatedHeader::new_after_consensus_checks(competing_tip_header, competing_tip_work);
+
+        let mut dag = HeaderDag::new(base, base_work, 16);
+        dag.insert(local).unwrap();
+        dag.insert(competing_first).unwrap();
+        dag.insert(competing_tip).unwrap();
+        assert_eq!(dag.best_tip(), competing_tip.point());
+        assert_eq!(
+            unresolved_selected_tip_probe_range(&dag, local.point(), 20).unwrap(),
+            (base.height, 23)
+        );
+    }
+
+    #[test]
     fn snapshot_segment_errors_separate_remote_bytes_from_local_state() {
         use noid_chain::storage::snapshot_staging::SnapshotStagingError;
 
@@ -6531,6 +6681,10 @@ async fn handle_p2p_events(
     struct PendingManifest {
         preferred_peer: libp2p::PeerId,
         providers: std::collections::HashSet<libp2p::PeerId>,
+        /// Canonical point from which this generation is permitted to replace
+        /// a local non-final branch. None means the manifest was staged as a
+        /// direct continuation of the current canonical tip.
+        rebase_base: Option<noid_node::networking::ChainPoint>,
         manifest: noid_p2p::protocol::VerifiedStateManifest,
         offer: noid_node::networking::snapshot_sync::SnapshotOffer,
         history_step: Option<VerifiedHistoryStepSnapshot>,
@@ -6823,6 +6977,7 @@ async fn handle_p2p_events(
     let mut last_exact_inventory_probe = Instant::now()
         .checked_sub(Duration::from_secs(2))
         .unwrap_or_else(Instant::now);
+    let mut last_snapshot_rebase_probe: Option<Instant> = None;
     // Payloads are authenticated one at a time and sealed to disk.  The
     // session retains only compact descriptors and a received bitset.
     let mut snapshot_staging: Option<SnapshotStagingSession> = None;
@@ -7268,8 +7423,12 @@ async fn handle_p2p_events(
             let header_manifest = manifest.clone();
             let terminal_height = manifest.tip_height;
             let rebase_base = snapshot_rebase_hint.and_then(|hint| {
-                (hint.ancestor_height < terminal_height)
-                    .then_some((hint.ancestor_height, hint.ancestor_hash))
+                (hint.ancestor_height < terminal_height).then_some(
+                    noid_node::networking::ChainPoint::new(
+                        hint.ancestor_height,
+                        hint.ancestor_hash,
+                    ),
+                )
             });
 
             // The manifest fixes one immutable State generation. Snapshot
@@ -7279,6 +7438,7 @@ async fn handle_p2p_events(
             pending_manifest = Some(PendingManifest {
                 preferred_peer: from,
                 providers: std::iter::once(from).collect(),
+                rebase_base,
                 manifest,
                 offer: snapshot_offer,
                 history_step: None,
@@ -7304,7 +7464,7 @@ async fn handle_p2p_events(
                         &store,
                         from,
                         header_manifest,
-                        rebase_base,
+                        rebase_base.map(|base| (base.height, base.hash)),
                     )
                 }));
                 let _ = completion.blocking_send(SnapshotHeaderStagingCompletion {
@@ -7327,7 +7487,7 @@ async fn handle_p2p_events(
             tracing::info!(
                 peer = %from,
                 target_height = terminal_height,
-                rebase_base_height = rebase_base.map(|(height, _)| height),
+                rebase_base_height = rebase_base.map(|base| base.height),
                 "snapshot: staging exact boundary headers"
             );
         }};
@@ -9152,10 +9312,35 @@ async fn handle_p2p_events(
                         }
                     }
                 }
+                if manifest_peers.contains(&from)
+                    && !rejected_suffix_object_peers.contains(&from)
+                {
+                    match advertise_inventory_for_known_headers(
+                        &mut header_dag,
+                        from,
+                        &records,
+                    ) {
+                        Ok(added) if added > 0 => {
+                            tracing::debug!(
+                                peer = %from,
+                                added,
+                                "exact inventory attached to already validated HeaderDAG headers"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                peer = %from,
+                                %error,
+                                "known-header exact inventory was not attached to HeaderDAG"
+                            );
+                        }
+                    }
+                }
                 // Data admission may be busy, but native-validated headers are
                 // control-plane authority and must still enter HeaderDAG. A
                 // busy data plane only defers object scheduling.
-                let data_plan_blocked = snapshot_plan_active!()
+                let mut data_plan_blocked = snapshot_plan_active!()
                     || snapshot_install_inflight.is_some()
                     || exact_suffix_apply_inflight.is_some();
                 if data_plan_blocked {
@@ -9303,15 +9488,8 @@ async fn handle_p2p_events(
                         // health, but mining pauses only after a concrete
                         // suffix/snapshot data plan exists.
                         mining_peer_quorum.observe_compatible(from);
-                        if data_plan_blocked {
-                            tracing::debug!(
-                                peer = %from,
-                                target_height = target.height,
-                                "HeaderDAG selected target; exact-object plan deferred"
-                            );
-                            continue;
-                        }
 
+                        let selected_rebase_base = (base != old_tip).then_some(base);
                         let needs_snapshot = if base == old_tip {
                             gap_requires_snapshot_sync(old_tip.height, target.height)
                         } else {
@@ -9322,6 +9500,46 @@ async fn handle_p2p_events(
                                         as usize
                                         * 2
                         };
+
+                        // A snapshot manifest can race ahead of the header
+                        // control plane after restart. If HeaderDAG later
+                        // proves that the selected chain has a different
+                        // non-final base, the old staging plan is objectively
+                        // stale. Retire only that transport generation and
+                        // keep the validated DAG/canonical database intact.
+                        let snapshot_base_mismatch = pending_manifest.as_ref().is_some_and(
+                            |pending| pending.rebase_base != selected_rebase_base,
+                        );
+                        if data_plan_blocked && snapshot_base_mismatch {
+                            snapshot_rebase_hint = needs_snapshot.then_some(SnapshotRebaseHint {
+                                ancestor_height: base.height,
+                                ancestor_hash: base.hash,
+                                competing_tip_height: target.height,
+                                competing_tip_hash: target.hash,
+                                armed_at: Instant::now(),
+                            });
+                            tracing::info!(
+                                peer = %from,
+                                old_base_height = old_tip.height,
+                                selected_base_height = base.height,
+                                target_height = target.height,
+                                needs_snapshot,
+                                "HeaderDAG superseded a snapshot staged on the wrong local branch"
+                            );
+                            retire_snapshot_plan!();
+                            data_plan_blocked = snapshot_plan_active!()
+                                || snapshot_install_inflight.is_some()
+                                || exact_suffix_apply_inflight.is_some();
+                        }
+                        if data_plan_blocked {
+                            tracing::debug!(
+                                peer = %from,
+                                target_height = target.height,
+                                "HeaderDAG selected target; exact-object plan deferred"
+                            );
+                            continue;
+                        }
+
                         if needs_snapshot {
                             snapshot_rebase_hint =
                                 (base != old_tip).then_some(SnapshotRebaseHint {
@@ -10827,6 +11045,41 @@ async fn handle_p2p_events(
                             "snapshot header prepare was misclassified as peer input: {error}"
                         ));
                     };
+                    let parent_mismatch_at_base = matches!(
+                        &error,
+                        SnapshotHeaderStagingError::ParentMismatch { height }
+                            if *height == sync.staging.base().header.height.saturating_add(1)
+                                && sync.staging.staged_len() == 0
+                    );
+                    if parent_mismatch_at_base
+                        && last_snapshot_rebase_probe.is_none_or(|last| {
+                            Instant::now().saturating_duration_since(last)
+                                >= EXACT_INVENTORY_RETRY_TTL
+                        })
+                    {
+                        let (probe_start, probe_count) = snapshot_rebase_discovery_range(
+                            header_dag.finalized().height,
+                            sync.target_height,
+                        );
+                        if try_dispatch_header_fetch(
+                            &p2p_cmd,
+                            &mut fetch_in_progress,
+                            &mut recent_header_fetches,
+                            range_from,
+                            probe_start,
+                            probe_count,
+                            Instant::now(),
+                        ) {
+                            last_snapshot_rebase_probe = Some(Instant::now());
+                            tracing::info!(
+                                peer = %range_from,
+                                probe_start,
+                                probe_count,
+                                snapshot_target = sync.target_height,
+                                "snapshot parent differs from the local tip; discovering the authenticated common ancestor"
+                            );
+                        }
+                    }
                     // A parent mismatch proves only that this source supplied
                     // the wrong exact range. It does not prove that the local
                     // base moved. Preserve the immutable plan and its staged
@@ -12381,11 +12634,23 @@ async fn handle_p2p_events(
                     >= EXACT_INVENTORY_PROBE_INTERVAL
             {
                 let target = header_dag.best_tip();
-                let (start_height, count) = unresolved_tip_probe_range(
-                    our_height,
-                    target.height,
+                let committed_tip = noid_node::networking::ChainPoint::new(our_height, our_hash);
+                let (start_height, count) = match unresolved_selected_tip_probe_range(
+                    &header_dag,
+                    committed_tip,
                     CONNECTED_TIP_PROBE_HEADERS,
-                );
+                ) {
+                    Ok(range) => range,
+                    Err(error) => {
+                        header_dag_faulted = true;
+                        tracing::error!(
+                            target_height = target.height,
+                            %error,
+                            "HeaderDAG could not locate the selected tip's common ancestor"
+                        );
+                        continue;
+                    }
+                };
                 let mut excluded = rejected_suffix_object_peers.clone();
                 let mut candidates = rotating_manifest_peers(
                     &locally_selected_peers,

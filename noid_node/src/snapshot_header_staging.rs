@@ -324,6 +324,26 @@ impl SnapshotHeaderStaging {
         Self::create_file(path, base)
     }
 
+    /// Create a candidate which replaces only the canonical suffix after an
+    /// independently selected common ancestor. The caller must already hold
+    /// HeaderDAG fork-choice authority for this exact base. Unlike `create`,
+    /// an existing canonical child is expected here; the base itself must
+    /// still be canonical and may never be below the pinned finalized point.
+    pub fn create_at_nonfinal_rebase_boundary(
+        path: &Path,
+        store: &MdbxStore,
+        base: CanonicalHeaderBoundary,
+    ) -> Result<Self> {
+        base.validate_against(store)?;
+        if base.header.height < base.finalized_height_at_pin {
+            return Err(SnapshotHeaderStagingError::CanonicalInvariant {
+                height: base.header.height,
+                reason: "snapshot rebase boundary is below finalized history".into(),
+            });
+        }
+        Self::create_file(path, base)
+    }
+
     fn create_file(path: &Path, base: CanonicalHeaderBoundary) -> Result<Self> {
         let mut file = secure_create_new(path)?;
         write_file_header(&mut file, &base)?;
@@ -1633,6 +1653,19 @@ mod tests {
         .unwrap();
         assert_eq!(exact.staged_len(), 0);
         assert_eq!(exact.next_height().unwrap(), 1);
+
+        // HeaderDAG-authorized replacement begins after the canonical common
+        // ancestor, so an existing non-final child is expected rather than a
+        // reason to reject the staging file.  The ordinary path above keeps
+        // its stricter first-missing-height invariant.
+        let rebase = SnapshotHeaderStaging::create_at_nonfinal_rebase_boundary(
+            &stage_dir.path().join("rebase"),
+            store,
+            genesis_base,
+        )
+        .unwrap();
+        assert_eq!(rebase.staged_len(), 0);
+        assert_eq!(rebase.next_height().unwrap(), 1);
     }
 
     #[test]
