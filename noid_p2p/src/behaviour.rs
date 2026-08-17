@@ -75,7 +75,7 @@ pub struct NodeBehaviour {
     /// Fixed header announcements and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Exact network-v9 profile handshake. A transport is never exposed to
+    /// Exact network-v7 profile handshake. A transport is never exposed to
     /// consensus/sync until this profile matches byte-for-byte.
     pub network_profile_sync: request_response::Behaviour<NetworkProfileCodec>,
 
@@ -308,12 +308,21 @@ impl NodeBehaviour {
         );
 
         let chain_sync = request_response::Behaviour::new(
-            [(
-                // v5 adds a canonical Busy response so header preparation
-                // never forms an unbounded queue behind State/data work.
-                StreamProtocol::try_from_owned(format!("{}/sync/headers/5", protocol_id))?,
-                ProtocolSupport::Full,
-            )],
+            [
+                (
+                    // New peers negotiate v5 and receive explicit bounded
+                    // Busy backpressure from a saturated header server.
+                    StreamProtocol::try_from_owned(format!("{}/sync/headers/5", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+                (
+                    // v2.0.1 already carries the same canonical headers and
+                    // exact retained-object inventory. Keep v4 as a fallback
+                    // so transport improvements do not split the testnet.
+                    StreamProtocol::try_from_owned(format!("{}/sync/headers/4", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+            ],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(30))
                 .with_max_concurrent_streams(8),

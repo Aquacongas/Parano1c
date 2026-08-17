@@ -30,17 +30,22 @@ Nodes combine three discovery sources:
 Successful peer addresses are persisted and reused. The peer store keeps up to
 500 peers and limits the number of remembered addresses for any one peer.
 
-The automatic topology manager maintains a four-neighbour GossipSub mesh. This
-is a connectivity floor, not a cap on the node's total peer count: inbound,
-direct, LAN and relay-backed peers may increase it further. DNS seeds provide
-the first two independent paths; as stable ordinary peers become available
-through discovery, seed connections are replaced without first dropping below
-the target. Seeds are therefore bootstrap anchors, not a permanent exclusive
-topology.
+GossipSub maintains a four-neighbour propagation mesh, while the automatic
+topology manager targets eight ordinary neighbours for exact-object diversity
+and failover. This is a connectivity floor, not a cap on the node's total peer
+count: inbound, direct, LAN and relay-backed peers may increase it further. At
+most four unselected incoming peers satisfy that floor, so each node still
+selects at least four ordinary neighbours independently. DNS seeds provide the
+first two paths; as stable ordinary peers become available, seed connections
+are replaced without first dropping below the target. Discovery uses identity
+jitter, one active lookup and exponential retry backoff. Seeds are therefore
+bootstrap anchors, not a permanent exclusive topology.
 
-DNS records point to network endpoints, not chain state. Changing software or
-resetting a node does not require changing its DNS name if the public address
-remains the same.
+Embedded seed names are resolved first through the operating system so scoped
+VPN resolvers work, while the DNS multiaddress remains available for later
+A/AAAA re-resolution. DNS records point to network endpoints, not chain state.
+Changing software or resetting a node does not require changing its DNS name
+if the public address remains the same.
 
 ## Gossip
 

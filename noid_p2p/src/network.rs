@@ -490,22 +490,28 @@ const TX_RELAY_RATE_MAX: u32 = 50;
 /// honest 20-second block and bounded transaction workload.
 const GOSSIP_ACCEPT_WINDOW: Duration = Duration::from_secs(10);
 const GOSSIP_ACCEPT_BYTES_PER_WINDOW: usize = 64 * 1024 * 1024;
-// GossipSub targets a four-peer mesh. Two diverse bootstrap/relay carriers
-// plus two ordinary neighbours are enough to form that mesh while the network
-// is still NAT-heavy. Chasing twelve outbound paths made every client probe
-// relay addresses indefinitely when only a handful of public relays existed,
-// creating a Kademlia/circuit retry storm without improving propagation.
-const AUTOMATIC_OUTBOUND_TARGET: usize = 4;
+// Maintain an eight-neighbour ordinary topology, with at least half selected
+// outbound by this node. This leaves ample socket headroom for inbound service
+// and relay upgrades. The former target of twelve amplified Kademlia/circuit
+// retries in a tiny NAT-heavy network; four was too sparse for independent
+// object sources and GUI-to-GUI growth.
+const AUTOMATIC_OUTBOUND_TARGET: usize = 8;
+// Inbound and behaviour-owned transports are useful bidirectional mesh
+// neighbours, but allowing them to satisfy the complete target lets a small
+// inbound set stop independent peer discovery. Credit at most half of the
+// target to such paths; every node therefore maintains at least four ordinary
+// neighbours selected by its own bounded discovery manager.
+const MAX_UNSELECTED_TOPOLOGY_CREDIT: usize = AUTOMATIC_OUTBOUND_TARGET / 2;
 // The shipped topology contains four individual DNS seeds. Probe all of them
 // when necessary, but leave room in the global pending table for ordinary
 // peers learned through Kademlia.
 const MAX_PENDING_BOOTSTRAP_DIALS: usize = 4;
 const MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS: usize =
     AUTOMATIC_OUTBOUND_TARGET + MAX_PENDING_BOOTSTRAP_DIALS + 1;
-// Four peers may legitimately use two relay/direct paths each. Keep additional
-// room for bootstrap overlap and DCUtR while staying well below the swarm's
-// 64 established-outbound ceiling.
-const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 16;
+// Eight peers may legitimately use two relay/direct paths each. Keep another
+// eight bounded slots for bootstrap overlap and DCUtR while staying well below
+// the swarm's 64 established-outbound ceiling.
+const MAX_AUTOMATIC_TRANSPORT_OCCUPANCY: usize = 24;
 // The swarm itself admits at most 32 pending outbound transports.
 const _: () = assert!(MAX_UNCONFIRMED_AUTOMATIC_CONNECTIONS <= 32);
 // Most GUI nodes discovered through Kademlia are not publicly dialable through
@@ -552,6 +558,7 @@ struct SyncPath {
     direct: bool,
     dialer: bool,
     identified: bool,
+    availability_capable: bool,
     profile_handshake_started: bool,
     closing: bool,
 }
@@ -847,6 +854,7 @@ impl PeerSyncPaths {
                 direct,
                 dialer,
                 identified: false,
+                availability_capable: false,
                 profile_handshake_started: false,
                 closing: false,
             },
@@ -933,6 +941,18 @@ impl PeerSyncPaths {
         if let Some(path) = self.paths.get_mut(&connection_id) {
             path.identified = true;
         }
+    }
+
+    fn mark_availability_capable(&mut self, connection_id: libp2p::swarm::ConnectionId) {
+        if let Some(path) = self.paths.get_mut(&connection_id) {
+            path.availability_capable = true;
+        }
+    }
+
+    fn supports_availability(&self, peer: PeerId) -> bool {
+        self.paths.values().any(|path| {
+            path.peer == peer && path.identified && path.availability_capable && !path.closing
+        })
     }
 
     fn mark_closing(&mut self, connection_id: libp2p::swarm::ConnectionId) {
@@ -1072,10 +1092,6 @@ struct AutomaticPeerState {
     /// transport. This is the topology count; physical dial direction is not.
     selected_identified_since: std::collections::HashMap<PeerId, Instant>,
     bootstrap_complete: bool,
-    /// Directly reachable public anchors wait for inbound clients and their
-    /// configured public peers. They must not initiate relay circuits back
-    /// into a wave of NAT wallets merely to fill one extra neighbour slot.
-    discovery_enabled: bool,
     /// At least one bounded random lookup has been started from a live seed.
     /// A full `kad.bootstrap()` walks every populated bucket and is far too
     /// expensive when many relay-only wallets join at once.
@@ -1101,7 +1117,6 @@ impl AutomaticPeerState {
             locally_selected_peers: std::collections::HashSet::new(),
             selected_identified_since: std::collections::HashMap::new(),
             bootstrap_complete: false,
-            discovery_enabled: true,
             initial_discovery_started: false,
             retry_salt: local_peer.to_bytes(),
             discovery_query: None,
@@ -1188,16 +1203,29 @@ impl AutomaticPeerState {
         self.selected_identified_since.len()
     }
 
-    /// Every identified peer is a bidirectional libp2p neighbour. An inbound
-    /// relay connection can carry headers and exact objects just as an
-    /// outbound one can, so it must satisfy the mesh target instead of making
-    /// both endpoints launch another DHT walk.
+    /// Every identified peer is a bidirectional libp2p neighbour, but an
+    /// arbitrary inbound set may satisfy at most half of the maintained
+    /// topology target. Explicit bootstrap peers are discovery roots rather
+    /// than ordinary mesh replacements and therefore do not count here.
+    /// This preserves inbound fanout while every node still selects at least
+    /// two independent ordinary neighbours of its own.
     fn topology_peer_count(&self) -> usize {
-        self.identified_connections
+        let bootstrap = self.bootstrap_peer_ids();
+        let selected = self
+            .selected_identified_since
+            .keys()
+            .filter(|peer| !bootstrap.contains(peer))
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let unselected = self
+            .identified_connections
             .values()
             .copied()
+            .filter(|peer| !bootstrap.contains(peer) && !selected.contains(peer))
             .collect::<std::collections::HashSet<_>>()
             .len()
+            .min(MAX_UNSELECTED_TOPOLOGY_CREDIT);
+        selected.len().saturating_add(unselected)
     }
 
     fn is_outbound(&self, peer: PeerId) -> bool {
@@ -1544,7 +1572,7 @@ impl AutomaticPeerState {
     }
 
     fn accelerate_discovery(&mut self) {
-        if self.discovery_enabled && !self.discovery_active() {
+        if !self.discovery_active() {
             let paced = Instant::now() + DISCOVERY_RETRY_MIN;
             if self.next_discovery_at > paced {
                 self.next_discovery_at = paced;
@@ -1628,7 +1656,7 @@ fn stop_discovery_after_mesh_formed(
 /// `libp2p-kad` starts a full bootstrap automatically whenever its routing
 /// table is small. Parano1d has its own identity-jittered, topology-bounded
 /// `GetClosestPeers` controller, so allowing both mechanisms makes one wallet
-/// launch walk up to K_VALUE peers through relays before the four-peer target
+/// launch walk up to K_VALUE peers through relays before the eight-peer target
 /// can stop it. The first `SwarmEvent::Dialing` gives the outer reactor a
 /// chance to finish the implicit query before it schedules the remaining
 /// peers. Explicit bounded lookups have a different `QueryInfo` and are left
@@ -2877,7 +2905,7 @@ pub enum NetworkCommand {
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// Fixed-size network-v9 header announcement with exact body/terminal IDs.
+    /// Fixed-size network-v7 header announcement with exact body/terminal IDs.
     HeaderAnnouncement {
         from: PeerId,
         announcement: HeaderAnnouncement,
@@ -3453,7 +3481,6 @@ async fn run_swarm(
     let mut successful_peer_cache = crate::peer_store::load(&data_dir);
     let local_peer_id = *swarm.local_peer_id();
     let mut automatic_peers = AutomaticPeerState::new(local_peer_id);
-    automatic_peers.discovery_enabled = !public_relay_enabled;
     for peer in successful_peer_cache.entries() {
         automatic_peers.add_peer_candidate(local_peer_id, peer.peer_id, peer.addrs.iter().cloned());
     }
@@ -4132,7 +4159,7 @@ async fn run_swarm(
                     tracing::warn!(
                         peer = %request.peer,
                         transport_stuck,
-                            "network-v9 profile handshake timed out"
+                            "network-v7 profile handshake timed out"
                     );
                     let _ = swarm.disconnect_peer_id(request.peer);
                 }
@@ -4398,8 +4425,8 @@ async fn run_swarm(
                     now,
                 );
                 // A lookup is a discovery operation, not a request to build a
-                // full all-to-all relay graph. Once four deliberately selected
-                // authenticated paths exist, stop its remaining Kademlia work
+                // full all-to-all relay graph. Once the bounded eight-neighbour
+                // topology exists, stop its remaining Kademlia work
                 // before it probes more relay-only wallets.
                 stop_discovery_after_mesh_formed(&mut swarm, &mut automatic_peers);
                 let under_target = automatic_peers
@@ -4938,7 +4965,7 @@ fn maintain_automatic_outbound(
 
     // `desired_bootstrap` falls to zero only after a stable ordinary
     // replacement exists. Extra bootstrap transports can therefore be closed
-    // immediately without waiting for the complete four-peer mesh target; that
+    // immediately without waiting for the complete eight-peer topology target; that
     // target is filled independently from Kademlia below.
     let protected_bootstrap = connected_bootstrap
         .iter()
@@ -4949,8 +4976,10 @@ fn maintain_automatic_outbound(
     // retained bootstrap floor and are never selected for connection pruning.
     let retained_bootstrap_floor = desired_bootstrap.max(protected_bootstrap);
     let release_seed = connected_bootstrap.len() > retained_bootstrap_floor;
-    let release_ordinary =
-        !release_seed && automatic.outbound_peer_count() > AUTOMATIC_OUTBOUND_TARGET;
+    // Protected bootstrap/relay carriers are outside the ordinary topology
+    // target. Counting them here would repeatedly prune a useful GUI/daemon
+    // neighbour each time discovery filled the ordinary mesh.
+    let release_ordinary = ordinary_release_needed(release_seed, automatic.topology_peer_count());
     if release_seed || release_ordinary {
         let mut releasable = automatic
             .managed_connections
@@ -5178,6 +5207,10 @@ fn automatic_ordinary_dial_capacity(
         .min(transport_capacity)
 }
 
+fn ordinary_release_needed(release_seed: bool, topology_peers: usize) -> bool {
+    !release_seed && topology_peers > AUTOMATIC_OUTBOUND_TARGET
+}
+
 /// Push one small exact-object availability hint across the current block
 /// mesh. Each receiver that commits the block repeats this step, so providers
 /// expand with the propagation wave instead of every wallet polling the same
@@ -5197,7 +5230,7 @@ fn announce_availability_to_mesh(
         .gossipsub
         .mesh_peers(&topic.hash())
         .copied()
-        .filter(|peer| sync_paths.is_dispatchable(*peer))
+        .filter(|peer| sync_paths.is_dispatchable(*peer) && sync_paths.supports_availability(*peer))
         .collect::<Vec<_>>();
     if peers.is_empty() {
         // A two-node network or a freshly formed connection may not have run
@@ -5207,7 +5240,9 @@ fn announce_availability_to_mesh(
             swarm
                 .connected_peers()
                 .copied()
-                .filter(|peer| sync_paths.is_dispatchable(*peer))
+                .filter(|peer| {
+                    sync_paths.is_dispatchable(*peer) && sync_paths.supports_availability(*peer)
+                })
                 .take(MAX_AVAILABILITY_FANOUT),
         );
     }
@@ -6014,7 +6049,7 @@ async fn handle_swarm_event(
                         tracing::debug!(
                             peer = %propagation_source,
                             %error,
-                            "network-v9 header announcement decode failed"
+                            "network-v7 header announcement decode failed"
                         );
                     }
                 }
@@ -6101,12 +6136,13 @@ async fn handle_swarm_event(
                 return;
             }
             // Identify is only capability discovery. The endpoint becomes a
-            // usable network-v9 peer after the explicit profile round trip
+            // usable network-v7 peer after the explicit profile round trip
             // below proves the exact genesis, caps, finality and proof bank.
             let profile_protocol = format!("{}/sync/profile/6", topics.protocol_id);
             let object_protocol = format!("{}/sync/objects/2", topics.protocol_id);
             let availability_protocol = format!("{}/sync/availability/1", topics.protocol_id);
-            let header_protocol = format!("{}/sync/headers/5", topics.protocol_id);
+            let header_protocol_v5 = format!("{}/sync/headers/5", topics.protocol_id);
+            let header_protocol_v4 = format!("{}/sync/headers/4", topics.protocol_id);
             let manifest_protocol = format!("{}/sync/manifest/7", topics.protocol_id);
             let manifest_page_protocol = format!("{}/sync/manifest-page/1", topics.protocol_id);
             let supports = |required: &str| {
@@ -6114,10 +6150,11 @@ async fn handle_swarm_event(
                     .iter()
                     .any(|protocol| protocol.as_ref() == required)
             };
+            let supports_availability = supports(&availability_protocol);
+            let supports_headers = supports(&header_protocol_v5) || supports(&header_protocol_v4);
             if !supports(&profile_protocol)
                 || !supports(&object_protocol)
-                || !supports(&availability_protocol)
-                || !supports(&header_protocol)
+                || !supports_headers
                 || !supports(&manifest_protocol)
                 || !supports(&manifest_page_protocol)
             {
@@ -6128,9 +6165,9 @@ async fn handle_swarm_event(
                     peer = %peer_id,
                     profile_protocol,
                     object_protocol,
-                    availability_protocol,
-                    header_protocol,
-                    "closing endpoint without the complete network-v9 protocol set"
+                    header_protocol_v5,
+                    header_protocol_v4,
+                    "closing endpoint without the compatible network-v7 protocol set"
                 );
                 return;
             }
@@ -6201,8 +6238,11 @@ async fn handle_swarm_event(
             relay_reservations.mark_hop_capable(peer_id, relay_hop_capable);
             automatic_peers.note_identified(connection_id, peer_id);
             sync_paths.mark_identified(connection_id);
+            if supports_availability {
+                sync_paths.mark_availability_capable(connection_id);
+            }
             // Stop an iterative lookup on the exact event that completes the
-            // four-peer mesh. Waiting for the two-second maintenance tick lets
+            // eight-peer topology. Waiting for the two-second maintenance tick lets
             // a fast relay-backed DHT open many unnecessary circuits first.
             stop_discovery_after_mesh_formed(swarm, automatic_peers);
             let profile_request_active = pending_network_profile_requests
@@ -6238,7 +6278,7 @@ async fn handle_swarm_event(
                 );
                 debug_assert!(inserted, "profile capacity checked before request");
                 sync_paths.mark_profile_handshake_started(connection_id);
-                tracing::debug!(peer = %peer_id, "network-v9 profile handshake started");
+                tracing::debug!(peer = %peer_id, "network-v7 profile handshake started");
             }
             if sync_paths.try_mark_announced(peer_id) {
                 let _ = required_event_tx
@@ -6248,7 +6288,7 @@ async fn handle_swarm_event(
                         failure_domain: peer_diversity.failure_domain(peer_id),
                     })
                     .await;
-                tracing::debug!(peer = %peer_id, "peer network-v9 profile ready");
+                tracing::debug!(peer = %peer_id, "peer network-v7 profile ready");
             }
             if automatic_peers.is_bootstrap_peer(peer_id) {
                 // Older releases recorded seeds as generic successful peers.
@@ -6263,14 +6303,16 @@ async fn handle_swarm_event(
 
             // 2. Arm one bounded random lookup now that at least one routable
             //    peer is present. It starts later on an identity-jittered
-            //    maintenance tick, unless incoming peers have already filled
-            //    the mesh. Starting a lookup immediately in every newly
-            //    launched wallet creates a quadratic relay herd.
+            //    maintenance tick. Unselected incoming peers receive bounded
+            //    topology credit, so they help the mesh without suppressing
+            //    independently selected ordinary neighbours. Starting a
+            //    lookup immediately in every newly launched wallet creates a
+            //    quadratic relay herd.
             //    Ordinary peers intentionally stay out
             //    of GossipSub's explicit set: explicit peers receive every
             //    publication outside the bounded mesh, producing O(degree)
             //    block and transaction fan-out on large networks.
-            if automatic_peers.discovery_enabled && !automatic_peers.initial_discovery_started {
+            if !automatic_peers.initial_discovery_started {
                 automatic_peers.initial_discovery_started = true;
                 tracing::debug!(
                     delay_ms = automatic_peers
@@ -6466,7 +6508,7 @@ async fn handle_swarm_event(
             }
         },
 
-        // --- Exact network-v9 profile handshake ---
+        // --- Exact network-v7 profile handshake ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
             request_response::Event::Message {
                 message:
@@ -6508,7 +6550,7 @@ async fn handle_swarm_event(
                         })
                         .await;
                 }
-                tracing::debug!(peer = %peer, profile = ?current.profile_id, "network-v9 profile verified from inbound request");
+                tracing::debug!(peer = %peer, profile = ?current.profile_id, "network-v7 profile verified from inbound request");
             }
         }
 
@@ -6535,7 +6577,7 @@ async fn handle_swarm_event(
                     peer = %peer,
                     requested_peer = %pending.peer,
                     profile = ?response.profile.profile_id,
-                    "network-v9 profile mismatch; closing peer"
+                    "network-v7 profile mismatch; closing peer"
                 );
                 let _ = swarm.disconnect_peer_id(peer);
                 return;
@@ -6551,7 +6593,7 @@ async fn handle_swarm_event(
                     })
                     .await;
             }
-            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v9 profile verified");
+            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v7 profile verified");
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
@@ -6565,7 +6607,7 @@ async fn handle_swarm_event(
                 .remove(&request_id)
                 .is_some()
             {
-                tracing::warn!(peer = %peer, err = %error, "network-v9 profile handshake failed");
+                tracing::warn!(peer = %peer, err = %error, "network-v7 profile handshake failed");
                 let _ = swarm.disconnect_peer_id(peer);
             }
         }
@@ -9088,9 +9130,12 @@ mod tests {
 
         paths.insert(connection, peer, true, true);
         paths.mark_identified(connection);
+        assert!(!paths.supports_availability(peer));
         assert!(!paths.is_dispatchable(peer));
         assert!(!paths.try_mark_announced(peer));
 
+        paths.mark_availability_capable(connection);
+        assert!(paths.supports_availability(peer));
         paths.mark_profile_verified(peer);
         assert!(paths.is_dispatchable(peer));
         assert!(paths.try_mark_announced(peer));
@@ -9585,6 +9630,19 @@ mod tests {
     }
 
     #[test]
+    fn protected_seed_paths_do_not_prune_a_full_ordinary_topology() {
+        assert!(!ordinary_release_needed(false, AUTOMATIC_OUTBOUND_TARGET));
+        assert!(ordinary_release_needed(
+            false,
+            AUTOMATIC_OUTBOUND_TARGET + 1
+        ));
+        assert!(!ordinary_release_needed(
+            true,
+            AUTOMATIC_OUTBOUND_TARGET + 1
+        ));
+    }
+
+    #[test]
     fn pending_dns_probe_does_not_impersonate_connected_bootstrap_quorum() {
         assert_eq!(
             bootstrap_probe_capacity(2, 1, 1, 8, 8),
@@ -9935,7 +9993,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_gui_neighbours_satisfy_the_mesh_without_extra_outbound_dials() {
+    fn inbound_gui_neighbours_receive_only_bounded_topology_credit() {
         let mut state = AutomaticPeerState::new(PeerId::random());
         for index in 0..AUTOMATIC_OUTBOUND_TARGET {
             let peer = PeerId::random();
@@ -9944,13 +10002,63 @@ mod tests {
             state.note_identified(connection_id, peer);
         }
 
-        assert_eq!(state.topology_peer_count(), AUTOMATIC_OUTBOUND_TARGET);
+        assert_eq!(state.topology_peer_count(), MAX_UNSELECTED_TOPOLOGY_CREDIT);
         assert_eq!(state.outbound_peer_count(), 0);
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                state.topology_peer_count(),
+                state.pending_ordinary_count(),
+                false,
+                state.automatic_dial_capacity(),
+            ),
+            AUTOMATIC_OUTBOUND_TARGET - MAX_UNSELECTED_TOPOLOGY_CREDIT
+        );
     }
 
     #[test]
-    fn automatic_target_matches_the_bounded_four_peer_gossip_mesh() {
-        assert_eq!(AUTOMATIC_OUTBOUND_TARGET, 4);
+    fn seeds_and_inbound_clients_cannot_suppress_four_ordinary_selections() {
+        let mut state = AutomaticPeerState::new(PeerId::random());
+        for index in 0..INITIAL_BOOTSTRAP_FANOUT {
+            let addr: Multiaddr = format!("/ip4/203.0.113.{}/tcp/9500", index + 1)
+                .parse()
+                .unwrap();
+            let peer = PeerId::random();
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(200 + index);
+            state.register_bootstrap(addr.clone());
+            state
+                .pending
+                .insert(connection_id, PendingAutomaticDial::Bootstrap(addr));
+            state.note_connection_established(connection_id, peer, true);
+            state.note_identified(connection_id, peer);
+        }
+        for index in 0..AUTOMATIC_OUTBOUND_TARGET {
+            let peer = PeerId::random();
+            let connection_id = libp2p::swarm::ConnectionId::new_unchecked(300 + index);
+            state.note_connection_established(connection_id, peer, false);
+            state.note_identified(connection_id, peer);
+        }
+
+        assert_eq!(state.outbound_peer_count(), INITIAL_BOOTSTRAP_FANOUT);
+        assert_eq!(
+            state.topology_peer_count(),
+            MAX_UNSELECTED_TOPOLOGY_CREDIT,
+            "bootstrap roots do not replace ordinary mesh neighbours"
+        );
+        assert_eq!(
+            automatic_ordinary_dial_capacity(
+                state.topology_peer_count(),
+                state.pending_ordinary_count(),
+                false,
+                state.automatic_dial_capacity(),
+            ),
+            AUTOMATIC_OUTBOUND_TARGET - MAX_UNSELECTED_TOPOLOGY_CREDIT
+        );
+    }
+
+    #[test]
+    fn automatic_target_keeps_eight_neighbours_with_four_selected_locally() {
+        assert_eq!(AUTOMATIC_OUTBOUND_TARGET, 8);
+        assert_eq!(MAX_UNSELECTED_TOPOLOGY_CREDIT, 4);
         assert_eq!(INITIAL_BOOTSTRAP_FANOUT, 2);
         assert!(MAX_AUTOMATIC_TRANSPORT_OCCUPANCY >= AUTOMATIC_OUTBOUND_TARGET * 2);
     }
@@ -9974,15 +10082,15 @@ mod tests {
     }
 
     #[test]
-    fn public_anchor_does_not_dial_back_into_nat_clients_for_topology() {
+    fn bounded_discovery_remains_available_after_topology_loss() {
         let mut state = AutomaticPeerState::new(PeerId::random());
-        state.discovery_enabled = false;
         state.next_discovery_at = Instant::now() + Duration::from_secs(5 * 60);
-        let scheduled = state.next_discovery_at;
+        let before = Instant::now();
 
         state.accelerate_discovery();
 
-        assert_eq!(state.next_discovery_at, scheduled);
+        assert!(state.next_discovery_at >= before + DISCOVERY_RETRY_MIN);
+        assert!(state.next_discovery_at <= Instant::now() + DISCOVERY_RETRY_MIN);
         assert!(!state.discovery_active());
     }
 

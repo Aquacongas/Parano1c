@@ -440,24 +440,16 @@ impl MiningPeerQuorum {
         );
     }
 
-    /// A natively validated view refreshes stable network health. It may also
-    /// expose a stronger branch, in which case proof construction and nonce
-    /// search pause until the immutable sync plan resolves it.
-    fn observe_compatible(&mut self, peer: libp2p::PeerId, blocks_mining: bool) {
+    /// A natively validated compatible view refreshes stable network health.
+    /// A stronger header by itself does not pause mining; the separate sync
+    /// state closes that gate only after exact data transport is admitted.
+    fn observe_compatible(&mut self, peer: libp2p::PeerId) {
         let now = Instant::now();
         let Some(failure_domain) = self.connected.get(&peer).copied() else {
             return;
         };
-        self.readiness.renew_health(
-            peer,
-            failure_domain,
-            self.expiry_ms(now),
-            true,
-            blocks_mining,
-        );
-        if blocks_mining {
-            self.frontier_confirmed.remove(&peer);
-        }
+        self.readiness
+            .renew_health(peer, failure_domain, self.expiry_ms(now), true, false);
         self.publish_at(now);
     }
 
@@ -521,14 +513,6 @@ impl MiningPeerQuorum {
         self.probe_attempts.remove(&peer);
         self.frontier_confirmed.remove(&peer);
         self.readiness.disconnect(peer);
-        self.publish();
-    }
-
-    fn invalidate_all(&mut self) {
-        self.unresolved_better_header = true;
-        self.readiness
-            .set_sync_state(self.initial_sync_complete, true);
-        self.frontier_confirmed.clear();
         self.publish();
     }
 
@@ -1106,12 +1090,19 @@ async fn embedded_seed_multiaddrs(
 ) -> anyhow::Result<Vec<libp2p::Multiaddr>> {
     let original = seed_to_multiaddr(seed, default_port)?;
     match resolve_embedded_seed_with_system_dns(seed, default_port).await {
-        Ok(addresses) => {
+        Ok(mut addresses) => {
             tracing::debug!(
                 seed,
                 addresses = addresses.len(),
                 "resolved embedded seed through system DNS"
             );
+            // Native resolution is the first path because it follows scoped
+            // VPN and platform resolver configuration. Keep the hostname as
+            // one last fallback as well: libp2p can then re-resolve a seed
+            // whose A/AAAA records change during a long-running daemon.
+            if !addresses.contains(&original) {
+                addresses.push(original);
+            }
             Ok(addresses)
         }
         Err(error) => {
@@ -4434,7 +4425,21 @@ fn source_independent_suffix_offer(
         .inventory_providers(&headers)
         .into_iter()
         .map(|peer| (peer, dag.inventory_for_provider(peer, &headers)))
-        .collect();
+        .collect::<Vec<_>>();
+    let every_body_has_a_source = headers.iter().enumerate().all(|(index, header)| {
+        inventories.iter().any(|(_, records)| {
+            records
+                .get(index)
+                .and_then(|record| record.body)
+                .is_some_and(|body| {
+                    body.claim.height == header.header.height
+                        && body.claim.block_hash == header.hash
+                })
+        })
+    });
+    if !every_body_has_a_source {
+        return Err(SuffixSyncError::MissingBodySource);
+    }
     Ok((terminal_peer, offer, inventories))
 }
 
@@ -4579,17 +4584,17 @@ fn admit_exact_suffix_offer(
 mod tests {
     use super::{
         admit_exact_suffix_offer, classify_snapshot_finalization_error,
-        classify_snapshot_session_prepare_error, competing_suffix_wins, gap_requires_snapshot_sync,
-        header_batch_exhausts_nonfinal_window, initial_sync_may_skip_peer_confirmation,
-        load_or_create_config, manifest_round_gap_is_resolved, manifest_round_retry_due,
-        mark_initial_sync_ready, merge_active_suffix_inventory, migrate_legacy_default_ports,
-        mining_quorum_probe_due, network_storage_epoch_is_current, nonfinal_header_discovery_range,
-        p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
-        persist_network_storage_epoch_marker, prepare_network_storage_epoch,
-        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        reset_install_preferences_at_root, resolve_embedded_seed_with_system_dns,
-        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
-        selected_tip_probe_range, snapshot_header_completion_base_moved,
+        classify_snapshot_session_prepare_error, competing_suffix_wins, embedded_seed_multiaddrs,
+        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
+        initial_sync_may_skip_peer_confirmation, load_or_create_config,
+        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
+        merge_active_suffix_inventory, migrate_legacy_default_ports, mining_quorum_probe_due,
+        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
+        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
+        prepare_network_storage_epoch, prune_superseded_snapshot_header_staging,
+        quarantine_exact_suffix_sources, reset_install_preferences_at_root,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
+        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
         steady_tip_probe_due, terminal_alternate_peer, terminal_transport_can_retry_same_peer,
@@ -4833,6 +4838,16 @@ mod tests {
         assert!(requests.iter().any(|request| {
             request.peer == tip_peer && request.objects.contains(&ObjectId::Terminal(terminal))
         }));
+
+        // A terminal identity alone must not start an immutable transport
+        // plan. Every selected header needs at least one exact body source;
+        // otherwise a header-only peer could pause miners indefinitely.
+        dag.remove_inventory_provider(body_peer);
+        assert_eq!(
+            source_independent_suffix_offer(&dag, tip_peer, base, base, headers.clone(),)
+                .unwrap_err(),
+            noid_node::networking::suffix_sync::SuffixSyncError::MissingBodySource
+        );
 
         let mut rejected = std::collections::HashSet::new();
         assert_eq!(
@@ -5376,9 +5391,9 @@ mod tests {
 
         // Multiple peers announce the same stronger child. Mining must pause
         // while its exact objects and recursive terminal are unverified.
-        quorum.observe_compatible(source, true);
-        quorum.observe_compatible(second_announcer, true);
-        quorum.invalidate_all();
+        quorum.observe_compatible(source);
+        quorum.observe_compatible(second_announcer);
+        quorum.set_sync_state(true, true);
         assert!(!*proof_rx.borrow());
         assert!(!*ready_rx.borrow());
 
@@ -5389,6 +5404,43 @@ mod tests {
         quorum.set_canonical_tip(51, [0x51; 32], true);
         quorum.resolve_committed_view();
         quorum.confirm_tip(source, 51, [0x51; 32]);
+        assert!(*proof_rx.borrow());
+        assert!(*ready_rx.borrow());
+    }
+
+    #[test]
+    fn header_only_candidate_does_not_pause_until_exact_plan_exists() {
+        let (proof_tx, proof_rx) = tokio::sync::watch::channel(false);
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+        let (count_tx, _count_rx) = tokio::sync::watch::channel(0usize);
+        let mut quorum = MiningPeerQuorum::new(false, proof_tx, ready_tx, count_tx);
+        let peer = libp2p::PeerId::random();
+        let height = 50;
+        let hash = [0x50; 32];
+
+        quorum.connect(peer, noid_node::networking::FailureDomain(1));
+        quorum.set_canonical_tip(height, hash, false);
+        quorum.set_sync_state(true, false);
+        quorum.confirm_tip(peer, height, hash);
+        assert!(*proof_rx.borrow());
+        assert!(*ready_rx.borrow());
+
+        // The peer supplied a native-valid stronger header, but no complete
+        // exact-object inventory yet. Keep the committed template live while
+        // bounded provider discovery continues.
+        quorum.observe_compatible(peer);
+        assert!(*proof_rx.borrow());
+        assert!(*ready_rx.borrow());
+
+        // Admitting the immutable exact plan pauses both stages immediately.
+        quorum.set_sync_state(true, true);
+        assert!(!*proof_rx.borrow());
+        assert!(!*ready_rx.borrow());
+
+        // If every exact source is later exhausted, retiring transport alone
+        // reopens the same committed parent without losing its frontier lease.
+        quorum.set_sync_state(true, false);
+        quorum.resolve_committed_view();
         assert!(*proof_rx.borrow());
         assert!(*ready_rx.borrow());
     }
@@ -5410,7 +5462,7 @@ mod tests {
         assert!(*proof_rx.borrow());
         assert!(*ready_rx.borrow());
 
-        quorum.invalidate_all();
+        quorum.set_sync_state(true, true);
         assert!(!*proof_rx.borrow());
         assert!(!*ready_rx.borrow());
 
@@ -5515,6 +5567,20 @@ mod tests {
             ) && matches!(
                 protocols.next(),
                 Some(libp2p::multiaddr::Protocol::Tcp(9500))
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn embedded_seed_keeps_dns_reresolution_after_native_lookup() {
+        let resolved = embedded_seed_multiaddrs("localhost", 9500).await.unwrap();
+        assert!(resolved
+            .iter()
+            .any(|addr| addr.to_string() == "/dns/localhost/tcp/9500"));
+        assert!(resolved.iter().any(|addr| {
+            matches!(
+                addr.iter().next(),
+                Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
             )
         }));
     }
@@ -8010,11 +8076,12 @@ async fn handle_p2p_events(
                 source_has_objects,
             }) => {
                 let announced_header = announcement.header;
-                let exact_inventory = source_has_objects.then(|| {
-                    noid_p2p::header_protocol::HeaderInventoryRecord::from_announcement(
-                        announcement,
-                    )
-                });
+                let exact_inventory = (source_has_objects && manifest_peers.contains(&from))
+                    .then(|| {
+                        noid_p2p::header_protocol::HeaderInventoryRecord::from_announcement(
+                            announcement,
+                        )
+                    });
                 let height = announced_header.height;
                 let announcement_data_blocked = snapshot_plan_active!()
                     || exact_suffix_apply_inflight.is_some()
@@ -8193,11 +8260,13 @@ async fn handle_p2p_events(
                         continue;
                     }
 
-                    // Only a fully native-validated child may become a sync
-                    // target. Raw announcement heights never affect readiness
-                    // or stale-tip recovery.
-                    mining_peer_quorum.observe_compatible(from, true);
-                    mining_peer_quorum.invalidate_all();
+                    // A native-valid header is control-plane authority for
+                    // fork choice, but it is not yet proof that the exact
+                    // body and recursive terminal remain obtainable. Keep
+                    // mining on the committed view until an immutable exact
+                    // data plan has actually been admitted. This prevents a
+                    // header-only source from pinning miners in sync forever.
+                    mining_peer_quorum.observe_compatible(from);
                     record_authenticated_height!(height, from);
 
                     let cumulative_work = noid_chain::add_work(
@@ -8220,7 +8289,7 @@ async fn handle_p2p_events(
                     }
 
                     if header_dag.best_tip() != validated.point() {
-                        mining_peer_quorum.observe_compatible(from, false);
+                        mining_peer_quorum.observe_compatible(from);
                         tracing::debug!(
                             peer = %from,
                             height,
@@ -8284,6 +8353,10 @@ async fn handle_p2p_events(
                                                 SuffixAdmission::KeptStrongerActive => "kept-stronger",
                                             },
                                             "exact direct-child suffix admitted"
+                                        );
+                                        mining_peer_quorum.set_sync_state(
+                                            *initial_sync_ready.borrow(),
+                                            true,
                                         );
                                         if let Some(sync) = active_suffix_sync.as_mut() {
                                             dispatch_exact_suffix_requests(sync, &p2p_cmd);
@@ -9128,7 +9201,17 @@ async fn handle_p2p_events(
                             );
                             continue;
                         }
-                        if rejected_suffix_object_peers.contains(&from) {
+                        if !manifest_peers.contains(&from) {
+                            // A disconnect event may overtake a previously
+                            // decoded data-lane response. Its headers remain
+                            // useful, but a closed session is not a current
+                            // exact-object source.
+                            tracing::debug!(
+                                peer = %from,
+                                target_height = target.height,
+                                "retaining late headers without disconnected object inventory"
+                            );
+                        } else if rejected_suffix_object_peers.contains(&from) {
                             tracing::debug!(
                                 peer = %from,
                                 target_height = target.height,
@@ -9150,7 +9233,7 @@ async fn handle_p2p_events(
                         // HeaderDAG, not the peer and not the object inventory,
                         // decides whether this exact target is authoritative.
                         if header_dag.best_tip() != target {
-                            mining_peer_quorum.observe_compatible(from, false);
+                            mining_peer_quorum.observe_compatible(from);
                             tracing::debug!(
                                 peer = %from,
                                 target_height = target.height,
@@ -9184,8 +9267,11 @@ async fn handle_p2p_events(
                             .expect("HeaderDAG selected a non-empty candidate suffix")
                             .point();
 
-                        mining_peer_quorum.observe_compatible(from, true);
-                        mining_peer_quorum.invalidate_all();
+                        // Header authority and object availability are kept
+                        // separate. A valid stronger header renews peer
+                        // health, but mining pauses only after a concrete
+                        // suffix/snapshot data plan exists.
+                        mining_peer_quorum.observe_compatible(from);
                         if data_plan_blocked {
                             tracing::debug!(
                                 peer = %from,
@@ -9286,6 +9372,10 @@ async fn handle_p2p_events(
                                                 SuffixAdmission::KeptStrongerActive => "kept-stronger",
                                             },
                                             "HeaderDAG-selected exact suffix plan admitted"
+                                        );
+                                        mining_peer_quorum.set_sync_state(
+                                            *initial_sync_ready.borrow(),
+                                            true,
                                         );
                                         if let Some(sync) = active_suffix_sync
                                             .as_mut()
@@ -11989,11 +12079,6 @@ async fn handle_p2p_events(
             let unresolved_canonical_work = active_suffix_sync.is_some()
                 || exact_suffix_apply_inflight.is_some()
                 || header_dag_faulted
-                || header_dag_has_unresolved_better_tip(
-                    &header_dag,
-                    noid_node::networking::ChainPoint::new(our_height, our_hash),
-                    our_work,
-                )
                 || pending_manifest.is_some()
                 || pending_snapshot_header_sync.is_some()
                 || snapshot_header_staging_inflight.is_some()
@@ -12345,6 +12430,13 @@ async fn handle_p2p_events(
                     target_hash = %hex::encode(retired_target.hash),
                     "exact suffix transport exhausted; retaining HeaderDAG and rematerializing its selected tip"
                 );
+
+                // The selected header remains in the DAG and provider probes
+                // continue, but no exact transport is currently viable. Mine
+                // on the last committed valid parent until a new immutable
+                // object plan can be materialized; a header alone must not be
+                // a permanent remote pause switch.
+                mining_peer_quorum.resolve_committed_view();
 
                 let (start_height, count) = selected_tip_probe_range(
                     our_height,

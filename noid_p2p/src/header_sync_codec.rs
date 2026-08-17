@@ -20,11 +20,14 @@ use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::{request_response, swarm::StreamProtocol};
 
 const REQUEST_MAGIC: [u8; 4] = *b"NHQ5";
+const LEGACY_REQUEST_MAGIC: [u8; 4] = *b"NHQ4";
 const RESPONSE_MAGIC: [u8; 4] = *b"NHB5";
+const LEGACY_RESPONSE_MAGIC: [u8; 4] = *b"NHB4";
 const REQUEST_BYTES: usize = 4 + 8 + 2 + 2;
 // magic + count + flags + status + retry + reserved + compressed length +
 // snapshot height + snapshot hash
 const RESPONSE_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 2 + 2 + 4 + 8 + 32;
+const LEGACY_RESPONSE_HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 4 + 8 + 32;
 const RESPONSE_HAS_SNAPSHOT_BOUNDARY: u8 = 1;
 const HEADER_COMPRESSION_LEVEL: i32 = 1;
 const HEADER_ZSTD_WINDOW_LOG_MAX: u32 = 21;
@@ -53,7 +56,7 @@ impl request_response::Codec for HeaderSyncCodec {
 
     async fn read_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Request>
     where
@@ -61,7 +64,12 @@ impl request_response::Codec for HeaderSyncCodec {
     {
         let mut encoded = [0u8; REQUEST_BYTES];
         io.read_exact(&mut encoded).await?;
-        if encoded[..4] != REQUEST_MAGIC {
+        let expected_magic = if is_legacy_protocol(protocol) {
+            LEGACY_REQUEST_MAGIC
+        } else {
+            REQUEST_MAGIC
+        };
+        if encoded[..4] != expected_magic {
             return Err(invalid_data("invalid header-sync request magic/version"));
         }
         if encoded[14] > 1 || encoded[15] != 0 {
@@ -81,42 +89,68 @@ impl request_response::Codec for HeaderSyncCodec {
 
     async fn read_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
-        let mut header = [0u8; RESPONSE_HEADER_BYTES];
-        io.read_exact(&mut header).await?;
-        if header[..4] != RESPONSE_MAGIC {
-            return Err(invalid_data("invalid header-sync response magic/version"));
-        }
-        if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[10..12] != [0, 0] {
-            return Err(invalid_data(
-                "invalid header-sync response flags/reserved bytes",
-            ));
-        }
-        let count = u16::from_le_bytes(header[4..6].try_into().expect("fixed count"));
+        let (status, count, flags, compressed_len, snapshot_height, snapshot_hash) =
+            if is_legacy_protocol(protocol) {
+                let mut header = [0u8; LEGACY_RESPONSE_HEADER_BYTES];
+                io.read_exact(&mut header).await?;
+                if header[..4] != LEGACY_RESPONSE_MAGIC {
+                    return Err(invalid_data("invalid header-sync response magic/version"));
+                }
+                if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[7] != 0 {
+                    return Err(invalid_data(
+                        "invalid header-sync response flags/reserved byte",
+                    ));
+                }
+                (
+                    DataResponseStatus::Ready,
+                    u16::from_le_bytes(header[4..6].try_into().expect("fixed count")),
+                    header[6],
+                    u32::from_le_bytes(header[8..12].try_into().expect("fixed compressed length"))
+                        as usize,
+                    u64::from_le_bytes(header[12..20].try_into().expect("fixed snapshot height")),
+                    header[20..52].try_into().expect("fixed snapshot hash"),
+                )
+            } else {
+                let mut header = [0u8; RESPONSE_HEADER_BYTES];
+                io.read_exact(&mut header).await?;
+                if header[..4] != RESPONSE_MAGIC {
+                    return Err(invalid_data("invalid header-sync response magic/version"));
+                }
+                if header[6] & !RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 || header[10..12] != [0, 0] {
+                    return Err(invalid_data(
+                        "invalid header-sync response flags/reserved bytes",
+                    ));
+                }
+                let retry_after_ms =
+                    u16::from_le_bytes(header[8..10].try_into().expect("fixed retry"));
+                let status = match header[7] {
+                    0 if retry_after_ms == 0 => DataResponseStatus::Ready,
+                    1 => DataResponseStatus::Busy { retry_after_ms },
+                    _ => return Err(invalid_data("invalid header-sync response status")),
+                };
+                if !status.is_canonical() {
+                    return Err(invalid_data("non-canonical header-sync response status"));
+                }
+                (
+                    status,
+                    u16::from_le_bytes(header[4..6].try_into().expect("fixed count")),
+                    header[6],
+                    u32::from_le_bytes(header[12..16].try_into().expect("fixed compressed length"))
+                        as usize,
+                    u64::from_le_bytes(header[16..24].try_into().expect("fixed snapshot height")),
+                    header[24..56].try_into().expect("fixed snapshot hash"),
+                )
+            };
         validate_count(count)?;
-        let retry_after_ms = u16::from_le_bytes(header[8..10].try_into().expect("fixed retry"));
-        let status = match header[7] {
-            0 if retry_after_ms == 0 => DataResponseStatus::Ready,
-            1 => DataResponseStatus::Busy { retry_after_ms },
-            _ => return Err(invalid_data("invalid header-sync response status")),
-        };
-        if !status.is_canonical() {
-            return Err(invalid_data("non-canonical header-sync response status"));
-        }
-        let compressed_len =
-            u32::from_le_bytes(header[12..16].try_into().expect("fixed compressed length"))
-                as usize;
-        let snapshot_height =
-            u64::from_le_bytes(header[16..24].try_into().expect("fixed snapshot height"));
-        let snapshot_hash: [u8; 32] = header[24..56].try_into().expect("fixed snapshot hash");
         if matches!(status, DataResponseStatus::Busy { .. }) {
             if count != 0
-                || header[6] != 0
+                || flags != 0
                 || compressed_len != 0
                 || snapshot_height != 0
                 || snapshot_hash != [0; 32]
@@ -130,7 +164,7 @@ impl request_response::Codec for HeaderSyncCodec {
                 snapshot_boundary: None,
             });
         }
-        let snapshot_boundary = if header[6] & RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 {
+        let snapshot_boundary = if flags & RESPONSE_HAS_SNAPSHOT_BOUNDARY != 0 {
             if snapshot_height == 0 || snapshot_hash == [0; 32] {
                 return Err(invalid_data("invalid advertised snapshot boundary"));
             }
@@ -180,7 +214,7 @@ impl request_response::Codec for HeaderSyncCodec {
 
     async fn write_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         request: Self::Request,
     ) -> io::Result<()>
@@ -189,7 +223,11 @@ impl request_response::Codec for HeaderSyncCodec {
     {
         validate_count(request.count)?;
         let mut encoded = [0u8; REQUEST_BYTES];
-        encoded[..4].copy_from_slice(&REQUEST_MAGIC);
+        encoded[..4].copy_from_slice(if is_legacy_protocol(protocol) {
+            &LEGACY_REQUEST_MAGIC
+        } else {
+            &REQUEST_MAGIC
+        });
         encoded[4..12].copy_from_slice(&request.start_height.to_le_bytes());
         encoded[12..14].copy_from_slice(&request.count.to_le_bytes());
         encoded[14] = request.include_inventory as u8;
@@ -198,7 +236,7 @@ impl request_response::Codec for HeaderSyncCodec {
 
     async fn write_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         response: Self::Response,
     ) -> io::Result<()>
@@ -213,10 +251,12 @@ impl request_response::Codec for HeaderSyncCodec {
         if !status.is_canonical() {
             return Err(invalid_data("non-canonical header-sync response status"));
         }
-        if matches!(status, DataResponseStatus::Busy { .. }) {
-            if !records.is_empty() || snapshot_boundary.is_some() {
-                return Err(invalid_data("busy header-sync response carries data"));
-            }
+        if matches!(status, DataResponseStatus::Busy { .. })
+            && (!records.is_empty() || snapshot_boundary.is_some())
+        {
+            return Err(invalid_data("busy header-sync response carries data"));
+        }
+        if matches!(status, DataResponseStatus::Busy { .. }) && !is_legacy_protocol(protocol) {
             let mut response_header = [0u8; RESPONSE_HEADER_BYTES];
             response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
             response_header[7] = 1;
@@ -229,6 +269,19 @@ impl request_response::Codec for HeaderSyncCodec {
             io.write_all(&response_header).await?;
             return Ok(());
         }
+        // Header v4 has no explicit Busy representation. An empty canonical
+        // response preserves bounded server work and makes a v2.0.1 caller
+        // retry normally without treating the peer as corrupt.
+        let records = if matches!(status, DataResponseStatus::Busy { .. }) {
+            Vec::new()
+        } else {
+            records
+        };
+        let snapshot_boundary = if matches!(status, DataResponseStatus::Busy { .. }) {
+            None
+        } else {
+            snapshot_boundary
+        };
         let count = u16::try_from(records.len())
             .map_err(|_| invalid_data("header batch count does not fit u16"))?;
         validate_count(count)?;
@@ -254,21 +307,44 @@ impl request_response::Codec for HeaderSyncCodec {
         let compressed_len = u32::try_from(compressed.len())
             .map_err(|_| io::Error::other("compressed header batch length does not fit u32"))?;
 
-        let mut response_header = [0u8; RESPONSE_HEADER_BYTES];
-        response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
-        response_header[4..6].copy_from_slice(&count.to_le_bytes());
-        response_header[12..16].copy_from_slice(&compressed_len.to_le_bytes());
-        if let Some(boundary) = snapshot_boundary {
-            if boundary.height == 0 || boundary.hash == [0; 32] {
-                return Err(invalid_data("invalid outgoing snapshot boundary"));
+        if is_legacy_protocol(protocol) {
+            let mut response_header = [0u8; LEGACY_RESPONSE_HEADER_BYTES];
+            response_header[..4].copy_from_slice(&LEGACY_RESPONSE_MAGIC);
+            response_header[4..6].copy_from_slice(&count.to_le_bytes());
+            response_header[8..12].copy_from_slice(&compressed_len.to_le_bytes());
+            if let Some(boundary) = snapshot_boundary {
+                validate_outgoing_boundary(boundary)?;
+                response_header[6] = RESPONSE_HAS_SNAPSHOT_BOUNDARY;
+                response_header[12..20].copy_from_slice(&boundary.height.to_le_bytes());
+                response_header[20..52].copy_from_slice(&boundary.hash);
             }
-            response_header[6] = RESPONSE_HAS_SNAPSHOT_BOUNDARY;
-            response_header[16..24].copy_from_slice(&boundary.height.to_le_bytes());
-            response_header[24..56].copy_from_slice(&boundary.hash);
+            io.write_all(&response_header).await?;
+        } else {
+            let mut response_header = [0u8; RESPONSE_HEADER_BYTES];
+            response_header[..4].copy_from_slice(&RESPONSE_MAGIC);
+            response_header[4..6].copy_from_slice(&count.to_le_bytes());
+            response_header[12..16].copy_from_slice(&compressed_len.to_le_bytes());
+            if let Some(boundary) = snapshot_boundary {
+                validate_outgoing_boundary(boundary)?;
+                response_header[6] = RESPONSE_HAS_SNAPSHOT_BOUNDARY;
+                response_header[16..24].copy_from_slice(&boundary.height.to_le_bytes());
+                response_header[24..56].copy_from_slice(&boundary.hash);
+            }
+            io.write_all(&response_header).await?;
         }
-        io.write_all(&response_header).await?;
         io.write_all(&compressed).await
     }
+}
+
+fn is_legacy_protocol(protocol: &StreamProtocol) -> bool {
+    protocol.as_ref().ends_with("/sync/headers/4")
+}
+
+fn validate_outgoing_boundary(boundary: crate::object_protocol::ChainPoint) -> io::Result<()> {
+    if boundary.height == 0 || boundary.hash == [0; 32] {
+        return Err(invalid_data("invalid outgoing snapshot boundary"));
+    }
+    Ok(())
 }
 
 fn validate_count(count: u16) -> io::Result<()> {
@@ -354,6 +430,10 @@ mod tests {
 
     fn protocol() -> StreamProtocol {
         StreamProtocol::new("/noid/test/sync/headers/5")
+    }
+
+    fn legacy_protocol() -> StreamProtocol {
+        StreamProtocol::new("/noid/test/sync/headers/4")
     }
 
     fn response_header(count: u16, compressed_len: usize) -> Vec<u8> {
@@ -460,6 +540,56 @@ mod tests {
         assert_eq!(decoded.records[0], fixture_record(1, 0x11));
         assert_eq!(decoded.records[1], fixture_record(2, 0x22));
         assert_eq!(decoded.snapshot_boundary, Some(snapshot_boundary));
+    }
+
+    #[tokio::test]
+    async fn legacy_v4_round_trip_is_byte_compatible_with_v2_0_1() {
+        let snapshot_boundary = crate::object_protocol::ChainPoint::new(42, [0xA5; 32]);
+        let response = GetHeadersResponse {
+            status: DataResponseStatus::Ready,
+            records: vec![fixture_record(1, 0x11), fixture_record(2, 0x22)],
+            snapshot_boundary: Some(snapshot_boundary),
+        };
+        let mut wire = Cursor::new(Vec::new());
+        HeaderSyncCodec
+            .write_response(&legacy_protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        assert_eq!(&wire.get_ref()[..4], &LEGACY_RESPONSE_MAGIC);
+        let compressed_len = u32::from_le_bytes(wire.get_ref()[8..12].try_into().unwrap());
+        assert_eq!(
+            wire.get_ref().len(),
+            LEGACY_RESPONSE_HEADER_BYTES + compressed_len as usize
+        );
+        wire.set_position(0);
+        let decoded = HeaderSyncCodec
+            .read_response(&legacy_protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.status, DataResponseStatus::Ready);
+        assert_eq!(decoded.records[0], fixture_record(1, 0x11));
+        assert_eq!(decoded.records[1], fixture_record(2, 0x22));
+        assert_eq!(decoded.snapshot_boundary, Some(snapshot_boundary));
+
+        let request = GetHeadersRequest {
+            start_height: 7,
+            count: 9,
+            include_inventory: true,
+        };
+        let mut request_wire = Cursor::new(Vec::new());
+        HeaderSyncCodec
+            .write_request(&legacy_protocol(), &mut request_wire, request)
+            .await
+            .unwrap();
+        assert_eq!(&request_wire.get_ref()[..4], &LEGACY_REQUEST_MAGIC);
+        request_wire.set_position(0);
+        let decoded = HeaderSyncCodec
+            .read_request(&legacy_protocol(), &mut request_wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.start_height, 7);
+        assert_eq!(decoded.count, 9);
+        assert!(decoded.include_inventory);
     }
 
     #[tokio::test]
@@ -582,6 +712,31 @@ mod tests {
                 retry_after_ms: 700
             }
         );
+        assert!(decoded.records.is_empty());
+        assert!(decoded.snapshot_boundary.is_none());
+    }
+
+    #[tokio::test]
+    async fn busy_response_degrades_to_empty_ready_for_legacy_v4() {
+        let response = GetHeadersResponse {
+            status: DataResponseStatus::Busy {
+                retry_after_ms: 700,
+            },
+            records: Vec::new(),
+            snapshot_boundary: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        HeaderSyncCodec
+            .write_response(&legacy_protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        assert_eq!(&wire.get_ref()[..4], &LEGACY_RESPONSE_MAGIC);
+        wire.set_position(0);
+        let decoded = HeaderSyncCodec
+            .read_response(&legacy_protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.status, DataResponseStatus::Ready);
         assert!(decoded.records.is_empty());
         assert!(decoded.snapshot_boundary.is_none());
     }

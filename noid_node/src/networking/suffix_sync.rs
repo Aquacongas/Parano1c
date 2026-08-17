@@ -226,6 +226,8 @@ pub enum SuffixSyncError {
     InventoryHeaderMismatch,
     #[error("the selected suffix tip has no exact terminal identity")]
     MissingTipTerminal,
+    #[error("the selected suffix has no exact body source for every header")]
+    MissingBodySource,
     #[error("an exact object claim differs from the immutable plan")]
     ObjectClaimMismatch,
     #[error("a reorg offer has no old canonical tip")]

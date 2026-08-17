@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (C) 2026 Paranoid Zero.
 
-//! Exact network-v9 profile advertised before a connection becomes usable.
+//! Exact network-v7 profile advertised before a connection becomes usable.
 
 use std::io;
 
@@ -18,14 +18,14 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 
 use crate::header_sync_codec::MAX_HEADERS_PER_BATCH;
 
-const PROFILE_ID_DOMAIN: &[u8] = b"NOID/P2P/NETWORK-PROFILE/V9";
+const PROFILE_ID_DOMAIN: &[u8] = b"NOID/P2P/NETWORK-PROFILE/V7";
 const REQUEST_MAGIC: [u8; 4] = *b"NPQ6";
 const RESPONSE_MAGIC: [u8; 4] = *b"NPS6";
 const REQUEST_BYTES: usize = 4 + 32;
 const PROFILE_BYTES: usize = 2 + 32 + 32 + 4 + 4 + 4 + 2 + 2 + 1 + 1;
 const RESPONSE_BYTES: usize = 4 + PROFILE_BYTES + 32;
 
-pub const NETWORK_WIRE_VERSION: u16 = 9;
+pub const NETWORK_WIRE_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkProfile {
