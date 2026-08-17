@@ -673,6 +673,15 @@ fn manifest_round_gap_is_resolved(local_height: u64, highest_announced: u64) -> 
     local_height >= highest_announced
 }
 
+fn stale_gap_recovery_is_due(
+    stale_secs: u64,
+    local_height: u64,
+    highest_announced: u64,
+    canonical_transition_active: bool,
+) -> bool {
+    stale_secs >= 30 && highest_announced > local_height && !canonical_transition_active
+}
+
 fn terminal_transport_can_retry_same_peer(kind: noid_p2p::RequestFailureKind) -> bool {
     matches!(
         kind,
@@ -4582,8 +4591,8 @@ mod tests {
         resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
         selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
-        snapshot_segment_failure_scope, source_independent_suffix_offer, steady_tip_probe_due,
-        terminal_alternate_peer, terminal_transport_can_retry_same_peer,
+        snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
+        steady_tip_probe_due, terminal_alternate_peer, terminal_transport_can_retry_same_peer,
         validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
         validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
         SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
@@ -6151,6 +6160,14 @@ mod tests {
         assert!(!manifest_round_gap_is_resolved(99, 100));
         assert!(manifest_round_gap_is_resolved(100, 100));
         assert!(manifest_round_gap_is_resolved(101, 100));
+    }
+
+    #[test]
+    fn stale_gap_recovery_never_duplicates_an_active_canonical_transition() {
+        assert!(!stale_gap_recovery_is_due(29, 99, 100, false));
+        assert!(stale_gap_recovery_is_due(30, 99, 100, false));
+        assert!(!stale_gap_recovery_is_due(30, 99, 100, true));
+        assert!(!stale_gap_recovery_is_due(30, 100, 100, false));
     }
 
     #[test]
@@ -12755,9 +12772,18 @@ async fn handle_p2p_events(
                     let ctx = chain.read().await;
                     ctx.tip_height()
                 };
-                if highest_announced > our_height {
+                let canonical_transition_active = active_suffix_sync.is_some()
+                    || exact_suffix_apply_inflight.is_some()
+                    || snapshot_plan_active!();
+                if stale_gap_recovery_is_due(
+                    stale_secs,
+                    our_height,
+                    highest_announced,
+                    canonical_transition_active,
+                ) {
                     if let Some(peer) = last_announcement_peer {
                         let gap = highest_announced - our_height;
+                        let mut recovery_dispatched = false;
                         if gap_requires_snapshot_sync(our_height, highest_announced) {
                             if pending_manifest.is_none()
                                 && pending_snapshot_header_sync.is_none()
@@ -12770,6 +12796,7 @@ async fn handle_p2p_events(
                                     .is_none_or(|sync| sync.all_segments_verified())
                             {
                                 if try_request_manifest!(peer, our_height, [0; 32]) {
+                                    recovery_dispatched = true;
                                     manifest_force_snapshot_peers.insert(peer);
                                     tracing::info!(
                                         our_height,
@@ -12784,7 +12811,7 @@ async fn handle_p2p_events(
                             let count = (gap + 1)
                                 .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
                                 as u16;
-                            try_dispatch_header_fetch(
+                            recovery_dispatched = try_dispatch_header_fetch(
                                 &p2p_cmd,
                                 &mut fetch_in_progress,
                                 &mut recent_header_fetches,
@@ -12793,15 +12820,19 @@ async fn handle_p2p_events(
                                 count,
                                 Instant::now(),
                             );
-                            tracing::info!(
-                                our_height,
-                                highest_announced,
-                                stale_secs,
-                                peer = %peer,
-                                "stale recent gap — re-requesting authenticated headers"
-                            );
+                            if recovery_dispatched {
+                                tracing::info!(
+                                    our_height,
+                                    highest_announced,
+                                    stale_secs,
+                                    peer = %peer,
+                                    "stale recent gap — re-requesting authenticated headers"
+                                );
+                            }
                         }
-                        last_tip_advance = Instant::now();
+                        if recovery_dispatched {
+                            last_tip_advance = Instant::now();
+                        }
                     }
                 }
             }
