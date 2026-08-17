@@ -3651,6 +3651,14 @@ struct AppliedVerifiedSnapshot {
 
 #[derive(Debug)]
 enum SnapshotInstallError {
+    /// The canonical chain advanced to or beyond this exact snapshot while
+    /// its already-verified State was waiting for the sole chain writer.
+    /// This is a successful competing sync path, not corruption.
+    Superseded {
+        snapshot_height: u64,
+        local_height: u64,
+        local_hash: [u8; 32],
+    },
     BeforeCommit(String),
     AfterCommit {
         applied: AppliedVerifiedSnapshot,
@@ -3659,9 +3667,29 @@ enum SnapshotInstallError {
     },
 }
 
+fn superseded_snapshot_install(
+    snapshot_height: u64,
+    local_height: u64,
+    local_hash: [u8; 32],
+) -> Option<SnapshotInstallError> {
+    (snapshot_height <= local_height).then_some(SnapshotInstallError::Superseded {
+        snapshot_height,
+        local_height,
+        local_hash,
+    })
+}
+
 impl std::fmt::Display for SnapshotInstallError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Superseded {
+                snapshot_height,
+                local_height,
+                ..
+            } => write!(
+                formatter,
+                "snapshot boundary {snapshot_height} was superseded by canonical height {local_height}"
+            ),
             Self::BeforeCommit(error) | Self::AfterCommit { error, .. } => {
                 formatter.write_str(error)
             }
@@ -4684,14 +4712,14 @@ mod tests {
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
-        terminal_alternate_peer, terminal_transport_can_retry_same_peer,
-        unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
-        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
-        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotSegmentFailureScope,
-        SnapshotSessionPrepareError, SuffixAdmission, TerminalRequestRace,
-        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        superseded_snapshot_install, terminal_alternate_peer,
+        terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
+        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
+        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
+        MiningPeerQuorum, NodeConfig, SnapshotFinalizationOutcome, SnapshotHeaderBoundary,
+        SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
+        SnapshotSegmentFailureScope, SnapshotSessionPrepareError, SuffixAdmission,
+        TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
         SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
@@ -4705,6 +4733,23 @@ mod tests {
             manifest_digest: [3; 32],
             format_version: noid_p2p::protocol::SNAPSHOT_MANIFEST_FORMAT_VERSION,
         }
+    }
+
+    #[test]
+    fn canonical_suffix_progress_supersedes_an_older_snapshot_install() {
+        let local_hash = [9; 32];
+        let Some(super::SnapshotInstallError::Superseded {
+            snapshot_height,
+            local_height,
+            local_hash: observed_hash,
+        }) = superseded_snapshot_install(54, 73, local_hash)
+        else {
+            panic!("older snapshot was not classified as superseded");
+        };
+        assert_eq!(snapshot_height, 54);
+        assert_eq!(local_height, 73);
+        assert_eq!(observed_hash, local_hash);
+        assert!(superseded_snapshot_install(74, 73, local_hash).is_none());
     }
 
     #[test]
@@ -11881,6 +11926,20 @@ async fn handle_p2p_events(
                         request_exact_tip_confirmation!(completed.key.observer_peer, height);
                     }
                 }
+                Err(SnapshotInstallError::Superseded {
+                    snapshot_height,
+                    local_height,
+                    local_hash,
+                }) => {
+                    snapshot_rebase_hint = None;
+                    tracing::info!(
+                        snapshot_height,
+                        local_height,
+                        local_hash = %hex::encode(local_hash),
+                        "verified snapshot install became unnecessary after exact suffix progress"
+                    );
+                    retire_snapshot_plan!();
+                }
                 Err(SnapshotInstallError::BeforeCommit(error)) => {
                     tracing::error!(
                         observer_peer = %completed.key.observer_peer,
@@ -13443,6 +13502,21 @@ async fn apply_verified_snapshot_boundary(
         // the verified recursive boundary and the finalized State staging.
         let inbound_memory_permit = inbound_memory_permit;
         let mut ctx = install_chain.blocking_write();
+        if let Some(superseded) =
+            superseded_snapshot_install(snapshot_height, ctx.tip_height(), ctx.tip_hash())
+        {
+            drop(ctx);
+            drop(staging);
+            drop(boundary);
+            drop(inbound_memory_permit);
+            if let Err(error) = headers.discard() {
+                tracing::warn!(
+                    err = %error,
+                    "superseded snapshot header staging cleanup deferred"
+                );
+            }
+            return Err(superseded);
+        }
         let state_install_started = Instant::now();
         if let Err(error) = ctx.apply_staged_state_snapshot(
             &staging,
@@ -13452,7 +13526,9 @@ async fn apply_verified_snapshot_boundary(
         ) {
             drop(ctx);
             let _ = headers.discard();
-            return Err(format!("apply authenticated state snapshot: {error:?}"));
+            return Err(SnapshotInstallError::BeforeCommit(format!(
+                "apply authenticated state snapshot: {error:?}"
+            )));
         }
         let state_install_elapsed = state_install_started.elapsed();
         let view = ChainView::from_mdbx(&ctx);
@@ -13464,17 +13540,12 @@ async fn apply_verified_snapshot_boundary(
         if let Err(error) = headers.discard() {
             tracing::warn!(err = %error, "committed snapshot header staging cleanup deferred");
         }
-        Ok::<_, String>((height, view, state_install_elapsed))
+        Ok::<_, SnapshotInstallError>((height, view, state_install_elapsed))
     })
     .await
     .map_err(|error| {
         SnapshotInstallError::BeforeCommit(format!("snapshot install worker panicked: {error}"))
-    })?
-    .map_err(|error| {
-        SnapshotInstallError::BeforeCommit(format!(
-            "failed to apply verified state snapshot: {error}"
-        ))
-    })?;
+    })??;
 
     let (applied_height, view, state_install_elapsed) = result;
     let applied = AppliedVerifiedSnapshot {
