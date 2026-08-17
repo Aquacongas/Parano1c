@@ -271,6 +271,30 @@ fn selected_tip_probe_range(local_height: u64, selected_height: u64, cap: u16) -
     (start_height.max(local_height), count)
 }
 
+/// Ordinary recent/direct recovery stays deliberately smaller than the 4,096
+/// record compressed wire batch used by snapshot and long-range header sync.
+const DIRECT_SYNC_HEADER_REQUEST_CAP: u64 = 512;
+
+/// Re-query every object-bearing header between the committed and selected
+/// tips while also leaving room to discover descendants that gossip may have
+/// missed.  A tail-only request cannot recover an unavailable body near the
+/// base and can keep the selected tip frozen just below the snapshot-routing
+/// threshold.
+fn unresolved_tip_probe_range(
+    local_height: u64,
+    selected_height: u64,
+    forward_headers: u16,
+) -> (u64, u16) {
+    let selected_span = selected_height
+        .saturating_sub(local_height)
+        .saturating_add(1);
+    let count = selected_span
+        .saturating_add(u64::from(forward_headers))
+        .min(DIRECT_SYNC_HEADER_REQUEST_CAP)
+        .max(1) as u16;
+    (local_height, count)
+}
+
 fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     let already_ready = *sender.borrow();
     if !already_ready {
@@ -4598,12 +4622,12 @@ mod tests {
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
         steady_tip_probe_due, terminal_alternate_peer, terminal_transport_can_retry_same_peer,
-        validate_history_step_tip_future_drift, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, MiningPeerQuorum, NodeConfig,
-        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotSegmentFailureScope,
-        SnapshotSessionPrepareError, SuffixAdmission, TerminalRequestRace,
-        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
+        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
+        MiningPeerQuorum, NodeConfig, SnapshotFinalizationOutcome, SnapshotHeaderBoundary,
+        SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
+        SnapshotSegmentFailureScope, SnapshotSessionPrepareError, SuffixAdmission,
+        TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
         SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
@@ -5780,6 +5804,13 @@ mod tests {
     fn rematerialization_probe_always_ends_at_the_selected_tip() {
         assert_eq!(selected_tip_probe_range(60, 87, 20), (68, 20));
         assert_eq!(selected_tip_probe_range(60, 68, 20), (60, 9));
+    }
+
+    #[test]
+    fn unresolved_tip_probe_covers_the_missing_prefix_and_future_tip() {
+        assert_eq!(unresolved_tip_probe_range(60, 68, 20), (60, 29));
+        assert_eq!(unresolved_tip_probe_range(60, 87, 20), (60, 48));
+        assert_eq!(unresolved_tip_probe_range(60, 900, 20), (60, 512));
     }
 
     #[test]
@@ -12350,7 +12381,7 @@ async fn handle_p2p_events(
                     >= EXACT_INVENTORY_PROBE_INTERVAL
             {
                 let target = header_dag.best_tip();
-                let (start_height, count) = selected_tip_probe_range(
+                let (start_height, count) = unresolved_tip_probe_range(
                     our_height,
                     target.height,
                     CONNECTED_TIP_PROBE_HEADERS,
