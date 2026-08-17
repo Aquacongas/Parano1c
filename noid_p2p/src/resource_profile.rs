@@ -17,6 +17,16 @@ pub enum BackgroundCapacity {
 }
 
 impl BackgroundCapacity {
+    /// Header batches are small control-plane objects. Ordinary wallet/full
+    /// nodes can serve more neighbours concurrently, while miners retain a
+    /// smaller but mesh-complete allowance beside proof construction.
+    pub(crate) const fn header_response_prepare_slots(self) -> usize {
+        match self {
+            Self::Full => 8,
+            Self::MiningReserved => 4,
+        }
+    }
+
     pub(crate) const fn global_data_slots(self) -> usize {
         match self {
             Self::Full => 8,
@@ -148,6 +158,8 @@ mod tests {
             full.global_data_outstanding()
         );
         assert!(mining.live_data_outstanding() > full.live_data_outstanding());
+        assert_eq!(full.header_response_prepare_slots(), 8);
+        assert_eq!(mining.header_response_prepare_slots(), 4);
         assert_eq!(
             mining.relay_max_reservations() * 2,
             full.relay_max_reservations()

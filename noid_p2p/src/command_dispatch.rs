@@ -197,7 +197,9 @@ fn classify(command: &NetworkCommand) -> CommandClass {
         | PeerCount { .. }
         | AdvanceSnapshotGeneration { .. }
         | CancelHistoryStepTerminalRace { .. } => CommandClass::Control,
-        AnnounceBlock { .. } | FetchHeaders { .. } => CommandClass::Header,
+        AnnounceBlock { .. } | AnnounceAvailability { .. } | FetchHeaders { .. } => {
+            CommandClass::Header
+        }
         BroadcastTx { .. }
         | FetchObjects { .. }
         | FetchSnapshotHeaders { .. }

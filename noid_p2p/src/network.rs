@@ -34,6 +34,7 @@ use noid_chain::storage::{
 use noid_chain::AcceptedBlockBundle;
 use noid_mempool::AsyncMempool;
 
+use crate::availability_codec::{AvailabilityRequest, AvailabilityResponse};
 use crate::behaviour::{NodeBehaviour, NodeBehaviourEvent};
 use crate::command_dispatch::{self, NetworkCommandReceiver, NetworkCommandSender};
 use crate::event_dispatch::{self, RequiredEventReceiver, RequiredEventSender};
@@ -2785,6 +2786,10 @@ pub enum NetworkCommand {
     /// Announce one complete accepted-block bundle. The event loop chooses
     /// inline gossip or header-only gossip from its canonical encoded size.
     AnnounceBlock { bundle: AcceptedBlockBundle },
+    /// Tell current mesh neighbours that this already authenticated header's
+    /// exact body and terminal are now locally serveable. This is best-effort
+    /// transport metadata, never consensus authority.
+    AnnounceAvailability { announcement: HeaderAnnouncement },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Arc<[u8]> },
     /// Register a bootstrap address with automatic retry and peer maintenance.
@@ -2872,7 +2877,7 @@ pub enum NetworkCommand {
 /// Events emitted by the P2P layer to the node.
 #[derive(Debug, Clone)]
 pub enum NetworkEvent {
-    /// Fixed-size network-v8 header announcement with exact body/terminal IDs.
+    /// Fixed-size network-v9 header announcement with exact body/terminal IDs.
     HeaderAnnouncement {
         from: PeerId,
         announcement: HeaderAnnouncement,
@@ -3532,7 +3537,9 @@ async fn run_swarm(
         mpsc::channel::<ManifestAssemblyCompletion>(2);
     let (mempool_response_tx, mut mempool_response_rx) = mpsc::channel::<PendingMempoolResponse>(1);
     let (object_response_tx, mut object_response_rx) = mpsc::channel::<PendingObjectResponse>(4);
-    let header_response_prepare_semaphore = Arc::new(Semaphore::new(2));
+    let header_response_prepare_semaphore = Arc::new(Semaphore::new(
+        background_capacity.header_response_prepare_slots(),
+    ));
     let history_step_response_prepare_semaphore = Arc::new(Semaphore::new(4));
     let segment_encode_semaphore = Arc::new(Semaphore::new(2));
     let mempool_response_prepare_semaphore = Arc::new(Semaphore::new(1));
@@ -4125,7 +4132,7 @@ async fn run_swarm(
                     tracing::warn!(
                         peer = %request.peer,
                         transport_stuck,
-                            "network-v8 profile handshake timed out"
+                            "network-v9 profile handshake timed out"
                     );
                     let _ = swarm.disconnect_peer_id(request.peer);
                 }
@@ -5171,6 +5178,52 @@ fn automatic_ordinary_dial_capacity(
         .min(transport_capacity)
 }
 
+/// Push one small exact-object availability hint across the current block
+/// mesh. Each receiver that commits the block repeats this step, so providers
+/// expand with the propagation wave instead of every wallet polling the same
+/// public anchors. Header gossip remains independent and is still the only
+/// authority that can enter HeaderDAG.
+fn announce_availability_to_mesh(
+    swarm: &mut libp2p::Swarm<NodeBehaviour>,
+    topics: &NetworkTopics,
+    sync_paths: &PeerSyncPaths,
+    announcement: HeaderAnnouncement,
+) -> usize {
+    const MAX_AVAILABILITY_FANOUT: usize = 8;
+
+    let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
+    let mut peers = swarm
+        .behaviour()
+        .gossipsub
+        .mesh_peers(&topic.hash())
+        .copied()
+        .filter(|peer| sync_paths.is_dispatchable(*peer))
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        // A two-node network or a freshly formed connection may not have run
+        // a GossipSub heartbeat yet. Preserve zero-config first-hop delivery
+        // without turning a public node's full inbound set into fanout.
+        peers.extend(
+            swarm
+                .connected_peers()
+                .copied()
+                .filter(|peer| sync_paths.is_dispatchable(*peer))
+                .take(MAX_AVAILABILITY_FANOUT),
+        );
+    }
+    peers.sort_unstable_by_key(|peer| peer.to_bytes());
+    peers.dedup();
+    peers.truncate(MAX_AVAILABILITY_FANOUT);
+
+    for peer in &peers {
+        swarm
+            .behaviour_mut()
+            .availability_sync
+            .send_request(peer, AvailabilityRequest { announcement });
+    }
+    peers.len()
+}
+
 /// Process a single network command. Separated from the select! loop so that
 /// pending commands can be drained via `try_recv` before blocking.
 async fn handle_network_command(
@@ -5216,18 +5269,19 @@ async fn handle_network_command(
     match cmd {
         NetworkCommand::AnnounceBlock { bundle } => {
             let height = bundle.height();
-            let message = match HeaderAnnouncement::from_accepted_bundle(
+            let announcement = match HeaderAnnouncement::from_accepted_bundle(
                 &bundle,
                 ProviderFlags::new(true, true, false),
-            )
-            .and_then(HeaderAnnouncement::encode)
-            {
-                Ok(message) => message,
+            ) {
+                Ok(announcement) => announcement,
                 Err(error) => {
                     tracing::error!(height, %error, "refusing to announce an invalid local block object set");
                     return;
                 }
             };
+            let message = announcement
+                .encode()
+                .expect("validated local header announcement must encode");
             let topic = gossipsub::IdentTopic::new(topics.blocks.clone());
             if let Err(error) = swarm
                 .behaviour_mut()
@@ -5236,6 +5290,31 @@ async fn handle_network_command(
             {
                 tracing::debug!(height, err = %error, "gossipsub: block announcement");
             }
+            let providers = announce_availability_to_mesh(swarm, topics, sync_paths, announcement);
+            tracing::debug!(
+                height,
+                providers,
+                "announced exact block availability to mesh peers"
+            );
+        }
+        NetworkCommand::AnnounceAvailability { announcement } => {
+            let height = announcement.header.height;
+            if announcement.validate().is_err()
+                || !announcement.providers.serves_body()
+                || !announcement.providers.serves_terminal()
+            {
+                tracing::error!(
+                    height,
+                    "refusing to announce invalid exact-object availability"
+                );
+                return;
+            }
+            let providers = announce_availability_to_mesh(swarm, topics, sync_paths, announcement);
+            tracing::debug!(
+                height,
+                providers,
+                "cascaded exact block availability to mesh peers"
+            );
         }
         NetworkCommand::BroadcastTx { intent_bytes } => {
             let topic = gossipsub::IdentTopic::new(topics.txs.clone());
@@ -5935,7 +6014,7 @@ async fn handle_swarm_event(
                         tracing::debug!(
                             peer = %propagation_source,
                             %error,
-                            "network-v8 header announcement decode failed"
+                            "network-v9 header announcement decode failed"
                         );
                     }
                 }
@@ -6022,10 +6101,11 @@ async fn handle_swarm_event(
                 return;
             }
             // Identify is only capability discovery. The endpoint becomes a
-            // usable network-v8 peer after the explicit profile round trip
+            // usable network-v9 peer after the explicit profile round trip
             // below proves the exact genesis, caps, finality and proof bank.
             let profile_protocol = format!("{}/sync/profile/6", topics.protocol_id);
             let object_protocol = format!("{}/sync/objects/2", topics.protocol_id);
+            let availability_protocol = format!("{}/sync/availability/1", topics.protocol_id);
             let header_protocol = format!("{}/sync/headers/5", topics.protocol_id);
             let manifest_protocol = format!("{}/sync/manifest/7", topics.protocol_id);
             let manifest_page_protocol = format!("{}/sync/manifest-page/1", topics.protocol_id);
@@ -6036,6 +6116,7 @@ async fn handle_swarm_event(
             };
             if !supports(&profile_protocol)
                 || !supports(&object_protocol)
+                || !supports(&availability_protocol)
                 || !supports(&header_protocol)
                 || !supports(&manifest_protocol)
                 || !supports(&manifest_page_protocol)
@@ -6047,8 +6128,9 @@ async fn handle_swarm_event(
                     peer = %peer_id,
                     profile_protocol,
                     object_protocol,
+                    availability_protocol,
                     header_protocol,
-                    "closing endpoint without the complete network-v8 protocol set"
+                    "closing endpoint without the complete network-v9 protocol set"
                 );
                 return;
             }
@@ -6156,7 +6238,7 @@ async fn handle_swarm_event(
                 );
                 debug_assert!(inserted, "profile capacity checked before request");
                 sync_paths.mark_profile_handshake_started(connection_id);
-                tracing::debug!(peer = %peer_id, "network-v8 profile handshake started");
+                tracing::debug!(peer = %peer_id, "network-v9 profile handshake started");
             }
             if sync_paths.try_mark_announced(peer_id) {
                 let _ = required_event_tx
@@ -6166,7 +6248,7 @@ async fn handle_swarm_event(
                         failure_domain: peer_diversity.failure_domain(peer_id),
                     })
                     .await;
-                tracing::debug!(peer = %peer_id, "peer network-v8 profile ready");
+                tracing::debug!(peer = %peer_id, "peer network-v9 profile ready");
             }
             if automatic_peers.is_bootstrap_peer(peer_id) {
                 // Older releases recorded seeds as generic successful peers.
@@ -6384,7 +6466,7 @@ async fn handle_swarm_event(
             }
         },
 
-        // --- Exact network-v8 profile handshake ---
+        // --- Exact network-v9 profile handshake ---
         SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
             request_response::Event::Message {
                 message:
@@ -6426,7 +6508,7 @@ async fn handle_swarm_event(
                         })
                         .await;
                 }
-                tracing::debug!(peer = %peer, profile = ?current.profile_id, "network-v8 profile verified from inbound request");
+                tracing::debug!(peer = %peer, profile = ?current.profile_id, "network-v9 profile verified from inbound request");
             }
         }
 
@@ -6453,7 +6535,7 @@ async fn handle_swarm_event(
                     peer = %peer,
                     requested_peer = %pending.peer,
                     profile = ?response.profile.profile_id,
-                    "network-v8 profile mismatch; closing peer"
+                    "network-v9 profile mismatch; closing peer"
                 );
                 let _ = swarm.disconnect_peer_id(peer);
                 return;
@@ -6469,7 +6551,7 @@ async fn handle_swarm_event(
                     })
                     .await;
             }
-            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v8 profile verified");
+            tracing::debug!(peer = %peer, profile = ?response.profile.profile_id, "network-v9 profile verified");
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::NetworkProfileSync(
@@ -6483,7 +6565,7 @@ async fn handle_swarm_event(
                 .remove(&request_id)
                 .is_some()
             {
-                tracing::warn!(peer = %peer, err = %error, "network-v8 profile handshake failed");
+                tracing::warn!(peer = %peer, err = %error, "network-v9 profile handshake failed");
                 let _ = swarm.disconnect_peer_id(peer);
             }
         }
@@ -6680,6 +6762,79 @@ async fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::ObjectSync(
+            request_response::Event::ResponseSent { .. },
+        )) => {}
+
+        // --- Direct exact-object availability between block-mesh peers ---
+        SwarmEvent::Behaviour(NodeBehaviourEvent::AvailabilitySync(
+            request_response::Event::Message {
+                message:
+                    request_response::Message::Request {
+                        request, channel, ..
+                    },
+                peer,
+                ..
+            },
+        )) => {
+            const AVAILABILITY_RATE_WINDOW: Duration = Duration::from_secs(10);
+            const AVAILABILITY_RATE_MAX: u32 = 20;
+            let announcement = request.announcement;
+            let admissible = sync_paths.is_dispatchable(peer)
+                && announcement.providers.serves_body()
+                && announcement.providers.serves_terminal()
+                && allow_peer_rate(
+                    block_event_rate,
+                    peer,
+                    AVAILABILITY_RATE_MAX,
+                    AVAILABILITY_RATE_WINDOW,
+                );
+            let response = if admissible
+                && required_event_tx
+                    .try_send(NetworkEvent::HeaderAnnouncement {
+                        from: peer,
+                        announcement,
+                        source_has_objects: true,
+                    })
+                    .is_ok()
+            {
+                AvailabilityResponse::Accepted
+            } else {
+                AvailabilityResponse::Busy
+            };
+            if swarm
+                .behaviour_mut()
+                .availability_sync
+                .send_response(channel, response)
+                .is_err()
+            {
+                tracing::debug!(peer = %peer, "availability response channel closed");
+            }
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::AvailabilitySync(
+            request_response::Event::Message {
+                message: request_response::Message::Response { response, .. },
+                peer,
+            },
+        )) => {
+            if response == AvailabilityResponse::Busy {
+                tracing::debug!(peer = %peer, "mesh peer deferred exact-object availability");
+            }
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::AvailabilitySync(
+            request_response::Event::OutboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "direct availability delivery failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::AvailabilitySync(
+            request_response::Event::InboundFailure { peer, error, .. },
+        )) => {
+            tracing::debug!(peer = %peer, err = %error, "direct availability response failed");
+        }
+
+        SwarmEvent::Behaviour(NodeBehaviourEvent::AvailabilitySync(
             request_response::Event::ResponseSent { .. },
         )) => {}
 

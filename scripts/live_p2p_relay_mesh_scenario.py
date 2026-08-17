@@ -33,6 +33,7 @@ BASE = Path(
 )
 CLIENT_COUNT = int(os.environ.get("NOID_LIVE_RELAY_MESH_CLIENTS", "16"))
 SETTLE_SECONDS = int(os.environ.get("NOID_LIVE_RELAY_MESH_SETTLE_SECONDS", "45"))
+TARGET_HEIGHT = int(os.environ.get("NOID_LIVE_RELAY_MESH_TARGET_HEIGHT", "2"))
 SEED_IPS = ("11.1.0.1", "12.1.0.1", "13.1.0.1", "14.1.0.1")
 SEED_P2P_BASE = 9500
 SEED_RPC_BASE = 27100
@@ -179,6 +180,21 @@ def private_mesh_ready(clients, minimum_peers=4, minimum_reservations=1):
     return False
 
 
+def canonical_header(node, height):
+    header = rpc(node.rpc_port, "getBlockHeader", [height], host=node.rpc_host)
+    if header is None or int(header["height"]) != height:
+        return False
+    return header
+
+
+def all_clients_have_header(clients, height, expected_hash):
+    for node in clients:
+        header = canonical_header(node, height)
+        if not header or header["hash"] != expected_hash:
+            return False
+    return True
+
+
 def assert_clean(label, text):
     forbidden = (
         " ERROR ",
@@ -217,6 +233,7 @@ def stop_all(nodes):
 def main():
     require(live.NODE_BIN.is_file(), f"release node is missing: {live.NODE_BIN}")
     require(8 <= CLIENT_COUNT <= 48, "relay scenario requires 8..48 private clients")
+    require(1 <= TARGET_HEIGHT <= 8, "relay scenario target requires 1..8 blocks")
     require(not BASE.exists(), f"run directory already exists: {BASE}")
 
     seed_endpoints = [
@@ -268,6 +285,7 @@ def main():
         "run_dir": str(BASE),
         "binary_sha256": binary_hash,
         "client_count": CLIENT_COUNT,
+        "target_height": TARGET_HEIGHT,
         "status": "running",
     }
     error = None
@@ -342,6 +360,51 @@ def main():
             f"accelerated Kademlia discovery remained unbounded: {accelerated}",
         )
 
+        # Connectivity alone is not sufficient: exercise the full header-first
+        # path, terminal serving and verification while every private client is
+        # reachable only through Circuit Relay. Reuse the first anchor's
+        # identity and database so the restart also proves that reservations
+        # recover without creating a second network.
+        relay_miner = seeds[0]
+        relay_miner.stop()
+        active_nodes.remove(relay_miner)
+        relay_miner_label = "04-seed-0-relay-miner"
+        relay_miner.start(
+            relay_miner_label,
+            mode="miner",
+            seeds=seed_endpoints[1:],
+        )
+        seed_labels.append(relay_miner_label)
+        active_nodes.append(relay_miner)
+        live.wait_value(
+            "restarted relay miner rejoins the public mesh",
+            lambda: int(rpc(relay_miner.rpc_port, "getPeerCount", host=relay_miner.rpc_host)) >= 2,
+            timeout=180,
+            interval=0.25,
+        )
+
+        propagation = []
+        for height in range(1, TARGET_HEIGHT + 1):
+            header = live.wait_value(
+                f"relay miner commits h{height}",
+                lambda height=height: canonical_header(relay_miner, height),
+                timeout=900,
+                interval=0.1,
+            )
+            observed_at = time.monotonic()
+            expected_hash = header["hash"]
+            live.wait_value(
+                f"all private clients commit canonical h{height}",
+                lambda height=height, expected_hash=expected_hash: all_clients_have_header(
+                    clients, height, expected_hash
+                ),
+                timeout=300,
+                interval=0.1,
+            )
+            elapsed = time.monotonic() - observed_at
+            propagation.append({"height": height, "seconds": round(elapsed, 3)})
+            print(f"[relay-fanout] h{height} all={elapsed:.3f}s", flush=True)
+
         # Remove one whole public failure domain. Existing exact peers and the
         # second reservation must keep every private node connected while the
         # topology heals without a redial storm.
@@ -369,6 +432,8 @@ def main():
                 "status": "passed",
                 "initial_mesh": initial,
                 "post_outage_mesh": after_failover,
+                "block_propagation": propagation,
+                "max_block_propagation_s": max(item["seconds"] for item in propagation),
                 "relay_circuits_accepted": accepted,
                 "relay_circuits_denied": denied,
                 "accelerated_discovery_rounds": accelerated,

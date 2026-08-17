@@ -8,6 +8,7 @@
 //! - Request-Response: headers, complete recent-block bundles, and HistoryStep terminals
 //! - Identify + Ping for peer management
 
+pub mod availability_codec;
 pub mod behaviour;
 mod command_dispatch;
 mod event_dispatch;

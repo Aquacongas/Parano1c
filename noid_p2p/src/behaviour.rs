@@ -39,6 +39,7 @@ use noid_poseidon2b::native::poseidon2b_hash_bytes;
 
 const GOSSIPSUB_MESSAGE_ID_DOMAIN: &[u8] = b"NOID_P2P_GOSSIPSUB_MESSAGE_ID";
 
+use crate::availability_codec::AvailabilityCodec;
 use crate::header_protocol::MAX_HEADER_ANNOUNCE_BYTES;
 use crate::header_sync_codec::HeaderSyncCodec;
 use crate::history_step_codec::HistoryStepTerminalCodec;
@@ -74,13 +75,18 @@ pub struct NodeBehaviour {
     /// Fixed header announcements and TxIntent gossip broadcast.
     pub gossipsub: gossipsub::Behaviour,
 
-    /// Exact network-v8 profile handshake. A transport is never exposed to
+    /// Exact network-v9 profile handshake. A transport is never exposed to
     /// consensus/sync until this profile matches byte-for-byte.
     pub network_profile_sync: request_response::Behaviour<NetworkProfileCodec>,
 
     /// Content-addressed bodies and recursive terminals for header-first
     /// propagation and immutable sync plans.
     pub object_sync: request_response::Behaviour<ObjectCodec>,
+
+    /// Small direct availability notices between current GossipSub mesh
+    /// neighbours. This lets newly committed object providers expand the data
+    /// plane without globally gossiping large proofs or polling public nodes.
+    pub availability_sync: request_response::Behaviour<AvailabilityCodec>,
 
     /// Typed request-response for chain headers.
     pub chain_sync: request_response::Behaviour<HeaderSyncCodec>,
@@ -291,6 +297,16 @@ impl NodeBehaviour {
                 .with_max_concurrent_streams(8),
         );
 
+        let availability_sync = request_response::Behaviour::new(
+            [(
+                StreamProtocol::try_from_owned(format!("{}/sync/availability/1", protocol_id))?,
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(10))
+                .with_max_concurrent_streams(16),
+        );
+
         let chain_sync = request_response::Behaviour::new(
             [(
                 // v5 adds a canonical Busy response so header preparation
@@ -499,6 +515,7 @@ impl NodeBehaviour {
             gossipsub,
             network_profile_sync,
             object_sync,
+            availability_sync,
             chain_sync,
             history_step_sync,
             kad,

@@ -6409,6 +6409,7 @@ async fn handle_p2p_events(
     struct ExactSuffixApplyCompletion {
         plan_id: noid_node::networking::PlanId,
         target: noid_node::networking::ChainPoint,
+        tip_announcement: noid_p2p::header_protocol::HeaderAnnouncement,
         confirmation_sources: Vec<libp2p::PeerId>,
         result: Result<AppliedExactSuffix, ExactSuffixApplyError>,
     }
@@ -7655,6 +7656,7 @@ async fn handle_p2p_events(
                 match sync.into_fetched() {
                     Ok(fetched) => {
                         let confirmation_sources = fetched.tip_confirmation_sources();
+                        let tip_announcement = fetched.tip_announcement();
                         exact_suffix_apply_inflight = Some(plan_id);
                         let apply_chain = Arc::clone(&chain);
                         let apply_mempool = mempool.clone();
@@ -7676,6 +7678,7 @@ async fn handle_p2p_events(
                                 .send(ExactSuffixApplyCompletion {
                                     plan_id,
                                     target,
+                                    tip_announcement,
                                     confirmation_sources,
                                     result,
                                 })
@@ -10815,6 +10818,22 @@ async fn handle_p2p_events(
                         );
                     }
                     if complete {
+                        let relay = p2p_cmd.clone();
+                        let announcement = completed.tip_announcement;
+                        tokio::spawn(async move {
+                            if relay
+                                .send(noid_p2p::NetworkCommand::AnnounceAvailability {
+                                    announcement,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    height = announcement.header.height,
+                                    "P2P command lanes closed before exact availability cascade"
+                                );
+                            }
+                        });
                         mark_bootstrap_complete_if_caught_up!(applied.height);
                     }
                 }
@@ -10837,6 +10856,22 @@ async fn handle_p2p_events(
                                 completed.target.hash,
                             );
                         }
+                        let relay = p2p_cmd.clone();
+                        let announcement = completed.tip_announcement;
+                        tokio::spawn(async move {
+                            if relay
+                                .send(noid_p2p::NetworkCommand::AnnounceAvailability {
+                                    announcement,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    height = announcement.header.height,
+                                    "P2P command lanes closed before reorg availability cascade"
+                                );
+                            }
+                        });
                     } else {
                         mining_peer_quorum.set_canonical_tip_unresolved(
                             completed.target.height,

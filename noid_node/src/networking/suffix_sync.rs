@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use libp2p::PeerId;
 use noid_p2p::{
-    header_protocol::HeaderInventoryRecord,
+    header_protocol::{HeaderAnnouncement, HeaderInventoryRecord, ProviderFlags},
     object_protocol::{
         ObjectId, ObjectPayload, MAX_OBJECTS_PER_REQUEST, MAX_OBJECT_RESPONSE_PAYLOAD_BYTES,
     },
@@ -166,10 +166,17 @@ pub struct FetchedSuffix {
     pub body_sources: Vec<PeerId>,
     pub terminal_bytes: Vec<u8>,
     pub terminal_source: PeerId,
+    tip_announcement: HeaderAnnouncement,
     _permits: Vec<Arc<OwnedSemaphorePermit>>,
 }
 
 impl FetchedSuffix {
+    /// Small source-independent availability notice for the exact selected
+    /// tip. It may be emitted only after verification and canonical commit.
+    pub const fn tip_announcement(&self) -> HeaderAnnouncement {
+        self.tip_announcement
+    }
+
     /// Peers that supplied exact objects for the selected tip.
     ///
     /// These identities carry no consensus authority by themselves.  The
@@ -698,6 +705,8 @@ impl SuffixSync {
         let mut body_sources = Vec::with_capacity(self.plan.headers().len());
         let mut terminal_bytes = None;
         let mut terminal_source = None;
+        let mut tip_body_object = None;
+        let mut terminal_object = None;
         let mut permits = Vec::new();
         for claim in self.plan.required_objects() {
             let received = self
@@ -711,11 +720,13 @@ impl SuffixSync {
                 permits.push(permit);
             }
             match received.object {
-                ObjectId::BlockBody(_) => {
+                ObjectId::BlockBody(body) => {
+                    tip_body_object = Some(body);
                     body_bytes.push(received.bytes);
                     body_sources.push(received.source);
                 }
-                ObjectId::Terminal(_) => {
+                ObjectId::Terminal(terminal) => {
+                    terminal_object = Some(terminal);
                     terminal_bytes = Some(received.bytes);
                     terminal_source = Some(received.source);
                 }
@@ -724,12 +735,28 @@ impl SuffixSync {
                 }
             }
         }
+        let tip_header = self
+            .plan
+            .headers()
+            .last()
+            .ok_or(SuffixSyncError::EmptySuffix)?
+            .header;
+        let tip_announcement = HeaderAnnouncement {
+            header: tip_header,
+            body: tip_body_object.ok_or(SuffixSyncError::Incomplete)?,
+            terminal: terminal_object.ok_or(SuffixSyncError::MissingTipTerminal)?,
+            providers: ProviderFlags::new(true, true, false),
+        };
+        tip_announcement
+            .validate()
+            .map_err(|_| SuffixSyncError::ObjectClaimMismatch)?;
         Ok(FetchedSuffix {
             plan: self.plan,
             body_bytes,
             body_sources,
             terminal_bytes: terminal_bytes.ok_or(SuffixSyncError::MissingTipTerminal)?,
             terminal_source: terminal_source.ok_or(SuffixSyncError::MissingTipTerminal)?,
+            tip_announcement,
             _permits: permits,
         })
     }
@@ -1080,6 +1107,9 @@ mod tests {
             .map(|object| expected[object].clone())
             .collect::<Vec<_>>();
         let expected_terminal = expected[offer.objects.last().unwrap()].clone();
+        let expected_tip_body = offer.objects[1].into_block_body().unwrap();
+        let expected_tip_terminal = offer.objects[2].into_terminal().unwrap();
+        let expected_tip_header = offer.plan().headers().last().unwrap().header;
         let mut sync = SuffixSync::from_offer(peer, FailureDomain(1), offer).unwrap();
         for request in sync.schedule(0) {
             let payloads = request
@@ -1099,6 +1129,15 @@ mod tests {
         assert_eq!(fetched.body_sources, vec![peer, peer]);
         assert_eq!(fetched.terminal_bytes, expected_terminal);
         assert_eq!(fetched.terminal_source, peer);
+        assert_eq!(
+            fetched.tip_announcement(),
+            HeaderAnnouncement {
+                header: expected_tip_header,
+                body: expected_tip_body,
+                terminal: expected_tip_terminal,
+                providers: ProviderFlags::new(true, true, false),
+            }
+        );
     }
 
     #[test]
