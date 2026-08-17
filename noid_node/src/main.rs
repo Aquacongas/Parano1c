@@ -1042,6 +1042,80 @@ fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multi
         .with_context(|| format!("build DNS multiaddr for {seed:?}"))
 }
 
+const SYSTEM_SEED_DNS_TIMEOUT: Duration = Duration::from_secs(5);
+// Match libp2p-dns' bounded address-attempt set. These are registered as
+// fallback candidates; the topology scheduler still permits only four pending
+// bootstrap dials and retains only two seed connections during initial sync.
+const MAX_SYSTEM_ADDRS_PER_SEED: usize = 16;
+
+fn resolved_system_seed_addrs(
+    socket_addrs: impl IntoIterator<Item = std::net::SocketAddr>,
+    port: u16,
+) -> Vec<libp2p::Multiaddr> {
+    use libp2p::multiaddr::Protocol;
+
+    let mut result = Vec::new();
+    for socket in socket_addrs {
+        let ip_protocol = match socket.ip() {
+            std::net::IpAddr::V4(ip) => Protocol::Ip4(ip),
+            std::net::IpAddr::V6(ip) => Protocol::Ip6(ip),
+        };
+        let mut addr = libp2p::Multiaddr::empty();
+        addr.push(ip_protocol);
+        addr.push(Protocol::Tcp(port));
+        if !result.contains(&addr) {
+            result.push(addr);
+            if result.len() == MAX_SYSTEM_ADDRS_PER_SEED {
+                break;
+            }
+        }
+    }
+    result
+}
+
+async fn resolve_embedded_seed_with_system_dns(
+    seed: &str,
+    port: u16,
+) -> Result<Vec<libp2p::Multiaddr>, String> {
+    let query = tokio::net::lookup_host((seed.to_owned(), port));
+    let socket_addrs = tokio::time::timeout(SYSTEM_SEED_DNS_TIMEOUT, query)
+        .await
+        .map_err(|_| format!("system DNS lookup for {seed} timed out"))?
+        .map_err(|error| format!("system DNS lookup for {seed} failed: {error}"))?;
+    let resolved = resolved_system_seed_addrs(socket_addrs, port);
+    if resolved.is_empty() {
+        return Err(format!(
+            "system DNS lookup for {seed} returned no addresses"
+        ));
+    }
+    Ok(resolved)
+}
+
+async fn embedded_seed_multiaddrs(
+    seed: &str,
+    default_port: u16,
+) -> anyhow::Result<Vec<libp2p::Multiaddr>> {
+    let original = seed_to_multiaddr(seed, default_port)?;
+    match resolve_embedded_seed_with_system_dns(seed, default_port).await {
+        Ok(addresses) => {
+            tracing::debug!(
+                seed,
+                addresses = addresses.len(),
+                "resolved embedded seed through system DNS"
+            );
+            Ok(addresses)
+        }
+        Err(error) => {
+            tracing::warn!(
+                seed,
+                %error,
+                "system DNS could not resolve embedded seed; retaining libp2p DNS fallback"
+            );
+            Ok(vec![original])
+        }
+    }
+}
+
 fn split_host_port(addr: &str) -> anyhow::Result<(&str, &str)> {
     if let Some(rest) = addr.strip_prefix('[') {
         let (host, port) = rest
@@ -1770,22 +1844,43 @@ async fn main() -> anyhow::Result<()> {
     } else {
         net.dns_seeds
     };
-    let all_seeds: Vec<String> = cfg
-        .network
-        .seeds
-        .clone()
-        .into_iter()
-        .chain(dns_seeds.iter().map(|s| s.to_string()))
-        .collect();
-    for seed_addr in &all_seeds {
+    let mut registered_seed_addrs = std::collections::HashSet::new();
+    for seed_addr in &cfg.network.seeds {
         let ma = seed_to_multiaddr(seed_addr, net.default_p2p_port);
         match ma {
             Ok(addr) => {
-                tracing::debug!(addr = %addr, "dialing seed");
-                p2p.dial(addr).await;
+                if registered_seed_addrs.insert(addr.clone()) {
+                    tracing::debug!(addr = %addr, "dialing configured seed");
+                    p2p.dial(addr).await;
+                }
             }
             Err(e) => {
                 tracing::warn!(addr = %seed_addr, err = %e, "cannot parse seed address");
+            }
+        }
+    }
+    // Resolve all four embedded names concurrently through the operating
+    // system. This includes scoped resolvers installed by VPN clients that may
+    // be invisible to libp2p's resolver. If native resolution is unavailable,
+    // retain the existing libp2p DNS multiaddr as a fallback.
+    let embedded_seed_results = futures::future::join_all(
+        dns_seeds
+            .iter()
+            .map(|seed| embedded_seed_multiaddrs(seed, net.default_p2p_port)),
+    )
+    .await;
+    for (seed, result) in dns_seeds.iter().zip(embedded_seed_results) {
+        match result {
+            Ok(addresses) => {
+                for address in addresses {
+                    if registered_seed_addrs.insert(address.clone()) {
+                        tracing::debug!(addr = %address, "dialing embedded seed");
+                        p2p.dial(address).await;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(addr = %seed, err = %error, "cannot parse embedded seed address");
             }
         }
     }
@@ -4483,7 +4578,8 @@ mod tests {
         p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
         persist_network_storage_epoch_marker, prepare_network_storage_epoch,
         prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        reset_install_preferences_at_root, rotating_manifest_peers, seed_to_multiaddr,
+        reset_install_preferences_at_root, resolve_embedded_seed_with_system_dns,
+        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
         selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_segment_failure_scope, source_independent_suffix_offer, steady_tip_probe_due,
@@ -4494,9 +4590,10 @@ mod tests {
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotSegmentFailureScope,
         SnapshotSessionPrepareError, SuffixAdmission, TerminalRequestRace,
         CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
-        HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MINING_PEER_CONFIRMATION_TTL,
-        MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL, SNAPSHOT_HEADER_BATCH,
-        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
+        HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
+        MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
+        SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
+        STEADY_TIP_PROBE_INTERVAL,
     };
 
     fn test_snapshot_id() -> noid_node::networking::SnapshotId {
@@ -5374,6 +5471,43 @@ mod tests {
             seed_to_multiaddr(&explicit, 9500).unwrap().to_string(),
             explicit
         );
+    }
+
+    #[test]
+    fn system_seed_resolution_is_deduplicated_and_bounded() {
+        let mut answers = vec![
+            "203.0.113.10:9500".parse().unwrap(),
+            "[2001:db8::10]:9500".parse().unwrap(),
+            "203.0.113.10:9500".parse().unwrap(),
+        ];
+        answers.extend((1..=20).map(|host| {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, host)),
+                9500,
+            )
+        }));
+        let resolved = resolved_system_seed_addrs(answers, 9500);
+        assert_eq!(resolved.len(), MAX_SYSTEM_ADDRS_PER_SEED);
+        assert_eq!(resolved[0].to_string(), "/ip4/203.0.113.10/tcp/9500");
+        assert_eq!(resolved[1].to_string(), "/ip6/2001:db8::10/tcp/9500");
+    }
+
+    #[tokio::test]
+    async fn system_seed_resolution_uses_native_localhost_lookup() {
+        let resolved = resolve_embedded_seed_with_system_dns("localhost", 9500)
+            .await
+            .unwrap();
+        assert!(!resolved.is_empty());
+        assert!(resolved.iter().all(|addr| {
+            let mut protocols = addr.iter();
+            matches!(
+                protocols.next(),
+                Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
+            ) && matches!(
+                protocols.next(),
+                Some(libp2p::multiaddr::Protocol::Tcp(9500))
+            )
+        }));
     }
 
     #[test]
