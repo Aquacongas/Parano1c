@@ -41,7 +41,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Keep the normal per-block profile at debug level, but surface genuinely
+/// slow local storage work in production logs. This is observability only:
+/// it neither changes admission nor adds work to the commit path beyond the
+/// `Instant` measurements that were already present.
+const RECURSIVE_SUFFIX_SLOW_PATH: Duration = Duration::from_secs(2);
 
 use crate::block::Block;
 use crate::block_header::BlockHeader;
@@ -1598,15 +1604,28 @@ impl MdbxChainContext {
         authority.previous_hash = block_id(&block.header);
         authority.next_height = block.header.height.saturating_add(1);
         authority.complete = is_final;
-        tracing::debug!(
-            height = block.header.height,
-            checks_ms = checks_elapsed.as_millis(),
-            preload_undo_ms = preload_elapsed.as_millis(),
-            materialize_ms = materialize_elapsed.as_millis(),
-            commit_ms = commit_elapsed.as_millis(),
-            total_ms = total_started.elapsed().as_millis(),
-            "recursive suffix block profile"
-        );
+        let total_elapsed = total_started.elapsed();
+        if total_elapsed >= RECURSIVE_SUFFIX_SLOW_PATH {
+            tracing::warn!(
+                height = block.header.height,
+                checks_ms = checks_elapsed.as_millis(),
+                preload_undo_ms = preload_elapsed.as_millis(),
+                materialize_ms = materialize_elapsed.as_millis(),
+                commit_ms = commit_elapsed.as_millis(),
+                total_ms = total_elapsed.as_millis(),
+                "recursive suffix block slow path"
+            );
+        } else {
+            tracing::debug!(
+                height = block.header.height,
+                checks_ms = checks_elapsed.as_millis(),
+                preload_undo_ms = preload_elapsed.as_millis(),
+                materialize_ms = materialize_elapsed.as_millis(),
+                commit_ms = commit_elapsed.as_millis(),
+                total_ms = total_elapsed.as_millis(),
+                "recursive suffix block profile"
+            );
+        }
         Ok(state_root)
     }
 
@@ -1866,6 +1885,8 @@ impl MdbxChainContext {
     {
         use crate::consensus::reorg::{restore_state_counters, ReorgResult};
 
+        let total_started = Instant::now();
+
         // Re-validate inside write lock: ancestor_height must be <= our CURRENT tip.
         // The caller computed ancestor_height outside the lock — if another task applied
         // blocks (or completed a reorg) in the meantime, ancestor_height may now be
@@ -2104,6 +2125,7 @@ impl MdbxChainContext {
             cumulative_chainwork: self.tip_chain_work,
             finalized: finalized_after_reorg,
         };
+        let commit_started = Instant::now();
         let commit_result = (|| -> Result<(), MdbxContextError> {
             let dirty_ids: Vec<u16> = self.state.state.dirty_segment_ids().collect();
             let eff_log = self.state.state.effective_log_segment_size() as u8;
@@ -2141,6 +2163,7 @@ impl MdbxChainContext {
         if let Err(error) = commit_result {
             return Err(self.abort_staged_reorg(error));
         }
+        let commit_elapsed = commit_started.elapsed();
         self.state.state.clear_dirty();
         self.state.state.evict_all_persisted_segments();
         self.finalized = finalized_after_reorg;
@@ -2152,6 +2175,18 @@ impl MdbxChainContext {
             new_tip = self.tip_height,
             "reorg complete"
         );
+        let total_elapsed = total_started.elapsed();
+        if total_elapsed >= RECURSIVE_SUFFIX_SLOW_PATH {
+            tracing::warn!(
+                ancestor_height,
+                reverted = reverted_heights.len(),
+                applied = applied_heights.len(),
+                prepare_apply_ms = total_elapsed.saturating_sub(commit_elapsed).as_millis(),
+                commit_ms = commit_elapsed.as_millis(),
+                total_ms = total_elapsed.as_millis(),
+                "atomic reorg slow path"
+            );
+        }
 
         Ok(ReorgResult {
             reverted_heights,

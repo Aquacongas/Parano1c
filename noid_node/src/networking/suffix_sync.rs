@@ -29,6 +29,14 @@ use super::{
 /// bytes, issue one bounded hedge instead of waiting behind a producer's
 /// serving FIFO.  Bodies are at most ~83 KiB and remain single-source.
 const TERMINAL_HEDGE_NO_PROGRESS_MS: u64 = 4_000;
+/// A hedge that has itself produced no complete response for this long may be
+/// replaced once by an exact provider in a third failure domain. The original
+/// primary remains alive, so a slow source is not confused with a dead one.
+const TERMINAL_HEDGE_ROTATE_AFTER_MS: u64 = 8_000;
+/// A deliberately rotated hedge remains a valid late responder, but is not
+/// selected for another request while its original 60-second transport may
+/// still be draining.
+const TERMINAL_ROTATED_SOURCE_BACKOFF_MS: u64 = 60_000;
 
 fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
@@ -144,6 +152,7 @@ pub struct ExactObjectRequest {
 struct PendingRequest {
     peer: PeerId,
     objects: Vec<ObjectId>,
+    issued_at_ms: u64,
     disconnected_at: Option<Instant>,
 }
 
@@ -260,6 +269,7 @@ pub struct SuffixSync {
     received: HashMap<ObjectClaimId, ReceivedObject>,
     pending: HashMap<u64, PendingRequest>,
     next_token: u64,
+    terminal_hedge_rotation_used: bool,
 }
 
 impl SuffixSync {
@@ -275,6 +285,7 @@ impl SuffixSync {
             received: HashMap::new(),
             pending: HashMap::new(),
             next_token: token_seed,
+            terminal_hedge_rotation_used: false,
         };
         for claim in runtime.plan.required_objects() {
             runtime.fetcher.want(*claim);
@@ -391,12 +402,56 @@ impl SuffixSync {
                 assignments.push(assignment);
             }
         }
+        if !self.terminal_hedge_rotation_used {
+            let rotation_claim = self.plan.required_objects().iter().find_map(|claim| {
+                let ObjectClaimId::Terminal(_) = claim else {
+                    return None;
+                };
+                let Some(FetchState::InFlight {
+                    hedge: Some(hedge), ..
+                }) = self.fetcher.state(*claim)
+                else {
+                    return None;
+                };
+                let hedge_started_ms = self
+                    .pending
+                    .values()
+                    .filter(|pending| {
+                        pending.peer == hedge
+                            && pending.objects.len() == 1
+                            && pending.objects[0].claim() == *claim
+                    })
+                    .map(|pending| pending.issued_at_ms)
+                    .max()?;
+                (now_ms.saturating_sub(hedge_started_ms) >= TERMINAL_HEDGE_ROTATE_AFTER_MS)
+                    .then_some(*claim)
+            });
+            if let Some(claim) = rotation_claim {
+                if let Ok(assignment) =
+                    self.fetcher
+                        .rotate_hedge(claim, now_ms, TERMINAL_ROTATED_SOURCE_BACKOFF_MS)
+                {
+                    self.terminal_hedge_rotation_used = true;
+                    tracing::info!(
+                        plan_id = ?self.plan.id(),
+                        target_height = self.plan.target().height,
+                        peer = %assignment.peer,
+                        "stalled exact terminal hedge rotated to a third failure domain"
+                    );
+                    assignments.push(assignment);
+                }
+            }
+        }
 
         let mut body_groups: Vec<(PeerId, Vec<ObjectId>, usize)> = Vec::new();
         let mut requests = Vec::new();
         for assignment in assignments {
             if matches!(assignment.object, ObjectId::Terminal(_)) {
-                requests.push(self.allocate_request(assignment.peer, vec![assignment.object]));
+                requests.push(self.allocate_request(
+                    assignment.peer,
+                    vec![assignment.object],
+                    now_ms,
+                ));
                 continue;
             }
             let encoded_len = assignment.object.encoded_len().unwrap_or(0) as usize;
@@ -416,12 +471,17 @@ impl SuffixSync {
         requests.extend(
             body_groups
                 .into_iter()
-                .map(|(peer, objects, _)| self.allocate_request(peer, objects)),
+                .map(|(peer, objects, _)| self.allocate_request(peer, objects, now_ms)),
         );
         requests
     }
 
-    fn allocate_request(&mut self, peer: PeerId, objects: Vec<ObjectId>) -> ExactObjectRequest {
+    fn allocate_request(
+        &mut self,
+        peer: PeerId,
+        objects: Vec<ObjectId>,
+        issued_at_ms: u64,
+    ) -> ExactObjectRequest {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1).max(1);
         let previous = self.pending.insert(
@@ -429,6 +489,7 @@ impl SuffixSync {
             PendingRequest {
                 peer,
                 objects: objects.clone(),
+                issued_at_ms,
                 disconnected_at: None,
             },
         );
@@ -585,6 +646,8 @@ impl SuffixSync {
         }
         for object in pending.objects {
             self.fetcher.fail_source_at(object.claim(), peer, now_ms)?;
+            self.fetcher
+                .forget_late_response(object.claim(), peer, object);
         }
         Ok(())
     }
@@ -614,6 +677,8 @@ impl SuffixSync {
         for object in pending.objects {
             self.fetcher
                 .busy_source(object.claim(), peer, retry_at_ms)?;
+            self.fetcher
+                .forget_late_response(object.claim(), peer, object);
         }
         Ok(())
     }
@@ -654,6 +719,8 @@ impl SuffixSync {
         }
         for object in pending.objects {
             self.fetcher.defer_source(object.claim(), peer)?;
+            self.fetcher
+                .forget_late_response(object.claim(), peer, object);
         }
         Ok(())
     }
@@ -1029,6 +1096,102 @@ mod tests {
         assert!(sync
             .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS.saturating_mul(2))
             .is_empty());
+    }
+
+    #[test]
+    fn stalled_terminal_hedge_rotates_once_to_a_third_domain() {
+        let peers = [PeerId::random(), PeerId::random(), PeerId::random()];
+        let offer = offer(&[1], 1);
+        let terminal = *offer.objects().last().unwrap();
+        let mut sync = SuffixSync::from_offer(peers[0], FailureDomain(1), offer.clone()).unwrap();
+        sync.add_offer(peers[1], FailureDomain(2), offer.clone())
+            .unwrap();
+        sync.add_offer(peers[2], FailureDomain(3), offer).unwrap();
+
+        let primary = sync
+            .schedule(0)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .unwrap();
+        let hedge = sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .unwrap();
+        assert!(sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS - 1)
+            .is_empty());
+
+        let replacement = sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .expect("stalled hedge rotates to the remaining independent provider");
+        assert_ne!(replacement.peer, primary.peer);
+        assert_ne!(replacement.peer, hedge.peer);
+        sync.request_failed(
+            hedge.token,
+            hedge.peer,
+            &hedge.objects,
+            TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS,
+        )
+        .unwrap();
+        assert_eq!(
+            sync.fetcher.state(terminal.claim()),
+            Some(FetchState::InFlight {
+                primary: primary.peer,
+                hedge: Some(replacement.peer),
+            })
+        );
+        assert!(sync
+            .schedule(
+                TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS.saturating_mul(2)
+            )
+            .is_empty());
+    }
+
+    #[test]
+    fn late_rotated_terminal_hedge_remains_a_harmless_winner() {
+        let peers = [PeerId::random(), PeerId::random(), PeerId::random()];
+        let mut offer = offer(&[1], 1);
+        let terminal_bytes = vec![0xC7; 101];
+        let terminal = match *offer.objects().last().unwrap() {
+            ObjectId::Terminal(terminal) => ObjectId::Terminal(
+                TerminalObjectId::from_bytes(terminal.claim, &terminal_bytes).unwrap(),
+            ),
+            _ => panic!("suffix offer must end in a terminal"),
+        };
+        *offer.objects.last_mut().unwrap() = terminal;
+        let mut sync = SuffixSync::from_offer(peers[0], FailureDomain(1), offer.clone()).unwrap();
+        sync.add_offer(peers[1], FailureDomain(2), offer.clone())
+            .unwrap();
+        sync.add_offer(peers[2], FailureDomain(3), offer).unwrap();
+        let _primary = sync.schedule(0);
+        let retired_hedge = sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .unwrap();
+        let replacement = sync
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS)
+            .into_iter()
+            .find(|request| request.objects == [terminal])
+            .unwrap();
+        assert_ne!(replacement.peer, retired_hedge.peer);
+
+        assert_eq!(
+            sync.accept_response(
+                retired_hedge.token,
+                retired_hedge.peer,
+                vec![ObjectPayload {
+                    object: terminal,
+                    bytes: Some(terminal_bytes),
+                }],
+                None,
+            )
+            .unwrap(),
+            1
+        );
     }
 
     #[test]

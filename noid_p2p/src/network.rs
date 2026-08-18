@@ -528,6 +528,146 @@ const AUTOMATIC_PEER_HEALTHY_AFTER: Duration = Duration::from_secs(30);
 // attempts. Initial bootstrap remains immediate; recovery discovery is paced.
 const DISCOVERY_RETRY_MIN: Duration = Duration::from_secs(30);
 const DISCOVERY_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+// A failed relay circuit is a property of one relay/destination route, not of
+// either peer globally. Keep direct and alternative-relay paths eligible while
+// spacing retries of only the route that just failed.
+const MAX_RELAY_CIRCUIT_BACKOFFS: usize = 1024;
+const RELAY_CIRCUIT_RETRY_FIRST: Duration = Duration::from_secs(30);
+const RELAY_CIRCUIT_RETRY_SECOND: Duration = Duration::from_secs(60);
+const RELAY_CIRCUIT_RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct RelayCircuitRoute {
+    relay: PeerId,
+    destination: PeerId,
+}
+
+#[derive(Clone, Debug)]
+struct RelayCircuitBackoffEntry {
+    addr: Multiaddr,
+    failures: u8,
+    retry_at: Instant,
+    suppressed: bool,
+    last_failure: Instant,
+}
+
+#[derive(Default)]
+struct RelayCircuitBackoff {
+    entries: std::collections::HashMap<RelayCircuitRoute, RelayCircuitBackoffEntry>,
+}
+
+impl RelayCircuitBackoff {
+    fn retry_delay(failures: u8) -> Duration {
+        match failures {
+            0 | 1 => RELAY_CIRCUIT_RETRY_FIRST,
+            2 => RELAY_CIRCUIT_RETRY_SECOND,
+            _ => RELAY_CIRCUIT_RETRY_MAX,
+        }
+    }
+
+    fn note_failure(
+        &mut self,
+        destination: PeerId,
+        addr: &Multiaddr,
+        now: Instant,
+    ) -> Option<(RelayCircuitRoute, Multiaddr, u8, Duration)> {
+        let (route, normalized_addr) = relay_circuit_route(destination, addr)?;
+        if !self.entries.contains_key(&route) && self.entries.len() >= MAX_RELAY_CIRCUIT_BACKOFFS {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| !entry.suppressed)
+                .min_by_key(|(_, entry)| entry.last_failure)
+                .map(|(route, _)| *route)
+            {
+                self.entries.remove(&oldest);
+            } else {
+                // Never forget an address while it is removed from discovery:
+                // doing so would make a memory cap turn into a permanent
+                // reachability loss. At the hard cap, leave this new route
+                // untouched instead of tracking it incompletely.
+                return None;
+            }
+        }
+        let entry = self
+            .entries
+            .entry(route)
+            .or_insert(RelayCircuitBackoffEntry {
+                addr: normalized_addr.clone(),
+                failures: 0,
+                retry_at: now,
+                suppressed: false,
+                last_failure: now,
+            });
+        entry.addr = normalized_addr.clone();
+        entry.failures = entry.failures.saturating_add(1);
+        let delay = Self::retry_delay(entry.failures);
+        entry.retry_at = now + delay;
+        entry.suppressed = true;
+        entry.last_failure = now;
+        Some((route, normalized_addr, entry.failures, delay))
+    }
+
+    fn is_blocked(&self, destination: PeerId, addr: &Multiaddr, now: Instant) -> bool {
+        let Some((route, _)) = relay_circuit_route(destination, addr) else {
+            return false;
+        };
+        self.entries
+            .get(&route)
+            .is_some_and(|entry| entry.suppressed && entry.retry_at > now)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Vec<(RelayCircuitRoute, Multiaddr)> {
+        self.entries
+            .iter_mut()
+            .filter_map(|(route, entry)| {
+                (entry.suppressed && entry.retry_at <= now).then(|| {
+                    entry.suppressed = false;
+                    (*route, entry.addr.clone())
+                })
+            })
+            .collect()
+    }
+
+    fn note_success(&mut self, destination: PeerId, addr: &Multiaddr) -> bool {
+        let Some((route, _)) = relay_circuit_route(destination, addr) else {
+            return false;
+        };
+        self.entries.remove(&route).is_some()
+    }
+}
+
+/// Return the exact relay/destination identity and the address form stored by
+/// Kademlia/automatic discovery (without a duplicate trailing destination).
+fn relay_circuit_route(
+    destination: PeerId,
+    addr: &Multiaddr,
+) -> Option<(RelayCircuitRoute, Multiaddr)> {
+    use libp2p::multiaddr::Protocol;
+
+    let mut relay = None;
+    let mut after_circuit = false;
+    let mut advertised_destination = None;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::P2p(peer) if !after_circuit => relay = Some(peer),
+            Protocol::P2pCircuit => after_circuit = true,
+            Protocol::P2p(peer) if after_circuit => advertised_destination = Some(peer),
+            _ => {}
+        }
+    }
+    if !after_circuit || advertised_destination.is_some_and(|peer| peer != destination) {
+        return None;
+    }
+    let normalized_addr = sanitize_automatic_peer_addr(destination, addr.clone())?;
+    Some((
+        RelayCircuitRoute {
+            relay: relay?,
+            destination,
+        },
+        normalized_addr,
+    ))
+}
 
 fn direct_tx_relay_limit(connected_peers: usize) -> usize {
     if connected_peers <= TX_DIRECT_SMALL_NETWORK_MAX_PEERS {
@@ -1195,6 +1335,19 @@ impl AutomaticPeerState {
             }
             candidate.addrs.push(addr);
             changed = true;
+        }
+        changed
+    }
+
+    fn remove_peer_candidate_addr(&mut self, peer: PeerId, addr: &Multiaddr) -> bool {
+        let Some(candidate) = self.peers.get_mut(&peer) else {
+            return false;
+        };
+        let previous_len = candidate.addrs.len();
+        candidate.addrs.retain(|known| known != addr);
+        let changed = candidate.addrs.len() != previous_len;
+        if candidate.addrs.is_empty() {
+            self.peers.remove(&peer);
         }
         changed
     }
@@ -3547,6 +3700,7 @@ async fn run_swarm(
     };
     let mut relay_reservations =
         RelayReservations::new(relay_reservation_target, *swarm.local_peer_id());
+    let mut relay_circuit_backoff = RelayCircuitBackoff::default();
 
     // One waiting response of each kind is sufficient: the request-response
     // behaviour owns the next response while its codec writes it. Byte permits
@@ -3692,6 +3846,7 @@ async fn run_swarm(
                     &mut manifest_page_assemblies,
                     &mut rejected_manifest_candidates,
                     &mut relay_reservations,
+                    &mut relay_circuit_backoff,
                     &mut successful_peer_cache,
                 )
                 .await;
@@ -4412,6 +4567,23 @@ async fn run_swarm(
                         "closing connection to flush a sync request stuck before its transport timeout"
                     );
                     let _ = swarm.disconnect_peer_id(peer);
+                }
+                let local_peer = *swarm.local_peer_id();
+                for (route, addr) in relay_circuit_backoff.take_due(now) {
+                    automatic_peers.add_peer_candidate(
+                        local_peer,
+                        route.destination,
+                        [addr.clone()],
+                    );
+                    swarm
+                        .behaviour_mut()
+                        .kad
+                        .add_address(&route.destination, addr);
+                    tracing::debug!(
+                        relay = %route.relay,
+                        destination = %route.destination,
+                        "relay circuit retry became eligible"
+                    );
                 }
                 maintain_automatic_outbound(
                     &mut swarm,
@@ -5947,6 +6119,7 @@ async fn handle_swarm_event(
     >,
     rejected_manifest_candidates: &mut std::collections::HashMap<ManifestAssemblyKey, Instant>,
     relay_reservations: &mut RelayReservations,
+    relay_circuit_backoff: &mut RelayCircuitBackoff,
     successful_peer_cache: &mut crate::peer_store::SuccessfulPeerCache,
 ) {
     let implicit_bootstraps = stop_implicit_kad_bootstraps(swarm);
@@ -6180,12 +6353,17 @@ async fn handle_swarm_event(
             let mut accepted_addrs = 0usize;
             let mut dropped_addrs = 0usize;
             let mut routable_addrs = Vec::new();
+            let now = Instant::now();
             for addr in &info.listen_addrs {
                 if accepted_addrs >= MAX_IDENTIFY_ADDRS_PER_PEER {
                     dropped_addrs += 1;
                     continue;
                 }
                 if !is_routable_identify_addr(addr) {
+                    dropped_addrs += 1;
+                    continue;
+                }
+                if relay_circuit_backoff.is_blocked(peer_id, addr, now) {
                     dropped_addrs += 1;
                     continue;
                 }
@@ -6410,7 +6588,21 @@ async fn handle_swarm_event(
                 let local = *swarm.local_peer_id();
                 let mut learned = false;
                 for peer in peers {
-                    learned |= automatic_peers.add_peer_candidate(local, peer.peer_id, peer.addrs);
+                    let mut eligible = Vec::new();
+                    for addr in peer.addrs {
+                        if relay_circuit_backoff.is_blocked(peer.peer_id, &addr, Instant::now()) {
+                            if let Some((_, normalized)) = relay_circuit_route(peer.peer_id, &addr)
+                            {
+                                swarm
+                                    .behaviour_mut()
+                                    .kad
+                                    .remove_address(&peer.peer_id, &normalized);
+                            }
+                        } else {
+                            eligible.push(addr);
+                        }
+                    }
+                    learned |= automatic_peers.add_peer_candidate(local, peer.peer_id, eligible);
                 }
                 automatic_peers.observe_discovery(id, learned, step.last);
                 tracing::debug!(found, learned, "kad: FIND_NODE returned peers");
@@ -6429,7 +6621,21 @@ async fn handle_swarm_event(
                 let local = *swarm.local_peer_id();
                 let mut learned = false;
                 for peer in peers {
-                    learned |= automatic_peers.add_peer_candidate(local, peer.peer_id, peer.addrs);
+                    let mut eligible = Vec::new();
+                    for addr in peer.addrs {
+                        if relay_circuit_backoff.is_blocked(peer.peer_id, &addr, Instant::now()) {
+                            if let Some((_, normalized)) = relay_circuit_route(peer.peer_id, &addr)
+                            {
+                                swarm
+                                    .behaviour_mut()
+                                    .kad
+                                    .remove_address(&peer.peer_id, &normalized);
+                            }
+                        } else {
+                            eligible.push(addr);
+                        }
+                    }
+                    learned |= automatic_peers.add_peer_candidate(local, peer.peer_id, eligible);
                 }
                 automatic_peers.observe_discovery(id, learned, step.last);
                 tracing::debug!(
@@ -8379,6 +8585,14 @@ async fn handle_swarm_event(
                 );
                 return;
             }
+            if !direct && relay_circuit_backoff.note_success(peer_id, endpoint.get_remote_address())
+            {
+                tracing::debug!(
+                    destination = %peer_id,
+                    address = %endpoint.get_remote_address(),
+                    "relay circuit route recovered; retry backoff cleared"
+                );
+            }
             if dialer && direct {
                 relay_reservations.observe_direct_transport(
                     peer_id,
@@ -8574,6 +8788,35 @@ async fn handle_swarm_event(
             error,
             ..
         } => {
+            if let (Some(destination), libp2p::swarm::DialError::Transport(errors)) =
+                (peer_id, &error)
+            {
+                let mut suppressed_routes = std::collections::HashSet::new();
+                for (addr, _) in errors {
+                    let Some((route, _)) = relay_circuit_route(destination, addr) else {
+                        continue;
+                    };
+                    if !suppressed_routes.insert(route) {
+                        continue;
+                    }
+                    if let Some((_, normalized_addr, failures, delay)) =
+                        relay_circuit_backoff.note_failure(destination, addr, Instant::now())
+                    {
+                        automatic_peers.remove_peer_candidate_addr(destination, &normalized_addr);
+                        swarm
+                            .behaviour_mut()
+                            .kad
+                            .remove_address(&destination, &normalized_addr);
+                        tracing::debug!(
+                            relay = %route.relay,
+                            destination = %destination,
+                            failures,
+                            retry_ms = delay.as_millis(),
+                            "failed relay circuit route entered bounded backoff"
+                        );
+                    }
+                }
+            }
             automatic_peers.note_dial_failed(connection_id);
             if let Some(peer) = peer_id.filter(|peer| !swarm.is_connected(peer)) {
                 automatic_peers.clear_local_selection(peer);
@@ -9120,6 +9363,114 @@ mod tests {
             .iter()
             .any(|protocol| matches!(protocol, Protocol::P2pCircuit)));
         assert!(crate::peer_diversity::contains_public_ip(&dial_addr));
+    }
+
+    #[test]
+    fn relay_circuit_backoff_is_scoped_to_one_relay_destination_pair() {
+        use libp2p::multiaddr::Protocol;
+
+        let relay = PeerId::random();
+        let destination = PeerId::random();
+        let other_destination = PeerId::random();
+        let advertised = "/ip4/8.8.4.4/tcp/9500"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(relay))
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(destination));
+        let direct = "/ip4/1.1.1.1/tcp/9500".parse::<Multiaddr>().unwrap();
+        let now = Instant::now();
+        let mut backoff = RelayCircuitBackoff::default();
+
+        let (route, normalized, failures, delay) =
+            backoff.note_failure(destination, &advertised, now).unwrap();
+        assert_eq!(route.relay, relay);
+        assert_eq!(route.destination, destination);
+        assert_eq!(
+            normalized,
+            sanitize_automatic_peer_addr(destination, advertised.clone()).unwrap()
+        );
+        assert_eq!(failures, 1);
+        assert_eq!(delay, Duration::from_secs(30));
+        assert!(backoff.is_blocked(destination, &advertised, now));
+        assert!(!backoff.is_blocked(other_destination, &advertised, now));
+        assert!(!backoff.is_blocked(destination, &direct, now));
+
+        assert!(backoff.take_due(now + Duration::from_secs(29)).is_empty());
+        assert_eq!(
+            backoff.take_due(now + Duration::from_secs(30)),
+            vec![(route, normalized.clone())]
+        );
+        assert!(!backoff.is_blocked(destination, &advertised, now + Duration::from_secs(30)));
+
+        let (_, _, failures, delay) = backoff
+            .note_failure(destination, &advertised, now + Duration::from_secs(31))
+            .unwrap();
+        assert_eq!(failures, 2);
+        assert_eq!(delay, Duration::from_secs(60));
+        assert_eq!(backoff.take_due(now + Duration::from_secs(91)).len(), 1);
+
+        let (_, _, failures, delay) = backoff
+            .note_failure(destination, &advertised, now + Duration::from_secs(92))
+            .unwrap();
+        assert_eq!(failures, 3);
+        assert_eq!(delay, Duration::from_secs(5 * 60));
+        assert!(backoff.note_success(destination, &advertised));
+        assert!(!backoff.is_blocked(destination, &advertised, now));
+    }
+
+    #[test]
+    fn malformed_relay_route_cannot_backoff_a_different_destination() {
+        use libp2p::multiaddr::Protocol;
+
+        let relay = PeerId::random();
+        let expected_destination = PeerId::random();
+        let advertised_destination = PeerId::random();
+        let mismatched = "/ip4/8.8.8.8/tcp/9500"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(relay))
+            .with(Protocol::P2pCircuit)
+            .with(Protocol::P2p(advertised_destination));
+        let mut backoff = RelayCircuitBackoff::default();
+
+        assert!(backoff
+            .note_failure(expected_destination, &mismatched, Instant::now())
+            .is_none());
+        assert!(backoff.entries.is_empty());
+    }
+
+    #[test]
+    fn suppressing_one_relay_route_preserves_direct_and_other_relay_candidates() {
+        use libp2p::multiaddr::Protocol;
+
+        let local = PeerId::random();
+        let destination = PeerId::random();
+        let failed_relay = PeerId::random();
+        let other_relay = PeerId::random();
+        let direct = "/ip4/1.1.1.1/tcp/9500".parse::<Multiaddr>().unwrap();
+        let failed = "/ip4/8.8.8.8/tcp/9500"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(failed_relay))
+            .with(Protocol::P2pCircuit);
+        let alternative = "/ip4/8.8.4.4/tcp/9500"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(other_relay))
+            .with(Protocol::P2pCircuit);
+        let mut automatic = AutomaticPeerState::new(local);
+        assert!(automatic.add_peer_candidate(
+            local,
+            destination,
+            [direct.clone(), failed.clone(), alternative.clone()],
+        ));
+
+        assert!(automatic.remove_peer_candidate_addr(destination, &failed));
+        let remaining = &automatic.peers.get(&destination).unwrap().addrs;
+        assert!(remaining.contains(&direct));
+        assert!(remaining.contains(&alternative));
+        assert!(!remaining.contains(&failed));
     }
 
     #[test]

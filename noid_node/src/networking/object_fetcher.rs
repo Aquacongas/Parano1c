@@ -254,6 +254,75 @@ impl ObjectFetcher {
         })
     }
 
+    /// Replace one stalled hedge while keeping the original primary alive.
+    ///
+    /// The replacement must advertise the same exact bytes and come from a
+    /// third failure domain. The retired hedge is parked only for this object;
+    /// it is not scored as a transport failure and a response already decoded
+    /// by another event lane remains acceptable through `late_responses`.
+    pub fn rotate_hedge(
+        &mut self,
+        claim: ObjectClaimId,
+        now_ms: u64,
+        retired_source_backoff_ms: u64,
+    ) -> Result<FetchAssignment, FetchError> {
+        let job = self.jobs.get_mut(&claim).ok_or(FetchError::UnknownClaim)?;
+        let (primary, retired_hedge) = match job.state {
+            FetchState::InFlight {
+                primary,
+                hedge: Some(hedge),
+            } => (primary, hedge),
+            _ => return Err(FetchError::InvalidState),
+        };
+        let primary_source = job.sources.get(&primary).ok_or(FetchError::NoSource)?;
+        let retired_source = job
+            .sources
+            .get(&retired_hedge)
+            .ok_or(FetchError::NoSource)?;
+        let selected_object = job.selected_object.ok_or(FetchError::InvalidState)?;
+        let selected = job
+            .sources
+            .iter()
+            .filter(|(peer, source)| {
+                **peer != primary
+                    && **peer != retired_hedge
+                    && source.failure_domain != primary_source.failure_domain
+                    && source.failure_domain != retired_source.failure_domain
+                    && source.retry_after_ms <= now_ms
+                    && source.object == selected_object
+            })
+            .min_by_key(|(peer, source)| (source.failures, peer.to_bytes()))
+            .map(|(peer, _)| *peer)
+            .ok_or(FetchError::NoSource)?;
+
+        let retired = job
+            .sources
+            .get_mut(&retired_hedge)
+            .expect("retired hedge source checked above");
+        retired.retry_after_ms = retired
+            .retry_after_ms
+            .max(now_ms.saturating_add(retired_source_backoff_ms));
+        job.source_history.insert(
+            retired_hedge,
+            SourceHistory {
+                failures: retired.failures,
+                busy_responses: retired.busy_responses,
+                retry_after_ms: retired.retry_after_ms,
+            },
+        );
+        job.late_responses.insert(retired_hedge, selected_object);
+        job.state = FetchState::InFlight {
+            primary,
+            hedge: Some(selected),
+        };
+        let source = job.sources[&selected];
+        Ok(FetchAssignment {
+            peer: selected,
+            object: source.object,
+            resumed_bytes: job.partial_bytes,
+        })
+    }
+
     pub fn record_progress(
         &mut self,
         claim: ObjectClaimId,
@@ -632,8 +701,8 @@ impl ObjectFetcher {
         }
     }
 
-    /// Forget one disconnected request correlation after its bounded
-    /// transport/event grace elapsed without a response.
+    /// Forget one retired request correlation after transport has proved that
+    /// no response remains, or after its bounded disconnect/event grace.
     pub fn forget_late_response(&mut self, claim: ObjectClaimId, peer: PeerId, object: ObjectId) {
         let Some(job) = self.jobs.get_mut(&claim) else {
             return;
@@ -965,6 +1034,41 @@ mod tests {
             fetcher.jobs[&claim].sources[&hedge.peer].failure_domain,
             primary_domain
         );
+    }
+
+    #[test]
+    fn stalled_hedge_rotates_to_a_third_domain_without_scoring_it() {
+        let (claim, object) = body(1, 1);
+        let peers = [PeerId::random(), PeerId::random(), PeerId::random()];
+        let mut fetcher = ObjectFetcher::new();
+        fetcher.want(claim);
+        for (index, peer) in peers.iter().copied().enumerate() {
+            fetcher
+                .advertise(claim, peer, FailureDomain(index as u64 + 1), object)
+                .unwrap();
+        }
+
+        let primary = fetcher.start_primary(claim, 0).unwrap();
+        let first_hedge = fetcher.start_hedge(claim, 4_000, 4_000).unwrap();
+        let replacement = fetcher.rotate_hedge(claim, 12_000, 60_000).unwrap();
+
+        assert_ne!(replacement.peer, primary.peer);
+        assert_ne!(replacement.peer, first_hedge.peer);
+        assert_eq!(replacement.object, object);
+        assert_eq!(
+            fetcher.state(claim),
+            Some(FetchState::InFlight {
+                primary: primary.peer,
+                hedge: Some(replacement.peer),
+            })
+        );
+
+        // The deliberately retired source can still win if its exact response
+        // was already decoded before the scheduler rotated the hedge.
+        fetcher
+            .finish_receive(claim, first_hedge.peer, object)
+            .unwrap();
+        fetcher.mark_verified(claim, object).unwrap();
     }
 
     #[test]

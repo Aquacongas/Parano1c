@@ -3968,7 +3968,16 @@ async fn apply_exact_suffix_offthread(
             "exact suffix terminal verified outside the chain writer"
         );
 
+        let writer_wait_started = Instant::now();
         let mut ctx = apply_chain.blocking_write();
+        let writer_wait = writer_wait_started.elapsed();
+        if writer_wait >= Duration::from_secs(2) {
+            tracing::warn!(
+                target_height = plan.target().height,
+                wait_ms = writer_wait.as_millis(),
+                "exact suffix waited for the chain writer"
+            );
+        }
 
         match plan.kind() {
             SyncPlanKind::LiveSuffix => {
