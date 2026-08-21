@@ -93,6 +93,16 @@ const T_OWNER_INDEX: &str = "owner_idx";
 const T_RETENTION_META: &str = "retention_meta";
 const N_TABLES: u64 = 17;
 
+/// Maximum reclaimed-page list searched for one contiguous overflow value.
+///
+/// HistoryStep terminals are close to one MiB and rotate through two bounded
+/// tables.  The libmdbx dynamic default is only about 2,044 pages on a small
+/// database; once free space becomes fragmented, that search can miss every
+/// suitable run and extend the file despite gigabytes already being free.
+/// 65,536 page numbers cover 256 MiB at the production 4 KiB page size while
+/// keeping the temporary allocator list bounded and small.
+const MDBX_RECLAIM_PAGE_SEARCH_LIMIT: u64 = 65_536;
+
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
 const KEY_META: &[u8] = &[0u8];
@@ -1449,6 +1459,12 @@ impl MdbxStore {
             DatabaseOptions {
                 max_tables: Some(N_TABLES),
                 mode: Mode::ReadWrite(rw),
+                // Reuse the most recently retired contiguous terminal pages
+                // before walking older fragmented GC records. This changes
+                // only local page allocation; the MDBX format and all chain
+                // data remain identical and readable without this flag.
+                liforeclaim: true,
+                rp_augment_limit: Some(MDBX_RECLAIM_PAGE_SEARCH_LIMIT),
                 ..Default::default()
             },
         )?;
@@ -4993,6 +5009,96 @@ mod tests {
                 crate::hash_block_header(&store.get_header(boundary - 1).unwrap().unwrap()),
             )
             .unwrap());
+    }
+
+    #[test]
+    fn fragmented_terminal_rotation_reuses_freed_overflow_pages() {
+        const FRAGMENT_RECORDS: u64 = 256;
+        const FRAGMENT_BYTES: usize = 256 * 1024;
+        const ROTATING_BYTES: usize = 512 * 1024;
+        const TERMINAL_RETENTION: u64 = 43;
+        const PROOF_RETENTION: u64 = 129;
+        const WARMUP_HEIGHT: u64 = 300;
+        const FINAL_HEIGHT: u64 = 500;
+        const ONE_GROWTH_STEP: u64 = 64 * 1024 * 1024;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+
+        // Build a fragmented free list whose individual 256 KiB holes cannot
+        // hold a rotating HistoryStep-sized value. This mirrors a mature node
+        // after State and proof objects of different lifetimes have churned.
+        let fragment = vec![0xA5; FRAGMENT_BYTES];
+        for first in (0..FRAGMENT_RECORDS).step_by(16) {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_SEGMENTS)).unwrap();
+            for id in first..(first + 16).min(FRAGMENT_RECORDS) {
+                txn.put(&table, u64_key(id), &fragment, WriteFlags::empty())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        for first in (0..FRAGMENT_RECORDS).step_by(32) {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_SEGMENTS)).unwrap();
+            for id in first..(first + 32).min(FRAGMENT_RECORDS) {
+                if id % 2 == 0 {
+                    txn.del(&table, u64_key(id), None).unwrap();
+                }
+            }
+            txn.commit().unwrap();
+        }
+
+        let rotating = vec![0x5A; ROTATING_BYTES];
+        let mut size_after_warmup = 0;
+        for height in 1..=FINAL_HEIGHT {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let terminals = txn.open_table(Some(T_HISTORY_STEP_TERMINALS)).unwrap();
+            let proofs = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS)).unwrap();
+            txn.put(&terminals, u64_key(height), &rotating, WriteFlags::empty())
+                .unwrap();
+            txn.put(
+                &proofs,
+                history_step_proof_object_key(height, [height as u8; 32], 0),
+                &rotating,
+                WriteFlags::empty(),
+            )
+            .unwrap();
+            if height > TERMINAL_RETENTION {
+                txn.del(&terminals, u64_key(height - TERMINAL_RETENTION), None)
+                    .unwrap();
+            }
+            if height > PROOF_RETENTION {
+                txn.del(
+                    &proofs,
+                    history_step_proof_object_key(
+                        height - PROOF_RETENTION,
+                        [(height - PROOF_RETENTION) as u8; 32],
+                        0,
+                    ),
+                    None,
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+
+            if height == WARMUP_HEIGHT {
+                size_after_warmup = std::fs::metadata(directory.path().join("mdbx.dat"))
+                    .unwrap()
+                    .len();
+            }
+        }
+
+        let final_size = std::fs::metadata(directory.path().join("mdbx.dat"))
+            .unwrap()
+            .len();
+        let free_bytes =
+            store.db.freelist().unwrap() as u64 * u64::from(store.db.stat().unwrap().page_size());
+        assert!(free_bytes > 0, "stress fixture did not create free pages");
+        assert!(
+            final_size <= size_after_warmup + ONE_GROWTH_STEP,
+            "rotating bounded proof data grew fragmented MDBX from {size_after_warmup} to {final_size} bytes despite {free_bytes} free bytes"
+        );
     }
 
     #[test]
