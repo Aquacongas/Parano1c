@@ -245,10 +245,12 @@ propagation, at a 20-second mean. Cumulative work selects the chain. An external
 miner receives an immutable, single-use template and returns only a nonce; it
 cannot alter the transactions or state root.
 
-## Public Testnet Profile
+## Mainnet Profile
 
 | Parameter | Value |
 |---|---:|
+| Genesis timestamp | 2026-08-21 16:00:00 UTC |
+| Genesis block ID | `860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610` |
 | Mean block target | 20 seconds |
 | Default miner class | B25, `m=22`, up to 25 effective page positions |
 | Large miner class | B255, `m=24`, up to 255 effective page positions |
@@ -310,7 +312,7 @@ An explicit seed may be supplied when diagnosing discovery or operating a
 private entry point:
 
 ```sh
-parano1d --seed <host>:9500
+parano1d --seed <host>:9600
 ```
 
 External nonce search keeps transaction selection and proving inside the node:
@@ -320,7 +322,7 @@ parano1d --extminer --mining-key <token>
 parano1d-miner --key <token>
 ```
 
-Default ports are `9500` for P2P and `127.0.0.1:9501` for JSON-RPC. First start
+Default ports are `9600` for P2P and `127.0.0.1:9601` for JSON-RPC. First start
 creates `~/.parano1d/parano1d.toml`, the MDBX state and the built-in wallet
 under `~/.parano1d/data/`.
 

@@ -40,13 +40,11 @@ use crate::model::{
     WALLET_CONSOLIDATION_INPUT_LIMIT,
 };
 
-const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9501";
-const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9501";
-const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9500";
-const LEGACY_DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9400";
-const LEGACY_DEFAULT_P2P_MULTIADDR: &str = "/ip4/0.0.0.0/tcp/9400";
+const DEFAULT_RPC_URL: &str = "http://127.0.0.1:9601";
+const DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9601";
+const DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9600";
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
-const NETWORK_STORAGE_SCHEMA: &[u8] = b"parano1d/testnet/network-storage/v1/";
+const NETWORK_STORAGE_EPOCH: &[u8] = b"parano1d/mainnet/network-storage/v1/860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610\n";
 const STATE_SEGMENT_LOG: u32 = 16;
 const STATE_MAP_BUCKETS: usize = 256;
 const GENESIS_DIFFICULTY_LOG2: f64 = 238.0;
@@ -1320,9 +1318,18 @@ impl Backend {
         })?;
         let config_path = config.data_dir.join("parano1d-gui.toml");
         let log_path = config.data_dir.join("parano1d-node.log");
-        let log = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let reset_log = !gui_network_storage_epoch_is_current(&config.data_dir);
+        let mut log_options = OpenOptions::new();
+        log_options.create(true);
+        if reset_log {
+            // The daemon preserves this already-open diagnostic file while it
+            // removes the incompatible storage epoch. Truncate legacy output
+            // here so the first mainnet session remains readable by the GUI.
+            log_options.write(true).truncate(true);
+        } else {
+            log_options.append(true);
+        }
+        let log = log_options
             .open(&log_path)
             .map_err(|error| format!("open node log {}: {error}", log_path.display()))?;
         let log_error = log
@@ -1493,19 +1500,19 @@ impl BackendConfig {
             .ok()
             .filter(|bytes| bytes.len() <= 64 * 1024)
             .and_then(|bytes| serde_json::from_slice::<PersistedGuiSettings>(&bytes).ok());
-        // Keep the selected data directory long enough to find wallet.key,
-        // but do not carry any old GUI/network preferences into network-v7.
-        // The daemon creates this marker only after its wallet-only reset.
+        // Keep the selected data directory long enough to locate the storage
+        // marker, but do not carry old GUI/network preferences into mainnet.
+        // The daemon creates the marker only after its one-time full reset.
         let data_dir = std::env::var_os("NOID_GUI_DATA_DIR")
             .map(PathBuf::from)
             .or_else(|| persisted.as_ref().map(|settings| settings.data_dir.clone()))
             .unwrap_or_else(default_data_dir);
-        let reset_legacy_settings =
-            legacy_gui_settings_reset_pending(&data_dir, persisted.is_some());
-        if reset_legacy_settings {
+        let reset_mainnet_settings =
+            mainnet_gui_settings_reset_pending(&data_dir, persisted.is_some());
+        if reset_mainnet_settings {
             let _ = std::fs::remove_file(&settings_path);
         }
-        let persisted_preferences = (!reset_legacy_settings)
+        let persisted_preferences = (!reset_mainnet_settings)
             .then_some(persisted.as_ref())
             .flatten();
         let rpc_url = std::env::var("NOID_RPC").unwrap_or_else(|_| DEFAULT_RPC_URL.into());
@@ -1516,7 +1523,7 @@ impl BackendConfig {
         });
         let p2p_listen = std::env::var("NOID_GUI_P2P_LISTEN").unwrap_or_else(|_| {
             persisted_preferences
-                .map(|settings| migrate_legacy_gui_p2p_listen(&settings.p2p_listen))
+                .map(|settings| settings.p2p_listen.clone())
                 .unwrap_or_else(|| DEFAULT_P2P_LISTEN.into())
         });
         let node_binary = std::env::var_os("NOID_GUI_NODE_BIN")
@@ -1567,18 +1574,7 @@ impl BackendConfig {
     }
 }
 
-fn migrate_legacy_gui_p2p_listen(listen: &str) -> String {
-    if matches!(
-        listen,
-        LEGACY_DEFAULT_P2P_LISTEN | LEGACY_DEFAULT_P2P_MULTIADDR
-    ) {
-        DEFAULT_P2P_LISTEN.into()
-    } else {
-        listen.into()
-    }
-}
-
-fn legacy_gui_settings_reset_pending(data_dir: &Path, settings_exist: bool) -> bool {
+fn mainnet_gui_settings_reset_pending(data_dir: &Path, settings_exist: bool) -> bool {
     settings_exist && !gui_network_storage_epoch_is_current(data_dir)
 }
 
@@ -1586,14 +1582,7 @@ fn gui_network_storage_epoch_is_current(data_dir: &Path) -> bool {
     let Ok(marker) = std::fs::read(data_dir.join(NETWORK_STORAGE_EPOCH_MARKER_FILE)) else {
         return false;
     };
-    let Some(genesis_hex) = marker.strip_prefix(NETWORK_STORAGE_SCHEMA) else {
-        return false;
-    };
-    genesis_hex.len() == 65
-        && genesis_hex[64] == b'\n'
-        && genesis_hex[..64]
-            .iter()
-            .all(|byte| byte.is_ascii_hexdigit())
+    marker == NETWORK_STORAGE_EPOCH
 }
 
 fn parse_log_level(value: &str) -> Option<LogLevel> {
@@ -3106,8 +3095,8 @@ mod tests {
     #[test]
     fn loopback_rpc_url_yields_a_daemon_listen_address() {
         assert_eq!(
-            rpc_listen_from_url("http://127.0.0.1:9501"),
-            Some("127.0.0.1:9501")
+            rpc_listen_from_url("http://127.0.0.1:9601"),
+            Some("127.0.0.1:9601")
         );
         assert_eq!(
             rpc_listen_from_url("http://127.0.0.1:9411/rpc"),
@@ -3116,38 +3105,22 @@ mod tests {
     }
 
     #[test]
-    fn legacy_gui_default_p2p_listener_migrates_but_custom_port_does_not() {
-        assert_eq!(
-            migrate_legacy_gui_p2p_listen("0.0.0.0:9400"),
-            DEFAULT_P2P_LISTEN
-        );
-        assert_eq!(
-            migrate_legacy_gui_p2p_listen("/ip4/0.0.0.0/tcp/9400"),
-            DEFAULT_P2P_LISTEN
-        );
-        assert_eq!(
-            migrate_legacy_gui_p2p_listen("127.0.0.1:19400"),
-            "127.0.0.1:19400"
-        );
-    }
-
-    #[test]
-    fn gui_preferences_are_discarded_until_wallet_only_reset_completes() {
+    fn gui_preferences_are_discarded_until_mainnet_reset_completes() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(legacy_gui_settings_reset_pending(directory.path(), true));
-        assert!(!legacy_gui_settings_reset_pending(directory.path(), false));
-        std::fs::write(
-            directory.path().join(NETWORK_STORAGE_EPOCH_MARKER_FILE),
-            b"parano1d/network-storage/v3/530016417023d5e9e6a5f7e0b55b7734e11f9fcd28fbdfd3f731edf6814bafe2\n",
-        )
-        .unwrap();
-        assert!(legacy_gui_settings_reset_pending(directory.path(), true));
+        assert!(mainnet_gui_settings_reset_pending(directory.path(), true));
+        assert!(!mainnet_gui_settings_reset_pending(directory.path(), false));
         std::fs::write(
             directory.path().join(NETWORK_STORAGE_EPOCH_MARKER_FILE),
             b"parano1d/testnet/network-storage/v1/530016417023d5e9e6a5f7e0b55b7734e11f9fcd28fbdfd3f731edf6814bafe2\n",
         )
         .unwrap();
-        assert!(!legacy_gui_settings_reset_pending(directory.path(), true));
+        assert!(mainnet_gui_settings_reset_pending(directory.path(), true));
+        std::fs::write(
+            directory.path().join(NETWORK_STORAGE_EPOCH_MARKER_FILE),
+            NETWORK_STORAGE_EPOCH,
+        )
+        .unwrap();
+        assert!(!mainnet_gui_settings_reset_pending(directory.path(), true));
     }
 
     #[test]
@@ -3283,7 +3256,7 @@ mod tests {
             p2p_listen: "127.0.0.1:19400".into(),
             data_dir: directory.path().join("node-data"),
             node_binary: PathBuf::from("parano1d"),
-            seeds: vec!["seed-a.example:9500".into(), "dnsaddr:noid.network".into()],
+            seeds: vec!["seed-a.example:9600".into(), "dnsaddr:noid.network".into()],
             log_level: LogLevel::Debug,
             language: Some(Language::Russian),
             settings_path: settings_path.clone(),

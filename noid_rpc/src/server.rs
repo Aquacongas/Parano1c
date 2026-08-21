@@ -3244,7 +3244,7 @@ pub async fn start_rpc_server(
     // When mining_key is None it is a transparent pass-through.
     // When Some(key), all requests must carry `Authorization: Bearer <key>`.
     //
-    // Pool operators:  parano1d --rpc-listen 0.0.0.0:9501 --mining-key <secret>
+    // Pool operators:  parano1d --rpc-listen 0.0.0.0:9601 --mining-key <secret>
     // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
     let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
     let server = Server::builder()

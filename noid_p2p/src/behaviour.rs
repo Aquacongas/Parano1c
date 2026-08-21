@@ -160,7 +160,7 @@ impl NodeBehaviour {
     /// Build the combined behaviour from a libp2p keypair.
     ///
     /// `protocol_id` is the network-specific prefix used for all sync stream
-    /// protocols (for example the current public-testnet namespace). This
+    /// protocols (for example the current mainnet namespace). This
     /// ensures distinct networks can never accidentally sync with each other.
     /// Build the combined behaviour.
     ///
@@ -318,7 +318,7 @@ impl NodeBehaviour {
                 (
                     // v2.0.1 already carries the same canonical headers and
                     // exact retained-object inventory. Keep v4 as a fallback
-                    // so transport improvements do not split the testnet.
+                    // so transport improvements do not split mainnet.
                     StreamProtocol::try_from_owned(format!("{}/sync/headers/4", protocol_id))?,
                     ProtocolSupport::Full,
                 ),

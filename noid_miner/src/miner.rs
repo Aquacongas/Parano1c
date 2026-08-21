@@ -48,7 +48,9 @@ use crate::cpu_budget::{
     install_pow_phase_cpu, ProcessCpuBudgetMode,
 };
 use crate::proof_capacity::AdaptiveProofCapacity;
-use crate::template::{TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger};
+use crate::template::{
+    mining_launch_is_open, TemplateBuilder, TemplateChainSnapshot, TemplateRefreshTrigger,
+};
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -404,6 +406,10 @@ impl BlockMiner {
                     continue;
                 }
             };
+            if !mining_launch_is_open(&snapshot.parent, now) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
             let max_user_pages = proof_capacity.page_limit();
             let tmpl = match builder
                 .build_from_snapshot_with_limit(snapshot, addr, now, max_user_pages)

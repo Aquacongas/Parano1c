@@ -1350,7 +1350,7 @@ mod tests {
                     miner_address: parent.miner_address,
                     // Pre-mined for this exact deterministic fixture. Keeping
                     // it fixed avoids debug-mode PoW work in CI.
-                    nonce: 39_433,
+                    nonce: 58_902,
                     difficulty_target: next_target(
                         anchor_height,
                         anchor.timestamp,
@@ -1407,7 +1407,7 @@ mod tests {
         )
         .expect("build native-valid coinbase child")
         // Pre-mined for this exact deterministic coinbase-only template.
-        .into_block(294_184)
+        .into_block(382_055)
     }
 
     /// Print a fresh pre-mined nonce for `native_coinbase_child` after a

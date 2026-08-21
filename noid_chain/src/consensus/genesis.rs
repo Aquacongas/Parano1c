@@ -19,8 +19,8 @@ use crate::consensus::{
 };
 use noid_poseidon2b::primitives::Address;
 
-/// Fixed genesis timestamp (2026-08-13 08:00:00 UTC).
-pub const GENESIS_TIMESTAMP: u64 = 1_786_608_000;
+/// Fixed mainnet genesis timestamp (2026-08-21 16:00:00 UTC).
+pub const GENESIS_TIMESTAMP: u64 = 1_787_328_000;
 
 /// The genesis burn address — coinbase recipient at height 0.
 /// Uses a zero address; no private key is known.
@@ -68,7 +68,7 @@ const GENESIS_STATE_ROOT: [u8; 32] = [
 /// Pre-mined genesis nonce.
 /// Satisfies: `H_POSEIDON_POW(genesis_header()) < GENESIS_TARGET`.
 /// Mined for the canonical 16-field PoW schedule.
-const GENESIS_NONCE: u128 = 46_516;
+const GENESIS_NONCE: u128 = 28_170;
 
 /// Find and return a valid genesis nonce at runtime.
 /// Used for verification only — not for production (nonce is hardcoded as `GENESIS_NONCE`).
@@ -170,9 +170,9 @@ mod tests {
         assert_eq!(
             crate::block_header::block_id(&genesis_header()),
             [
-                0x53, 0x00, 0x16, 0x41, 0x70, 0x23, 0xd5, 0xe9, 0xe6, 0xa5, 0xf7, 0xe0, 0xb5, 0x5b,
-                0x77, 0x34, 0xe1, 0x1f, 0x9f, 0xcd, 0x28, 0xfb, 0xdf, 0xd3, 0xf7, 0x31, 0xed, 0xf6,
-                0x81, 0x4b, 0xaf, 0xe2,
+                0x86, 0x0e, 0x70, 0x45, 0x33, 0x90, 0xbf, 0x81, 0x57, 0x18, 0xe9, 0x33, 0xaa, 0x49,
+                0x27, 0x16, 0x7a, 0x13, 0xd0, 0x98, 0xb0, 0x15, 0x13, 0x91, 0xee, 0xfd, 0x72, 0x2e,
+                0xe1, 0xad, 0xd6, 0x10,
             ]
         );
     }
@@ -180,6 +180,6 @@ mod tests {
     #[test]
     #[allow(clippy::assertions_on_constants)]
     fn genesis_timestamp_is_reasonable() {
-        assert!(GENESIS_TIMESTAMP > 1_700_000_000);
+        assert_eq!(GENESIS_TIMESTAMP, 1_787_328_000);
     }
 }

@@ -308,6 +308,9 @@ impl TemplateBuilder {
         use noid_chain::consensus::median_time_past;
 
         let parent = snapshot.parent;
+        if !mining_launch_is_open(&parent, now_unix) {
+            return None;
+        }
         let finalized_active_counts = &snapshot.finalized_active_counts;
         let prev_timestamps = &snapshot.prev_timestamps;
 
@@ -440,6 +443,10 @@ impl TemplateBuilder {
     }
 }
 
+pub(crate) fn mining_launch_is_open(parent: &BlockHeader, now_unix: u64) -> bool {
+    parent.height != 0 || now_unix >= parent.timestamp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,5 +470,19 @@ mod tests {
             );
         }
         assert_eq!(template_epoch_anchor_heights(u64::MAX), None);
+    }
+
+    #[test]
+    fn first_template_unlocks_exactly_at_genesis_time() {
+        let genesis = noid_chain::consensus::genesis_header();
+        assert!(!mining_launch_is_open(
+            &genesis,
+            genesis.timestamp.saturating_sub(1)
+        ));
+        assert!(mining_launch_is_open(&genesis, genesis.timestamp));
+
+        let mut later_parent = genesis;
+        later_parent.height = 1;
+        assert!(mining_launch_is_open(&later_parent, 0));
     }
 }

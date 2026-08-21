@@ -4,11 +4,11 @@ Parano1d uses libp2p for peer identity, discovery, relay and synchronization.
 The public network protocol is identified as:
 
 ```text
-/noid/testnet/530016417023d5e9/1
+/noid/mainnet/860e70453390bf81/1
 ```
 
-The default P2P listener is TCP `9500`. JSON-RPC is a separate local
-administration interface on `127.0.0.1:9501`.
+The default P2P listener is TCP `9600`. JSON-RPC is a separate local
+administration interface on `127.0.0.1:9601`.
 
 ## Peer identity and consensus identity
 
@@ -121,7 +121,7 @@ proof verification and cumulative-work consensus.
 
 ## Interface boundaries
 
-P2P port `9500` is intended for public exposure. RPC port `9501` is not. RPC
+P2P port `9600` is intended for public exposure. RPC port `9601` is not. RPC
 includes wallet and process-control methods and has no public transport
 authentication layer; keep it on loopback or behind an authenticated private
 tunnel.

@@ -14,7 +14,7 @@
 
 ```toml
 [network]
-listen = "0.0.0.0:9500"
+listen = "0.0.0.0:9600"
 seeds = []
 
 [storage]
@@ -22,7 +22,7 @@ backend = "mdbx"
 path = "~/.parano1d/data"
 
 [rpc]
-listen = "127.0.0.1:9501"
+listen = "127.0.0.1:9601"
 
 [mining]
 enabled = false
@@ -36,14 +36,14 @@ miner_address = ""
 
 `network.listen` принимает `HOST:PORT` или [мультиадрес libp2p](../reference/glossary.md#мультиадрес-libp2p-multiaddress).
 Для публичных
-IPv4-соединений используйте `0.0.0.0:9500`.
+IPv4-соединений используйте `0.0.0.0:9600`.
 
 `network.seeds` добавляет начальные пиры. Допустимые формы:
 
 ```text
-198.51.100.10:9500
-seed.example.org:9500
-/ip4/198.51.100.10/tcp/9500
+198.51.100.10:9600
+seed.example.org:9600
+/ip4/198.51.100.10/tcp/9600
 dnsaddr:seed.example.org
 ```
 
@@ -68,7 +68,7 @@ dnsaddr:seed.example.org
 Оставляйте RPC на:
 
 ```text
-127.0.0.1:9501
+127.0.0.1:9601
 ```
 
 Интерфейс позволяет отправлять транзакции кошелька и управлять процессом. Это

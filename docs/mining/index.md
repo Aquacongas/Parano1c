@@ -137,7 +137,7 @@ Run the worker against its loopback RPC endpoint:
 
 ```sh
 parano1d-miner \
-  --rpc http://127.0.0.1:9501 \
+  --rpc http://127.0.0.1:9601 \
   --key '<long-random-token>' \
   --threads 12
 ```

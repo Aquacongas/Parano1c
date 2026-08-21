@@ -827,35 +827,6 @@ use config::NodeConfig;
 use sync_phase_telemetry::{SnapshotSyncTelemetry, SyncPhase, SyncPhaseMeasurement};
 use wallet::{SharedWallet, WalletHandle, WalletState};
 
-const LEGACY_DEFAULT_P2P_LISTEN: &str = "0.0.0.0:9400";
-const LEGACY_DEFAULT_P2P_MULTIADDR: &str = "/ip4/0.0.0.0/tcp/9400";
-const LEGACY_DEFAULT_RPC_LISTEN: &str = "127.0.0.1:9401";
-
-/// Carry an existing installation across the network-v7 port change without
-/// rewriting deliberate custom listeners or explicit CLI overrides.
-fn migrate_legacy_default_ports(
-    config: &mut NodeConfig,
-    network: &NetworkConfig,
-    migrate_p2p: bool,
-    migrate_rpc: bool,
-) -> bool {
-    let mut changed = false;
-    if migrate_p2p
-        && matches!(
-            config.network.listen.as_deref(),
-            Some(LEGACY_DEFAULT_P2P_LISTEN | LEGACY_DEFAULT_P2P_MULTIADDR)
-        )
-    {
-        config.network.listen = Some(format!("0.0.0.0:{}", network.default_p2p_port));
-        changed = true;
-    }
-    if migrate_rpc && config.rpc.listen.as_deref() == Some(LEGACY_DEFAULT_RPC_LISTEN) {
-        config.rpc.listen = Some(network.default_rpc_listen());
-        changed = true;
-    }
-    changed
-}
-
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
@@ -908,7 +879,7 @@ impl HistoryStepCacheClass {
     name = "parano1d",
     about = "ParanO(1)d full node daemon — proof-native HistoryStep UTXO network",
     version = env!("CARGO_PKG_VERSION"),
-    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  parano1d --miner --data-dir ~/.parano1d/data\n  parano1d --p2p-listen 0.0.0.0:9500 --seed 1.2.3.4:9500",
+    long_about = "Run a ParanO(1)d node and wallet.\n\nExample:\n  parano1d --miner --data-dir ~/.parano1d/data\n  parano1d --p2p-listen 0.0.0.0:9600 --seed 1.2.3.4:9600",
 )]
 struct Cli {
     /// Path to TOML config file. A missing file is created with safe defaults.
@@ -953,16 +924,16 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     data_dir: Option<PathBuf>,
 
-    /// P2P listen address in HOST:PORT format. Default: 0.0.0.0:9500
+    /// P2P listen address in HOST:PORT format. Default: 0.0.0.0:9600
     #[arg(long, value_name = "HOST:PORT")]
     p2p_listen: Option<String>,
 
-    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9501
+    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9601
     #[arg(long, value_name = "HOST:PORT")]
     rpc_listen: Option<String>,
 
     /// Seed peer address (HOST:PORT). Repeat for multiple seeds.
-    /// Example: --seed 1.2.3.4:9500 --seed 5.6.7.8:9500
+    /// Example: --seed 1.2.3.4:9600 --seed 5.6.7.8:9600
     #[arg(long, value_name = "HOST:PORT", action = clap::ArgAction::Append)]
     seed: Vec<String>,
 
@@ -982,7 +953,7 @@ struct Cli {
     /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
     ///
     /// Pool example:
-    ///   parano1d --rpc-listen 0.0.0.0:9501 --mining-key s3cr3t
+    ///   parano1d --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t
     ///   # External miner: Authorization: Bearer s3cr3t
     #[arg(long, value_name = "TOKEN")]
     mining_key: Option<String>,
@@ -997,7 +968,7 @@ struct Cli {
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
     /// Example:
-    ///   parano1d --rpc-listen 0.0.0.0:9501 --mining-key s3cr3t --allow-custom-coinbase
+    ///   parano1d --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t --allow-custom-coinbase
     ///   # Miner: getBlockTemplate("o1their_own_address")
     #[arg(long, requires = "mining_key")]
     allow_custom_coinbase: bool,
@@ -1040,8 +1011,8 @@ struct Cli {
 /// easy multi-node seed rotation via DNS.
 ///
 /// DNS setup for format 4:
-///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9500/p2p/12D3KooW..."
-///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9500/p2p/12D3KooW..."
+///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/1.2.3.4/tcp/9600/p2p/12D3KooW..."
+///   _dnsaddr.example.org  TXT  "dnsaddr=/ip4/5.6.7.8/tcp/9600/p2p/12D3KooW..."
 fn seed_to_multiaddr(s: &str, default_port: u16) -> anyhow::Result<libp2p::Multiaddr> {
     let seed = s.trim();
 
@@ -1166,7 +1137,7 @@ fn split_host_port(addr: &str) -> anyhow::Result<(&str, &str)> {
     }
     addr.rsplit_once(':').with_context(|| {
         format!(
-            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9500)",
+            "invalid address {:?}: expected HOST:PORT (e.g. 127.0.0.1:9600)",
             addr
         )
     })
@@ -1189,8 +1160,8 @@ fn seed_host_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> 
 
 /// Convert a user-friendly "HOST:PORT" string into a libp2p Multiaddr.
 ///
-/// Users type:  `127.0.0.1:9500`  or  `0.0.0.0:9500`
-/// libp2p needs: `/ip4/127.0.0.1/tcp/9500`
+/// Users type:  `127.0.0.1:9600`  or  `0.0.0.0:9600`
+/// libp2p needs: `/ip4/127.0.0.1/tcp/9600`
 ///
 /// This conversion is purely internal — users never see multiaddrs.
 fn ip_port_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
@@ -1223,13 +1194,16 @@ fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
     ip_port_to_multiaddr(addr)
 }
 
-// Network-v7 deliberately has no compatibility path from the withdrawn
-// launch clients. On first start, retain only the master wallet secret and
-// rebuild every derived chain, P2P, receipt, cache and GUI-daemon artifact.
+// Mainnet deliberately has no storage compatibility path from testnet. On
+// first start, remove every State, wallet, cache, identity and configuration
+// entry from the selected data directory and initialize a fresh genesis-bound
+// storage epoch. The GUI may already have the node log open when the daemon
+// starts, so that one diagnostic file is retained and truncated by the GUI.
 // The marker binds both the storage schema and genesis so a future genesis
 // replacement cannot accidentally reuse this database.
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
-const NETWORK_STORAGE_SCHEMA: &[u8] = b"parano1d/testnet/network-storage/v1/";
+const NETWORK_STORAGE_SCHEMA: &[u8] = b"parano1d/mainnet/network-storage/v1/";
+const NODE_LOG_FILE: &str = "parano1d-node.log";
 
 fn network_storage_epoch_bytes() -> Vec<u8> {
     let genesis = noid_chain::consensus::genesis_header();
@@ -1346,40 +1320,30 @@ fn prepare_network_storage_epoch(data_dir: &Path) -> anyhow::Result<bool> {
     }
 
     validate_network_storage_reset_target(data_dir)?;
-    let wallet_path = data_dir.join("wallet.key");
-    if let Ok(metadata) = std::fs::symlink_metadata(&wallet_path) {
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            anyhow::bail!(
-                "refusing to replace non-regular wallet key {}",
-                wallet_path.display()
-            );
-        }
-    }
-
-    let wallet_preserved = wallet_path.is_file();
     let mut removed = 0usize;
     for entry in std::fs::read_dir(data_dir)
         .with_context(|| format!("enumerate legacy data directory {}", data_dir.display()))?
     {
         let entry = entry.with_context(|| format!("read entry in {}", data_dir.display()))?;
-        if entry.file_name() == std::ffi::OsStr::new("wallet.key") {
+        if entry.file_name() == std::ffi::OsStr::new(NODE_LOG_FILE) {
             continue;
         }
         remove_network_storage_entry(&entry.path())?;
         removed = removed.saturating_add(1);
     }
-    persist_network_storage_epoch_marker(data_dir)?;
-    let legacy_installation = wallet_preserved || removed != 0;
-    if legacy_installation {
+    let previous_installation_removed = removed != 0;
+    if previous_installation_removed {
         tracing::warn!(
             removed,
-            wallet_preserved,
-            "one-time v2 testnet reset completed; only wallet.key was retained"
+            "one-time mainnet data reset prepared; all previous data was removed"
         );
     } else {
-        tracing::debug!("initialized v2 testnet storage epoch");
+        tracing::debug!("empty mainnet storage epoch prepared");
     }
-    Ok(legacy_installation)
+    // `true` means that a reset is required, even if the directory was empty.
+    // The caller persists the marker only after configuration is durably reset;
+    // otherwise a crash between those steps could revive stale settings.
+    Ok(true)
 }
 
 fn remove_file_if_present(path: &Path) -> anyhow::Result<bool> {
@@ -1390,16 +1354,25 @@ fn remove_file_if_present(path: &Path) -> anyhow::Result<bool> {
     }
 }
 
-fn reset_install_preferences_at_root(root: &Path, data_dir: &Path) -> anyhow::Result<()> {
-    if data_dir != root.join("data") {
+fn reset_install_preferences_at_root(
+    root: &Path,
+    data_dir: &Path,
+    config_path: &Path,
+    gui_supervised: bool,
+) -> anyhow::Result<()> {
+    let default_config = root.join("parano1d.toml");
+    if data_dir != root.join("data") && expand_tilde(config_path) != default_config {
         return Ok(());
     }
-    let gui_removed = remove_file_if_present(&root.join("gui-settings.json"))?;
-    // The GUI supervises the daemon with a generated config inside `data`, so
-    // the selected config path is not necessarily this legacy Core default.
-    // Remove both default preference files whenever the default installation
-    // is reset; custom configs outside the installation root remain untouched.
-    let core_removed = remove_file_if_present(&root.join("parano1d.toml"))?;
+    // The new GUI rejects legacy settings before starting the daemon and may
+    // already have persisted the user's new language choice. Preserve that
+    // freshly written file only for the exact GUI-supervised config path.
+    let gui_removed = if gui_supervised {
+        false
+    } else {
+        remove_file_if_present(&root.join("gui-settings.json"))?
+    };
+    let core_removed = remove_file_if_present(&default_config)?;
     if gui_removed || core_removed {
         tracing::info!(
             gui_removed,
@@ -1410,9 +1383,27 @@ fn reset_install_preferences_at_root(root: &Path, data_dir: &Path) -> anyhow::Re
     Ok(())
 }
 
-fn reset_default_install_preferences(data_dir: &Path) -> anyhow::Result<()> {
+fn reset_default_install_preferences(
+    data_dir: &Path,
+    config_path: &Path,
+    gui_supervised: bool,
+) -> anyhow::Result<()> {
     let root = expand_tilde(Path::new("~/.parano1d"));
-    reset_install_preferences_at_root(&root, data_dir)
+    reset_install_preferences_at_root(&root, data_dir, config_path, gui_supervised)
+}
+
+fn reset_node_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<()> {
+    let expanded = expand_tilde(path);
+    remove_file_if_present(&expanded)?;
+    let (_, created) = load_or_create_config(&expanded, defaults)?;
+    if !created {
+        anyhow::bail!(
+            "node config was recreated concurrently during mainnet reset: {}",
+            expanded.display()
+        );
+    }
+    tracing::info!(path = %expanded.display(), "initialized mainnet node settings");
+    Ok(())
 }
 
 fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
@@ -1534,7 +1525,7 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
     }
     // --- Network ---
-    let net = NetworkConfig::testnet();
+    let net = NetworkConfig::mainnet();
     tracing::debug!(network = %net.kind, "daemon starting");
 
     // --- Config file ---
@@ -1548,32 +1539,12 @@ async fn main() -> anyhow::Result<()> {
     if config_created {
         tracing::info!(path = %config_path.display(), "created default node config");
     }
-    if migrate_legacy_default_ports(
-        &mut cfg,
-        &net,
-        cli.p2p_listen.is_none(),
-        cli.rpc_listen.is_none(),
-    ) {
-        tracing::info!(
-            p2p = %cfg.network.listen.as_deref().unwrap_or_default(),
-            rpc = %cfg.rpc.listen.as_deref().unwrap_or_default(),
-            "migrated legacy default listeners to network-v7 ports"
-        );
-    }
-
-    // CLI flags override config.
-    if let Some(dir) = cli.data_dir {
-        cfg.storage.path = dir;
-    }
-    // The CLI mode is authoritative: node/extminer never start the internal
-    // miner even if a stale config file has mining.enabled=true.
-    cfg.mining.enabled = cli.mode == NodeMode::Miner;
-    if let Some(addr) = cli.miner_address {
-        cfg.mining.miner_address = addr;
+    if let Some(dir) = cli.data_dir.as_ref() {
+        cfg.storage.path = dir.clone();
     }
     // Resolve the selected storage directory before any matrix cache, wallet,
-    // database or P2P identity is opened. The one-time network-v7 migration
-    // must be the first writer and retains exactly wallet.key.
+    // database or P2P identity is opened. The one-time mainnet reset must be
+    // the first writer and carries no testnet data into mainnet.
     let data_dir = if cfg.storage.path == Path::new("~/.parano1d/data") {
         expand_tilde(Path::new("~/.parano1d/data"))
     } else {
@@ -1582,11 +1553,18 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
     if prepare_network_storage_epoch(&data_dir)? {
-        cfg.network.listen = Some(format!("0.0.0.0:{}", net.default_p2p_port));
-        cfg.network.seeds.clear();
-        cfg.network.public_addresses.clear();
-        cfg.rpc.listen = Some(net.default_rpc_listen());
-        reset_default_install_preferences(&data_dir)?;
+        cfg = config_defaults.clone();
+        cfg.storage.path = data_dir.clone();
+        let gui_supervised = expand_tilde(&config_path) == data_dir.join("parano1d-gui.toml");
+        reset_default_install_preferences(&data_dir, &config_path, gui_supervised)?;
+        reset_node_config(&config_path, &cfg)?;
+        persist_network_storage_epoch_marker(&data_dir)?;
+        tracing::info!("one-time mainnet reset completed");
+    }
+    // CLI flags are authoritative after any first-mainnet reset.
+    cfg.mining.enabled = cli.mode == NodeMode::Miner;
+    if let Some(addr) = cli.miner_address {
+        cfg.mining.miner_address = addr;
     }
     // Validate both listeners before artifact prewarm, database opening, or
     // wallet creation. A typo in user configuration must fail immediately.
@@ -4711,11 +4689,11 @@ mod tests {
         header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
         initial_sync_may_skip_peer_confirmation, load_or_create_config,
         manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        merge_active_suffix_inventory, migrate_legacy_default_ports, mining_quorum_probe_due,
-        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
-        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
-        prepare_network_storage_epoch, prune_superseded_snapshot_header_staging,
-        quarantine_exact_suffix_sources, reset_install_preferences_at_root,
+        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
+        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
+        persist_network_storage_epoch_marker, prepare_network_storage_epoch,
+        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
+        reset_install_preferences_at_root, reset_node_config,
         resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
         seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
@@ -4773,33 +4751,6 @@ mod tests {
                 (false, false)
             );
         }
-    }
-
-    #[test]
-    fn legacy_generated_ports_migrate_without_touching_custom_listeners() {
-        let network = noid_chain::consensus::NetworkConfig::testnet();
-        let mut config = NodeConfig::default();
-        config.network.listen = Some("0.0.0.0:9400".into());
-        config.rpc.listen = Some("127.0.0.1:9401".into());
-        assert!(migrate_legacy_default_ports(
-            &mut config,
-            &network,
-            true,
-            true
-        ));
-        assert_eq!(config.network.listen.as_deref(), Some("0.0.0.0:9500"));
-        assert_eq!(config.rpc.listen.as_deref(), Some("127.0.0.1:9501"));
-
-        config.network.listen = Some("127.0.0.1:19400".into());
-        config.rpc.listen = Some("127.0.0.1:19401".into());
-        assert!(!migrate_legacy_default_ports(
-            &mut config,
-            &network,
-            true,
-            true
-        ));
-        assert_eq!(config.network.listen.as_deref(), Some("127.0.0.1:19400"));
-        assert_eq!(config.rpc.listen.as_deref(), Some("127.0.0.1:19401"));
     }
 
     #[test]
@@ -5033,19 +4984,22 @@ mod tests {
     }
 
     #[test]
-    fn network_v7_reset_preserves_only_wallet_key_and_runs_once() {
+    fn mainnet_reset_removes_every_previous_entry_and_runs_once() {
         let directory = tempfile::tempdir().unwrap();
         let wallet = directory.path().join("wallet.key");
         std::fs::write(&wallet, b"canonical-wallet-secret").unwrap();
         std::fs::write(directory.path().join("wallet.receipts"), b"old receipts").unwrap();
         std::fs::write(directory.path().join("wallet.meta"), b"old metadata").unwrap();
         std::fs::write(directory.path().join("peers.json"), b"old peers").unwrap();
+        std::fs::write(directory.path().join("parano1d-node.log"), b"old log").unwrap();
         let cache = directory.path().join("history-step-cache");
         std::fs::create_dir(&cache).unwrap();
         std::fs::write(cache.join("derived.bin"), b"derived").unwrap();
 
         assert!(prepare_network_storage_epoch(directory.path()).unwrap());
-        assert_eq!(std::fs::read(&wallet).unwrap(), b"canonical-wallet-secret");
+        assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
+        persist_network_storage_epoch_marker(directory.path()).unwrap();
+        assert!(!wallet.exists());
         let mut names = std::fs::read_dir(directory.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
@@ -5055,8 +5009,12 @@ mod tests {
             names,
             vec![
                 std::ffi::OsString::from(".network-storage-epoch"),
-                std::ffi::OsString::from("wallet.key")
+                std::ffi::OsString::from("parano1d-node.log")
             ]
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("parano1d-node.log")).unwrap(),
+            b"old log"
         );
 
         std::fs::write(directory.path().join("peers.json"), b"new peers").unwrap();
@@ -5068,7 +5026,16 @@ mod tests {
     }
 
     #[test]
-    fn default_install_reset_discards_gui_and_core_preferences() {
+    fn empty_directory_still_initializes_mainnet_reset_once() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
+        assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
+        persist_network_storage_epoch_marker(directory.path()).unwrap();
+        assert!(!prepare_network_storage_epoch(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn default_install_reset_discards_legacy_preferences_but_preserves_new_gui_settings() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join(".parano1d");
         let data = root.join("data");
@@ -5076,11 +5043,47 @@ mod tests {
         std::fs::write(root.join("gui-settings.json"), b"legacy GUI settings").unwrap();
         std::fs::write(root.join("parano1d.toml"), b"legacy Core settings").unwrap();
 
-        reset_install_preferences_at_root(&root, &data).unwrap();
+        reset_install_preferences_at_root(&root, &data, &root.join("parano1d.toml"), false)
+            .unwrap();
 
         assert!(!root.join("gui-settings.json").exists());
         assert!(!root.join("parano1d.toml").exists());
         assert!(data.is_dir());
+
+        std::fs::write(root.join("gui-settings.json"), b"new mainnet settings").unwrap();
+        std::fs::write(root.join("parano1d.toml"), b"legacy Core settings").unwrap();
+        reset_install_preferences_at_root(&root, &data, &data.join("parano1d-gui.toml"), true)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join("gui-settings.json")).unwrap(),
+            b"new mainnet settings"
+        );
+        assert!(!root.join("parano1d.toml").exists());
+    }
+
+    #[test]
+    fn mainnet_reset_replaces_selected_node_config_for_the_next_start() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("parano1d.toml");
+        std::fs::write(
+            &config_path,
+            "[network]\nlisten = \"0.0.0.0:9500\"\nseeds = []\n\
+             [storage]\nbackend = \"mdbx\"\npath = \"/tmp/legacy\"\n\
+             [rpc]\nlisten = \"127.0.0.1:9501\"\n\
+             [mining]\nenabled = false\nminer_address = \"\"\n",
+        )
+        .unwrap();
+        let mut defaults = NodeConfig::default();
+        defaults.network.listen = Some("0.0.0.0:9600".into());
+        defaults.rpc.listen = Some("127.0.0.1:9601".into());
+        defaults.storage.path = directory.path().join("mainnet-data");
+
+        reset_node_config(&config_path, &defaults).unwrap();
+        let (loaded, created) = load_or_create_config(&config_path, &defaults).unwrap();
+        assert!(!created);
+        assert_eq!(loaded.network.listen.as_deref(), Some("0.0.0.0:9600"));
+        assert_eq!(loaded.rpc.listen.as_deref(), Some("127.0.0.1:9601"));
+        assert_eq!(loaded.storage.path, defaults.storage.path);
     }
 
     #[test]
@@ -5646,14 +5649,14 @@ mod tests {
     #[test]
     fn p2p_listener_accepts_socket_and_multiaddr_forms() {
         assert_eq!(
-            p2p_listen_to_multiaddr("0.0.0.0:9500").unwrap().to_string(),
-            "/ip4/0.0.0.0/tcp/9500"
+            p2p_listen_to_multiaddr("0.0.0.0:9600").unwrap().to_string(),
+            "/ip4/0.0.0.0/tcp/9600"
         );
         assert_eq!(
-            p2p_listen_to_multiaddr("/ip4/0.0.0.0/tcp/9500")
+            p2p_listen_to_multiaddr("/ip4/0.0.0.0/tcp/9600")
                 .unwrap()
                 .to_string(),
-            "/ip4/0.0.0.0/tcp/9500"
+            "/ip4/0.0.0.0/tcp/9600"
         );
     }
 
@@ -5661,32 +5664,32 @@ mod tests {
     fn seed_parser_accepts_gui_and_operator_forms_without_losing_peer_id() {
         let peer = libp2p::PeerId::random();
         assert_eq!(
-            seed_to_multiaddr("seed.example:9500", 9500)
+            seed_to_multiaddr("seed.example:9600", 9600)
                 .unwrap()
                 .to_string(),
-            "/dns/seed.example/tcp/9500"
+            "/dns/seed.example/tcp/9600"
         );
         assert_eq!(
-            seed_to_multiaddr("203.0.113.10:9500", 9500)
+            seed_to_multiaddr("203.0.113.10:9600", 9600)
                 .unwrap()
                 .to_string(),
-            "/ip4/203.0.113.10/tcp/9500"
+            "/ip4/203.0.113.10/tcp/9600"
         );
         assert_eq!(
-            seed_to_multiaddr("[2001:db8::10]:9500", 9500)
+            seed_to_multiaddr("[2001:db8::10]:9600", 9600)
                 .unwrap()
                 .to_string(),
-            "/ip6/2001:db8::10/tcp/9500"
+            "/ip6/2001:db8::10/tcp/9600"
         );
         assert_eq!(
-            seed_to_multiaddr("dnsaddr:example.net", 9500)
+            seed_to_multiaddr("dnsaddr:example.net", 9600)
                 .unwrap()
                 .to_string(),
             "/dnsaddr/example.net"
         );
-        let explicit = format!("/ip4/203.0.113.10/tcp/9500/p2p/{peer}");
+        let explicit = format!("/ip4/203.0.113.10/tcp/9600/p2p/{peer}");
         assert_eq!(
-            seed_to_multiaddr(&explicit, 9500).unwrap().to_string(),
+            seed_to_multiaddr(&explicit, 9600).unwrap().to_string(),
             explicit
         );
     }
@@ -5694,25 +5697,25 @@ mod tests {
     #[test]
     fn system_seed_resolution_is_deduplicated_and_bounded() {
         let mut answers = vec![
-            "203.0.113.10:9500".parse().unwrap(),
-            "[2001:db8::10]:9500".parse().unwrap(),
-            "203.0.113.10:9500".parse().unwrap(),
+            "203.0.113.10:9600".parse().unwrap(),
+            "[2001:db8::10]:9600".parse().unwrap(),
+            "203.0.113.10:9600".parse().unwrap(),
         ];
         answers.extend((1..=20).map(|host| {
             std::net::SocketAddr::new(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, host)),
-                9500,
+                9600,
             )
         }));
-        let resolved = resolved_system_seed_addrs(answers, 9500);
+        let resolved = resolved_system_seed_addrs(answers, 9600);
         assert_eq!(resolved.len(), MAX_SYSTEM_ADDRS_PER_SEED);
-        assert_eq!(resolved[0].to_string(), "/ip4/203.0.113.10/tcp/9500");
-        assert_eq!(resolved[1].to_string(), "/ip6/2001:db8::10/tcp/9500");
+        assert_eq!(resolved[0].to_string(), "/ip4/203.0.113.10/tcp/9600");
+        assert_eq!(resolved[1].to_string(), "/ip6/2001:db8::10/tcp/9600");
     }
 
     #[tokio::test]
     async fn system_seed_resolution_uses_native_localhost_lookup() {
-        let resolved = resolve_embedded_seed_with_system_dns("localhost", 9500)
+        let resolved = resolve_embedded_seed_with_system_dns("localhost", 9600)
             .await
             .unwrap();
         assert!(!resolved.is_empty());
@@ -5723,17 +5726,17 @@ mod tests {
                 Some(libp2p::multiaddr::Protocol::Ip4(_) | libp2p::multiaddr::Protocol::Ip6(_))
             ) && matches!(
                 protocols.next(),
-                Some(libp2p::multiaddr::Protocol::Tcp(9500))
+                Some(libp2p::multiaddr::Protocol::Tcp(9600))
             )
         }));
     }
 
     #[tokio::test]
     async fn embedded_seed_keeps_dns_reresolution_after_native_lookup() {
-        let resolved = embedded_seed_multiaddrs("localhost", 9500).await.unwrap();
+        let resolved = embedded_seed_multiaddrs("localhost", 9600).await.unwrap();
         assert!(resolved
             .iter()
-            .any(|addr| addr.to_string() == "/dns/localhost/tcp/9500"));
+            .any(|addr| addr.to_string() == "/dns/localhost/tcp/9600"));
         assert!(resolved.iter().any(|addr| {
             matches!(
                 addr.iter().next(),
@@ -5768,8 +5771,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("nested/parano1d.toml");
         let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9500".into());
-        defaults.rpc.listen = Some("127.0.0.1:9501".into());
+        defaults.network.listen = Some("0.0.0.0:9600".into());
+        defaults.rpc.listen = Some("127.0.0.1:9601".into());
 
         let (created_config, created) = load_or_create_config(&path, &defaults).unwrap();
         assert!(created);

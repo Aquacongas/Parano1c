@@ -6,7 +6,7 @@ neighbour path. Every block must propagate through that mesh and converge on
 all followers without requiring the producer to accept a direct connection
 from every node. The topology uses only loopback addresses. Run it in an
 isolated network namespace because the production node intentionally keeps
-mDNS enabled and a public GUI on the host must not leak the public testnet into
+mDNS enabled and a public GUI on the host must not leak mainnet into
 this fresh chain.
 """
 

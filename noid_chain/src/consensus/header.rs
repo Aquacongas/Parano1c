@@ -190,6 +190,13 @@ fn validate_header_inner(
     validate_median_time_past(header.timestamp, prev_timestamps)
         .map_err(|_| ConsensusError::BadTimestamp)?;
     if let Some(local_time) = local_time {
+        // The normal future-drift allowance must not let the first mainnet
+        // child enter local consensus before the fixed genesis time. This is
+        // an admission-time rule only; timeless historical verification is
+        // unchanged once the network has launched.
+        if parent.height == 0 && local_time < parent.timestamp {
+            return Err(ConsensusError::BadTimestamp);
+        }
         validate_future_drift(header.timestamp, local_time)
             .map_err(|_| ConsensusError::BadTimestamp)?;
     }
@@ -298,6 +305,49 @@ mod tests {
             &h1,
             &genesis,
             &prev_ts,
+            &[],
+            0,
+            genesis.timestamp,
+            &genesis.difficulty_target,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn first_child_unlocks_exactly_at_genesis_time() {
+        let genesis = make_header(0, 1_000_000, None);
+        let mut h1 = make_header(1, genesis.timestamp + BLOCK_TIME, Some(&genesis));
+        mine(&mut h1);
+        let previous = [genesis.timestamp];
+
+        assert_eq!(
+            validate_header(
+                &h1,
+                &genesis,
+                &previous,
+                &[],
+                genesis.timestamp - 1,
+                0,
+                genesis.timestamp,
+                &genesis.difficulty_target,
+            ),
+            Err(ConsensusError::BadTimestamp)
+        );
+        assert!(validate_header(
+            &h1,
+            &genesis,
+            &previous,
+            &[],
+            genesis.timestamp,
+            0,
+            genesis.timestamp,
+            &genesis.difficulty_target,
+        )
+        .is_ok());
+        assert!(validate_header_timeless(
+            &h1,
+            &genesis,
+            &previous,
             &[],
             0,
             genesis.timestamp,

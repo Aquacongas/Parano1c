@@ -3,10 +3,10 @@
 Parano1d 使用 libp2p 完成[对等节点身份](../reference/glossary.md#peer-identity)、发现、转发与同步。公网协议标识为：
 
 ```text
-/noid/testnet/530016417023d5e9/1
+/noid/mainnet/860e70453390bf81/1
 ```
 
-默认 P2P 监听 TCP `9500`。[JSON-RPC](../reference/glossary.md#rpc) 是单独的本地管理接口，监听 `127.0.0.1:9501`。
+默认 P2P 监听 TCP `9600`。[JSON-RPC](../reference/glossary.md#rpc) 是单独的本地管理接口，监听 `127.0.0.1:9601`。
 
 ## 对等节点身份与共识身份
 
@@ -72,6 +72,6 @@ DNS 记录指向网络端点，而不是链上 State。只要公网地址不变�
 
 ## 接口边界
 
-P2P 端口 `9500` 可以公开暴露，RPC 端口 `9501` 不应公开。RPC 包含钱包与进程控制方法，本身没有面向公网的传输认证层；请仅在回环地址上监听，或将其置于经过认证的私有隧道之后。
+P2P 端口 `9600` 可以公开暴露，RPC 端口 `9601` 不应公开。RPC 包含钱包与进程控制方法，本身没有面向公网的传输认证层；请仅在回环地址上监听，或将其置于经过认证的私有隧道之后。
 
 部署选项见[配置](../operate/configuration.md)，同步协议承载的数据见[同步](synchronization.md)。
