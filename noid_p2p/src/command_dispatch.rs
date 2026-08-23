@@ -201,6 +201,7 @@ fn classify(command: &NetworkCommand) -> CommandClass {
             CommandClass::Header
         }
         BroadcastTx { .. }
+        | ResolveTxGossip { .. }
         | FetchObjects { .. }
         | FetchSnapshotHeaders { .. }
         | RequestStateManifest { .. }

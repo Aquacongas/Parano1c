@@ -13,7 +13,7 @@ body:
     attributes:
       label: Version
       description: Release version or commit hash
-      placeholder: v1.0.0
+      placeholder: v1.0.1
     validations:
       required: true
   - type: input

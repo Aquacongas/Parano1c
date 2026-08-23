@@ -144,8 +144,15 @@ def main():
         }
         require(second_ids == first_ids, f"PeerId rotated across restart: {first_ids} -> {second_ids}")
         require(second_hashes == first_hashes, "identity file changed across restart")
+        combined_first_logs = first_logs["a"] + first_logs["b"]
         require(
-            "mDNS: discovered LAN peer" in first_logs["a"] + first_logs["b"],
+            any(
+                marker in combined_first_logs
+                for marker in (
+                    "mDNS: discovered LAN peer",
+                    "mDNS: discovered direct LAN peer",
+                )
+            ),
             "fresh no-seed connection has no mDNS discovery evidence",
         )
         for label, text in {**first_logs, "a-restart": second_logs["a"], "b-restart": second_logs["b"]}.items():

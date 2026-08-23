@@ -669,6 +669,23 @@ fn relay_circuit_route(
     ))
 }
 
+/// Prefer a peer's direct transport without discarding its relay fallback.
+/// After a failed attempt, put that exact address last once so the fallback is
+/// actually tried. The caller randomizes first, preserving load distribution
+/// inside each remaining group.
+fn prioritize_peer_addresses(
+    destination: PeerId,
+    attempted: &[Multiaddr],
+    addrs: &mut [Multiaddr],
+) {
+    addrs.sort_by_key(|addr| {
+        (
+            attempted.contains(addr),
+            relay_circuit_route(destination, addr).is_some(),
+        )
+    });
+}
+
 fn direct_tx_relay_limit(connected_peers: usize) -> usize {
     if connected_peers <= TX_DIRECT_SMALL_NETWORK_MAX_PEERS {
         connected_peers
@@ -690,6 +707,9 @@ struct AutomaticPeerCandidate {
     failures: u8,
     next_attempt: Instant,
     last_seen: Instant,
+    /// Transports already tried in the current bounded address round. They
+    /// remain cached and become eligible again after every address was tried.
+    attempted_addrs: Vec<Multiaddr>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1323,6 +1343,7 @@ impl AutomaticPeerState {
             failures: 0,
             next_attempt: now,
             last_seen: now,
+            attempted_addrs: Vec::new(),
         });
         candidate.last_seen = now;
         let mut changed = false;
@@ -1336,6 +1357,9 @@ impl AutomaticPeerState {
             candidate.addrs.push(addr);
             changed = true;
         }
+        candidate
+            .attempted_addrs
+            .retain(|attempted| candidate.addrs.contains(attempted));
         changed
     }
 
@@ -1563,6 +1587,7 @@ impl AutomaticPeerState {
                     if let Some(candidate) = self.peers.get_mut(&connection.peer) {
                         candidate.failures = 0;
                         candidate.next_attempt = now;
+                        candidate.attempted_addrs.clear();
                     }
                 }
             }
@@ -2973,6 +2998,12 @@ pub enum NetworkCommand {
     AnnounceAvailability { announcement: HeaderAnnouncement },
     /// Broadcast a new TxIntent to all peers.
     BroadcastTx { intent_bytes: Arc<[u8]> },
+    /// Resolve manual GossipSub validation after node-side mempool admission.
+    ResolveTxGossip {
+        message_id: gossipsub::MessageId,
+        propagation_source: PeerId,
+        acceptance: gossipsub::MessageAcceptance,
+    },
     /// Register a bootstrap address with automatic retry and peer maintenance.
     Dial { addr: Multiaddr },
     /// Initial chain synchronization is complete; bootstrap connections may be
@@ -3093,6 +3124,9 @@ pub enum NetworkEvent {
     NewTx {
         from: PeerId,
         intent_bytes: Vec<u8>,
+        /// Present only for GossipSub delivery. The node resolves this after
+        /// authoritative mempool admission.
+        gossip_message_id: Option<gossipsub::MessageId>,
         /// Direct-push requests reserve their decoded bytes process-globally
         /// until node-side admission finishes. Gossip messages carry `None`.
         inbound_memory_permit: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -4945,7 +4979,7 @@ fn report_gossip_validation(
     propagation_source: &PeerId,
     acceptance: gossipsub::MessageAcceptance,
 ) {
-    if let Err(error) = swarm
+    if !swarm
         .behaviour_mut()
         .gossipsub
         .report_message_validation_result(message_id, propagation_source, acceptance)
@@ -4953,8 +4987,7 @@ fn report_gossip_validation(
         tracing::debug!(
             peer = %propagation_source,
             message = %message_id,
-            %error,
-            "GossipSub validation result could not be applied"
+            "GossipSub validation result was no longer available"
         );
     }
 }
@@ -5298,7 +5331,13 @@ fn maintain_automatic_outbound(
                 && !pending_peers.contains(peer)
                 && !swarm.is_connected(peer)
         })
-        .map(|(peer, candidate)| (*peer, candidate.addrs.clone()))
+        .map(|(peer, candidate)| {
+            (
+                *peer,
+                candidate.addrs.clone(),
+                candidate.attempted_addrs.clone(),
+            )
+        })
         .collect::<Vec<_>>();
     candidates.shuffle(&mut rand::thread_rng());
 
@@ -5312,11 +5351,18 @@ fn maintain_automatic_outbound(
         connected_bootstrap.len() > desired_bootstrap,
         automatic.automatic_dial_capacity(),
     );
-    for (peer, mut addrs) in candidates {
+    for (peer, mut addrs, mut attempted_addrs) in candidates {
         if available == 0 {
             break;
         }
+        if addrs.iter().all(|addr| attempted_addrs.contains(addr)) {
+            attempted_addrs.clear();
+            if let Some(candidate) = automatic.peers.get_mut(&peer) {
+                candidate.attempted_addrs.clear();
+            }
+        }
         addrs.shuffle(&mut rand::thread_rng());
+        prioritize_peer_addresses(peer, &attempted_addrs, &mut addrs);
         let selected = addrs.into_iter().find_map(|addr| {
             let group = crate::peer_diversity::public_network_group(&addr)?;
             let pending_same_group = automatic.pending_group_count(group);
@@ -5327,6 +5373,11 @@ fn maintain_automatic_outbound(
         let Some((addr, group)) = selected else {
             continue;
         };
+        if let Some(candidate) = automatic.peers.get_mut(&peer) {
+            if !candidate.attempted_addrs.contains(&addr) {
+                candidate.attempted_addrs.push(addr.clone());
+            }
+        }
         if begin_peer_dial(swarm, automatic, peer, addr, group) {
             available -= 1;
         }
@@ -5557,6 +5608,13 @@ async fn handle_network_command(
                     "direct transaction relay queued"
                 );
             }
+        }
+        NetworkCommand::ResolveTxGossip {
+            message_id,
+            propagation_source,
+            acceptance,
+        } => {
+            report_gossip_validation(swarm, &message_id, &propagation_source, acceptance);
         }
         NetworkCommand::Dial { addr } => {
             tracing::debug!(address = %addr, "registered automatic bootstrap candidate");
@@ -6265,17 +6323,22 @@ async fn handle_swarm_event(
                         tracing::debug!(peer = %propagation_source, bytes = message.data.len(), "global gossip byte budget exhausted — transaction dropped before propagation");
                         return;
                     }
-                    report_gossip_validation(
-                        swarm,
-                        &message_id,
-                        &propagation_source,
-                        gossipsub::MessageAcceptance::Accept,
-                    );
-                    let _ = gossip_event_tx.send(NetworkEvent::NewTx {
-                        from: propagation_source,
-                        intent_bytes: message.data,
-                        inbound_memory_permit: None,
-                    });
+                    if gossip_event_tx
+                        .send(NetworkEvent::NewTx {
+                            from: propagation_source,
+                            intent_bytes: message.data,
+                            gossip_message_id: Some(message_id.clone()),
+                            inbound_memory_permit: None,
+                        })
+                        .is_err()
+                    {
+                        report_gossip_validation(
+                            swarm,
+                            &message_id,
+                            &propagation_source,
+                            gossipsub::MessageAcceptance::Ignore,
+                        );
+                    }
                 }
             } else {
                 report_gossip_validation(
@@ -6768,6 +6831,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_network_profile_requests.remove(&request_id) else {
@@ -6807,6 +6871,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             if pending_network_profile_requests
@@ -6823,6 +6888,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             tracing::debug!(peer = %peer, ?request_id, err = %error, "network-profile response failed");
@@ -6927,6 +6993,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_object_requests.remove(&request_id) else {
@@ -6984,6 +7051,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             let Some(pending) = pending_object_requests.remove(&request_id) else {
@@ -7004,6 +7072,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             tracing::debug!(peer = %peer, ?request_id, err = %error, "exact-object response failed");
@@ -7063,6 +7132,7 @@ async fn handle_swarm_event(
             request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
                 peer,
+                ..
             },
         )) => {
             if response == AvailabilityResponse::Busy {
@@ -7095,6 +7165,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_header_requests.remove(&request_id) else {
@@ -7233,6 +7304,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             let kind = RequestFailureKind::from(&error);
@@ -7445,6 +7517,7 @@ async fn handle_swarm_event(
                         request_id,
                     },
                 peer,
+                ..
             },
         )) => {
             tracing::debug!(
@@ -7573,6 +7646,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_history_step_requests.remove(&request_id) else {
@@ -7757,6 +7831,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_state_manifest_requests.remove(&request_id) else {
@@ -8040,6 +8115,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_manifest_page_requests.remove(&request_id) else {
@@ -8309,6 +8385,7 @@ async fn handle_swarm_event(
                         response,
                     },
                 peer,
+                ..
             },
         )) => {
             let Some(pending) = pending_state_segment_requests.remove(&request_id) else {
@@ -8399,6 +8476,7 @@ async fn handle_swarm_event(
                         request, channel, ..
                     },
                 peer,
+                ..
             },
         )) => match request {
             MempoolRequest::Pull => {
@@ -8476,6 +8554,7 @@ async fn handle_swarm_event(
                 if let Err(error) = required_event_tx.try_send(NetworkEvent::NewTx {
                     from: peer,
                     intent_bytes,
+                    gossip_message_id: None,
                     inbound_memory_permit,
                 }) {
                     tracing::debug!(
@@ -8495,6 +8574,7 @@ async fn handle_swarm_event(
             request_response::Event::Message {
                 message: request_response::Message::Response { response, .. },
                 peer,
+                ..
             },
         )) => {
             mempool_sync_retries.remove(&peer);
@@ -8831,6 +8911,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             let kind = RequestFailureKind::from(&error);
@@ -8868,6 +8949,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             let Some(pending) = pending_manifest_page_requests.remove(&request_id) else {
@@ -8917,6 +8999,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             tracing::debug!(peer = %peer, err = %error, "segment sync request failed");
@@ -8945,6 +9028,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             let kind = RequestFailureKind::from(&error);
@@ -8990,6 +9074,7 @@ async fn handle_swarm_event(
                 peer,
                 request_id,
                 error,
+                ..
             },
         )) => {
             tracing::warn!(
@@ -9001,7 +9086,9 @@ async fn handle_swarm_event(
         }
 
         SwarmEvent::Behaviour(NodeBehaviourEvent::HistoryStepSync(
-            request_response::Event::ResponseSent { peer, request_id },
+            request_response::Event::ResponseSent {
+                peer, request_id, ..
+            },
         )) => {
             tracing::debug!(
                 %peer,
@@ -9363,6 +9450,40 @@ mod tests {
             .iter()
             .any(|protocol| matches!(protocol, Protocol::P2pCircuit)));
         assert!(crate::peer_diversity::contains_public_ip(&dial_addr));
+    }
+
+    #[test]
+    fn automatic_peer_addresses_prefer_direct_before_relay_fallbacks() {
+        use libp2p::multiaddr::Protocol;
+
+        let destination = PeerId::random();
+        let first_relay = PeerId::random();
+        let second_relay = PeerId::random();
+        let direct: Multiaddr = "/ip4/1.1.1.1/tcp/9600".parse().unwrap();
+        let relay_one = "/ip4/8.8.8.8/tcp/9600"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(first_relay))
+            .with(Protocol::P2pCircuit);
+        let relay_two = "/ip4/8.8.4.4/tcp/9600"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .with(Protocol::P2p(second_relay))
+            .with(Protocol::P2pCircuit);
+        let mut addresses = vec![relay_one.clone(), relay_two.clone(), direct.clone()];
+
+        prioritize_peer_addresses(destination, &[], &mut addresses);
+
+        assert_eq!(addresses[0], direct);
+        assert!(addresses[1..]
+            .iter()
+            .all(|addr| relay_circuit_route(destination, addr).is_some()));
+        assert!(addresses.contains(&relay_one));
+        assert!(addresses.contains(&relay_two));
+
+        prioritize_peer_addresses(destination, std::slice::from_ref(&direct), &mut addresses);
+        assert!(relay_circuit_route(destination, &addresses[0]).is_some());
+        assert_eq!(addresses.last(), Some(&direct));
     }
 
     #[test]
@@ -10852,6 +10973,7 @@ mod tests {
                 .send(NetworkEvent::NewTx {
                     from: peer,
                     intent_bytes: vec![byte],
+                    gossip_message_id: None,
                     inbound_memory_permit: None,
                 })
                 .unwrap();

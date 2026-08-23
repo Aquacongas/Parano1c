@@ -531,6 +531,35 @@ impl SnapshotHeaderStaging {
         Ok(Some(self.read_record(index)?.header))
     }
 
+    /// Check that the already native-validated candidate crosses one exact
+    /// HeaderDAG point. This binds a long on-disk suffix to bounded in-memory
+    /// fork choice without loading the suffix back into RAM.
+    pub fn matches_exact_point(
+        &mut self,
+        height: u64,
+        expected_hash: [u8; 32],
+        expected_chainwork: [u8; 32],
+    ) -> Result<bool> {
+        let record = if height == self.base.header.height {
+            StagedHeaderRecord {
+                header: self.base.header,
+                block_hash: self.base.block_hash,
+                cumulative_chainwork: self.base.cumulative_chainwork,
+            }
+        } else {
+            let Some(index) = height
+                .checked_sub(self.base.header.height.saturating_add(1))
+                .filter(|index| *index < self.count)
+            else {
+                return Ok(false);
+            };
+            self.read_record(index)?
+        };
+        Ok(record.header.height == height
+            && record.block_hash == expected_hash
+            && record.cumulative_chainwork == expected_chainwork)
+    }
+
     /// Bind the staged tip, exact work and transaction-epoch header.
     pub fn exact_boundary(
         &mut self,
@@ -1547,6 +1576,35 @@ mod tests {
         assert!(validated.next_record().is_err());
         assert!(store.get_header(1).unwrap().is_none());
         assert!(store.get_chain_work(1).unwrap().is_none());
+    }
+
+    #[test]
+    fn staged_candidate_can_be_bound_to_an_exact_header_dag_point() {
+        let db = tempfile::tempdir().unwrap();
+        let stage_dir = tempfile::tempdir().unwrap();
+        let path = stage_dir.path().join("candidate");
+        let chain = noid_chain::storage::MdbxChainContext::open_or_create(db.path()).unwrap();
+        let store = &chain.store;
+        let base = canonical_base(store);
+        let mut staging = SnapshotHeaderStaging::create(&path, store, base).unwrap();
+        staging
+            .append_batch(store, &fixture_chain()[1..=1])
+            .unwrap();
+        let tip = staging.tip_record().unwrap();
+
+        assert!(staging
+            .matches_exact_point(tip.header.height, tip.block_hash, tip.cumulative_chainwork)
+            .unwrap());
+        assert!(!staging
+            .matches_exact_point(tip.header.height, [0xFF; 32], tip.cumulative_chainwork)
+            .unwrap());
+        assert!(staging
+            .matches_exact_point(
+                base.header.height,
+                base.block_hash,
+                base.cumulative_chainwork
+            )
+            .unwrap());
     }
     #[test]
     fn appended_partial_record_after_validation_cannot_be_streamed() {
