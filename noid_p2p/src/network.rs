@@ -5057,11 +5057,18 @@ fn begin_bootstrap_dial(
     let options = if let Some(peer) = peer {
         libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
             .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+            // Ordinary bootstrap traffic does not need TCP source-port
+            // reuse. Some VPN, NAT and stateful-firewall paths silently drop
+            // a 9600 -> 9600 flow while accepting the same destination from
+            // an ephemeral source port. DCUtR owns its separate reuse dials
+            // for hole punching and is deliberately unaffected here.
+            .allocate_new_port()
             .addresses(vec![addr.clone()])
             .build()
     } else {
         libp2p::swarm::dial_opts::DialOpts::unknown_peer_id()
             .address(addr.clone())
+            .allocate_new_port()
             .build()
     };
     let connection_id = options.connection_id();
@@ -5090,6 +5097,11 @@ fn begin_peer_dial(
 ) -> bool {
     let options = libp2p::swarm::dial_opts::DialOpts::peer_id(peer)
         .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+        // Maintained neighbours are ordinary outbound sessions. Allocate an
+        // ephemeral TCP source port so their reachability does not depend on
+        // listener-port reuse surviving the local VPN/NAT path. DCUtR dials
+        // still request PortUse::Reuse independently when hole punching.
+        .allocate_new_port()
         .addresses(vec![addr])
         .build();
     let connection_id = options.connection_id();

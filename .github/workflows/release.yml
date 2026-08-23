@@ -24,6 +24,11 @@ on:
         description: Successful Platform CI run for the tagged commit
         required: true
         type: string
+      replace_existing:
+        description: Replace an already published release only after every native build is ready
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   actions: read
@@ -42,6 +47,7 @@ env:
   PACK_SHA256: ${{ inputs.pack_sha256 }}
   RELEASE_CHANNEL: ${{ inputs.release_channel }}
   PLATFORM_CI_RUN_ID: ${{ inputs.platform_ci_run_id }}
+  REPLACE_EXISTING: ${{ inputs.replace_existing }}
 
 jobs:
   preflight:
@@ -73,6 +79,7 @@ jobs:
           [[ "$PACK_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$PLATFORM_CI_RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$RELEASE_CHANNEL" == prerelease || "$RELEASE_CHANNEL" == stable ]]
+          [[ "$REPLACE_EXISTING" == true || "$REPLACE_EXISTING" == false ]]
           version_without_build="${RELEASE_TAG%%+*}"
           if [[ "$RELEASE_CHANNEL" == stable && "$version_without_build" == *-* ]]; then
             echo "stable releases cannot use a semantic prerelease version" >&2
@@ -88,8 +95,18 @@ jobs:
           test "v$RELEASE_VERSION" = "$RELEASE_TAG"
           test -s ".github/release-notes/$RELEASE_TAG.md"
           release_state="$(gh release view "$RELEASE_TAG" \
-            --json assets,isDraft,name,tagName)"
-          test "$(jq -r .isDraft <<<"$release_state")" = true
+            --json assets,isDraft,isPrerelease,name,tagName)"
+          if [[ "$REPLACE_EXISTING" == true ]]; then
+            if [[ "$(jq -r .isDraft <<<"$release_state")" == false ]]; then
+              if [[ "$RELEASE_CHANNEL" == prerelease ]]; then
+                test "$(jq -r .isPrerelease <<<"$release_state")" = true
+              else
+                test "$(jq -r .isPrerelease <<<"$release_state")" = false
+              fi
+            fi
+          else
+            test "$(jq -r .isDraft <<<"$release_state")" = true
+          fi
           test "$(jq -r .tagName <<<"$release_state")" = "$RELEASE_TAG"
           expected_title="$(sed -n '1s/^# //p' \
             ".github/release-notes/$RELEASE_TAG.md")"
@@ -359,6 +376,11 @@ jobs:
             "parano1d-gui-$RELEASE_TAG-macos-x86_64.dmg" \
             history-step-pack-v1.tar.gz \
             > SHA256SUMS
+          # A replacement release remains fully available while all platform
+          # jobs run. Hide it only for the final, fail-closed asset switch so
+          # users can never download a mixture of old binaries and new sums.
+          gh release edit "$RELEASE_TAG" --draft=true
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
           gh release upload "$RELEASE_TAG" \
             "parano1d-core-$RELEASE_TAG-linux-x86_64.tar.gz" \
             "parano1d-core-$RELEASE_TAG-linux-aarch64.tar.gz" \
