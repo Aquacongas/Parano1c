@@ -33,8 +33,6 @@
 //! exactly the 16-byte little-endian nonce in lowercase hex. The worker never
 //! receives or submits a block body, HistoryStep witness or proof.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -200,12 +198,20 @@ const DIGEST_BATCH: usize = 256;
 const POW_HEADER_FIELD_COUNT: usize = 16;
 const POW_NONCE_FIELD_INDEX: usize = 10;
 const POW_FIELDS_HEX_BYTES: usize = POW_HEADER_FIELD_COUNT * 16;
+const TEMPLATE_SUBMIT_MARGIN: Duration = Duration::from_secs(1);
+
+fn template_search_deadline(received_at: Instant, expires_in_seconds: u64) -> Instant {
+    let usable = Duration::from_secs(expires_in_seconds).saturating_sub(TEMPLATE_SUBMIT_MARGIN);
+    received_at.checked_add(usable).unwrap_or(received_at)
+}
+
 /// Search for a valid nonce using all rayon threads.
-/// Returns `Some(nonce)` or `None` if cancelled.
+/// Returns `Some(nonce)` or `None` when the node-owned template is too close
+/// to expiry to submit safely.
 fn search_nonce(
     pow_fields: &[Block128; POW_HEADER_FIELD_COUNT],
     target: &[u8; 32],
-    cancel: &AtomicBool,
+    deadline: Instant,
 ) -> Option<u128> {
     let num_threads = rayon::current_num_threads();
     let per_thread = CHUNK_SIZE.div_ceil(num_threads as u128);
@@ -222,7 +228,7 @@ fn search_nonce(
     let mut chunk_start = start_nonce;
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if Instant::now() >= deadline {
             return None;
         }
 
@@ -239,7 +245,7 @@ fn search_nonce(
             let mut digests = [[0u8; 32]; DIGEST_BATCH];
             let mut nonce = ts;
             while nonce < te {
-                if cancel.load(Ordering::Relaxed) {
+                if Instant::now() >= deadline {
                     return None;
                 }
                 let n = ((te - nonce).min(DIGEST_BATCH as u128)) as usize;
@@ -332,8 +338,8 @@ fn mine(cli: &Cli) -> Result<()> {
 
     loop {
         // Fetch template.
-        let tmpl = match rpc.get_template(&cli.coinbase) {
-            Ok(t) => t,
+        let (tmpl, template_received_at) = match rpc.get_template(&cli.coinbase) {
+            Ok(t) => (t, Instant::now()),
             Err(e) => {
                 eprintln!("template fetch failed: {e}  — retrying in 2s");
                 std::thread::sleep(Duration::from_secs(2));
@@ -387,18 +393,22 @@ fn mine(cli: &Cli) -> Result<()> {
             &tmpl.difficulty_target_hex[tmpl.difficulty_target_hex.len().saturating_sub(8)..]
         );
 
-        let cancel = Arc::new(AtomicBool::new(false));
         let t0 = Instant::now();
+        let deadline = template_search_deadline(template_received_at, tmpl.expires_in_seconds);
 
-        let nonce = match search_nonce(&pow_fields, &target, &cancel) {
+        let nonce = match search_nonce(&pow_fields, &target, deadline) {
             Some(n) => n,
             None => {
-                // Was cancelled (shouldn't happen without explicit cancellation).
+                eprintln!("└─ EXPIRED  refreshing node-owned template");
                 continue;
             }
         };
 
         let elapsed = t0.elapsed();
+        if Instant::now() >= deadline {
+            eprintln!("└─ EXPIRED  solution arrived too late; refreshing template");
+            continue;
+        }
 
         // Submit only the nonce for this single-use node-owned template.
         match rpc.submit_nonce(&tmpl.template_id, nonce) {
@@ -453,6 +463,10 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{search_nonce, template_search_deadline, Block128, POW_HEADER_FIELD_COUNT};
+
     #[test]
     fn nonce_submission_is_canonical_little_endian_hex() {
         let nonce = 0x0123_4567_89ab_cdef_fedc_ba98_7654_3210u128;
@@ -462,5 +476,23 @@ mod tests {
             u128::from_le_bytes(hex::decode(encoded).unwrap().try_into().unwrap()),
             nonce
         );
+    }
+
+    #[test]
+    fn template_deadline_reserves_submit_margin() {
+        let received_at = Instant::now();
+        let deadline = template_search_deadline(received_at, 30);
+        assert_eq!(
+            deadline.duration_since(received_at),
+            Duration::from_secs(29)
+        );
+        assert_eq!(template_search_deadline(received_at, 1), received_at);
+        assert_eq!(template_search_deadline(received_at, 0), received_at);
+    }
+
+    #[test]
+    fn expired_template_stops_before_hashing() {
+        let fields = [Block128::from(0u128); POW_HEADER_FIELD_COUNT];
+        assert_eq!(search_nonce(&fields, &[0xff; 32], Instant::now()), None);
     }
 }
