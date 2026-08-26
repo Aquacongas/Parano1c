@@ -706,13 +706,18 @@ impl Backend {
         &self,
         recipient: String,
         amount_micronoid: u64,
+        fee_micronoid: u64,
     ) -> Result<PaymentSubmission, String> {
         if self.is_mock() {
             return Ok(PaymentSubmission {
                 recipient,
                 txid: "8f3ca28a5a7191de79dbea850f1679965f43c33c79c557107ec01e04ae45d908".into(),
                 amount_micronoid,
-                fee_micronoid: 5_800,
+                fee_micronoid: if fee_micronoid == 0 {
+                    5_800
+                } else {
+                    fee_micronoid
+                },
                 input_count: 1,
                 output_count: 2,
             });
@@ -720,7 +725,7 @@ impl Backend {
         let result = self
             .rpc_with_timeout::<WalletSendResult>(
                 "walletSend",
-                json!([recipient.clone(), amount_micronoid, 0]),
+                json!([recipient.clone(), amount_micronoid, fee_micronoid]),
                 Duration::from_secs(120),
             )
             .await?;

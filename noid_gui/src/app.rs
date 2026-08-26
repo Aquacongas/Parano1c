@@ -86,6 +86,7 @@ pub struct App {
     pub action: Option<Action>,
     pub send_recipient: String,
     pub send_amount: String,
+    pub send_fee: String,
     pub send_in_flight: bool,
     proof_forge_started_at: Option<Instant>,
     pub send_result: Option<PaymentSubmission>,
@@ -198,6 +199,7 @@ pub enum Message {
     CloseAction,
     SendRecipientChanged(String),
     SendAmountChanged(String),
+    SendFeeChanged(String),
     SubmitSend,
     ProofForgeTick,
     SendFinished(Result<PaymentSubmission, String>),
@@ -373,6 +375,7 @@ impl App {
             action: None,
             send_recipient: String::new(),
             send_amount: String::new(),
+            send_fee: String::new(),
             send_in_flight: false,
             proof_forge_started_at: None,
             send_result: None,
@@ -619,6 +622,13 @@ impl App {
                     self.send_error = None;
                 }
             }
+            Message::SendFeeChanged(fee) => {
+                if !self.send_in_flight {
+                    self.send_fee = fee;
+                    self.send_result = None;
+                    self.send_error = None;
+                }
+            }
             Message::SubmitSend => {
                 if self.send_in_flight
                     || !matches!(
@@ -640,13 +650,24 @@ impl App {
                         return Task::none();
                     }
                 };
+                let fee_micronoid = match parse_optional_noid_fee(&self.send_fee) {
+                    Ok(fee) => fee,
+                    Err(error) => {
+                        self.send_error = Some(error);
+                        return Task::none();
+                    }
+                };
                 self.send_in_flight = true;
                 self.proof_forge_started_at = Some(Instant::now());
                 self.send_result = None;
                 self.send_error = None;
                 let backend = self.backend.clone();
                 return Task::perform(
-                    async move { backend.send_payment(recipient, amount_micronoid).await },
+                    async move {
+                        backend
+                            .send_payment(recipient, amount_micronoid, fee_micronoid)
+                            .await
+                    },
                     Message::SendFinished,
                 );
             }
@@ -658,6 +679,7 @@ impl App {
                     Ok(submission) => {
                         self.send_result = Some(submission);
                         self.send_amount.clear();
+                        self.send_fee.clear();
                         return self.refresh_snapshot();
                     }
                     Err(error) => self.send_error = Some(error),
@@ -2546,6 +2568,13 @@ fn parse_noid_amount(input: &str) -> Result<u64, String> {
     Ok(amount)
 }
 
+fn parse_optional_noid_fee(input: &str) -> Result<u64, String> {
+    if input.trim().is_empty() {
+        return Ok(0);
+    }
+    parse_noid_amount(input).map_err(|error| format!("Invalid network fee: {error}"))
+}
+
 fn utxo_page_count_for(output_count: usize) -> usize {
     output_count.div_ceil(UTXO_PAGE_SIZE).max(1)
 }
@@ -2580,8 +2609,8 @@ fn record_snapshot_refresh_failure(
 #[cfg(test)]
 mod tests {
     use super::{
-        normalize_utxo_page_after_refresh, parse_noid_amount, record_snapshot_refresh_failure,
-        utxo_page_count_for, BackendState,
+        normalize_utxo_page_after_refresh, parse_noid_amount, parse_optional_noid_fee,
+        record_snapshot_refresh_failure, utxo_page_count_for, BackendState,
     };
 
     #[test]
@@ -2592,6 +2621,15 @@ mod tests {
         assert!(parse_noid_amount("0").is_err());
         assert!(parse_noid_amount("1.0000001").is_err());
         assert!(parse_noid_amount("1.2.3").is_err());
+    }
+
+    #[test]
+    fn parses_blank_fee_as_automatic_and_explicit_fee_exactly() {
+        assert_eq!(parse_optional_noid_fee("").unwrap(), 0);
+        assert_eq!(parse_optional_noid_fee("   ").unwrap(), 0);
+        assert_eq!(parse_optional_noid_fee("0.01").unwrap(), 10_000);
+        assert!(parse_optional_noid_fee("0").is_err());
+        assert!(parse_optional_noid_fee("fee").is_err());
     }
 
     #[test]

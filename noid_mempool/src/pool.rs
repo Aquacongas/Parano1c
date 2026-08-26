@@ -577,6 +577,9 @@ impl AsyncMempool {
 
         // Rebuild slot sets after bulk eviction (O(pool) once/block vs O(N²) per submit).
         rebuild_slot_sets(&mut st);
+        if st.pool.is_empty() {
+            st.floor.reset();
+        }
 
         tracing::debug!(
             height = new_height,
@@ -617,6 +620,9 @@ impl AsyncMempool {
                 st.pool.remove(hash);
                 tracing::debug!(?hash, "reorg: removed re-submitted duplicate from pool");
             }
+        }
+        if st.pool.is_empty() {
+            st.floor.reset();
         }
     }
 
@@ -1040,6 +1046,25 @@ mod tests {
         let mut bytes = vec![0; noid_tx::paged_spend_authorization_wire_offset(1).unwrap()];
         bytes.extend(std::iter::repeat_n(auth_byte, auth_len));
         bytes
+    }
+
+    #[tokio::test]
+    async fn empty_pool_resets_stale_dynamic_fee_floor_on_block_advance() {
+        use noid_chain::consensus::params::MIN_FEE_BASE;
+
+        let state = ChainState::with_log_slots(6);
+        let view = ChainView::new(0, HashMap::new(), 0, state.state);
+        let pool = AsyncMempool::new(view.clone(), MempoolConfig::default());
+        {
+            let mut locked = pool.state.lock().await;
+            locked.floor.record(100_000);
+            assert!(locked.floor.current() > MIN_FEE_BASE);
+            assert!(locked.pool.is_empty());
+        }
+
+        pool.on_new_block(&[], 1, view).await;
+
+        assert_eq!(pool.fee_floor().await, MIN_FEE_BASE);
     }
 
     #[tokio::test]

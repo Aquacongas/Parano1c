@@ -1790,6 +1790,14 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         compact,
         app.send_in_flight,
     );
+    let fee = send_input_line(
+        "NETWORK FEE / NOID",
+        "AUTO",
+        &app.send_fee,
+        Message::SendFeeChanged,
+        compact,
+        app.send_in_flight,
+    );
 
     let proof_label = if app.send_in_flight {
         "BUILDING"
@@ -1890,11 +1898,8 @@ fn send_form(app: &App, compact: bool) -> Element<'_, Message> {
         ),
         recipient,
         amount,
-        form_line(
-            "NETWORK FEE",
-            "AUTOMATIC · calculated by the wallet",
-            compact
-        ),
+        fee,
+        form_line("FEE MODE", "Leave empty for automatic", compact),
         status,
         feedback,
         controls,
