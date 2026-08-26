@@ -238,24 +238,11 @@ fn sync_target_requires_snapshot(
             .is_some_and(|tail| tail.allows_exact_target(local_height, peer_height))
 }
 
-fn validate_rebase_snapshot_selection(
+fn validate_snapshot_install_selection(
     header_dag: &noid_node::networking::header_dag::HeaderDag,
-    hint: SnapshotRebaseHint,
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
 ) -> Result<Option<SnapshotRebaseAnchor>, String> {
-    use noid_node::networking::ChainPoint;
-
-    let hinted_tip = ChainPoint::new(hint.competing_tip_height, hint.competing_tip_hash);
     let selected_tip = header_dag.best_tip();
-    if !header_dag
-        .is_ancestor(hinted_tip, selected_tip)
-        .map_err(|error| format!("selected snapshot target is no longer in HeaderDAG: {error}"))?
-    {
-        return Err("selected snapshot target was superseded by another header branch".into());
-    }
-    if manifest.tip_height <= hint.ancestor_height {
-        return Err("snapshot boundary is outside the selected replacement ancestry".into());
-    }
     if manifest.tip_height > selected_tip.height {
         let selected_work = header_dag
             .cumulative_work(selected_tip)
@@ -290,6 +277,27 @@ fn validate_rebase_snapshot_selection(
         return Err("snapshot boundary work differs from HeaderDAG authority".into());
     }
     Ok(None)
+}
+
+fn validate_rebase_snapshot_selection(
+    header_dag: &noid_node::networking::header_dag::HeaderDag,
+    hint: SnapshotRebaseHint,
+    manifest: &noid_p2p::protocol::GetStateManifestResponse,
+) -> Result<Option<SnapshotRebaseAnchor>, String> {
+    use noid_node::networking::ChainPoint;
+
+    let hinted_tip = ChainPoint::new(hint.competing_tip_height, hint.competing_tip_hash);
+    let selected_tip = header_dag.best_tip();
+    if !header_dag
+        .is_ancestor(hinted_tip, selected_tip)
+        .map_err(|error| format!("selected snapshot target is no longer in HeaderDAG: {error}"))?
+    {
+        return Err("selected snapshot target was superseded by another header branch".into());
+    }
+    if manifest.tip_height <= hint.ancestor_height {
+        return Err("snapshot boundary is outside the selected replacement ancestry".into());
+    }
+    validate_snapshot_install_selection(header_dag, manifest)
 }
 
 /// Admit one exact header job to the reserved header lane before publishing
@@ -4807,13 +4815,13 @@ mod tests {
         terminal_alternate_peer, terminal_transport_can_retry_same_peer,
         unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
         validate_history_step_tip_future_drift, validate_rebase_snapshot_selection,
-        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
-        ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, PostSnapshotTail,
-        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
-        SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
-        SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
-        SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
-        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        validate_snapshot_header_batch_admission, validate_snapshot_install_selection,
+        validate_snapshot_staged_header_boundary, ManifestTerminalCapability, MiningPeerQuorum,
+        NodeConfig, PostSnapshotTail, SnapshotFinalizationOutcome, SnapshotHeaderBoundary,
+        SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
+        SnapshotRebaseAnchor, SnapshotRebaseHint, SnapshotSegmentFailureScope,
+        SnapshotSessionPrepareError, SnapshotTerminalSourceKey, SuffixAdmission,
+        TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
         SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
@@ -6391,6 +6399,105 @@ mod tests {
             validate_rebase_snapshot_selection(&dag, hint, &selected_ancestor).unwrap(),
             None,
             "a verified snapshot on selected ancestry remains installable below the live tip"
+        );
+    }
+
+    #[test]
+    fn linear_snapshot_install_is_bound_to_selected_header_dag_ancestry() {
+        use noid_chain::block_header::block_id;
+        use noid_node::networking::{
+            header_dag::{HeaderDag, ValidatedHeader},
+            ChainPoint,
+        };
+
+        let genesis = noid_chain::consensus::genesis_header();
+        let base = ChainPoint::new(0, block_id(&genesis));
+        let base_work = [0u8; 32];
+        let mut dag = HeaderDag::new(base, base_work, 32);
+
+        let mut branch_a_parent = base;
+        let mut branch_a_header = genesis;
+        let mut branch_a_work = base_work;
+        for height in 1..=6 {
+            branch_a_header.height = height;
+            branch_a_header.prev_block_hash = branch_a_parent.hash;
+            branch_a_header.timestamp = genesis.timestamp + height;
+            branch_a_header.nonce = 100 + u128::from(height);
+            branch_a_work = noid_chain::add_work(
+                &branch_a_work,
+                &noid_chain::block_work(&branch_a_header.difficulty_target),
+            );
+            let validated =
+                ValidatedHeader::new_after_consensus_checks(branch_a_header, branch_a_work);
+            branch_a_parent = validated.point();
+            dag.insert(validated).unwrap();
+        }
+        let losing_boundary = branch_a_parent;
+        let losing_boundary_work = branch_a_work;
+
+        let mut branch_b_parent = base;
+        let mut branch_b_header = genesis;
+        let mut branch_b_work = base_work;
+        let mut selected_boundary = None;
+        for height in 1..=7 {
+            branch_b_header.height = height;
+            branch_b_header.prev_block_hash = branch_b_parent.hash;
+            branch_b_header.timestamp = genesis.timestamp + height;
+            branch_b_header.nonce = 200 + u128::from(height);
+            branch_b_work = noid_chain::add_work(
+                &branch_b_work,
+                &noid_chain::block_work(&branch_b_header.difficulty_target),
+            );
+            let validated =
+                ValidatedHeader::new_after_consensus_checks(branch_b_header, branch_b_work);
+            branch_b_parent = validated.point();
+            if height == 6 {
+                selected_boundary = Some((branch_b_parent, branch_b_work));
+            }
+            dag.insert(validated).unwrap();
+        }
+        assert_eq!(dag.best_tip(), branch_b_parent);
+
+        let losing = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: losing_boundary.height,
+            tip_hash: losing_boundary.hash,
+            cumulative_chainwork: losing_boundary_work,
+            ..Default::default()
+        };
+        assert!(validate_snapshot_install_selection(&dag, &losing).is_err());
+
+        let (selected_boundary, selected_boundary_work) = selected_boundary.unwrap();
+        let selected_ancestor = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: selected_boundary.height,
+            tip_hash: selected_boundary.hash,
+            cumulative_chainwork: selected_boundary_work,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_snapshot_install_selection(&dag, &selected_ancestor).unwrap(),
+            None
+        );
+
+        let mut farther_work = branch_b_work;
+        for _ in 8..=12 {
+            farther_work = noid_chain::add_work(
+                &farther_work,
+                &noid_chain::block_work(&branch_b_header.difficulty_target),
+            );
+        }
+        let farther = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: 12,
+            tip_hash: [0xA5; 32],
+            cumulative_chainwork: farther_work,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_snapshot_install_selection(&dag, &farther).unwrap(),
+            Some(SnapshotRebaseAnchor {
+                height: branch_b_parent.height,
+                hash: branch_b_parent.hash,
+                cumulative_work: branch_b_work,
+            })
         );
     }
 
@@ -8503,17 +8610,20 @@ async fn handle_p2p_events(
     macro_rules! try_start_ready_snapshot_install {
         () => {{
             if finalized_snapshot_waiting.is_some() {
-                let stale_rebase_candidate = snapshot_rebase_hint.and_then(|hint| {
-                    pending_manifest.as_ref().and_then(|pending| {
-                        validate_rebase_snapshot_selection(
+                let stale_snapshot_candidate = pending_manifest.as_ref().and_then(|pending| {
+                    match snapshot_rebase_hint {
+                        Some(hint) => validate_rebase_snapshot_selection(
                             &header_dag,
                             hint,
                             &pending.manifest,
-                        )
-                        .err()
-                    })
+                        ),
+                        None => {
+                            validate_snapshot_install_selection(&header_dag, &pending.manifest)
+                        }
+                    }
+                    .err()
                 });
-                if let Some(error) = stale_rebase_candidate {
+                if let Some(error) = stale_snapshot_candidate {
                     let previous_peer = pending_manifest
                         .as_ref()
                         .map(|pending| pending.preferred_peer);
