@@ -1309,16 +1309,13 @@ fn p2p_listen_to_multiaddr(addr: &str) -> anyhow::Result<libp2p::Multiaddr> {
     ip_port_to_multiaddr(addr)
 }
 
-// Mainnet deliberately has no storage compatibility path from testnet. On
-// first start, remove every State, wallet, cache, identity and configuration
-// entry from the selected data directory and initialize a fresh genesis-bound
-// storage epoch. The GUI may already have the node log open when the daemon
-// starts, so that one diagnostic file is retained and truncated by the GUI.
-// The marker binds both the storage schema and genesis so a future genesis
-// replacement cannot accidentally reuse this database.
+// Bind the selected storage directory to this schema and genesis without ever
+// deleting user data implicitly. A missing marker is repaired when the MDBX
+// database is empty or already contains this mainnet genesis. An incompatible
+// database fails closed unless the operator explicitly requests --purge-state;
+// that operation clears chain tables only and preserves wallet.key.
 const NETWORK_STORAGE_EPOCH_MARKER_FILE: &str = ".network-storage-epoch";
 const NETWORK_STORAGE_SCHEMA: &[u8] = b"parano1d/mainnet/network-storage/v1/";
-const NODE_LOG_FILE: &str = "parano1d-node.log";
 
 fn network_storage_epoch_bytes() -> Vec<u8> {
     let genesis = noid_chain::consensus::genesis_header();
@@ -1391,134 +1388,58 @@ fn persist_network_storage_epoch_marker(data_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn validate_network_storage_reset_target(data_dir: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(data_dir)
-        .with_context(|| format!("inspect data directory {}", data_dir.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        anyhow::bail!(
-            "refusing network storage reset outside a real directory: {}",
-            data_dir.display()
-        );
-    }
-    let canonical = std::fs::canonicalize(data_dir)
-        .with_context(|| format!("resolve data directory {}", data_dir.display()))?;
-    if canonical.parent().is_none() {
-        anyhow::bail!("refusing network storage reset at filesystem root");
-    }
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .and_then(|home| std::fs::canonicalize(home).ok())
-    {
-        if canonical == home {
-            anyhow::bail!("refusing network storage reset at the user home directory");
-        }
-    }
-    Ok(())
-}
-
-fn remove_network_storage_entry(path: &Path) -> anyhow::Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("inspect legacy data entry {}", path.display()))?;
-    if metadata.is_dir() && !metadata.file_type().is_symlink() {
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("remove legacy data directory {}", path.display()))
-    } else {
-        std::fs::remove_file(path)
-            .with_context(|| format!("remove legacy data file {}", path.display()))
-    }
-}
-
-fn prepare_network_storage_epoch(data_dir: &Path) -> anyhow::Result<bool> {
+/// Ensure the storage marker is bound to this mainnet genesis. Returns true
+/// only when an explicit --purge-state was consumed while repairing it.
+fn ensure_network_storage_epoch(data_dir: &Path, explicit_purge: bool) -> anyhow::Result<bool> {
     if network_storage_epoch_is_current(data_dir)? {
         return Ok(false);
     }
 
-    validate_network_storage_reset_target(data_dir)?;
-    let mut removed = 0usize;
-    for entry in std::fs::read_dir(data_dir)
-        .with_context(|| format!("enumerate legacy data directory {}", data_dir.display()))?
-    {
-        let entry = entry.with_context(|| format!("read entry in {}", data_dir.display()))?;
-        if entry.file_name() == std::ffi::OsStr::new(NODE_LOG_FILE) {
-            continue;
-        }
-        remove_network_storage_entry(&entry.path())?;
-        removed = removed.saturating_add(1);
-    }
-    let previous_installation_removed = removed != 0;
-    if previous_installation_removed {
-        tracing::warn!(
-            removed,
-            "one-time mainnet data reset prepared; all previous data was removed"
-        );
-    } else {
-        tracing::debug!("empty mainnet storage epoch prepared");
-    }
-    // `true` means that a reset is required, even if the directory was empty.
-    // The caller persists the marker only after configuration is durably reset;
-    // otherwise a crash between those steps could revive stale settings.
-    Ok(true)
-}
-
-fn remove_file_if_present(path: &Path) -> anyhow::Result<bool> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
-    }
-}
-
-fn reset_install_preferences_at_root(
-    root: &Path,
-    data_dir: &Path,
-    config_path: &Path,
-    gui_supervised: bool,
-) -> anyhow::Result<()> {
-    let default_config = root.join("parano1d.toml");
-    if data_dir != root.join("data") && expand_tilde(config_path) != default_config {
-        return Ok(());
-    }
-    // The new GUI rejects legacy settings before starting the daemon and may
-    // already have persisted the user's new language choice. Preserve that
-    // freshly written file only for the exact GUI-supervised config path.
-    let gui_removed = if gui_supervised {
-        false
-    } else {
-        remove_file_if_present(&root.join("gui-settings.json"))?
-    };
-    let core_removed = remove_file_if_present(&default_config)?;
-    if gui_removed || core_removed {
+    let database_path = data_dir.join("mdbx.dat");
+    if !database_path.exists() {
+        persist_network_storage_epoch_marker(data_dir)?;
         tracing::info!(
-            gui_removed,
-            core_removed,
-            "discarded legacy default installation settings"
+            path = %data_dir.display(),
+            "initialized mainnet storage identity without deleting existing files"
         );
+        return Ok(false);
     }
-    Ok(())
-}
 
-fn reset_default_install_preferences(
-    data_dir: &Path,
-    config_path: &Path,
-    gui_supervised: bool,
-) -> anyhow::Result<()> {
-    let root = expand_tilde(Path::new("~/.parano1d"));
-    reset_install_preferences_at_root(&root, data_dir, config_path, gui_supervised)
-}
+    let store = MdbxStore::open(data_dir).context("inspect unmarked MDBX storage")?;
+    let database_empty = store.is_empty().context("inspect unmarked MDBX contents")?;
+    let mainnet_genesis = noid_chain::consensus::genesis_header();
+    let genesis_matches = store
+        .get_header(0)
+        .context("read genesis from unmarked MDBX storage")?
+        .is_some_and(|header| header == mainnet_genesis);
+    drop(store);
 
-fn reset_node_config(path: &Path, defaults: &NodeConfig) -> anyhow::Result<()> {
-    let expanded = expand_tilde(path);
-    remove_file_if_present(&expanded)?;
-    let (_, created) = load_or_create_config(&expanded, defaults)?;
-    if !created {
+    if database_empty || genesis_matches {
+        persist_network_storage_epoch_marker(data_dir)?;
+        tracing::info!(
+            path = %data_dir.display(),
+            database_empty,
+            "repaired missing mainnet storage identity without deleting user data"
+        );
+        return Ok(false);
+    }
+
+    if !explicit_purge {
         anyhow::bail!(
-            "node config was recreated concurrently during mainnet reset: {}",
-            expanded.display()
+            "data directory {} contains a database that is not bound to this mainnet genesis; \
+             no files were modified. Select a fresh --data-dir, move the old directory aside, \
+             or rerun with --purge-state to clear chain state while preserving wallet.key",
+            data_dir.display()
         );
     }
-    tracing::info!(path = %expanded.display(), "initialized mainnet node settings");
-    Ok(())
+
+    purge_chain_state(data_dir)?;
+    persist_network_storage_epoch_marker(data_dir)?;
+    tracing::warn!(
+        path = %data_dir.display(),
+        "explicitly purged incompatible chain state; wallet and local preferences were preserved"
+    );
+    Ok(true)
 }
 
 fn purge_chain_state(data_dir: &Path) -> anyhow::Result<()> {
@@ -1657,9 +1578,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(dir) = cli.data_dir.as_ref() {
         cfg.storage.path = dir.clone();
     }
-    // Resolve the selected storage directory before any matrix cache, wallet,
-    // database or P2P identity is opened. The one-time mainnet reset must be
-    // the first writer and carries no testnet data into mainnet.
+    // Resolve and bind the selected storage directory before opening wallet or
+    // P2P identity data. Incompatible chain data is never removed implicitly.
     let data_dir = if cfg.storage.path == Path::new("~/.parano1d/data") {
         expand_tilde(Path::new("~/.parano1d/data"))
     } else {
@@ -1667,16 +1587,8 @@ async fn main() -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("create data dir: {}", data_dir.display()))?;
-    if prepare_network_storage_epoch(&data_dir)? {
-        cfg = config_defaults.clone();
-        cfg.storage.path = data_dir.clone();
-        let gui_supervised = expand_tilde(&config_path) == data_dir.join("parano1d-gui.toml");
-        reset_default_install_preferences(&data_dir, &config_path, gui_supervised)?;
-        reset_node_config(&config_path, &cfg)?;
-        persist_network_storage_epoch_marker(&data_dir)?;
-        tracing::info!("one-time mainnet reset completed");
-    }
-    // CLI flags are authoritative after any first-mainnet reset.
+    let epoch_purge_applied = ensure_network_storage_epoch(&data_dir, cli.purge_state)?;
+    // CLI flags remain authoritative over persisted settings.
     cfg.mining.enabled = cli.mode == NodeMode::Miner;
     if let Some(addr) = cli.miner_address {
         cfg.mining.miner_address = addr;
@@ -1830,7 +1742,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Storage ---
     tracing::debug!(path = %data_dir.display(), "opening MDBX");
-    if cli.purge_state {
+    if cli.purge_state && !epoch_purge_applied {
         purge_chain_state(&data_dir)?;
     }
     let ctx = MdbxChainContext::open_or_create(&data_dir).context("open MDBX")?;
@@ -4797,31 +4709,31 @@ mod tests {
     use super::{
         admit_exact_suffix_offer, advertise_inventory_for_known_headers, advertised_terminal_peer,
         classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
-        competing_suffix_wins, embedded_seed_multiaddrs, gap_requires_snapshot_sync,
-        header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
-        initial_sync_may_skip_peer_confirmation, load_or_create_config,
-        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
-        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
-        persist_network_storage_epoch_marker, prepare_network_storage_epoch,
+        competing_suffix_wins, embedded_seed_multiaddrs, ensure_network_storage_epoch,
+        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
+        header_inventory_validation_anchor, initial_sync_may_skip_peer_confirmation,
+        load_or_create_config, manifest_round_gap_is_resolved, manifest_round_retry_due,
+        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
+        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
+        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
         prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        record_snapshot_terminal_transport_failure, reset_install_preferences_at_root,
-        reset_node_config, resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
-        rotating_manifest_peers, seed_to_multiaddr, selected_tip_probe_range,
-        snapshot_header_completion_base_moved, snapshot_header_completion_rejects_candidate,
-        snapshot_header_next_action, snapshot_rebase_discovery_range,
-        snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
-        steady_tip_probe_due, superseded_snapshot_install, sync_target_requires_snapshot,
-        terminal_alternate_peer, terminal_transport_can_retry_same_peer,
-        unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
-        validate_history_step_tip_future_drift, validate_rebase_snapshot_selection,
-        validate_snapshot_header_batch_admission, validate_snapshot_install_selection,
-        validate_snapshot_staged_header_boundary, ManifestTerminalCapability, MiningPeerQuorum,
-        NodeConfig, PostSnapshotTail, SnapshotFinalizationOutcome, SnapshotHeaderBoundary,
-        SnapshotHeaderNextAction, SnapshotHeaderPipeline, SnapshotHeaderStagingError,
-        SnapshotRebaseAnchor, SnapshotRebaseHint, SnapshotSegmentFailureScope,
-        SnapshotSessionPrepareError, SnapshotTerminalSourceKey, SuffixAdmission,
-        TerminalRequestRace, CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
+        record_snapshot_terminal_transport_failure, resolve_embedded_seed_with_system_dns,
+        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
+        selected_tip_probe_range, snapshot_header_completion_base_moved,
+        snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
+        snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
+        source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
+        superseded_snapshot_install, sync_target_requires_snapshot, terminal_alternate_peer,
+        terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
+        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
+        validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
+        validate_snapshot_install_selection, validate_snapshot_staged_header_boundary,
+        ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, PostSnapshotTail,
+        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
+        SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
+        SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
+        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
         HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
         MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
         SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
@@ -5099,7 +5011,7 @@ mod tests {
     }
 
     #[test]
-    fn mainnet_reset_removes_every_previous_entry_and_runs_once() {
+    fn storage_epoch_initialization_preserves_wallet_and_local_files() {
         let directory = tempfile::tempdir().unwrap();
         let wallet = directory.path().join("wallet.key");
         std::fs::write(&wallet, b"canonical-wallet-secret").unwrap();
@@ -5107,98 +5019,66 @@ mod tests {
         std::fs::write(directory.path().join("wallet.meta"), b"old metadata").unwrap();
         std::fs::write(directory.path().join("peers.json"), b"old peers").unwrap();
         std::fs::write(directory.path().join("parano1d-node.log"), b"old log").unwrap();
+        std::fs::write(directory.path().join("parano1d.toml"), b"local config").unwrap();
         let cache = directory.path().join("history-step-cache");
         std::fs::create_dir(&cache).unwrap();
         std::fs::write(cache.join("derived.bin"), b"derived").unwrap();
 
-        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
-        assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
-        persist_network_storage_epoch_marker(directory.path()).unwrap();
-        assert!(!wallet.exists());
-        let mut names = std::fs::read_dir(directory.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect::<Vec<_>>();
-        names.sort();
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
+        assert!(network_storage_epoch_is_current(directory.path()).unwrap());
+        assert_eq!(std::fs::read(&wallet).unwrap(), b"canonical-wallet-secret");
         assert_eq!(
-            names,
-            vec![
-                std::ffi::OsString::from(".network-storage-epoch"),
-                std::ffi::OsString::from("parano1d-node.log")
-            ]
+            std::fs::read(directory.path().join("wallet.receipts")).unwrap(),
+            b"old receipts"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("wallet.meta")).unwrap(),
+            b"old metadata"
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("peers.json")).unwrap(),
+            b"old peers"
         );
         assert_eq!(
             std::fs::read(directory.path().join("parano1d-node.log")).unwrap(),
             b"old log"
         );
-
-        std::fs::write(directory.path().join("peers.json"), b"new peers").unwrap();
-        assert!(!prepare_network_storage_epoch(directory.path()).unwrap());
         assert_eq!(
-            std::fs::read(directory.path().join("peers.json")).unwrap(),
-            b"new peers"
+            std::fs::read(directory.path().join("parano1d.toml")).unwrap(),
+            b"local config"
+        );
+        assert_eq!(
+            std::fs::read(cache.join("derived.bin")).unwrap(),
+            b"derived"
         );
     }
 
     #[test]
-    fn empty_directory_still_initializes_mainnet_reset_once() {
+    fn empty_directory_initializes_mainnet_storage_identity_once() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(prepare_network_storage_epoch(directory.path()).unwrap());
-        assert!(!network_storage_epoch_is_current(directory.path()).unwrap());
-        persist_network_storage_epoch_marker(directory.path()).unwrap();
-        assert!(!prepare_network_storage_epoch(directory.path()).unwrap());
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
+        assert!(network_storage_epoch_is_current(directory.path()).unwrap());
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
     }
 
     #[test]
-    fn default_install_reset_discards_legacy_preferences_but_preserves_new_gui_settings() {
+    fn missing_marker_is_repaired_for_an_existing_mainnet_database() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join(".parano1d");
-        let data = root.join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        std::fs::write(root.join("gui-settings.json"), b"legacy GUI settings").unwrap();
-        std::fs::write(root.join("parano1d.toml"), b"legacy Core settings").unwrap();
+        let context =
+            noid_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(context.tip_height(), 0);
+        drop(context);
+        std::fs::write(directory.path().join("wallet.key"), b"preserved-wallet").unwrap();
 
-        reset_install_preferences_at_root(&root, &data, &root.join("parano1d.toml"), false)
-            .unwrap();
-
-        assert!(!root.join("gui-settings.json").exists());
-        assert!(!root.join("parano1d.toml").exists());
-        assert!(data.is_dir());
-
-        std::fs::write(root.join("gui-settings.json"), b"new mainnet settings").unwrap();
-        std::fs::write(root.join("parano1d.toml"), b"legacy Core settings").unwrap();
-        reset_install_preferences_at_root(&root, &data, &data.join("parano1d-gui.toml"), true)
-            .unwrap();
+        assert!(!ensure_network_storage_epoch(directory.path(), false).unwrap());
+        assert!(network_storage_epoch_is_current(directory.path()).unwrap());
         assert_eq!(
-            std::fs::read(root.join("gui-settings.json")).unwrap(),
-            b"new mainnet settings"
+            std::fs::read(directory.path().join("wallet.key")).unwrap(),
+            b"preserved-wallet"
         );
-        assert!(!root.join("parano1d.toml").exists());
-    }
-
-    #[test]
-    fn mainnet_reset_replaces_selected_node_config_for_the_next_start() {
-        let directory = tempfile::tempdir().unwrap();
-        let config_path = directory.path().join("parano1d.toml");
-        std::fs::write(
-            &config_path,
-            "[network]\nlisten = \"0.0.0.0:9500\"\nseeds = []\n\
-             [storage]\nbackend = \"mdbx\"\npath = \"/tmp/legacy\"\n\
-             [rpc]\nlisten = \"127.0.0.1:9501\"\n\
-             [mining]\nenabled = false\nminer_address = \"\"\n",
-        )
-        .unwrap();
-        let mut defaults = NodeConfig::default();
-        defaults.network.listen = Some("0.0.0.0:9600".into());
-        defaults.rpc.listen = Some("127.0.0.1:9601".into());
-        defaults.storage.path = directory.path().join("mainnet-data");
-
-        reset_node_config(&config_path, &defaults).unwrap();
-        let (loaded, created) = load_or_create_config(&config_path, &defaults).unwrap();
-        assert!(!created);
-        assert_eq!(loaded.network.listen.as_deref(), Some("0.0.0.0:9600"));
-        assert_eq!(loaded.rpc.listen.as_deref(), Some("127.0.0.1:9601"));
-        assert_eq!(loaded.storage.path, defaults.storage.path);
+        let reopened =
+            noid_chain::storage::MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 0);
     }
 
     #[test]
