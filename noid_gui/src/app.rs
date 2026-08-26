@@ -198,6 +198,8 @@ pub enum Message {
     OpenAction(Action),
     CloseAction,
     SendRecipientChanged(String),
+    PasteSendRecipient,
+    SendRecipientClipboardLoaded(Option<String>),
     SendAmountChanged(String),
     SendFeeChanged(String),
     SubmitSend,
@@ -613,6 +615,30 @@ impl App {
                     self.send_recipient = recipient;
                     self.send_result = None;
                     self.send_error = None;
+                }
+            }
+            Message::PasteSendRecipient => {
+                if self.send_in_flight || self.action != Some(Action::Send) {
+                    return Task::none();
+                }
+                return iced::clipboard::read().map(Message::SendRecipientClipboardLoaded);
+            }
+            Message::SendRecipientClipboardLoaded(contents) => {
+                if self.send_in_flight || self.action != Some(Action::Send) {
+                    return Task::none();
+                }
+                let recipient = contents.map(|contents| {
+                    contents
+                        .chars()
+                        .filter(|character| !character.is_ascii_whitespace())
+                        .collect::<String>()
+                });
+                if let Some(recipient) = recipient.filter(|recipient| !recipient.is_empty()) {
+                    self.send_recipient = recipient;
+                    self.send_result = None;
+                    self.send_error = None;
+                } else {
+                    self.send_error = Some("Clipboard does not contain text.".into());
                 }
             }
             Message::SendAmountChanged(amount) => {

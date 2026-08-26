@@ -48,6 +48,7 @@ const NETWORK_STORAGE_EPOCH: &[u8] = b"parano1d/mainnet/network-storage/v1/860e7
 const STATE_SEGMENT_LOG: u32 = 16;
 const STATE_MAP_BUCKETS: usize = 256;
 const GENESIS_DIFFICULTY_LOG2: f64 = 238.0;
+const NETWORK_OBSERVATION_BLOCKS: u64 = 30;
 
 #[derive(Clone)]
 pub struct Backend {
@@ -1885,7 +1886,7 @@ fn average_block_time_window_start(height: u64) -> u64 {
     if height <= 1 {
         height
     } else {
-        height.saturating_sub(10).max(1)
+        height.saturating_sub(NETWORK_OBSERVATION_BLOCKS).max(1)
     }
 }
 
@@ -3129,12 +3130,12 @@ mod tests {
     }
 
     #[test]
-    fn average_block_time_window_never_uses_genesis_as_a_sample() {
+    fn network_observation_window_uses_thirty_blocks_without_sampling_genesis() {
         assert_eq!(average_block_time_window_start(0), 0);
         assert_eq!(average_block_time_window_start(1), 1);
         assert_eq!(average_block_time_window_start(2), 1);
-        assert_eq!(average_block_time_window_start(11), 1);
-        assert_eq!(average_block_time_window_start(12), 2);
+        assert_eq!(average_block_time_window_start(31), 1);
+        assert_eq!(average_block_time_window_start(32), 2);
     }
 
     #[test]
