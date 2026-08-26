@@ -303,6 +303,10 @@ fn validate_rebase_snapshot_selection(
 /// Admit one exact header job to the reserved header lane before publishing
 /// any in-flight correlation state. A full lane leaves the job Wanted; it must
 /// never create a phantom request that suppresses later gossip or retries.
+const fn direct_header_request_within_cap(count: u16) -> bool {
+    count as u64 <= DIRECT_SYNC_HEADER_REQUEST_CAP
+}
+
 fn try_dispatch_header_fetch(
     p2p_cmd: &noid_p2p::NetworkCommandSender,
     fetch_in_progress: &mut std::collections::HashSet<libp2p::PeerId>,
@@ -312,6 +316,16 @@ fn try_dispatch_header_fetch(
     count: u16,
     requested_at: Instant,
 ) -> bool {
+    if !direct_header_request_within_cap(count) {
+        tracing::error!(
+            peer = %peer,
+            start_height,
+            count,
+            cap = DIRECT_SYNC_HEADER_REQUEST_CAP,
+            "refusing oversized direct header request"
+        );
+        return false;
+    }
     if fetch_in_progress.contains(&peer) {
         return false;
     }
@@ -4203,6 +4217,11 @@ enum HeaderInventoryPlan {
 }
 
 const HEADER_DAG_MAX_NODES: usize = 1024;
+// Direct responses include their known anchor, so each branch contributes at
+// most `DIRECT_SYNC_HEADER_REQUEST_CAP - 1` new nodes. Keep room for two
+// independently validated branches. Bulk snapshot headers bypass HeaderDAG
+// and are streamed into bounded disk staging instead.
+const _: () = assert!(DIRECT_SYNC_HEADER_REQUEST_CAP as usize * 2 <= HEADER_DAG_MAX_NODES);
 
 /// Reconstruct the bounded control-plane DAG from the durable canonical
 /// non-final window. This is used at startup and after an atomic snapshot
@@ -4709,17 +4728,17 @@ mod tests {
     use super::{
         admit_exact_suffix_offer, advertise_inventory_for_known_headers, advertised_terminal_peer,
         classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
-        competing_suffix_wins, embedded_seed_multiaddrs, ensure_network_storage_epoch,
-        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
-        header_inventory_validation_anchor, initial_sync_may_skip_peer_confirmation,
-        load_or_create_config, manifest_round_gap_is_resolved, manifest_round_retry_due,
-        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
-        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
-        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
-        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        record_snapshot_terminal_transport_failure, resolve_embedded_seed_with_system_dns,
-        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
-        selected_tip_probe_range, snapshot_header_completion_base_moved,
+        competing_suffix_wins, direct_header_request_within_cap, embedded_seed_multiaddrs,
+        ensure_network_storage_epoch, gap_requires_snapshot_sync,
+        header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
+        initial_sync_may_skip_peer_confirmation, load_or_create_config,
+        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
+        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
+        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
+        persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
+        quarantine_exact_suffix_sources, record_snapshot_terminal_transport_failure,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
+        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
@@ -4733,11 +4752,11 @@ mod tests {
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
         SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
-        CONNECTED_TIP_PROBE_HEADERS, HISTORY_STEP_TERMINAL_HARD_DEADLINE,
-        HISTORY_STEP_TERMINAL_HEDGE_AFTER, MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED,
-        MINING_PEER_CONFIRMATION_TTL, MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL,
-        SNAPSHOT_HEADER_BATCH, SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT,
-        STEADY_TIP_PROBE_INTERVAL,
+        CONNECTED_TIP_PROBE_HEADERS, DIRECT_SYNC_HEADER_REQUEST_CAP, HEADER_DAG_MAX_NODES,
+        HISTORY_STEP_TERMINAL_HARD_DEADLINE, HISTORY_STEP_TERMINAL_HEDGE_AFTER,
+        MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED, MINING_PEER_CONFIRMATION_TTL,
+        MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL, SNAPSHOT_HEADER_BATCH,
+        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
     };
 
     fn test_snapshot_id() -> noid_node::networking::SnapshotId {
@@ -6081,6 +6100,18 @@ mod tests {
             noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2
         );
         assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 20);
+    }
+
+    #[test]
+    fn direct_header_windows_cannot_fill_the_bounded_dag_with_one_branch() {
+        assert_eq!(DIRECT_SYNC_HEADER_REQUEST_CAP, 512);
+        assert_eq!(HEADER_DAG_MAX_NODES, 1024);
+        assert!(
+            DIRECT_SYNC_HEADER_REQUEST_CAP as usize * 2 <= HEADER_DAG_MAX_NODES,
+            "two direct branch windows must fit before leaf eviction is needed"
+        );
+        assert!(direct_header_request_within_cap(512));
+        assert!(!direct_header_request_within_cap(513));
     }
 
     #[test]
