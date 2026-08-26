@@ -3240,9 +3240,11 @@ pub async fn start_rpc_server(
         external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::default())),
     };
 
-    // Always add the Bearer-auth middleware layer.
-    // When mining_key is None it is a transparent pass-through.
-    // When Some(key), all requests must carry `Authorization: Bearer <key>`.
+    // Always add the RPC access-control middleware layer. Browser-originated
+    // requests are rejected before JSON-RPC dispatch so an arbitrary website
+    // cannot reach a wallet through its loopback listener. Native local
+    // clients do not send Origin. When mining_key is Some(key), all remaining
+    // requests must also carry `Authorization: Bearer <key>`.
     //
     // Pool operators:  parano1d --rpc-listen 0.0.0.0:9601 --mining-key <secret>
     // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
@@ -3265,7 +3267,7 @@ pub async fn start_rpc_server(
 
 #[derive(Clone)]
 struct BearerAuthLayer {
-    /// `None` = pass-through (no auth required). `Some(s)` = require `Authorization: <s>`.
+    /// `None` = no bearer token required. `Some(s)` = require `Authorization: <s>`.
     expected: Option<String>,
 }
 
@@ -3307,7 +3309,19 @@ where
     }
 
     fn call(&mut self, req: http::Request<B>) -> Self::Future {
-        // No key configured — pass through unconditionally.
+        // A browser can reach a loopback TCP listener from an unrelated web
+        // origin. Reject every browser-originated HTTP and WebSocket request;
+        // the official GUI, CLI and miner are native clients without Origin.
+        if req.headers().contains_key(http::header::ORIGIN) {
+            return Box::pin(async {
+                Ok(http::Response::builder()
+                    .status(http::StatusCode::FORBIDDEN)
+                    .body(jsonrpsee::server::HttpBody::empty())
+                    .expect("static 403 response"))
+            });
+        }
+
+        // No key configured — native clients may pass without bearer auth.
         let Some(ref expected) = self.expected else {
             let fut = self.inner.call(req);
             return Box::pin(fut);
@@ -3334,5 +3348,84 @@ where
                     .expect("static 401 response"))
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod access_control_tests {
+    use std::convert::Infallible;
+    use std::future::{ready, Ready};
+    use std::task::{Context, Poll};
+
+    use super::*;
+    use tower::{Layer, Service, ServiceExt};
+
+    #[derive(Clone)]
+    struct OkService;
+
+    impl<B> Service<http::Request<B>> for OkService {
+        type Response = http::Response<jsonrpsee::server::HttpBody>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: http::Request<B>) -> Self::Future {
+            ready(Ok(http::Response::builder()
+                .status(http::StatusCode::OK)
+                .body(jsonrpsee::server::HttpBody::empty())
+                .expect("static test response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_origin_is_rejected_before_rpc_dispatch() {
+        let service = BearerAuthLayer { expected: None }.layer(OkService);
+        let request = http::Request::builder()
+            .header(http::header::ORIGIN, "https://attacker.example")
+            .header(http::header::UPGRADE, "websocket")
+            .body(())
+            .unwrap();
+
+        let response = service.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn native_originless_client_remains_available_without_a_key() {
+        let service = BearerAuthLayer { expected: None }.layer(OkService);
+        let request = http::Request::builder().body(()).unwrap();
+
+        let response = service.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_remains_required_when_configured() {
+        let layer = BearerAuthLayer {
+            expected: Some("Bearer correct-token".into()),
+        };
+
+        let unauthorized = layer
+            .clone()
+            .layer(OkService)
+            .oneshot(http::Request::builder().body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), http::StatusCode::UNAUTHORIZED);
+
+        let authorized = layer
+            .layer(OkService)
+            .oneshot(
+                http::Request::builder()
+                    .header(http::header::AUTHORIZATION, "Bearer correct-token")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), http::StatusCode::OK);
     }
 }
