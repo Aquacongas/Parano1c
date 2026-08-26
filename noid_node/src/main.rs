@@ -8751,11 +8751,17 @@ async fn handle_p2p_events(
                     let precheck = {
                         let ctx = chain.read().await;
                         let parent = *ctx.tip_header();
-                        let prev_timestamps = ctx.prev_timestamps();
-                        let anchor = ctx.anchor_info();
                         let local_time = unix_now();
-                        match ctx.finalized_active_counts() {
-                            Ok(finalized_active_counts) => {
+                        let validation_context =
+                            (|| -> Result<_, noid_chain::storage::MdbxContextError> {
+                                Ok((
+                                    ctx.prev_timestamps()?,
+                                    ctx.anchor_info()?,
+                                    ctx.finalized_active_counts()?,
+                                ))
+                            })();
+                        match validation_context {
+                            Ok((prev_timestamps, anchor, finalized_active_counts)) => {
                                 Some((
                                     noid_chain::consensus::validate_header(
                                         &announced_header,
@@ -8777,7 +8783,7 @@ async fn handle_p2p_events(
                             Err(error) => {
                                 tracing::error!(
                                     err = %error,
-                                    "canonical finalized expansion window is unavailable"
+                                    "canonical header-validation window is unavailable"
                                 );
                                 None
                             }

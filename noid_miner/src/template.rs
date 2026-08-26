@@ -171,8 +171,8 @@ impl TemplateChainSnapshot {
         Ok(Self {
             parent,
             finalized_active_counts: ctx.finalized_active_counts()?,
-            prev_timestamps: ctx.prev_timestamps(),
-            anchor: ctx.anchor_info(),
+            prev_timestamps: ctx.prev_timestamps()?,
+            anchor: ctx.anchor_info()?,
             state: ctx
                 .state
                 .durable_metadata_clone()

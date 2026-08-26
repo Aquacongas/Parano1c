@@ -1334,9 +1334,9 @@ impl MdbxChainContext {
         let block = &block;
         let history_step_terminal_bytes = accepted_bundle.history_step_terminal_bytes();
         let parent = *self.tip_header();
-        let prev_timestamps = self.prev_timestamps();
+        let prev_timestamps = self.prev_timestamps()?;
         let finalized_active_counts = self.finalized_active_counts()?;
-        let anchor = self.anchor_info();
+        let anchor = self.anchor_info()?;
         let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
         let tx_anchor_header =
             self.get_header_from_store(tx_anchor_height)?
@@ -1504,9 +1504,9 @@ impl MdbxChainContext {
 
         let parent = *self.tip_header();
         let checks_started = Instant::now();
-        let prev_timestamps = self.prev_timestamps();
+        let prev_timestamps = self.prev_timestamps()?;
         let finalized_active_counts = self.finalized_active_counts()?;
-        let anchor = self.anchor_info();
+        let anchor = self.anchor_info()?;
         let tx_anchor_height = tx_epoch_anchor_height_for_child(block.header.height);
         let tx_anchor_header =
             self.get_header_from_store(tx_anchor_height)?
@@ -2725,12 +2725,17 @@ impl MdbxChainContext {
         self.store.get_header(height)
     }
 
-    pub fn prev_timestamps(&self) -> Vec<u64> {
+    pub fn prev_timestamps(&self) -> Result<Vec<u64>, MdbxContextError> {
         let tip = self.tip_height;
         let start = tip.saturating_sub(MEDIAN_TIME_BLOCKS as u64 - 1);
-        (start..=tip)
-            .filter_map(|h| self.recent_headers.get(&h).map(|hdr| hdr.timestamp))
-            .collect()
+        let mut timestamps = Vec::with_capacity(tip.saturating_sub(start) as usize + 1);
+        for height in start..=tip {
+            let header = self
+                .get_header_from_store(height)?
+                .ok_or(MdbxContextError::Corrupt("canonical MTP header is missing"))?;
+            timestamps.push(header.timestamp);
+        }
+        Ok(timestamps)
     }
 
     /// Collect the complete oldest-first hard-finalized occupancy window that
@@ -2760,17 +2765,18 @@ impl MdbxChainContext {
         Ok(counts)
     }
 
-    pub fn anchor_info(&self) -> AnchorInfo {
+    pub fn anchor_info(&self) -> Result<AnchorInfo, MdbxContextError> {
         let anchor_height = asert_anchor_height(self.tip_height);
-        let anchor_header = self
-            .recent_headers
-            .get(&anchor_height)
-            .unwrap_or_else(|| self.tip_header());
-        AnchorInfo {
+        let anchor_header =
+            self.get_header_from_store(anchor_height)?
+                .ok_or(MdbxContextError::Corrupt(
+                    "canonical ASERT anchor header is missing",
+                ))?;
+        Ok(AnchorInfo {
             anchor_height,
             anchor_timestamp: anchor_header.timestamp,
             anchor_target: anchor_header.difficulty_target,
-        }
+        })
     }
 
     /// Check exact equality with the start anchor for the next child block.
@@ -2810,7 +2816,7 @@ mod tests {
     ) -> crate::AcceptedBlockBundle {
         let parent = *context.tip_header();
         let timestamp = parent.timestamp.saturating_add(1);
-        let anchor = context.anchor_info();
+        let anchor = context.anchor_info().unwrap();
         let target = crate::consensus::next_target(
             anchor.anchor_height,
             anchor.anchor_timestamp,
@@ -3059,6 +3065,51 @@ mod tests {
             context.finalized_active_counts(),
             Err(MdbxContextError::Corrupt(
                 "hard-finalized expansion header is missing"
+            ))
+        ));
+    }
+
+    #[test]
+    fn header_validation_helpers_load_ram_misses_from_the_canonical_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        context.recent_headers = (1..=5)
+            .map(|height| (height, occupancy_header(height, 0)))
+            .collect();
+        context.tip_height = 5;
+
+        let genesis = context.get_header_from_store(0).unwrap().unwrap();
+        let timestamps = context.prev_timestamps().unwrap();
+        assert_eq!(timestamps.len(), 6);
+        assert_eq!(timestamps[0], genesis.timestamp);
+
+        let anchor = context.anchor_info().unwrap();
+        assert_eq!(anchor.anchor_height, 0);
+        assert_eq!(anchor.anchor_timestamp, genesis.timestamp);
+        assert_eq!(anchor.anchor_target, genesis.difficulty_target);
+    }
+
+    #[test]
+    fn header_validation_helpers_fail_closed_on_a_missing_canonical_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = small_context(directory.path());
+        context.recent_headers = (0..=11)
+            .map(|height| (height, occupancy_header(height, 0)))
+            .collect();
+        context.tip_height = 11;
+
+        context.recent_headers.remove(&2);
+        assert!(matches!(
+            context.prev_timestamps(),
+            Err(MdbxContextError::Corrupt("canonical MTP header is missing"))
+        ));
+
+        context.recent_headers.insert(2, occupancy_header(2, 0));
+        context.recent_headers.remove(&6);
+        assert!(matches!(
+            context.anchor_info(),
+            Err(MdbxContextError::Corrupt(
+                "canonical ASERT anchor header is missing"
             ))
         ));
     }
