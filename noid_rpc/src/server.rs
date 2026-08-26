@@ -2860,19 +2860,15 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Parse an address from canonical bech32m (`o1…`).
-/// Empty string → zero address (used when no miner address is configured).
-fn parse_address(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
+/// Parse a required address parameter from canonical bech32m (`o1…`).
+/// Optional mining payout selection handles its empty sentinel before calling
+/// this function; wallet recipients and active addresses must never be empty.
+fn parse_address_param(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
     if s.is_empty() {
-        return Ok(noid_poseidon2b::primitives::Address([0u8; 32]));
+        return Err(rpc_err("address must not be empty"));
     }
     noid_poseidon2b::primitives::Address::parse(s)
         .map_err(|e| rpc_err(format!("invalid address: {e}")))
-}
-
-#[inline]
-fn parse_address_param(s: &str) -> RpcResult<noid_poseidon2b::primitives::Address> {
-    parse_address(s)
 }
 
 #[cfg(test)]
@@ -3153,6 +3149,15 @@ mod tests {
         assert!(decode_external_nonce_hex(&encoded.to_uppercase()).is_err());
         assert!(decode_external_nonce_hex(&format!("0x{encoded}")).is_err());
         assert!(decode_external_nonce_hex(&encoded[..30]).is_err());
+    }
+
+    #[test]
+    fn required_address_parameters_reject_the_empty_mining_sentinel() {
+        let error = parse_address_param("").unwrap_err();
+        assert_eq!(error.message(), "address must not be empty");
+
+        let address = noid_poseidon2b::primitives::Address([0x42; 32]);
+        assert_eq!(parse_address_param(&address.to_bech32()).unwrap(), address);
     }
 }
 
