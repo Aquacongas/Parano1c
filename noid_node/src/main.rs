@@ -217,26 +217,6 @@ fn validate_rebase_snapshot_selection(
     Ok(None)
 }
 
-fn snapshot_candidate_wins_header_dag(
-    header_dag: &noid_node::networking::header_dag::HeaderDag,
-    manifest: &noid_p2p::protocol::GetStateManifestResponse,
-) -> bool {
-    let selected = header_dag.best_tip();
-    let selected_work = header_dag.best_work();
-    (manifest.tip_height == selected.height
-        && manifest.tip_hash == selected.hash
-        && manifest.cumulative_chainwork == selected_work)
-        || matches!(
-            noid_chain::choose_chain_by_work(
-                &manifest.cumulative_chainwork,
-                &manifest.tip_hash,
-                &selected_work,
-                &selected.hash,
-            ),
-            noid_chain::consensus::fork_choice::ChainChoice::A
-        )
-}
-
 /// Admit one exact header job to the reserved header lane before publishing
 /// any in-flight correlation state. A full lane leaves the job Wanted; it must
 /// never create a phantom request that suppresses later gossip or retries.
@@ -4745,11 +4725,10 @@ mod tests {
         record_snapshot_terminal_transport_failure, reset_install_preferences_at_root,
         reset_node_config, resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
         rotating_manifest_peers, seed_to_multiaddr, selected_tip_probe_range,
-        snapshot_candidate_wins_header_dag, snapshot_header_completion_base_moved,
-        snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
-        snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
-        source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
-        superseded_snapshot_install, terminal_alternate_peer,
+        snapshot_header_completion_base_moved, snapshot_header_completion_rejects_candidate,
+        snapshot_header_next_action, snapshot_rebase_discovery_range,
+        snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
+        steady_tip_probe_due, superseded_snapshot_install, terminal_alternate_peer,
         terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
         unresolved_tip_probe_range, validate_history_step_tip_future_drift,
         validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
@@ -6248,7 +6227,6 @@ mod tests {
         };
         assert!(validate_rebase_snapshot_selection(&dag, hint, &losing).is_err());
 
-        assert!(snapshot_candidate_wins_header_dag(&dag, &farther));
         let mut third_header = selected_header;
         third_header.height = 3;
         third_header.prev_block_hash = selected.hash;
@@ -6271,7 +6249,19 @@ mod tests {
         let fourth = ValidatedHeader::new_after_consensus_checks(fourth_header, fourth_work);
         dag.insert(third).unwrap();
         dag.insert(fourth).unwrap();
-        assert!(!snapshot_candidate_wins_header_dag(&dag, &farther));
+
+        assert!(validate_rebase_snapshot_selection(&dag, hint, &farther).is_err());
+        let selected_ancestor = noid_p2p::protocol::GetStateManifestResponse {
+            tip_height: third.header.height,
+            tip_hash: third.hash,
+            cumulative_chainwork: third.cumulative_work,
+            ..Default::default()
+        };
+        assert_eq!(
+            validate_rebase_snapshot_selection(&dag, hint, &selected_ancestor).unwrap(),
+            None,
+            "a verified snapshot on selected ancestry remains installable below the live tip"
+        );
     }
 
     #[test]
@@ -8383,17 +8373,24 @@ async fn handle_p2p_events(
     macro_rules! try_start_ready_snapshot_install {
         () => {{
             if finalized_snapshot_waiting.is_some() {
-                let stale_rebase_candidate = snapshot_rebase_hint.is_some()
-                    && pending_manifest.as_ref().is_some_and(|pending| {
-                        !snapshot_candidate_wins_header_dag(&header_dag, &pending.manifest)
-                    });
-                if stale_rebase_candidate {
+                let stale_rebase_candidate = snapshot_rebase_hint.and_then(|hint| {
+                    pending_manifest.as_ref().and_then(|pending| {
+                        validate_rebase_snapshot_selection(
+                            &header_dag,
+                            hint,
+                            &pending.manifest,
+                        )
+                        .err()
+                    })
+                });
+                if let Some(error) = stale_rebase_candidate {
                     let previous_peer = pending_manifest
                         .as_ref()
                         .map(|pending| pending.preferred_peer);
                     tracing::info!(
                         selected_height = header_dag.best_tip().height,
-                        "verified snapshot no longer wins HeaderDAG fork choice; selecting a fresher boundary"
+                        %error,
+                        "verified snapshot left the HeaderDAG-selected ancestry; selecting a fresh boundary"
                     );
                     retire_snapshot_plan!();
                     if let Some(previous_peer) = previous_peer {

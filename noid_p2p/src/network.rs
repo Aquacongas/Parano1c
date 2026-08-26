@@ -2972,6 +2972,28 @@ fn validate_header_batch_shape(records: &[HeaderInventoryRecord]) -> Result<(), 
     Ok(())
 }
 
+/// Bind an ordinary header response to the exact range requested by this
+/// node. Honest peers may return fewer records when they reach their tip, but
+/// they may not move the start height or expand a small probe into a bulk
+/// HeaderDAG insertion.
+fn validate_general_header_response(
+    pending: &PendingHeaderRequest,
+    records: &[HeaderInventoryRecord],
+) -> Result<(), &'static str> {
+    debug_assert_eq!(pending.kind, HeaderRequestKind::General);
+    validate_header_batch_shape(records)?;
+    if records.len() > usize::from(pending.count) {
+        return Err("header response exceeds requested count");
+    }
+    if records
+        .first()
+        .is_some_and(|record| record.header.height != pending.start_height)
+    {
+        return Err("header response starts outside the requested range");
+    }
+    Ok(())
+}
+
 fn snapshot_header_request_is_superseded(
     pending: &PendingHeaderRequest,
     generation: u64,
@@ -7256,7 +7278,11 @@ async fn handle_swarm_event(
                 }
                 return;
             }
-            if let Err(error) = validate_header_batch_shape(&records) {
+            let response_shape = match pending.kind {
+                HeaderRequestKind::General => validate_general_header_response(&pending, &records),
+                HeaderRequestKind::Snapshot { .. } => validate_header_batch_shape(&records),
+            };
+            if let Err(error) = response_shape {
                 tracing::warn!(from = %peer, error, "invalid header batch response — dropped");
                 match pending.kind {
                     HeaderRequestKind::General => {
@@ -10955,6 +10981,68 @@ mod tests {
                 HeaderInventoryRecord::header_only(wrong_parent),
             ]),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn general_header_response_is_bound_to_the_requested_range() {
+        let peer = PeerId::random();
+        let pending = PendingHeaderRequest {
+            peer,
+            start_height: 77,
+            count: 2,
+            kind: HeaderRequestKind::General,
+            issued_at: Instant::now(),
+            notify_node: true,
+        };
+        let mut first = noid_chain::consensus::genesis::genesis_header();
+        first.height = 77;
+        let mut second = first;
+        second.height = 78;
+        second.prev_block_hash = noid_chain::hash_block_header(&first);
+        let mut third = second;
+        third.height = 79;
+        third.prev_block_hash = noid_chain::hash_block_header(&second);
+
+        assert_eq!(validate_general_header_response(&pending, &[]), Ok(()));
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[HeaderInventoryRecord::header_only(first)],
+            ),
+            Ok(()),
+            "an honest peer at its tip may return fewer headers than requested"
+        );
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[
+                    HeaderInventoryRecord::header_only(first),
+                    HeaderInventoryRecord::header_only(second),
+                ],
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[
+                    HeaderInventoryRecord::header_only(first),
+                    HeaderInventoryRecord::header_only(second),
+                    HeaderInventoryRecord::header_only(third),
+                ],
+            ),
+            Err("header response exceeds requested count")
+        );
+        assert_eq!(
+            validate_general_header_response(
+                &pending,
+                &[
+                    HeaderInventoryRecord::header_only(second),
+                    HeaderInventoryRecord::header_only(third),
+                ],
+            ),
+            Err("header response starts outside the requested range")
         );
     }
 
