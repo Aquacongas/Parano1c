@@ -406,12 +406,12 @@ pub fn install_reorg_snapshot_and_artifacts(
             block,
         );
         let confirmed_block_hash = noid_chain::block_id(&block.header);
+        for txid in noid_chain::try_compute_logical_txids(&block.transactions)
+            .expect("committed replacement block has canonical logical txids")
+        {
+            let _ = wallet.confirm_pending_tx(&txid.0, block.header.height, confirmed_block_hash);
+        }
         for transaction in &block.transactions {
-            let _ = wallet.confirm_pending_tx(
-                &transaction.txid().0,
-                block.header.height,
-                confirmed_block_hash,
-            );
             let output_slots: Vec<u32> = transaction
                 .body
                 .live_outputs()
@@ -1970,6 +1970,118 @@ mod tests {
             !reloaded.receipts.contains_key(&orphan_hash),
             "orphan receipt must not return after restart"
         );
+    }
+
+    #[test]
+    fn reorg_confirms_pending_send_by_logical_transaction_id() {
+        use noid_chain::block_header::BlockHeader;
+        use noid_poseidon2b::primitives::Address;
+        use noid_tx::{
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
+        };
+
+        let (dir, handle) = handle_with_utxos(&[]);
+        let owner = handle
+            .inner
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .active_address();
+        let recipient = Address([0xA5; 32]);
+        let mut inputs = [TxInput::dummy(); TX_INPUTS];
+        inputs[0] = TxInput {
+            slot_index: 7,
+            amount: 50,
+            creation_id: 3,
+        };
+        let mut outputs = [TxOutput::dummy(); TX_OUTPUTS];
+        outputs[0] = TxOutput {
+            slot_index: 9,
+            amount: 40,
+            owner: recipient,
+        };
+        let payment = Transaction::new(TxBody {
+            epoch_anchor: [0x11; 32],
+            fee: 10,
+            input_owner: owner,
+            inputs,
+            outputs,
+            validity_bitmap: 1 | output_bitmap_bit(0) | PAGED_SPEND_START_BIT | PAGED_SPEND_END_BIT,
+            is_coinbase: false,
+        });
+        let physical_txid = payment.txid().0;
+        let coinbase = Transaction::new(TxBody {
+            epoch_anchor: [0; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [TxOutput::dummy(); TX_OUTPUTS],
+            validity_bitmap: output_bitmap_bit(0),
+            is_coinbase: true,
+        });
+        let transactions = vec![coinbase, payment];
+        let logical_txid = noid_chain::try_compute_logical_txids(&transactions).unwrap()[1].0;
+        assert_ne!(logical_txid, physical_txid);
+        let header = BlockHeader {
+            prev_block_hash: [0; 32],
+            state_root: [0; 32],
+            tx_root: noid_chain::compute_tx_root(&transactions),
+            timestamp: 123,
+            height: 7,
+            miner_address: Address([0x77; 32]),
+            nonce: 0,
+            difficulty_target: [0xFF; 32],
+            log_slots: 24,
+            active_slot_count: 1,
+            alloc_counter: 1,
+        };
+        let block = noid_chain::Block {
+            header,
+            transactions,
+        };
+        let confirmed_block_hash = noid_chain::block_id(&block.header);
+        {
+            let mut guard = handle.inner.lock().unwrap();
+            guard
+                .as_mut()
+                .unwrap()
+                .record_pending_send(logical_txid, 40, recipient.0)
+                .unwrap();
+        }
+
+        install_reorg_snapshot_and_artifacts(
+            &handle.inner,
+            0,
+            1,
+            owner.0,
+            empty_snapshot(owner.0),
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+            &[noid_poseidon2b::primitives::TxBodyHash(logical_txid)],
+            &[&block],
+        )
+        .unwrap();
+
+        let guard = handle.inner.lock().unwrap();
+        let entry = guard
+            .as_ref()
+            .unwrap()
+            .history
+            .iter()
+            .find(|entry| entry.tx_hash == logical_txid)
+            .expect("replacement-chain send remains in wallet history");
+        assert_eq!(entry.height, 7);
+        assert_eq!(entry.block_hash, Some(confirmed_block_hash));
+        drop(guard);
+
+        let reloaded = state::WalletState::create_or_load(dir.path().join("wallet.key")).unwrap();
+        assert!(reloaded.history.iter().any(|entry| {
+            entry.tx_hash == logical_txid
+                && entry.height == 7
+                && entry.block_hash == Some(confirmed_block_hash)
+        }));
     }
 
     #[test]
