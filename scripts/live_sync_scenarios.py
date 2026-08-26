@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Clean release-binary sync suite: exact catch-up and deep snapshot recovery.
 
-Every run starts from empty primary and secondary data directories.  The
-catch-up phases exercise the 42-block exact-object serving window and the
-snapshot path immediately beyond it.
+Every run starts from empty primary and secondary data directories.  Ordinary
+catch-up uses an exact suffix through 18 blocks and requests a snapshot beyond
+that boundary.  If no snapshot generation is ahead of the requester, the node
+must still make progress through the available exact suffix.
 """
 
 import datetime
@@ -515,6 +516,10 @@ def main():
 
         secondary.stop()
         primary.stop()
+        # At h43 the newest rounded finalized snapshot boundary is h24, equal
+        # to this node's current tip. There is no newer State generation to
+        # install, so the >18 snapshot attempt must safely fall back to the
+        # available 19-block exact suffix rather than loop on h24.
         summary["phases"]["gap19_mining"] = mine_phase(
             primary, "10-primary-gap19-mining", 24, 19, genesis=True
         )
@@ -546,9 +551,9 @@ def main():
             **gap19,
         }
 
-        # A node left at h5 now falls 43 blocks behind. This is the first gap
-        # outside the guaranteed exact-object window and must use one snapshot
-        # at h30 followed by one exact 18-block suffix to h48.
+        # A node left at h5 now falls 43 blocks behind. The h30 snapshot is
+        # ahead of its local State, so normal deep sync must install it once
+        # and then finish the authenticated 18-block tail to h48.
         secondary.stop()
         primary.stop()
         summary["phases"]["deep_gap_mining"] = mine_phase(
@@ -590,7 +595,7 @@ def main():
             **deep,
         }
         summary["status"] = "passed"
-        print("[PASS] exact-window and deep-snapshot sync suite", flush=True)
+        print("[PASS] 18-block boundary and deep-snapshot sync suite", flush=True)
     except Exception as caught:
         error = caught
         summary["status"] = "failed"

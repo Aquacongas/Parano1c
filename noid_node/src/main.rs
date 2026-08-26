@@ -158,9 +158,79 @@ struct SnapshotRebaseAnchor {
     cumulative_work: [u8; 32],
 }
 
+/// One temporary exact-object allowance after a verified snapshot jump.
+///
+/// Ordinary catch-up switches to a snapshot after the authenticated recent
+/// suffix (18 blocks).  A snapshot itself lands on a finalized generation,
+/// so the live tip learned after its commit can be farther away while State
+/// was transferred. The larger 42-block serving window exists only to discover
+/// and finish this one authenticated tail; it must never become the ordinary
+/// sync threshold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PostSnapshotTail {
+    boundary: noid_node::networking::ChainPoint,
+    target: Option<noid_node::networking::ChainPoint>,
+}
+
+impl PostSnapshotTail {
+    fn serving_limit(self) -> u64 {
+        self.boundary
+            .height
+            .saturating_add(noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH)
+    }
+
+    fn allows_exact_target(self, local_height: u64, candidate_height: u64) -> bool {
+        let exact_limit = self
+            .target
+            .map_or_else(|| self.serving_limit(), |target| target.height);
+        local_height >= self.boundary.height
+            && candidate_height > local_height
+            && candidate_height <= exact_limit
+            && exact_limit <= self.serving_limit()
+    }
+
+    /// Pin the first target selected by native HeaderDAG validation after the
+    /// snapshot commit. Raw announcements can trigger header discovery inside
+    /// the bounded serving window, but cannot set this target.
+    fn pin_selected_target(
+        &mut self,
+        local: noid_node::networking::ChainPoint,
+        selected: noid_node::networking::ChainPoint,
+    ) -> bool {
+        if self.target.is_some() {
+            return self.target == Some(selected);
+        }
+        if local.height < self.boundary.height
+            || selected.height <= local.height
+            || selected.height > self.serving_limit()
+        {
+            return false;
+        }
+        self.target = Some(selected);
+        true
+    }
+
+    fn is_finished_or_invalid_at(self, local_height: u64) -> bool {
+        local_height < self.boundary.height
+            || self
+                .target
+                .is_some_and(|target| local_height >= target.height)
+    }
+}
+
 fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
     peer_height
-        > local_height.saturating_add(noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH)
+        > local_height.saturating_add(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH)
+}
+
+fn sync_target_requires_snapshot(
+    local_height: u64,
+    peer_height: u64,
+    post_snapshot_tail: Option<PostSnapshotTail>,
+) -> bool {
+    gap_requires_snapshot_sync(local_height, peer_height)
+        && !post_snapshot_tail
+            .is_some_and(|tail| tail.allows_exact_target(local_height, peer_height))
 }
 
 fn validate_rebase_snapshot_selection(
@@ -4728,12 +4798,13 @@ mod tests {
         snapshot_header_completion_base_moved, snapshot_header_completion_rejects_candidate,
         snapshot_header_next_action, snapshot_rebase_discovery_range,
         snapshot_segment_failure_scope, source_independent_suffix_offer, stale_gap_recovery_is_due,
-        steady_tip_probe_due, superseded_snapshot_install, terminal_alternate_peer,
-        terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
-        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
-        validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
-        validate_snapshot_staged_header_boundary, ManifestTerminalCapability, MiningPeerQuorum,
-        NodeConfig, SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
+        steady_tip_probe_due, superseded_snapshot_install, sync_target_requires_snapshot,
+        terminal_alternate_peer, terminal_transport_can_retry_same_peer,
+        unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
+        validate_history_step_tip_future_drift, validate_rebase_snapshot_selection,
+        validate_snapshot_header_batch_admission, validate_snapshot_staged_header_boundary,
+        ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, PostSnapshotTail,
+        SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
         SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
         SnapshotTerminalSourceKey, SuffixAdmission, TerminalRequestRace,
@@ -5926,18 +5997,55 @@ mod tests {
     }
 
     #[test]
-    fn sync_mode_uses_guaranteed_object_serving_window_boundary() {
-        let retention = noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH;
-        assert_eq!(
-            retention, 42,
-            "the operational exact-object serving window is 42 blocks"
-        );
+    fn ordinary_sync_mode_uses_the_authenticated_recent_suffix_boundary() {
         let local_height = 100;
 
         assert!(!gap_requires_snapshot_sync(local_height, local_height));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 41));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 42));
-        assert!(gap_requires_snapshot_sync(local_height, local_height + 43));
+        assert!(!gap_requires_snapshot_sync(local_height, local_height + 17));
+        assert!(!gap_requires_snapshot_sync(local_height, local_height + 18));
+        assert!(gap_requires_snapshot_sync(local_height, local_height + 19));
+        assert!(gap_requires_snapshot_sync(local_height, local_height + 42));
+    }
+
+    #[test]
+    fn verified_snapshot_gets_one_bounded_exact_tail_without_moving_the_normal_threshold() {
+        use noid_node::networking::ChainPoint;
+
+        let mut tail = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [1; 32]),
+            target: None,
+        };
+
+        assert!(sync_target_requires_snapshot(100, 119, None));
+        assert!(!sync_target_requires_snapshot(100, 142, Some(tail)));
+        assert!(sync_target_requires_snapshot(100, 143, Some(tail)));
+        assert!(
+            tail.pin_selected_target(ChainPoint::new(100, [1; 32]), ChainPoint::new(123, [2; 32]),)
+        );
+        assert!(!sync_target_requires_snapshot(100, 119, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 123, Some(tail)));
+        assert!(sync_target_requires_snapshot(100, 124, Some(tail)));
+        assert!(tail.is_finished_or_invalid_at(123));
+
+        let longest_retained_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [3; 32]),
+            target: Some(ChainPoint::new(142, [4; 32])),
+        };
+        assert!(!sync_target_requires_snapshot(
+            100,
+            142,
+            Some(longest_retained_tail)
+        ));
+
+        let outside_serving_window = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [5; 32]),
+            target: Some(ChainPoint::new(143, [6; 32])),
+        };
+        assert!(sync_target_requires_snapshot(
+            100,
+            143,
+            Some(outside_serving_window)
+        ));
     }
 
     #[test]
@@ -8514,6 +8622,42 @@ async fn handle_p2p_events(
     let mut highest_announced: u64 = 0;
     let mut last_announcement_peer: Option<libp2p::PeerId> = None;
     let mut bootstrap_complete_sent = false;
+    // Armed only by a successfully installed, HeaderDAG-bound snapshot. It
+    // lets that one snapshot finish its pinned exact tail without changing
+    // the ordinary 18-block snapshot threshold.
+    let mut post_snapshot_tail: Option<PostSnapshotTail> = None;
+
+    macro_rules! arm_post_snapshot_tail {
+        ($height:expr, $hash:expr) => {{
+            let boundary = noid_node::networking::ChainPoint::new($height, $hash);
+            let tail = PostSnapshotTail {
+                boundary,
+                target: None,
+            };
+            tracing::info!(
+                boundary_height = boundary.height,
+                serving_limit = tail.serving_limit(),
+                "snapshot installed — awaiting one authenticated HeaderDAG tail target"
+            );
+            post_snapshot_tail = Some(tail);
+        }};
+    }
+
+    macro_rules! retire_post_snapshot_tail_if_finished {
+        ($height:expr) => {{
+            let height = $height;
+            if post_snapshot_tail.is_some_and(|tail| tail.is_finished_or_invalid_at(height)) {
+                if let Some(tail) = post_snapshot_tail.take() {
+                    tracing::debug!(
+                        height,
+                        boundary_height = tail.boundary.height,
+                        target_height = tail.target.map(|target| target.height),
+                        "retired completed post-snapshot exact-tail allowance"
+                    );
+                }
+            }
+        }};
+    }
 
     // Raw announcement and manifest heights are routing hints only. This
     // target advances exclusively after native header validation or atomic
@@ -8591,6 +8735,14 @@ async fn handle_p2p_events(
                     .is_ok()
                 {
                     bootstrap_complete_sent = true;
+                    if let Some(tail) = post_snapshot_tail.take() {
+                        tracing::debug!(
+                            local_height,
+                            boundary_height = tail.boundary.height,
+                            target_height = tail.target.map(|target| target.height),
+                            "retired post-snapshot exact-tail allowance at bootstrap completion"
+                        );
+                    }
                     tracing::debug!(
                         local_height,
                         highest_announced,
@@ -8620,6 +8772,7 @@ async fn handle_p2p_events(
                     )
                 };
                 mining_peer_quorum.reconcile_canonical_tip(height, hash, prev_hash);
+                retire_post_snapshot_tail_if_finished!(height);
                 // Local commits arrive through this watch channel (including blocks
                 // submitted by an external miner).  They advance the canonical tip
                 // just as surely as an exact-suffix or snapshot commit, so stale-gap
@@ -8722,7 +8875,7 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                if gap_requires_snapshot_sync(our_height, height) {
+                if sync_target_requires_snapshot(our_height, height, post_snapshot_tail) {
                     // Raw height is only a routing hint. Pull a bounded native
                     // header range first; only HeaderDAG may select the target
                     // that is allowed to start snapshot object scheduling.
@@ -9902,8 +10055,24 @@ async fn handle_p2p_events(
                         mining_peer_quorum.observe_compatible(from);
 
                         let selected_rebase_base = (base != old_tip).then_some(base);
+                        if base == old_tip {
+                            if let Some(tail) = post_snapshot_tail.as_mut() {
+                                let was_unpinned = tail.target.is_none();
+                                if tail.pin_selected_target(old_tip, target) && was_unpinned {
+                                    tracing::info!(
+                                        boundary_height = tail.boundary.height,
+                                        target_height = target.height,
+                                        "post-snapshot exact tail pinned to authenticated HeaderDAG target"
+                                    );
+                                }
+                            }
+                        }
                         let needs_snapshot = if base == old_tip {
-                            gap_requires_snapshot_sync(old_tip.height, target.height)
+                            sync_target_requires_snapshot(
+                                old_tip.height,
+                                target.height,
+                                post_snapshot_tail,
+                            )
                         } else {
                             old_tip.height.saturating_sub(base.height)
                                 > noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
@@ -11870,6 +12039,7 @@ async fn handle_p2p_events(
                 let ctx = chain.read().await;
                 ctx.tip_height()
             };
+            retire_post_snapshot_tail_if_finished!(current_height);
             let probe_peer = deferred_sync_peer
                 .take()
                 .filter(|peer| manifest_peers.contains(peer))
@@ -12245,6 +12415,7 @@ async fn handle_p2p_events(
                     ));
 
                     let height = applied.height;
+                    arm_post_snapshot_tail!(height, applied.block_hash);
                     mining_peer_quorum.set_canonical_tip(height, applied.block_hash, false);
                     record_authenticated_height!(height, completed.key.observer_peer);
                     tracing::info!(
@@ -12353,6 +12524,7 @@ async fn handle_p2p_events(
                         applied.tail_apply_elapsed,
                     ));
                     let height = applied.height;
+                    arm_post_snapshot_tail!(height, applied.block_hash);
                     mining_peer_quorum.set_canonical_tip(height, applied.block_hash, false);
                     record_authenticated_height!(height, completed.key.observer_peer);
                     tracing::warn!(
@@ -12788,6 +12960,7 @@ async fn handle_p2p_events(
                     }
                 }
             }
+            retire_post_snapshot_tail_if_finished!(our_height);
             // This also catches locally mined or RPC-submitted blocks, whose
             // commits do not pass through this P2P event handler. A direct
             // child preserves fresh ancestry leases; any discontinuity is a
@@ -13603,7 +13776,11 @@ async fn handle_p2p_events(
                     if let Some(peer) = last_announcement_peer {
                         let gap = highest_announced - our_height;
                         let mut recovery_dispatched = false;
-                        if gap_requires_snapshot_sync(our_height, highest_announced) {
+                        if sync_target_requires_snapshot(
+                            our_height,
+                            highest_announced,
+                            post_snapshot_tail,
+                        ) {
                             if pending_manifest.is_none()
                                 && pending_snapshot_header_sync.is_none()
                                 && snapshot_header_staging_inflight.is_none()
