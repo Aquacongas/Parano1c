@@ -160,12 +160,12 @@ struct SnapshotRebaseAnchor {
 
 /// One temporary exact-object allowance after a verified snapshot jump.
 ///
-/// Ordinary catch-up switches to a snapshot after the authenticated recent
-/// suffix (18 blocks).  A snapshot itself lands on a finalized generation,
-/// so the live tip learned after its commit can be farther away while State
-/// was transferred. The larger 42-block serving window exists only to discover
-/// and finish this one authenticated tail; it must never become the ordinary
-/// sync threshold.
+/// Ordinary catch-up switches to a snapshot as soon as a deterministic
+/// finalized snapshot boundary exists ahead of the committed State. A
+/// snapshot itself lands on that finalized generation, so the live tip learned
+/// after its commit can be farther away while State was transferred. The
+/// larger 42-block serving window exists only to discover and finish this one
+/// authenticated tail; it must never become the ordinary sync threshold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PostSnapshotTail {
     boundary: noid_node::networking::ChainPoint,
@@ -218,9 +218,14 @@ impl PostSnapshotTail {
     }
 }
 
+fn newest_deterministic_snapshot_boundary(peer_height: u64) -> u64 {
+    let finalized_height =
+        peer_height.saturating_sub(noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH);
+    finalized_height - finalized_height % noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL
+}
+
 fn gap_requires_snapshot_sync(local_height: u64, peer_height: u64) -> bool {
-    peer_height
-        > local_height.saturating_add(noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH)
+    peer_height > local_height && newest_deterministic_snapshot_boundary(peer_height) > local_height
 }
 
 fn sync_target_requires_snapshot(
@@ -5997,14 +6002,29 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_sync_mode_uses_the_authenticated_recent_suffix_boundary() {
-        let local_height = 100;
+    fn ordinary_sync_waits_for_a_snapshot_boundary_ahead_of_local_state() {
+        assert!(!gap_requires_snapshot_sync(20_371, 20_393));
+        assert!(gap_requires_snapshot_sync(20_371, 20_394));
 
-        assert!(!gap_requires_snapshot_sync(local_height, local_height));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 17));
-        assert!(!gap_requires_snapshot_sync(local_height, local_height + 18));
-        assert!(gap_requires_snapshot_sync(local_height, local_height + 19));
-        assert!(gap_requires_snapshot_sync(local_height, local_height + 42));
+        // Finality is 18 blocks and deterministic snapshot boundaries are six
+        // blocks apart. Depending on local height alignment, the first usable
+        // boundary appears at a gap from 19 through 24. The exact bridge can
+        // therefore never exceed 23 blocks.
+        for local_height in 96..102 {
+            let first_snapshot_gap = (1..=24)
+                .find(|gap| {
+                    gap_requires_snapshot_sync(local_height, local_height.saturating_add(*gap))
+                })
+                .expect("a forward snapshot boundary exists within 24 blocks");
+            assert_eq!(first_snapshot_gap, 24 - local_height % 6);
+            assert!((19..=24).contains(&first_snapshot_gap));
+            for gap in 0..first_snapshot_gap {
+                assert!(!gap_requires_snapshot_sync(
+                    local_height,
+                    local_height.saturating_add(gap)
+                ));
+            }
+        }
     }
 
     #[test]
@@ -6016,13 +6036,15 @@ mod tests {
             target: None,
         };
 
-        assert!(sync_target_requires_snapshot(100, 119, None));
+        assert!(!sync_target_requires_snapshot(100, 119, None));
+        assert!(sync_target_requires_snapshot(100, 120, None));
         assert!(!sync_target_requires_snapshot(100, 142, Some(tail)));
         assert!(sync_target_requires_snapshot(100, 143, Some(tail)));
         assert!(
             tail.pin_selected_target(ChainPoint::new(100, [1; 32]), ChainPoint::new(123, [2; 32]),)
         );
         assert!(!sync_target_requires_snapshot(100, 119, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 120, Some(tail)));
         assert!(!sync_target_requires_snapshot(100, 123, Some(tail)));
         assert!(sync_target_requires_snapshot(100, 124, Some(tail)));
         assert!(tail.is_finished_or_invalid_at(123));
@@ -8875,12 +8897,13 @@ async fn handle_p2p_events(
                     continue;
                 }
 
-                if sync_target_requires_snapshot(our_height, height, post_snapshot_tail) {
-                    // Raw height is only a routing hint. Pull a bounded native
-                    // header range first; only HeaderDAG may select the target
-                    // that is allowed to start snapshot object scheduling.
+                if height > our_height.saturating_add(1) {
+                    // Raw height is only a routing hint. Every non-adjacent
+                    // target first pulls a bounded native header range; only
+                    // HeaderDAG may then select either an exact continuation
+                    // or a snapshot-backed target.
                     let start_height = finalized_header_search_floor(our_height);
-                    let count = (CONSENSUS_FINALITY_DEPTH as u16 * 2).min(512);
+                    let (_, count) = unresolved_tip_probe_range(start_height, height, 0);
                     let request_key = (from, start_height, count);
                     let recently_requested = recent_header_fetches
                         .get(&request_key)
@@ -13804,9 +13827,7 @@ async fn handle_p2p_events(
                                 }
                             }
                         } else {
-                            let count = (gap + 1)
-                                .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
-                                as u16;
+                            let count = (gap + 1).min(DIRECT_SYNC_HEADER_REQUEST_CAP) as u16;
                             recovery_dispatched = try_dispatch_header_fetch(
                                 &p2p_cmd,
                                 &mut fetch_in_progress,

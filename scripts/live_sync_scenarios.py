@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Clean release-binary sync suite: exact catch-up and deep snapshot recovery.
 
-Every run starts from empty primary and secondary data directories.  Ordinary
-catch-up uses an exact suffix through 18 blocks and requests a snapshot beyond
-that boundary.  If no snapshot generation is ahead of the requester, the node
-must still make progress through the available exact suffix.
+Every run starts from empty primary and secondary data directories. Ordinary
+catch-up uses an exact suffix until a deterministic finalized snapshot boundary
+exists ahead of the requester, then switches to that snapshot. This closes the
+six-block boundary-alignment gap without changing 18-block finality.
 """
 
 import datetime
@@ -416,7 +416,10 @@ def main():
         short_secondary.start("03-secondary-fresh-h5", seeds=[primary.seed])
         wait_converged(primary, short_secondary, timeout=300)
         elapsed = time.monotonic() - started
-        fresh_short = sync_counts(short_secondary.log_text())
+        fresh_short = wait_sync_counts(
+            short_secondary,
+            lambda counts: counts["exact_suffix_blocks"] == [5],
+        )
         assert_no_sync_failures("fresh-h5", short_secondary.log_text())
         require(fresh_short["snapshot_installs"] == 0, f"fresh h5 used snapshot: {fresh_short}")
         require(
@@ -458,7 +461,10 @@ def main():
         secondary.start("06-secondary-fresh", seeds=[primary.seed])
         wait_converged(primary, secondary, timeout=600)
         elapsed = time.monotonic() - started
-        fresh = sync_counts(secondary.log_text())
+        fresh = wait_sync_counts(
+            secondary,
+            lambda counts: counts["exact_suffix_blocks"] == [19],
+        )
         assert_no_sync_failures("fresh", secondary.log_text())
         require(fresh["snapshot_installs"] == 0, f"fresh h19 used snapshot: {fresh}")
         require(
@@ -489,7 +495,10 @@ def main():
         secondary.start("09-secondary-gap5", seeds=[primary.seed])
         wait_converged(primary, secondary, timeout=300)
         elapsed = time.monotonic() - started
-        gap5 = sync_counts(secondary.log_text())
+        gap5 = wait_sync_counts(
+            secondary,
+            lambda counts: counts["exact_suffix_blocks"] == [5],
+        )
         assert_no_sync_failures("gap5", secondary.log_text())
         require(gap5["snapshot_installs"] == 0, f"gap5 unexpectedly used snapshot: {gap5}")
         require(
@@ -518,8 +527,8 @@ def main():
         primary.stop()
         # At h43 the newest rounded finalized snapshot boundary is h24, equal
         # to this node's current tip. There is no newer State generation to
-        # install, so the >18 snapshot attempt must safely fall back to the
-        # available 19-block exact suffix rather than loop on h24.
+        # install, so routing must choose the available 19-block exact suffix
+        # rather than loop on h24.
         summary["phases"]["gap19_mining"] = mine_phase(
             primary, "10-primary-gap19-mining", 24, 19, genesis=True
         )
@@ -529,7 +538,10 @@ def main():
         secondary.start("12-secondary-gap19", seeds=[primary.seed])
         wait_converged(primary, secondary, timeout=600)
         elapsed = time.monotonic() - started
-        gap19 = sync_counts(secondary.log_text())
+        gap19 = wait_sync_counts(
+            secondary,
+            lambda counts: counts["exact_suffix_blocks"] == [19],
+        )
         assert_no_sync_failures("gap19", secondary.log_text())
         require(gap19["snapshot_installs"] == 0, f"gap19 unexpectedly used snapshot: {gap19}")
         require(
