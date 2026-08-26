@@ -3577,6 +3577,132 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_recursive_suffix_resumes_through_live_suffix_retry() {
+        let (first, second) = two_block_suffix();
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let mut context = easy_block_context(directory.path());
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = context.get_header_from_store(0).unwrap().unwrap();
+            let mut authority = context
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    first.block_bytes(),
+                    crate::Block::from_bytes(first.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+            assert_eq!(context.tip_height(), 1);
+            assert!(!authority.is_complete());
+        }
+
+        {
+            let mut reopened =
+                MdbxChainContext::restore_from_mdbx(MdbxStore::open(directory.path()).unwrap())
+                    .unwrap();
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = reopened.get_header_from_store(0).unwrap().unwrap();
+            let mut retry = reopened
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            reopened
+                .apply_verified_recursive_suffix_block(
+                    &mut retry,
+                    second.block_bytes(),
+                    second_block.header.timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+            assert!(retry.is_complete());
+            assert_eq!(reopened.tip_height(), 2);
+            assert_eq!(reopened.tip_hash(), second.block_hash());
+        }
+
+        let reopened = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 2);
+        assert_eq!(reopened.tip_hash(), second.block_hash());
+    }
+
+    #[test]
+    fn interrupted_recursive_suffix_rejects_authority_rotation_without_poisoning_reopen() {
+        let blocks = block_sequence(3);
+        let first = &blocks[0];
+        let second = &blocks[1];
+        let third = &blocks[2];
+        let directory = tempfile::tempdir().unwrap();
+        {
+            let mut context = easy_block_context(directory.path());
+            let second_block = crate::Block::from_bytes(second.block_bytes()).unwrap();
+            let genesis = context.get_header_from_store(0).unwrap().unwrap();
+            let mut authority = context
+                .verify_recursive_suffix(
+                    second_block.header,
+                    genesis,
+                    second.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap();
+            context
+                .apply_verified_recursive_suffix_block(
+                    &mut authority,
+                    first.block_bytes(),
+                    crate::Block::from_bytes(first.block_bytes())
+                        .unwrap()
+                        .header
+                        .timestamp,
+                    |block, state| {
+                        crate::materialize_accepted_block_state(state, block)
+                            .map_err(|error| format!("{error:?}"))
+                    },
+                )
+                .unwrap();
+
+            let third_block = crate::Block::from_bytes(third.block_bytes()).unwrap();
+            let error = context
+                .verify_recursive_suffix(
+                    third_block.header,
+                    genesis,
+                    third.history_step_terminal_bytes().to_vec(),
+                    |_| Ok(()),
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                MdbxContextError::Store(StoreError::Decode(
+                    "recursive suffix retry target differs from marker authority"
+                ))
+            ));
+            assert_eq!(context.tip_height(), 1);
+        }
+
+        let reopened = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        assert_eq!(reopened.tip_height(), 1);
+        assert_eq!(reopened.tip_hash(), first.block_hash());
+    }
+
+    #[test]
     fn rejected_recursive_suffix_terminal_never_authorizes_or_mutates_bodies() {
         let (first, second) = two_block_suffix();
         let directory = tempfile::tempdir().unwrap();
