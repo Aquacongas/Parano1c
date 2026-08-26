@@ -1210,13 +1210,13 @@ impl RpcHandler {
             (snapshot, addr)
         };
         drop(wallet_operation);
-        let max_user_pages = self
+        let max_effective_pages = self
             .external_mining_capacity
             .lock()
             .map_err(|_| rpc_err("external mining capacity lock poisoned"))?
             .page_limit();
         let tmpl = builder
-            .build_from_snapshot_with_limit(snapshot, addr, now, max_user_pages)
+            .build_from_snapshot_with_limit(snapshot, addr, now, max_effective_pages)
             .await
             .ok_or_else(|| rpc_err("template build failed"))?;
 
@@ -1304,7 +1304,7 @@ impl RpcHandler {
             mining = "external",
             user_pages,
             ?proof_class,
-            max_user_pages,
+            max_effective_pages,
             previous_page_limit,
             next_page_limit,
             history_step_ms = prepare_elapsed.as_millis(),
