@@ -33,15 +33,16 @@ parano1d
 | `--rpc-listen HOST:PORT` | Адрес приёма JSON-RPC-соединений; по умолчанию `127.0.0.1:9601` |
 | `--seed ENDPOINT` | Добавить адрес первоначального подключения; можно повторять |
 | `--log LEVEL` | Фильтр tracing: `error`, `warn`, `info`, `debug` и другие |
-| `--mining-key TOKEN` | Требовать токен доступа к RPC |
+| `--mining-key TOKEN` | Токен внешнего майнинга; сохранён для совместимости |
+| `--mining-key-file FILE` | Прочитать токен внешнего майнинга из файла, доступного только владельцу |
 | `--allow-custom-coinbase` | Разрешить аутентифицированному внешнему вычислителю запросить свою выплату |
 | `--purge-state` | Очистить базу цепи и заново синхронизировать цепь и Live State у пиров |
 | `--check-hardware` | Проверить совместимость CPU и выйти, не затрагивая данные ноды |
 
 Параметры конкретного режима отклоняются там, где неприменимы.
 `--cpu-threads` относится ко встроенному майнеру. Внешний режим требует
-`--mining-key`, а `--allow-custom-coinbase` — одновременно внешний режим и
-этот ключ.
+`--mining-key` или `--mining-key-file`, а `--allow-custom-coinbase` —
+одновременно внешний режим и настроенный ключ.
 
 `--purge-state` — инструмент восстановления, а не обычный параметр запуска.
 Он очищает всю базу цепи: заголовки, индексы, сохранённые полные блоки, данные
@@ -58,7 +59,7 @@ parano1d --data-dir ~/.parano1d/data
 parano1d --mode miner --cpu-threads 12
 
 # Node with a local external nonce worker
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
 Оставляйте RPC на локальном интерфейсе, если он не защищён приватным или
@@ -73,7 +74,8 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 | Параметр | По умолчанию | Значение |
 |---|---|---|
 | `--rpc URL` | `http://127.0.0.1:9601` | Адрес JSON-RPC ноды |
-| `--key TOKEN` | — | Токен доступа, совпадающий с `--mining-key` ноды |
+| `--key TOKEN` | — | Токен, совпадающий с токеном ноды; сохранён для совместимости |
+| `--key-file FILE` | — | Прочитать токен из файла, доступного только владельцу |
 | `--threads N` | `0` | Потоки PoW; ноль использует все видимые логические CPU |
 | `--coinbase ADDRESS` | — | Пользовательская выплата `o1…`, если нода явно её разрешила |
 | `--poll-ms MS` | `500` | Задержка перед запросом следующего шаблона |
@@ -85,7 +87,7 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key 'LONG-RANDOM-TOKEN' \
+  --key-file ~/.parano1d/mining.key \
   --threads 12
 ```
 

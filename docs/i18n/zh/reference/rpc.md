@@ -37,15 +37,20 @@ curl --silent --show-error \
 
 RPC 默认没有认证，因此必须仅监听回环地址。
 
-使用 `--mining-key TOKEN` 启动 Core 后，必须提供：
+使用 `--mining-key TOKEN` 或 `--mining-key-file FILE` 启动 Core 后，外部挖矿
+请求必须提供：
 
 ```http
 Authorization: Bearer TOKEN
 ```
 
-而且是对**每一条** RPC 请求，不只是挖矿方法。Token 缺失或不匹配时返回
-HTTP `401`，没有 JSON-RPC 结果。Token 只负责认证，不加密连接；远程访问
-应使用私有传输或 TLS 代理。
+Token 缺失或不匹配时返回 HTTP `401`，没有 JSON-RPC 结果。有效的挖矿
+Token 只允许 `paranoid_getBlockTemplate` 和 `paranoid_submitBlock`；它不能
+访问钱包、节点控制或其他 RPC 方法。Token 只负责认证，不加密连接；远程
+访问应使用私有传输或 TLS 代理。
+
+命令行 Token 形式继续保留以兼容现有部署。建议使用仅所有者可读的 key
+文件，避免 Token 出现在进程参数中。
 
 ## 链方法
 

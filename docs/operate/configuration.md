@@ -71,10 +71,11 @@ Keep RPC on:
 The interface includes wallet submission and process control. It is not a
 public explorer API with general authentication.
 
-External-mining deployments can protect the entire RPC endpoint with
-`--mining-key`. The bearer token does not encrypt transport. Use loopback, a
-private network, an SSH tunnel or an authenticated TLS proxy when the worker
-is remote.
+External-mining deployments require `--mining-key` or
+`--mining-key-file`. The credential authorizes only `getBlockTemplate` and
+`submitBlock`; it cannot authorize wallet or process-control methods. The
+bearer token does not encrypt transport. Use loopback, a private network, an
+SSH tunnel or an authenticated TLS proxy when the worker is remote.
 
 ## Mining
 
@@ -83,7 +84,7 @@ Process mode is authoritative:
 ```sh
 parano1d --mode node
 parano1d --mode miner
-parano1d --mode extminer --mining-key TOKEN
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
 The legacy `mining.enabled` field does not override `--mode`. An empty

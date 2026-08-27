@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use jsonrpsee::core::async_trait;
 use jsonrpsee::core::RpcResult;
-use jsonrpsee::server::Server;
-use jsonrpsee::types::ErrorObject;
+use jsonrpsee::server::middleware::rpc::{RpcServiceBuilder, RpcServiceT};
+use jsonrpsee::server::{MethodResponse, Server};
+use jsonrpsee::types::{ErrorObject, Request};
 use tokio::sync::RwLock;
 
 use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
@@ -894,11 +895,6 @@ pub struct RpcHandler {
     /// Explicit configured payout. `None` means resolve the wallet's current
     /// active address for every newly built template.
     pub mining_payout_address: Option<noid_poseidon2b::primitives::Address>,
-    /// Optional bearer token for external mining API access.
-    /// If None, only localhost callers may use getBlockTemplate / submitBlock
-    /// (enforced by binding RPC to 127.0.0.1 by default).
-    /// If Some(token), callers must include `Authorization: Bearer <token>`.
-    pub mining_key: Option<String>,
     /// When true (requires mining_key to be set), external miners may specify
     /// any valid address as `miner_address` in getBlockTemplate and receive
     /// block rewards directly. The node operator earns via off-chain service fees.
@@ -3236,7 +3232,6 @@ pub async fn start_rpc_server(
         stop_tx,
         mining_api_enabled,
         mining_payout_address,
-        mining_key: mining_key.clone(),
         allow_custom_coinbase,
         history_step_runtime,
         history_step_ghost,
@@ -3245,19 +3240,20 @@ pub async fn start_rpc_server(
         external_mining_capacity: Arc::new(Mutex::new(AdaptiveProofCapacity::default())),
     };
 
-    // Always add the RPC access-control middleware layer. Browser-originated
-    // requests are rejected before JSON-RPC dispatch so an arbitrary website
-    // cannot reach a wallet through its loopback listener. Native local
-    // clients do not send Origin. When mining_key is Some(key), all remaining
-    // requests must also carry `Authorization: Bearer <key>`.
-    //
-    // Pool operators:  parano1d --rpc-listen 0.0.0.0:9601 --mining-key <secret>
-    // Solo miners:     no --mining-key; RPC stays on 127.0.0.1 (safe by default)
+    // Browser-originated requests are rejected before JSON-RPC dispatch so an
+    // arbitrary website cannot reach a wallet through its loopback listener.
+    // When a mining key is configured, HTTP middleware authenticates it and
+    // marks the connection as mining-only. JSON-RPC middleware then restricts
+    // that capability to the two external-mining methods. The credential can
+    // never authorize wallet, node-control, or general inspection methods.
     let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
+    let rpc_middleware =
+        RpcServiceBuilder::new().layer_fn(|inner| MiningCredentialScopeService { inner });
     let server = Server::builder()
         .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
             expected: expected_bearer,
         }))
+        .set_rpc_middleware(rpc_middleware)
         .build(listen)
         .await
         .map_err(|e| anyhow::anyhow!("build RPC server: {e}"))?;
@@ -3313,7 +3309,7 @@ where
         self.inner.poll_ready(cx)
     }
 
-    fn call(&mut self, req: http::Request<B>) -> Self::Future {
+    fn call(&mut self, mut req: http::Request<B>) -> Self::Future {
         // A browser can reach a loopback TCP listener from an unrelated web
         // origin. Reject every browser-originated HTTP and WebSocket request;
         // the official GUI, CLI and miner are native clients without Origin.
@@ -3339,6 +3335,7 @@ where
             .unwrap_or("");
 
         if auth == expected {
+            req.extensions_mut().insert(MiningCredential);
             let fut = self.inner.call(req);
             Box::pin(fut)
         } else {
@@ -3356,11 +3353,60 @@ where
     }
 }
 
+/// Marker propagated from the authenticated HTTP request or WebSocket
+/// handshake into each JSON-RPC request on that connection.
+#[derive(Clone, Copy, Debug)]
+struct MiningCredential;
+
+#[derive(Clone)]
+struct MiningCredentialScopeService<S> {
+    inner: S,
+}
+
+fn mining_credential_method_allowed(method: &str) -> bool {
+    matches!(method, "paranoid_getBlockTemplate" | "paranoid_submitBlock")
+}
+
+impl<'a, S> RpcServiceT<'a> for MiningCredentialScopeService<S>
+where
+    S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
+    S::Future: Send + 'a,
+{
+    type Future = Pin<Box<dyn Future<Output = MethodResponse> + Send + 'a>>;
+
+    fn call(&self, request: Request<'a>) -> Self::Future {
+        if request.extensions().get::<MiningCredential>().is_some()
+            && !mining_credential_method_allowed(request.method_name())
+        {
+            let id = request.id();
+            return Box::pin(async move {
+                MethodResponse::error(
+                    id,
+                    ErrorObject::owned(
+                        -32001,
+                        "mining credential is restricted to getBlockTemplate and submitBlock",
+                        None::<()>,
+                    ),
+                )
+            });
+        }
+
+        let future = self.inner.call(request);
+        Box::pin(future)
+    }
+}
+
 #[cfg(test)]
 mod access_control_tests {
     use std::convert::Infallible;
     use std::future::{ready, Ready};
+    use std::net::SocketAddr;
     use std::task::{Context, Poll};
+
+    use jsonrpsee::core::server::ResponsePayload;
+    use jsonrpsee::types::Id;
+    use jsonrpsee::RpcModule;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use tower::{Layer, Service, ServiceExt};
@@ -3383,6 +3429,67 @@ mod access_control_tests {
                 .body(jsonrpsee::server::HttpBody::empty())
                 .expect("static test response")))
         }
+    }
+
+    #[derive(Clone)]
+    struct MiningCredentialProbeService;
+
+    impl<B> Service<http::Request<B>> for MiningCredentialProbeService {
+        type Response = http::Response<jsonrpsee::server::HttpBody>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: http::Request<B>) -> Self::Future {
+            let status = if request.extensions().get::<MiningCredential>().is_some() {
+                http::StatusCode::OK
+            } else {
+                http::StatusCode::INTERNAL_SERVER_ERROR
+            };
+            ready(Ok(http::Response::builder()
+                .status(status)
+                .body(jsonrpsee::server::HttpBody::empty())
+                .expect("static test response")))
+        }
+    }
+
+    #[derive(Clone)]
+    struct RpcOkService;
+
+    impl<'a> RpcServiceT<'a> for RpcOkService {
+        type Future = Ready<MethodResponse>;
+
+        fn call(&self, request: Request<'a>) -> Self::Future {
+            ready(MethodResponse::response(
+                request.id(),
+                ResponsePayload::success("ok"),
+                usize::MAX,
+            ))
+        }
+    }
+
+    fn rpc_request(method: &'static str, mining_credential: bool) -> Request<'static> {
+        let mut request = Request::new(method.into(), None, Id::Number(1));
+        if mining_credential {
+            request.extensions_mut().insert(MiningCredential);
+        }
+        request
+    }
+
+    async fn post_rpc(addr: SocketAddr, method: &str, token: &str) -> String {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8(response).unwrap()
     }
 
     #[tokio::test]
@@ -3432,5 +3539,91 @@ mod access_control_tests {
             .await
             .unwrap();
         assert_eq!(authorized.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_marks_the_connection_as_mining_only() {
+        let service = BearerAuthLayer {
+            expected: Some("Bearer correct-token".into()),
+        }
+        .layer(MiningCredentialProbeService);
+        let response = service
+            .oneshot(
+                http::Request::builder()
+                    .header(http::header::AUTHORIZATION, "Bearer correct-token")
+                    .body(())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn mining_credential_is_limited_to_external_mining_methods() {
+        let service = MiningCredentialScopeService {
+            inner: RpcOkService,
+        };
+
+        for method in ["paranoid_getBlockTemplate", "paranoid_submitBlock"] {
+            let response = service.call(rpc_request(method, true)).await;
+            assert!(response.is_success(), "{method} must remain available");
+        }
+
+        for method in [
+            "paranoid_walletSend",
+            "paranoid_walletStatus",
+            "paranoid_stop",
+            "paranoid_getChainInfo",
+        ] {
+            let response = service.call(rpc_request(method, true)).await;
+            assert_eq!(response.as_error_code(), Some(-32001), "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_loopback_rpc_is_not_restricted_to_mining_methods() {
+        let service = MiningCredentialScopeService {
+            inner: RpcOkService,
+        };
+        let response = service
+            .call(rpc_request("paranoid_walletSend", false))
+            .await;
+        assert!(response.is_success());
+    }
+
+    #[tokio::test]
+    async fn live_server_propagates_bearer_scope_into_rpc_dispatch() {
+        let rpc_middleware =
+            RpcServiceBuilder::new().layer_fn(|inner| MiningCredentialScopeService { inner });
+        let server = Server::builder()
+            .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
+                expected: Some("Bearer integration-token".into()),
+            }))
+            .set_rpc_middleware(rpc_middleware)
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let mut module = RpcModule::new(());
+        module
+            .register_method("paranoid_getBlockTemplate", |_, _, _| "template")
+            .unwrap();
+        module
+            .register_method("paranoid_walletStatus", |_, _, _| "wallet")
+            .unwrap();
+        let handle = server.start(module);
+
+        let mining = post_rpc(addr, "paranoid_getBlockTemplate", "integration-token").await;
+        assert!(mining.starts_with("HTTP/1.1 200"), "{mining}");
+        assert!(mining.contains(r#""result":"template""#), "{mining}");
+
+        let wallet = post_rpc(addr, "paranoid_walletStatus", "integration-token").await;
+        assert!(wallet.starts_with("HTTP/1.1 200"), "{wallet}");
+        assert!(wallet.contains(r#""code":-32001"#), "{wallet}");
+        assert!(!wallet.contains(r#""result":"wallet""#), "{wallet}");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
     }
 }

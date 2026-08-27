@@ -39,15 +39,20 @@ curl --silent --show-error \
 
 RPC has no authentication by default and must remain on loopback.
 
-Starting Core with `--mining-key TOKEN` requires:
+Starting Core with `--mining-key TOKEN` or `--mining-key-file FILE` requires:
 
 ```http
 Authorization: Bearer TOKEN
 ```
 
-on **every** RPC request, not only mining methods. A missing or different token
-receives HTTP `401` without a JSON-RPC result. The token authenticates but does
-not encrypt the connection; use a private transport or TLS proxy remotely.
+on external-mining requests. A missing or different token receives HTTP `401`
+without a JSON-RPC result. A valid mining credential is restricted to
+`paranoid_getBlockTemplate` and `paranoid_submitBlock`; it cannot authorize
+wallet, node-control or other RPC methods. The token authenticates but does not
+encrypt the connection; use a private transport or TLS proxy remotely.
+
+The command-line token remains supported for compatibility. An owner-only key
+file is preferred because it keeps the token out of process arguments.
 
 ## Chain methods
 

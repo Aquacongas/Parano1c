@@ -9,10 +9,13 @@
 
 ## Локальный вычислитель
 
-Запустите ноду в режиме внешнего майнера с токеном доступа:
+Создайте защищённый файл с токеном и используйте его для ноды и вычислителя:
 
 ```sh
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+umask 077
+printf '%s\n' 'LONG-RANDOM-TOKEN' > ~/.parano1d/mining.key
+
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
 В другом терминале:
@@ -20,16 +23,19 @@ parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key 'LONG-RANDOM-TOKEN'
+  --key-file ~/.parano1d/mining.key
 ```
 
-Если нода запущена с `--mining-key`, токен обязателен даже при обращении через
-локальный интерфейс.
+Если нода запущена с mining-токеном, он обязателен даже при обращении через
+локальный интерфейс. Старые формы `--mining-key TOKEN` и `--key TOKEN`
+сохранены для совместимости, но их значения видны в аргументах процесса. На
+Unix файл ключа должен принадлежать текущему пользователю и быть недоступен
+группе и остальным.
 
 При необходимости ограничьте число потоков:
 
 ```sh
-parano1d-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+parano1d-miner --key-file ~/.parano1d/mining.key --threads 8
 ```
 
 ## Удалённый вычислитель
@@ -46,7 +52,7 @@ RPC только
 parano1d \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
-  --mining-key 'LONG-RANDOM-TOKEN'
+  --mining-key-file /secure/parano1d-mining.key
 ```
 
 Межсетевой экран должен пропускать порт только от нужных вычислителей или
@@ -63,7 +69,7 @@ parano1d \
 ```sh
 parano1d \
   --mode extminer \
-  --mining-key 'LONG-RANDOM-TOKEN' \
+  --mining-key-file ~/.parano1d/mining.key \
   --allow-custom-coinbase
 ```
 
@@ -71,12 +77,15 @@ parano1d \
 
 ```sh
 parano1d-miner \
-  --key 'LONG-RANDOM-TOKEN' \
+  --key-file ~/.parano1d/mining.key \
   --coinbase o1...
 ```
 
 Пользовательский адрес меняет только выплату, зафиксированную до построения
 доказательства. Сам доказанный шаблон вычислитель изменить не может.
+
+Mining-токен разрешает только `getBlockTemplate` и `submitBlock`. Он не может
+вызывать методы кошелька, управления нодой или общие информационные методы.
 
 ## Жизненный цикл шаблона
 

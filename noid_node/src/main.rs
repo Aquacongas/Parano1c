@@ -976,8 +976,69 @@ pub enum NodeMode {
     Miner,
     /// Mining node with an external PoW worker. The node owns the immutable
     /// template; the worker returns only a nonce, after which the node proves
-    /// and commits the complete block. Requires `--mining-key`.
+    /// and commits the complete block. Requires a mining credential.
     Extminer,
+}
+
+const MAX_MINING_KEY_FILE_BYTES: u64 = 4096;
+
+fn read_mining_key_file(path: &Path) -> anyhow::Result<String> {
+    let expanded = expand_tilde(path);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&expanded)
+        .with_context(|| format!("open mining key file: {}", expanded.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("inspect mining key file: {}", expanded.display()))?;
+    if !metadata.is_file() {
+        anyhow::bail!(
+            "mining key path is not a regular file: {}",
+            expanded.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!(
+                "mining key file must not be accessible by group or others: {} has mode {mode:03o}",
+                expanded.display()
+            );
+        }
+        let actual = metadata.uid();
+        // SAFETY: geteuid has no preconditions and only reads process state.
+        let expected = unsafe { libc::geteuid() };
+        if actual != expected {
+            anyhow::bail!(
+                "mining key file must be owned by the current user: {} is uid {actual}, expected {expected}",
+                expanded.display()
+            );
+        }
+    }
+
+    let mut raw = String::new();
+    file.take(MAX_MINING_KEY_FILE_BYTES + 1)
+        .read_to_string(&mut raw)
+        .with_context(|| format!("read mining key file: {}", expanded.display()))?;
+    if raw.len() as u64 > MAX_MINING_KEY_FILE_BYTES {
+        anyhow::bail!("mining key file is too large: {}", expanded.display());
+    }
+    let key = raw.trim_end_matches(['\r', '\n']).to_owned();
+    if key.len() < 16 {
+        anyhow::bail!("mining key must contain at least 16 characters");
+    }
+    if key.chars().any(char::is_whitespace) {
+        anyhow::bail!("mining key must not contain whitespace");
+    }
+    Ok(key)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1020,7 +1081,7 @@ struct Cli {
     ///
     /// node     — ordinary node and wallet, no mining (default)
     /// miner    — mining node with built-in PoW and automatic proof pipeline
-    /// extminer — mining node with external PoW nonce search; requires --mining-key
+    /// extminer — mining node with external PoW nonce search; requires a mining key
     #[arg(long, value_enum, default_value_t = NodeMode::Node)]
     mode: NodeMode,
 
@@ -1075,31 +1136,36 @@ struct Cli {
     #[arg(long, default_value = "info", value_name = "LEVEL")]
     log: String,
 
-    /// Bearer token required for external mining API (getBlockTemplate / submitBlock).
+    /// Bearer token required for external mining API access.
+    /// The credential is restricted to getBlockTemplate and submitBlock.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "mining_key_file")]
+    mining_key: Option<String>,
+
+    /// Owner-only file containing the Bearer token for the external mining API.
     ///
-    /// When set, external callers must include `Authorization: Bearer <TOKEN>` in
-    /// HTTP requests to use the mining methods. Without this flag the mining API
-    /// only accepts connections from 127.0.0.1 (enforced by --rpc-listen default).
+    /// The file must contain one token of at least 16 characters. On Unix it
+    /// must be owned by the current user and inaccessible to group and others.
+    /// The credential authorizes only getBlockTemplate and submitBlock.
     ///
     /// Pool example:
-    ///   parano1d --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t
-    ///   # External miner: Authorization: Bearer s3cr3t
-    #[arg(long, value_name = "TOKEN")]
-    mining_key: Option<String>,
+    ///   parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
+    #[arg(long, value_name = "FILE")]
+    mining_key_file: Option<PathBuf>,
 
     /// Allow external miners to specify their own coinbase address in getBlockTemplate.
     ///
-    /// REQUIRES --mining-key to be set. Without --mining-key this flag is rejected
-    /// at startup to prevent unauthenticated access to custom-coinbase templates.
+    /// Requires either --mining-key or --mining-key-file. Without a credential
+    /// this flag is rejected at startup.
     ///
     /// Use case: infrastructure pool where the node prepares and proves complete blocks and
     /// relays them over P2P, while each miner receives rewards directly to its own address.
     /// The node operator earns via an off-chain service fee, not via coinbase.
     ///
     /// Example:
-    ///   parano1d --rpc-listen 0.0.0.0:9601 --mining-key s3cr3t --allow-custom-coinbase
+    ///   parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key \
+    ///     --allow-custom-coinbase
     ///   # Miner: getBlockTemplate("o1their_own_address")
-    #[arg(long, requires = "mining_key")]
+    #[arg(long)]
     allow_custom_coinbase: bool,
 
     /// Clear the complete chain database on startup and synchronize it again.
@@ -1497,6 +1563,13 @@ async fn main() -> anyhow::Result<()> {
         cli.mode = NodeMode::Extminer;
     }
 
+    let mining_key = match (&cli.mining_key, cli.mining_key_file.as_deref()) {
+        (Some(key), None) => Some(key.clone()),
+        (None, Some(path)) => Some(read_mining_key_file(path)?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting mining key sources"),
+    };
+
     // --- Tracing ---
     // Log format: HH:MM:SS LEVEL target: message
     //
@@ -1533,13 +1606,11 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // --- Mode validation ---
-    if cli.mode == NodeMode::Extminer && cli.mining_key.is_none() {
-        anyhow::bail!("--mode extminer requires --mining-key <TOKEN>");
+    if cli.mode == NodeMode::Extminer && mining_key.is_none() {
+        anyhow::bail!("--mode extminer requires --mining-key or --mining-key-file");
     }
-    if cli.mode == NodeMode::Miner && cli.mining_key.is_some() {
-        tracing::warn!(
-            "--mining-key is ignored in --mode miner (internal miner needs no bearer token)"
-        );
+    if cli.mode == NodeMode::Miner && mining_key.is_some() {
+        tracing::warn!("mining key is ignored in --mode miner (internal miner needs no token)");
     }
     if cli.cpu_threads.is_some() && cli.mode != NodeMode::Miner {
         anyhow::bail!("--cpu-threads requires --mode miner");
@@ -1559,6 +1630,7 @@ async fn main() -> anyhow::Result<()> {
             || cli.miner_address.is_some()
             || cli.cpu_threads.is_some()
             || cli.mining_key.is_some()
+            || cli.mining_key_file.is_some()
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("owner secret maintenance cannot be combined with node or mining actions");
@@ -1570,6 +1642,7 @@ async fn main() -> anyhow::Result<()> {
             || cli.miner_address.is_some()
             || cli.cpu_threads.is_some()
             || cli.mining_key.is_some()
+            || cli.mining_key_file.is_some()
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
@@ -2018,12 +2091,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(parse_address(&cfg.mining.miner_address)?)
     };
-    if let Some(ref key) = cli.mining_key {
-        if key.len() < 16 {
-            tracing::warn!(
-                "--mining-key is short (<16 chars) — use a longer random token in production"
-            );
-        }
+    if mining_key.is_some() {
         tracing::info!(
             allow_custom_coinbase = cli.allow_custom_coinbase,
             "mining API: external access enabled with bearer token authentication"
@@ -2059,7 +2127,7 @@ async fn main() -> anyhow::Result<()> {
         template_change_tx.clone(),
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
-        cli.mining_key,
+        mining_key,
         cli.allow_custom_coinbase,
     )
     .await
@@ -4736,9 +4804,10 @@ mod tests {
         merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
         nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
         persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
-        quarantine_exact_suffix_sources, record_snapshot_terminal_transport_failure,
-        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
-        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
+        quarantine_exact_suffix_sources, read_mining_key_file,
+        record_snapshot_terminal_transport_failure, resolve_embedded_seed_with_system_dns,
+        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
+        selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
@@ -4746,8 +4815,8 @@ mod tests {
         terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
         unresolved_tip_probe_range, validate_history_step_tip_future_drift,
         validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
-        validate_snapshot_install_selection, validate_snapshot_staged_header_boundary,
-        ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, PostSnapshotTail,
+        validate_snapshot_install_selection, validate_snapshot_staged_header_boundary, Cli,
+        ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, NodeMode, PostSnapshotTail,
         SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
         SnapshotHeaderPipeline, SnapshotHeaderStagingError, SnapshotRebaseAnchor,
         SnapshotRebaseHint, SnapshotSegmentFailureScope, SnapshotSessionPrepareError,
@@ -5906,6 +5975,90 @@ mod tests {
 
         let error = load_or_create_config(&path, &NodeConfig::default()).unwrap_err();
         assert!(error.to_string().contains("parse node config"));
+    }
+
+    #[test]
+    fn external_mining_accepts_legacy_and_file_credentials() {
+        use clap::Parser;
+
+        let legacy = Cli::try_parse_from([
+            "parano1d",
+            "--mode",
+            "extminer",
+            "--mining-key",
+            "0123456789abcdef",
+        ])
+        .unwrap();
+        assert_eq!(legacy.mode, NodeMode::Extminer);
+        assert_eq!(legacy.mining_key.as_deref(), Some("0123456789abcdef"));
+        assert!(legacy.mining_key_file.is_none());
+
+        let file = Cli::try_parse_from([
+            "parano1d",
+            "--mode",
+            "extminer",
+            "--mining-key-file",
+            "/secure/mining.key",
+        ])
+        .unwrap();
+        assert_eq!(file.mode, NodeMode::Extminer);
+        assert!(file.mining_key.is_none());
+        assert_eq!(
+            file.mining_key_file.as_deref(),
+            Some(std::path::Path::new("/secure/mining.key"))
+        );
+
+        assert!(Cli::try_parse_from([
+            "parano1d",
+            "--mode",
+            "extminer",
+            "--mining-key",
+            "0123456789abcdef",
+            "--mining-key-file",
+            "/secure/mining.key",
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mining_key_file_is_owner_only_and_trims_only_line_endings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mining.key");
+        std::fs::write(&path, b"0123456789abcdef0123456789abcdef\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert_eq!(
+            read_mining_key_file(&path).unwrap(),
+            "0123456789abcdef0123456789abcdef"
+        );
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_mining_key_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("group or others"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mining_key_file_rejects_symlinks_and_short_values() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.key");
+        std::fs::write(&target, b"too-short\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_mining_key_file(&target)
+            .unwrap_err()
+            .to_string()
+            .contains("at least 16"));
+
+        let link = temp.path().join("link.key");
+        symlink(&target, &link).unwrap();
+        assert!(read_mining_key_file(&link).is_err());
     }
 
     #[test]

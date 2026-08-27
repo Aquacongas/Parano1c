@@ -32,10 +32,37 @@ final fix, and coordinate disclosure with the reporter.
 
 ## Parano1d Bug Hunt ①
 
+**Scope updated: August 27, 2026.** Reports received before this update are
+assessed under the rules in effect when they were submitted.
+
 Parano1d pays for previously unknown, reproducible bugs that exist in the
-unmodified current mainnet release or its official release artifacts. A test
-harness or instrumentation may be used to demonstrate a bug, but the defect
-itself must exist without changing Parano1d's validation or consensus rules.
+unmodified current mainnet release or its official release artifacts and fall
+within the scope below. A test harness or instrumentation may be used to
+demonstrate a bug, but the defect itself must exist without changing
+Parano1d's validation or consensus rules.
+
+### Scope
+
+The Bug Hunt covers the Parano1d protocol and consensus implementation, the
+full-node core, State validation and storage, synchronization and P2P safety,
+the proof and cryptographic stack, the built-in wallet and GUI, and the
+built-in mining path.
+
+The standalone `parano1d-miner`, `--mode extminer`, the external-mining RPC
+integration, pool compatibility, template delivery, custom coinbase and
+worker authentication are outside this Bug Hunt. External mining is an
+optional integration surface provided for pool operators; it is not the
+supported mining path for this reward program. Report reproducible
+external-mining problems as ordinary GitHub issues.
+
+If an external-mining report contains details that could expose credentials,
+funds or a remote operator before a fix is available, submit it privately
+rather than publishing those details. Private handling does not make an
+otherwise excluded external-mining issue eligible for a reward.
+
+Finding a defect while using external mining does not exclude it when the
+report independently demonstrates that the same underlying defect affects an
+in-scope core, protocol, cryptographic or wallet security boundary.
 
 | Reward | Finding |
 |---:|---|
@@ -58,6 +85,16 @@ blocks, hardware performance, or degraded liveness do not by themselves meet
 the critical tier, although an underlying reproducible code defect may still
 qualify for 500 NOID.
 
+A benchmark, performance difference or faster alternative is not evidence of
+a Bug Hunt defect. A performance-related report must demonstrate an incorrect
+result, unbounded resource behavior, violation of a documented safety bound,
+or material failure of an in-scope supported path. Showing that different
+timeouts, windows, batches, queues or hardware would be faster is an
+optimization proposal, not a bounty report.
+
+Reproducible performance, usability and maintenance problems are still
+welcome as ordinary GitHub issues, but they are not Bug Hunt submissions.
+
 ### Eligible reports
 
 - affect the current mainnet release or its official release artifacts;
@@ -73,7 +110,19 @@ qualify for 500 NOID.
 
 - feature requests, protocol redesigns, upgrade proposals, or suggestions for
   new functionality;
-- performance and optimization suggestions without a reproducible defect;
+- performance, optimization, acceleration, throughput or latency reports whose
+  demonstrated outcome is only that an operation could be faster, cheaper or
+  use fewer resources;
+- benchmark comparisons and proposals to change retry or hedge timing,
+  timeouts, queue capacities, peer targets, header or snapshot windows, batch
+  sizes, thread counts, proof-class selection or other tuned operational
+  constants;
+- slower synchronization, proof construction, template preparation, mining or
+  propagation on particular hardware when no correctness or security boundary
+  is violated;
+- additional CPU, memory, disk, bandwidth or repeated work that remains within
+  explicit protocol or implementation bounds and does not cause an in-scope
+  correctness or security failure;
 - behavior caused only by removing or changing local validation, proof, or
   consensus checks;
 - expected protocol behavior, user or configuration errors, hardware limits,
@@ -83,6 +132,9 @@ qualify for 500 NOID.
   underlying code defect;
 - cosmetic UI, wording, logging, or telemetry issues without material
   operational or security impact;
+- defects limited to `parano1d-miner`, `--mode extminer`, external-mining RPC
+  or pool integration, including template delivery, custom coinbase, worker
+  authentication, compatibility and performance;
 - vague concerns, speculative issue lists, or claims without evidence;
 - upstream dependency reports without demonstrated impact through the current
   mainnet release;

@@ -8,10 +8,13 @@ The worker receives no block body or proving witness.
 
 ## Local worker
 
-Start the node in external-miner mode with a bearer token:
+Create one protected token file and use it for the node and local worker:
 
 ```sh
-parano1d --mode extminer --mining-key 'LONG-RANDOM-TOKEN'
+umask 077
+printf '%s\n' 'LONG-RANDOM-TOKEN' > ~/.parano1d/mining.key
+
+parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
 In another terminal:
@@ -19,22 +22,23 @@ In another terminal:
 ```sh
 parano1d-miner \
   --rpc http://127.0.0.1:9601 \
-  --key 'LONG-RANDOM-TOKEN'
+  --key-file ~/.parano1d/mining.key
 ```
 
-The token is required even on loopback when the node was started with
-`--mining-key`.
+The token is required even on loopback when the node was started with a mining
+credential. The legacy `--mining-key TOKEN` and `--key TOKEN` forms remain
+compatible, but their values can be visible in process arguments. A key file
+must be owned by the current user and inaccessible to group and others on Unix.
 
 Limit worker threads when needed:
 
 ```sh
-parano1d-miner --key 'LONG-RANDOM-TOKEN' --threads 8
+parano1d-miner --key-file ~/.parano1d/mining.key --threads 8
 ```
 
 ## Remote worker
 
-Do not expose an unencrypted bearer token and general RPC interface directly
-to the Internet.
+Do not expose an unencrypted bearer token directly to the Internet.
 
 Place the worker and node on an authenticated private network, or terminate TLS
 and restrict the exposed path at a reverse proxy. Bind public RPC only after
@@ -44,7 +48,7 @@ that transport is in place:
 parano1d \
   --mode extminer \
   --rpc-listen 0.0.0.0:9601 \
-  --mining-key 'LONG-RANDOM-TOKEN'
+  --mining-key-file /secure/parano1d-mining.key
 ```
 
 Firewall the port so only intended workers or the proxy can reach it.
@@ -59,7 +63,7 @@ To let a worker request its own payout, the node operator must opt in:
 ```sh
 parano1d \
   --mode extminer \
-  --mining-key 'LONG-RANDOM-TOKEN' \
+  --mining-key-file ~/.parano1d/mining.key \
   --allow-custom-coinbase
 ```
 
@@ -67,12 +71,15 @@ The worker can then use:
 
 ```sh
 parano1d-miner \
-  --key 'LONG-RANDOM-TOKEN' \
+  --key-file ~/.parano1d/mining.key \
   --coinbase o1...
 ```
 
 Custom coinbase changes only the payout embedded before proof construction.
 The worker still cannot modify the proved template.
+
+The bearer credential is scoped to `getBlockTemplate` and `submitBlock`. It
+cannot call wallet, node-control or general inspection methods.
 
 ## Template lifecycle
 
