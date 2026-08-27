@@ -239,6 +239,15 @@ fn sync_target_requires_snapshot(
             .is_some_and(|tail| tail.allows_exact_target(local_height, peer_height))
 }
 
+fn canonical_tip_supersedes_snapshot_boundary(
+    canonical_tip_height: u64,
+    canonical_boundary: Option<noid_node::networking::ChainPoint>,
+    snapshot_boundary: noid_node::networking::ChainPoint,
+) -> bool {
+    canonical_tip_height >= snapshot_boundary.height
+        && canonical_boundary == Some(snapshot_boundary)
+}
+
 fn validate_snapshot_install_selection(
     header_dag: &noid_node::networking::header_dag::HeaderDag,
     manifest: &noid_p2p::protocol::GetStateManifestResponse,
@@ -4822,19 +4831,19 @@ mod tests {
     use super::{
         admit_exact_suffix_offer, advance_initial_sync_stage,
         advertise_inventory_for_known_headers, advertised_terminal_peer,
-        classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
-        competing_suffix_wins, direct_header_request_within_cap, embedded_seed_multiaddrs,
-        ensure_network_storage_epoch, gap_requires_snapshot_sync,
-        header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
-        initial_sync_may_skip_peer_confirmation, load_or_create_config,
-        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
-        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
-        persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
-        quarantine_exact_suffix_sources, read_mining_key_file,
-        record_snapshot_terminal_transport_failure, resolve_embedded_seed_with_system_dns,
-        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
-        selected_tip_probe_range, snapshot_header_completion_base_moved,
+        canonical_tip_supersedes_snapshot_boundary, classify_snapshot_finalization_error,
+        classify_snapshot_session_prepare_error, competing_suffix_wins,
+        direct_header_request_within_cap, embedded_seed_multiaddrs, ensure_network_storage_epoch,
+        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
+        header_inventory_validation_anchor, initial_sync_may_skip_peer_confirmation,
+        load_or_create_config, manifest_round_gap_is_resolved, manifest_round_retry_due,
+        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
+        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
+        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
+        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
+        read_mining_key_file, record_snapshot_terminal_transport_failure,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
+        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
@@ -4880,6 +4889,31 @@ mod tests {
         assert_eq!(local_height, 73);
         assert_eq!(observed_hash, local_hash);
         assert!(superseded_snapshot_install(74, 73, local_hash).is_none());
+    }
+
+    #[test]
+    fn exact_progress_retires_only_a_canonical_snapshot_boundary() {
+        let snapshot = noid_node::networking::ChainPoint::new(54, [1; 32]);
+        let competing = noid_node::networking::ChainPoint::new(54, [2; 32]);
+
+        assert!(canonical_tip_supersedes_snapshot_boundary(
+            73,
+            Some(snapshot),
+            snapshot,
+        ));
+        assert!(!canonical_tip_supersedes_snapshot_boundary(
+            73,
+            Some(competing),
+            snapshot,
+        ));
+        assert!(!canonical_tip_supersedes_snapshot_boundary(
+            53,
+            Some(snapshot),
+            snapshot,
+        ));
+        assert!(!canonical_tip_supersedes_snapshot_boundary(
+            73, None, snapshot,
+        ));
     }
 
     #[test]
@@ -6591,7 +6625,6 @@ mod tests {
             validate_snapshot_install_selection(&dag, &selected_ancestor).unwrap(),
             None
         );
-
         let mut farther_work = branch_b_work;
         for _ in 8..=12 {
             farther_work = noid_chain::add_work(
@@ -12116,6 +12149,7 @@ async fn handle_p2p_events(
                 continue;
             }
             exact_suffix_apply_inflight = None;
+            let mut committed_exact_tip = None;
 
             match completed.result {
                 Ok(AppliedExactSuffix::Live(mut applied)) => {
@@ -12179,6 +12213,10 @@ async fn handle_p2p_events(
                         );
                     }
                     if complete {
+                        committed_exact_tip = Some(noid_node::networking::ChainPoint::new(
+                            applied.height,
+                            applied.block_hash,
+                        ));
                         let relay = p2p_cmd.clone();
                         let announcement = completed.tip_announcement;
                         tokio::spawn(async move {
@@ -12199,6 +12237,7 @@ async fn handle_p2p_events(
                     }
                 }
                 Ok(AppliedExactSuffix::Reorg(applied)) => {
+                    committed_exact_tip = Some(completed.target);
                     let reverted = applied.result.reverted_heights.len();
                     let applied_blocks = applied.result.applied_heights.len();
                     let selected_tip_committed = !header_dag_faulted
@@ -12277,6 +12316,55 @@ async fn handle_p2p_events(
                         %error,
                         "exact suffix rejected before canonical selection completed"
                     );
+                }
+            }
+
+            if let Some(exact_tip) = committed_exact_tip {
+                let snapshot = pending_manifest
+                    .as_ref()
+                    .map(|pending| pending.offer.snapshot_id());
+                let superseded_snapshot = if let Some(snapshot) = snapshot {
+                    let (canonical_tip_height, canonical_boundary) = {
+                        let ctx = chain.read().await;
+                        let canonical_boundary = if ctx.tip_height() >= snapshot.boundary.height {
+                            match ctx.get_header_from_store(snapshot.boundary.height) {
+                                Ok(Some(header)) => {
+                                    Some(noid_node::networking::ChainPoint::new(
+                                        snapshot.boundary.height,
+                                        noid_chain::block_header::block_id(&header),
+                                    ))
+                                }
+                                Ok(None) => None,
+                                Err(error) => {
+                                    tracing::error!(
+                                        snapshot_height = snapshot.boundary.height,
+                                        %error,
+                                        "failed to load canonical snapshot-boundary header after exact progress"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        (ctx.tip_height(), canonical_boundary)
+                    };
+                    canonical_tip_supersedes_snapshot_boundary(
+                        canonical_tip_height,
+                        canonical_boundary,
+                        snapshot.boundary,
+                    )
+                    .then_some(snapshot)
+                } else {
+                    None
+                };
+                if let Some(snapshot) = superseded_snapshot {
+                    tracing::info!(
+                        exact_height = exact_tip.height,
+                        snapshot_height = snapshot.boundary.height,
+                        "exact suffix completed first — retiring superseded snapshot transfer"
+                    );
+                    retire_snapshot_plan!();
                 }
             }
 
