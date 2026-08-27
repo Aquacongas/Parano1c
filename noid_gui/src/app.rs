@@ -29,6 +29,8 @@ const PROOF_FORGE_FRAME: Duration = Duration::from_millis(33);
 const SHUTDOWN_FORGE_FRAME: Duration = Duration::from_millis(33);
 const LANGUAGE_FORGE_FRAME: Duration = Duration::from_millis(33);
 const CONSOLIDATION_HINT_CLOSE_FRAME: Duration = Duration::from_millis(80);
+const HEADER_COIN_FRAME: Duration = Duration::from_millis(66);
+const HEADER_COIN_TURN_SECONDS: f32 = 8.5;
 const NODE_LOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const NODE_LOG_BYTE_LIMIT: u64 = 64 * 1024;
 const PHOTO_SCAN_COMPLETE_HOLD: Duration = Duration::from_millis(160);
@@ -143,6 +145,7 @@ pub struct App {
     pub matrix_b255: MatrixCacheState,
     matrix_preparation_id: u64,
     pub consolidation_hint_open: bool,
+    pub header_coin_elapsed: Duration,
     consolidation_badge_hovered: bool,
     consolidation_card_hovered: bool,
     consolidation_hint_close_ticks: u8,
@@ -152,6 +155,8 @@ pub struct App {
     consecutive_refresh_failures: u8,
     shutting_down: bool,
     shutdown_forge_started_at: Option<Instant>,
+    header_coin_last_tick: Instant,
+    window_focused: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,6 +229,8 @@ pub enum Message {
     EnterConsolidationCard,
     LeaveConsolidationCard,
     ConsolidationHintCloseTick,
+    HeaderCoinTick(Instant),
+    WindowFocused(bool),
     EnsureNodeFinished(Result<(), String>),
     RefreshTick,
     SnapshotLoaded(Result<Box<BackendSnapshot>, String>),
@@ -442,6 +449,7 @@ impl App {
             },
             matrix_preparation_id: 0,
             consolidation_hint_open: false,
+            header_coin_elapsed: Duration::ZERO,
             consolidation_badge_hovered: false,
             consolidation_card_hovered: false,
             consolidation_hint_close_ticks: 0,
@@ -451,6 +459,8 @@ impl App {
             consecutive_refresh_failures: 0,
             shutting_down: false,
             shutdown_forge_started_at: None,
+            header_coin_last_tick: Instant::now(),
+            window_focused: true,
         };
         let task = if mock || wallet_setup_required {
             Task::none()
@@ -887,6 +897,17 @@ impl App {
                     }
                 }
             }
+            Message::HeaderCoinTick(now) => {
+                if self.window_focused {
+                    self.header_coin_elapsed +=
+                        now.saturating_duration_since(self.header_coin_last_tick);
+                }
+                self.header_coin_last_tick = now;
+            }
+            Message::WindowFocused(focused) => {
+                self.window_focused = focused;
+                self.header_coin_last_tick = Instant::now();
+            }
             Message::EnsureNodeFinished(result) => {
                 self.ensure_in_flight = false;
                 match result {
@@ -926,6 +947,7 @@ impl App {
                     Ok(live) => {
                         let mut live = *live;
                         let previous_height = self.snapshot.network.height;
+                        let previous_synced = self.snapshot.network.synced;
                         let previous_state_root = self.snapshot.network.state_root.clone();
                         let returned_mining_page = live.snapshot.mined_blocks.page;
                         live.snapshot.preserve_local_labels_from(&self.snapshot);
@@ -956,6 +978,12 @@ impl App {
                             filter_removed,
                         );
                         self.backend_state = BackendState::Online;
+                        if self.snapshot.network.synced {
+                            self.header_coin_elapsed = Duration::ZERO;
+                        } else if previous_synced {
+                            self.header_coin_elapsed = Duration::ZERO;
+                            self.header_coin_last_tick = Instant::now();
+                        }
                         self.backend_error = None;
                         self.consecutive_refresh_failures = 0;
                         if self.snapshot.mined_blocks.total_pages > 0
@@ -2210,6 +2238,12 @@ impl App {
             iced::window::close_requests().map(|_| Message::Exit),
             iced::event::listen_with(|event, _status, _window| match event {
                 iced::Event::Keyboard(event) => Some(Message::Keyboard(event)),
+                iced::Event::Window(iced::window::Event::Focused) => {
+                    Some(Message::WindowFocused(true))
+                }
+                iced::Event::Window(iced::window::Event::Unfocused) => {
+                    Some(Message::WindowFocused(false))
+                }
                 _ => None,
             }),
         ];
@@ -2235,7 +2269,25 @@ impl App {
                     .map(|_| Message::ConsolidationHintCloseTick),
             );
         }
+        if self.window_focused && self.header_coin_rotating() && !self.shutting_down {
+            subscriptions.push(iced::time::every(HEADER_COIN_FRAME).map(Message::HeaderCoinTick));
+        }
         Subscription::batch(subscriptions)
+    }
+
+    pub fn header_coin_angle(&self) -> f32 {
+        if !self.header_coin_rotating() {
+            return 0.0;
+        }
+        (self.header_coin_elapsed.as_secs_f32() / HEADER_COIN_TURN_SECONDS * std::f32::consts::TAU)
+            % std::f32::consts::TAU
+    }
+
+    fn header_coin_rotating(&self) -> bool {
+        !self.language_selection_required
+            && !self.wallet_setup_required
+            && self.backend_state == BackendState::Online
+            && !self.snapshot.network.synced
     }
 
     pub fn consolidation_recommended(&self) -> bool {

@@ -361,6 +361,7 @@ MiningInfo {
 
 NodeStatus {
   synced: bool
+  sync_stage: "headers" | "state" | "tip"
   mining: bool
   mining_ready: bool
   mining_confirmed_peers: usize

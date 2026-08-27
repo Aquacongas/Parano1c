@@ -58,6 +58,7 @@ use noid_node::snapshot_header_staging::{
     MAX_STAGED_HEADER_BATCH,
 };
 use noid_p2p::{NetworkEvent, P2PNetwork};
+use noid_rpc::types::NodeSyncStage;
 use noid_rpc::{start_rpc_server, ExternalMiningAttemptInvalidator, WalletOperationGate};
 
 struct AppliedCompactSuffix {
@@ -445,6 +446,26 @@ fn mark_initial_sync_ready(sender: &tokio::sync::watch::Sender<bool>) {
     let already_ready = *sender.borrow();
     if !already_ready {
         sender.send_replace(true);
+    }
+}
+
+fn advance_initial_sync_stage(
+    current: NodeSyncStage,
+    state_active: bool,
+    tip_active: bool,
+) -> NodeSyncStage {
+    let observed = if state_active {
+        NodeSyncStage::State
+    } else if tip_active {
+        NodeSyncStage::Tip
+    } else {
+        NodeSyncStage::Headers
+    };
+
+    match (current, observed) {
+        (NodeSyncStage::Tip, _) => NodeSyncStage::Tip,
+        (NodeSyncStage::State, NodeSyncStage::Headers) => NodeSyncStage::State,
+        (_, observed) => observed,
     }
 }
 
@@ -1848,6 +1869,8 @@ async fn main() -> anyhow::Result<()> {
     // A Notify permit can be consumed by one of many mempool/miner waiters;
     // watch preserves the state for every current and future subscriber.
     let (initial_sync_ready_tx, initial_sync_ready_rx) = tokio::sync::watch::channel(false);
+    let (initial_sync_stage_tx, initial_sync_stage_rx) =
+        tokio::sync::watch::channel(NodeSyncStage::Headers);
     let (mining_proof_ready_tx, mining_proof_ready_rx) = tokio::sync::watch::channel(cli.genesis);
     let (mining_network_ready_tx, mining_network_ready_rx) =
         tokio::sync::watch::channel(cli.genesis);
@@ -2034,6 +2057,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_cmd_for_events = p2p.cmd_tx.clone();
     let p2p_template_changes = template_change_tx.clone();
     let p2p_initial_sync_ready = initial_sync_ready_tx.clone();
+    let p2p_initial_sync_stage = initial_sync_stage_tx;
     let p2p_mining_peer_quorum = MiningPeerQuorum::new(
         cli.genesis,
         mining_proof_ready_tx,
@@ -2053,6 +2077,7 @@ async fn main() -> anyhow::Result<()> {
             p2p_wallet,
             p2p_cmd_for_events,
             p2p_initial_sync_ready,
+            p2p_initial_sync_stage,
             p2p_mining_peer_quorum,
             p2p_template_changes,
             p2p_wallet_operation_gate,
@@ -2113,6 +2138,7 @@ async fn main() -> anyhow::Result<()> {
         p2p_health_rx,
         canonical_tip_change_tx.clone(),
         initial_sync_ready_rx.clone(),
+        initial_sync_stage_rx,
         mining_network_ready_rx.clone(),
         mining_confirmed_peer_count_rx.clone(),
         MINING_PEER_QUORUM,
@@ -4794,7 +4820,8 @@ fn admit_exact_suffix_offer(
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_exact_suffix_offer, advertise_inventory_for_known_headers, advertised_terminal_peer,
+        admit_exact_suffix_offer, advance_initial_sync_stage,
+        advertise_inventory_for_known_headers, advertised_terminal_peer,
         classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
         competing_suffix_wins, direct_header_request_within_cap, embedded_seed_multiaddrs,
         ensure_network_storage_epoch, gap_requires_snapshot_sync,
@@ -4827,6 +4854,7 @@ mod tests {
         MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL, SNAPSHOT_HEADER_BATCH,
         SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
     };
+    use noid_rpc::types::NodeSyncStage;
 
     fn test_snapshot_id() -> noid_node::networking::SnapshotId {
         noid_node::networking::SnapshotId {
@@ -5336,6 +5364,28 @@ mod tests {
         assert!(*first.borrow());
         assert!(*second.borrow());
         assert!(*late.borrow());
+    }
+
+    #[test]
+    fn initial_sync_stage_advances_without_regressing_during_idle_gaps() {
+        let stage = advance_initial_sync_stage(NodeSyncStage::Headers, false, false);
+        assert_eq!(stage, NodeSyncStage::Headers);
+
+        let stage = advance_initial_sync_stage(stage, true, false);
+        assert_eq!(stage, NodeSyncStage::State);
+        let stage = advance_initial_sync_stage(stage, false, false);
+        assert_eq!(stage, NodeSyncStage::State);
+
+        let stage = advance_initial_sync_stage(stage, false, true);
+        assert_eq!(stage, NodeSyncStage::Tip);
+        assert_eq!(
+            advance_initial_sync_stage(stage, true, false),
+            NodeSyncStage::Tip
+        );
+        assert_eq!(
+            advance_initial_sync_stage(stage, false, false),
+            NodeSyncStage::Tip
+        );
     }
 
     #[test]
@@ -7266,6 +7316,7 @@ async fn handle_p2p_events(
     wallet: SharedWallet,
     p2p_cmd: noid_p2p::NetworkCommandSender,
     initial_sync_ready: tokio::sync::watch::Sender<bool>,
+    initial_sync_stage_tx: tokio::sync::watch::Sender<NodeSyncStage>,
     mut mining_peer_quorum: MiningPeerQuorum,
     template_changes: tokio::sync::broadcast::Sender<()>,
     wallet_operation_gate: WalletOperationGate,
@@ -13158,6 +13209,24 @@ async fn handle_p2p_events(
                 }
             }
             retire_post_snapshot_tail_if_finished!(our_height);
+            if !*initial_sync_ready.borrow() {
+                let state_active = retained_snapshot_headers.is_some()
+                    || history_step_verification_inflight.is_some()
+                    || active_snapshot_sync.is_some()
+                    || snapshot_staging.is_some()
+                    || snapshot_staging_inflight.is_some()
+                    || snapshot_install_inflight.is_some();
+                let stage = advance_initial_sync_stage(
+                    *initial_sync_stage_tx.borrow(),
+                    state_active,
+                    active_suffix_sync.is_some()
+                        || exact_suffix_apply_inflight.is_some()
+                        || post_snapshot_tail.is_some(),
+                );
+                if *initial_sync_stage_tx.borrow() != stage {
+                    initial_sync_stage_tx.send_replace(stage);
+                }
+            }
             // This also catches locally mined or RPC-submitted blocks, whose
             // commits do not pass through this P2P event handler. A direct
             // child preserves fresh ancestry leases; any discontinuity is a

@@ -33,7 +33,7 @@ use crate::api::ParanoidApiServer;
 use crate::types::{
     AddressInfo, BlockDetailsInfo, BlockHeaderInfo, BlockTemplateResponse, BlockTransactionInfo,
     BlockTransactionInputInfo, BlockTransactionOutputInfo, ChainInfo, FeeBreakdownInfo,
-    FeeEstimate, MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus,
+    FeeEstimate, MempoolInfo, MempoolStats, MempoolTxInfo, MiningInfo, NodeStatus, NodeSyncStage,
     ReceiptInputInfo, ReceiptOutputInfo, ReceiptSummaryInfo, ReceiptVerifyResult,
     RecentTransactionInfo, RecentTransactionsPage, RetainedBlockInfo, SlotInfo, StateInfo,
     StateMapInfo, TxInfo, WalletAddressInfo, WalletBalance, WalletConsolidationPlan,
@@ -875,6 +875,8 @@ pub struct RpcHandler {
     pub canonical_tip_changes: tokio::sync::watch::Sender<noid_p2p::object_protocol::ChainPoint>,
     /// The same durable readiness watch consumed by the internal miner.
     pub initial_sync_ready: tokio::sync::watch::Receiver<bool>,
+    /// Coarse read-only initial synchronization stage for operator clients.
+    pub initial_sync_stage: tokio::sync::watch::Receiver<NodeSyncStage>,
     /// Live mining gate and its authenticated-peer count.
     pub mining_network_ready: tokio::sync::watch::Receiver<bool>,
     pub mining_confirmed_peers: tokio::sync::watch::Receiver<usize>,
@@ -2100,6 +2102,7 @@ impl ParanoidApiServer for RpcHandler {
         let heartbeat_age = p2p.updated_at.elapsed();
         Ok(NodeStatus {
             synced: *self.initial_sync_ready.borrow(),
+            sync_stage: *self.initial_sync_stage.borrow(),
             mining: self.internal_mining_enabled,
             mining_ready: *self.mining_network_ready.borrow(),
             mining_confirmed_peers: *self.mining_confirmed_peers.borrow(),
@@ -3177,6 +3180,7 @@ pub async fn start_rpc_server(
     p2p_health: tokio::sync::watch::Receiver<noid_p2p::P2PHealthSnapshot>,
     canonical_tip_changes: tokio::sync::watch::Sender<noid_p2p::object_protocol::ChainPoint>,
     initial_sync_ready: tokio::sync::watch::Receiver<bool>,
+    initial_sync_stage: tokio::sync::watch::Receiver<NodeSyncStage>,
     mining_network_ready: tokio::sync::watch::Receiver<bool>,
     mining_confirmed_peers: tokio::sync::watch::Receiver<usize>,
     mining_required_peers: usize,
@@ -3221,6 +3225,7 @@ pub async fn start_rpc_server(
         p2p_health,
         canonical_tip_changes,
         initial_sync_ready,
+        initial_sync_stage,
         mining_network_ready,
         mining_confirmed_peers,
         mining_required_peers,

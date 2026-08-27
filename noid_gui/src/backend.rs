@@ -32,7 +32,7 @@ use crate::model::{
     BlockTransactionInputSnapshot, BlockTransactionOutputSnapshot, BlockTransactionSnapshot,
     ExplorerAddressSnapshot, ExplorerBlockSnapshot, ExplorerSearchResultSnapshot,
     ExplorerSlotSnapshot, ExplorerSnapshot, Language, LogLevel, MatrixClass, MinedBlockSnapshot,
-    MinedBlocksSnapshot, MiningSnapshot, NetworkSnapshot, NodeSettingsSnapshot,
+    MinedBlocksSnapshot, MiningSnapshot, NetworkSnapshot, NodeSettingsSnapshot, NodeSyncStage,
     ReceiptDetailSnapshot, ReceiptInputSnapshot, ReceiptOutputSnapshot, ReceiptSnapshot,
     ReceiptSummarySnapshot, ReceiptVerificationSnapshot, ReceiptsSnapshot,
     RecentTransactionSnapshot, RecentTransactionsSnapshot, RetainedBlockSnapshot, SegmentSnapshot,
@@ -993,6 +993,7 @@ impl Backend {
                 difficulty_target: mining.difficulty_target,
                 backend: node_status.backend.to_ascii_uppercase(),
                 synced: node_status.synced,
+                sync_stage: node_status.sync_stage,
                 // Reaching this snapshot means the production node accepted
                 // the canonical tip and its exact state transition proof.
                 terminal_verified: true,
@@ -1990,6 +1991,8 @@ struct MiningInfo {
 #[derive(Debug, Clone, Deserialize)]
 struct NodeStatus {
     synced: bool,
+    #[serde(default)]
+    sync_stage: NodeSyncStage,
     mining: bool,
     mining_ready: bool,
     isolated_mining: bool,
