@@ -181,13 +181,17 @@ impl PostSnapshotTail {
     }
 
     fn allows_exact_target(self, local_height: u64, candidate_height: u64) -> bool {
-        let exact_limit = self
-            .target
-            .map_or_else(|| self.serving_limit(), |target| target.height);
+        let serving_limit = self.serving_limit();
+        // The first authenticated target fixes the lifetime of this allowance,
+        // not its height ceiling. A fresher HeaderDAG-selected descendant may
+        // arrive while that immutable suffix is still being applied; admission
+        // below will defer it instead of restarting the active plan.
         local_height >= self.boundary.height
             && candidate_height > local_height
-            && candidate_height <= exact_limit
-            && exact_limit <= self.serving_limit()
+            && candidate_height <= serving_limit
+            && self
+                .target
+                .is_none_or(|target| target.height <= serving_limit && local_height < target.height)
     }
 
     /// Pin the first target selected by native HeaderDAG validation after the
@@ -237,6 +241,16 @@ fn sync_target_requires_snapshot(
     gap_requires_snapshot_sync(local_height, peer_height)
         && !post_snapshot_tail
             .is_some_and(|tail| tail.allows_exact_target(local_height, peer_height))
+}
+
+/// A proactive manifest is only a discovery hint while the verified snapshot
+/// is still completing its bounded exact tail. HeaderDAG may explicitly
+/// authorize a new snapshot by marking the correlated request as forced.
+fn unforced_manifest_waits_for_header_dag(
+    force_snapshot: bool,
+    post_snapshot_tail: Option<PostSnapshotTail>,
+) -> bool {
+    !force_snapshot && post_snapshot_tail.is_some()
 }
 
 fn canonical_tip_supersedes_snapshot_boundary(
@@ -4848,8 +4862,9 @@ mod tests {
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
         superseded_snapshot_install, sync_target_requires_snapshot, terminal_alternate_peer,
-        terminal_transport_can_retry_same_peer, unresolved_selected_tip_probe_range,
-        unresolved_tip_probe_range, validate_history_step_tip_future_drift,
+        terminal_transport_can_retry_same_peer, unforced_manifest_waits_for_header_dag,
+        unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
+        validate_history_step_tip_future_drift,
         validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
         validate_snapshot_install_selection, validate_snapshot_staged_header_boundary, Cli,
         ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, NodeMode, PostSnapshotTail,
@@ -6190,12 +6205,33 @@ mod tests {
         assert!(!sync_target_requires_snapshot(100, 119, Some(tail)));
         assert!(!sync_target_requires_snapshot(100, 120, Some(tail)));
         assert!(!sync_target_requires_snapshot(100, 123, Some(tail)));
-        assert!(sync_target_requires_snapshot(100, 124, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 124, Some(tail)));
+        assert!(!sync_target_requires_snapshot(100, 142, Some(tail)));
+        assert!(sync_target_requires_snapshot(100, 143, Some(tail)));
+        assert!(tail.allows_exact_target(122, 142));
         assert!(tail.is_finished_or_invalid_at(123));
+        assert!(!tail.allows_exact_target(123, 142));
+
+        let advanced_unfinished_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(100, [3; 32]),
+            target: Some(ChainPoint::new(123, [4; 32])),
+        };
+        assert!(advanced_unfinished_tail.allows_exact_target(110, 142));
+        assert!(!advanced_unfinished_tail.allows_exact_target(110, 143));
+
+        let stale_completed_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(96, [5; 32]),
+            target: Some(ChainPoint::new(97, [6; 32])),
+        };
+        assert!(sync_target_requires_snapshot(
+            97,
+            120,
+            Some(stale_completed_tail)
+        ));
 
         let longest_retained_tail = PostSnapshotTail {
-            boundary: ChainPoint::new(100, [3; 32]),
-            target: Some(ChainPoint::new(142, [4; 32])),
+            boundary: ChainPoint::new(100, [7; 32]),
+            target: Some(ChainPoint::new(142, [8; 32])),
         };
         assert!(!sync_target_requires_snapshot(
             100,
@@ -6204,14 +6240,30 @@ mod tests {
         ));
 
         let outside_serving_window = PostSnapshotTail {
-            boundary: ChainPoint::new(100, [5; 32]),
-            target: Some(ChainPoint::new(143, [6; 32])),
+            boundary: ChainPoint::new(100, [9; 32]),
+            target: Some(ChainPoint::new(143, [10; 32])),
         };
+        assert!(!outside_serving_window.allows_exact_target(100, 120));
+        assert!(!outside_serving_window.allows_exact_target(100, 142));
         assert!(sync_target_requires_snapshot(
             100,
-            143,
+            120,
             Some(outside_serving_window)
         ));
+
+        assert!(!tail.allows_exact_target(99, 120));
+        assert!(!tail.allows_exact_target(110, 110));
+
+        let saturated_tail = PostSnapshotTail {
+            boundary: ChainPoint::new(u64::MAX - 10, [11; 32]),
+            target: Some(ChainPoint::new(u64::MAX - 5, [12; 32])),
+        };
+        assert!(saturated_tail.allows_exact_target(u64::MAX - 10, u64::MAX));
+        assert!(!saturated_tail.allows_exact_target(u64::MAX - 5, u64::MAX));
+
+        assert!(unforced_manifest_waits_for_header_dag(false, Some(tail)));
+        assert!(!unforced_manifest_waits_for_header_dag(true, Some(tail)));
+        assert!(!unforced_manifest_waits_for_header_dag(false, None));
     }
 
     #[test]
@@ -10422,7 +10474,12 @@ async fn handle_p2p_events(
                                     .as_ref()
                                     .is_none_or(|sync| sync.all_segments_verified())
                             {
-                                if try_request_manifest!(from, our_height, [0; 32]) {
+                                // A proactive manifest request may already be in flight from
+                                // PeerConnected. Once HeaderDAG selects a snapshot route, upgrade
+                                // that exact request instead of waiting for a second round.
+                                if manifest_requested_peers.contains(&from)
+                                    || try_request_manifest!(from, our_height, [0; 32])
+                                {
                                     manifest_force_snapshot_peers.insert(from);
                                     tracing::info!(
                                         peer = %from,
@@ -10819,6 +10876,7 @@ async fn handle_p2p_events(
                         let ctx = chain.read().await;
                         ctx.tip_height()
                     };
+                    retire_post_snapshot_tail_if_finished!(our_height);
                     if manifest.tip_height <= our_height {
                         tracing::debug!(
                             from = %from,
@@ -10846,6 +10904,28 @@ async fn handle_p2p_events(
                                 "announced gap closed — discarded obsolete manifest round"
                             );
                         }
+                        continue;
+                    }
+
+                    // A normal connection probe is not authority to replace a
+                    // snapshot which has just committed. Let the parallel native
+                    // header probe reach HeaderDAG: it either admits the bounded
+                    // exact tail or marks a subsequent manifest request as forced.
+                    // Matching providers for an already active immutable snapshot
+                    // were admitted above and never reach this branch.
+                    if unforced_manifest_waits_for_header_dag(force_snapshot, post_snapshot_tail)
+                    {
+                        deferred_sync_peer = Some(from);
+                        if manifest_requested_peers.is_empty() {
+                            manifest_response_count = 0;
+                            manifest_round_started_at = None;
+                        }
+                        tracing::info!(
+                            from = %from,
+                            our_height,
+                            snapshot_height = manifest.tip_height,
+                            "post-snapshot exact tail deferred an unforced manifest to HeaderDAG"
+                        );
                         continue;
                     }
 
