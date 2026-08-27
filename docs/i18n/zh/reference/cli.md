@@ -35,6 +35,8 @@ parano1d
 | `--log LEVEL` | Tracing 过滤器，如 `error`、`warn`、`info`、`debug` |
 | `--mining-key TOKEN` | 外部挖矿 Bearer 令牌；为兼容性保留 |
 | `--mining-key-file FILE` | 从仅所有者可读的文件读取外部挖矿令牌 |
+| `--operator-key TOKEN` | 用于固定矿池记账和付款 RPC 范围的独立 Bearer 令牌 |
+| `--operator-key-file FILE` | 从仅所有者可读的文件读取运营者令牌 |
 | `--allow-custom-coinbase` | 允许经过认证的外部挖矿进程请求自己的奖励地址 |
 | `--purge-state` | 清除完整链数据库，并从对等节点重新同步 |
 | `--check-hardware` | 报告发布版 CPU 支持情况后退出，不触碰节点数据 |
@@ -60,8 +62,7 @@ parano1d --mode miner --cpu-threads 12
 parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
-除非由私有或认证传输保护，否则 RPC 应保持在回环地址上。Bearer 密钥用于认证
-请求，但不会加密传输。
+除非由私有或认证传输保护，否则 RPC 应保持在回环地址上。Bearer 令牌用于认证请求，但不会加密传输。运营者令牌可以授权 `walletSend`，因此应优先使用 `--operator-key-file`，使用与挖矿凭据不同的令牌，并通过防火墙限制 listener。Core 拒绝在非回环地址上启动未认证的 RPC listener。即使配置了受限令牌，GUI 和 CLI 也可以从实际 TCP 回环地址连接而无需密钥。RPC 仅支持 HTTP，并拒绝 WebSocket 升级。
 
 ## 外部矿工
 

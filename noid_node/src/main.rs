@@ -1024,9 +1024,22 @@ pub enum NodeMode {
     Extminer,
 }
 
-const MAX_MINING_KEY_FILE_BYTES: u64 = 4096;
+const MAX_RPC_KEY_FILE_BYTES: u64 = 4096;
 
-fn read_mining_key_file(path: &Path) -> anyhow::Result<String> {
+fn validate_rpc_key(key: String, role: &str) -> anyhow::Result<String> {
+    if key.len() < 16 {
+        anyhow::bail!("{role} key must contain at least 16 characters");
+    }
+    if key.chars().any(char::is_whitespace) {
+        anyhow::bail!("{role} key must not contain whitespace");
+    }
+    if key.len() as u64 > MAX_RPC_KEY_FILE_BYTES {
+        anyhow::bail!("{role} key is too large");
+    }
+    Ok(key)
+}
+
+fn read_rpc_key_file(path: &Path, role: &str) -> anyhow::Result<String> {
     let expanded = expand_tilde(path);
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1037,13 +1050,13 @@ fn read_mining_key_file(path: &Path) -> anyhow::Result<String> {
     }
     let file = options
         .open(&expanded)
-        .with_context(|| format!("open mining key file: {}", expanded.display()))?;
+        .with_context(|| format!("open {role} key file: {}", expanded.display()))?;
     let metadata = file
         .metadata()
-        .with_context(|| format!("inspect mining key file: {}", expanded.display()))?;
+        .with_context(|| format!("inspect {role} key file: {}", expanded.display()))?;
     if !metadata.is_file() {
         anyhow::bail!(
-            "mining key path is not a regular file: {}",
+            "{role} key path is not a regular file: {}",
             expanded.display()
         );
     }
@@ -1053,7 +1066,7 @@ fn read_mining_key_file(path: &Path) -> anyhow::Result<String> {
         let mode = metadata.permissions().mode() & 0o777;
         if mode & 0o077 != 0 {
             anyhow::bail!(
-                "mining key file must not be accessible by group or others: {} has mode {mode:03o}",
+                "{role} key file must not be accessible by group or others: {} has mode {mode:03o}",
                 expanded.display()
             );
         }
@@ -1062,27 +1075,41 @@ fn read_mining_key_file(path: &Path) -> anyhow::Result<String> {
         let expected = unsafe { libc::geteuid() };
         if actual != expected {
             anyhow::bail!(
-                "mining key file must be owned by the current user: {} is uid {actual}, expected {expected}",
+                "{role} key file must be owned by the current user: {} is uid {actual}, expected {expected}",
                 expanded.display()
             );
         }
     }
 
     let mut raw = String::new();
-    file.take(MAX_MINING_KEY_FILE_BYTES + 1)
+    file.take(MAX_RPC_KEY_FILE_BYTES + 1)
         .read_to_string(&mut raw)
-        .with_context(|| format!("read mining key file: {}", expanded.display()))?;
-    if raw.len() as u64 > MAX_MINING_KEY_FILE_BYTES {
-        anyhow::bail!("mining key file is too large: {}", expanded.display());
+        .with_context(|| format!("read {role} key file: {}", expanded.display()))?;
+    if raw.len() as u64 > MAX_RPC_KEY_FILE_BYTES {
+        anyhow::bail!("{role} key file is too large: {}", expanded.display());
     }
     let key = raw.trim_end_matches(['\r', '\n']).to_owned();
-    if key.len() < 16 {
-        anyhow::bail!("mining key must contain at least 16 characters");
+    validate_rpc_key(key, role)
+}
+
+fn distinct_rpc_keys(mining_key: Option<&str>, operator_key: Option<&str>) -> anyhow::Result<()> {
+    if mining_key.is_some() && mining_key == operator_key {
+        anyhow::bail!("mining key and operator key must be different");
     }
-    if key.chars().any(char::is_whitespace) {
-        anyhow::bail!("mining key must not contain whitespace");
+    Ok(())
+}
+
+fn validate_rpc_listener_auth(
+    listen: std::net::SocketAddr,
+    mining_key: Option<&str>,
+    operator_key: Option<&str>,
+) -> anyhow::Result<()> {
+    if !listen.ip().is_loopback() && mining_key.is_none() && operator_key.is_none() {
+        anyhow::bail!(
+            "non-loopback RPC listener {listen} requires --mining-key[-file] or --operator-key[-file]"
+        );
     }
-    Ok(key)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -1162,7 +1189,8 @@ struct Cli {
     #[arg(long, value_name = "HOST:PORT")]
     p2p_listen: Option<String>,
 
-    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9601
+    /// JSON-RPC listen address in HOST:PORT format. Default: 127.0.0.1:9601.
+    /// A non-loopback address requires a mining or operator credential.
     #[arg(long, value_name = "HOST:PORT")]
     rpc_listen: Option<String>,
 
@@ -1195,6 +1223,20 @@ struct Cli {
     ///   parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
     #[arg(long, value_name = "FILE")]
     mining_key_file: Option<PathBuf>,
+
+    /// Bearer token for remote pool accounting and payout operations.
+    /// The credential is restricted to the documented operator RPC allowlist.
+    #[arg(long, value_name = "TOKEN", conflicts_with = "operator_key_file")]
+    operator_key: Option<String>,
+
+    /// Owner-only file containing the remote pool operator Bearer token.
+    ///
+    /// The file must contain one token of at least 16 characters. On Unix it
+    /// must be owned by the current user and inaccessible to group and others.
+    /// This credential can spend from the active wallet; use it only across an
+    /// authenticated private network or encrypted tunnel.
+    #[arg(long, value_name = "FILE")]
+    operator_key_file: Option<PathBuf>,
 
     /// Allow external miners to specify their own coinbase address in getBlockTemplate.
     ///
@@ -1607,12 +1649,21 @@ async fn main() -> anyhow::Result<()> {
         cli.mode = NodeMode::Extminer;
     }
 
-    let mining_key = match (&cli.mining_key, cli.mining_key_file.as_deref()) {
-        (Some(key), None) => Some(key.clone()),
-        (None, Some(path)) => Some(read_mining_key_file(path)?),
+    let inline_mining_key_configured = cli.mining_key.is_some();
+    let inline_operator_key_configured = cli.operator_key.is_some();
+    let mining_key = match (cli.mining_key.take(), cli.mining_key_file.as_deref()) {
+        (Some(key), None) => Some(validate_rpc_key(key, "mining")?),
+        (None, Some(path)) => Some(read_rpc_key_file(path, "mining")?),
         (None, None) => None,
         (Some(_), Some(_)) => unreachable!("clap rejects conflicting mining key sources"),
     };
+    let operator_key = match (cli.operator_key.take(), cli.operator_key_file.as_deref()) {
+        (Some(key), None) => Some(validate_rpc_key(key, "operator")?),
+        (None, Some(path)) => Some(read_rpc_key_file(path, "operator")?),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("clap rejects conflicting operator key sources"),
+    };
+    distinct_rpc_keys(mining_key.as_deref(), operator_key.as_deref())?;
 
     // --- Tracing ---
     // Log format: HH:MM:SS LEVEL target: message
@@ -1673,8 +1724,10 @@ async fn main() -> anyhow::Result<()> {
             || cli.purge_state
             || cli.miner_address.is_some()
             || cli.cpu_threads.is_some()
-            || cli.mining_key.is_some()
+            || inline_mining_key_configured
             || cli.mining_key_file.is_some()
+            || inline_operator_key_configured
+            || cli.operator_key_file.is_some()
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("owner secret maintenance cannot be combined with node or mining actions");
@@ -1685,8 +1738,10 @@ async fn main() -> anyhow::Result<()> {
             || cli.purge_state
             || cli.miner_address.is_some()
             || cli.cpu_threads.is_some()
-            || cli.mining_key.is_some()
+            || inline_mining_key_configured
             || cli.mining_key_file.is_some()
+            || inline_operator_key_configured
+            || cli.operator_key_file.is_some()
             || cli.allow_custom_coinbase)
     {
         anyhow::bail!("matrix preparation cannot be combined with node or mining actions");
@@ -1751,6 +1806,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|| net.default_rpc_listen())
     });
     let rpc_listen: std::net::SocketAddr = rpc_addr_str.parse().context("parse RPC listen")?;
+    validate_rpc_listener_auth(rpc_listen, mining_key.as_deref(), operator_key.as_deref())?;
 
     // Establish the process-wide bounded phase pool before the embedded
     // registry/matrix prewarm or any verifier can enter Rayon. Internal PoW,
@@ -2151,6 +2207,17 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     }
+    if operator_key.is_some() {
+        tracing::info!(
+            "operator API: pool accounting and payout allowlist enabled with separate bearer authentication"
+        );
+        if !rpc_listen.ip().is_loopback() {
+            tracing::warn!(
+                listen = %rpc_listen,
+                "operator API carries wallet authority without transport encryption; require a private firewall, VPN, or TLS tunnel"
+            );
+        }
+    }
     let (rpc_handle, rpc_stop_rx) = start_rpc_server(
         rpc_listen,
         chain.clone(),
@@ -2177,6 +2244,7 @@ async fn main() -> anyhow::Result<()> {
         cli.mode == NodeMode::Extminer,
         mining_payout_address,
         mining_key,
+        operator_key,
         cli.allow_custom_coinbase,
     )
     .await
@@ -4847,25 +4915,26 @@ mod tests {
         advertise_inventory_for_known_headers, advertised_terminal_peer,
         canonical_tip_supersedes_snapshot_boundary, classify_snapshot_finalization_error,
         classify_snapshot_session_prepare_error, competing_suffix_wins,
-        direct_header_request_within_cap, embedded_seed_multiaddrs, ensure_network_storage_epoch,
-        gap_requires_snapshot_sync, header_batch_exhausts_nonfinal_window,
-        header_inventory_validation_anchor, initial_sync_may_skip_peer_confirmation,
-        load_or_create_config, manifest_round_gap_is_resolved, manifest_round_retry_due,
-        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
-        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
-        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
-        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        read_mining_key_file, record_snapshot_terminal_transport_failure,
-        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
-        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
+        direct_header_request_within_cap, distinct_rpc_keys, embedded_seed_multiaddrs,
+        ensure_network_storage_epoch, gap_requires_snapshot_sync,
+        header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
+        initial_sync_may_skip_peer_confirmation, load_or_create_config,
+        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
+        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
+        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
+        persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
+        quarantine_exact_suffix_sources, read_rpc_key_file,
+        record_snapshot_terminal_transport_failure, resolve_embedded_seed_with_system_dns,
+        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
+        selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
         superseded_snapshot_install, sync_target_requires_snapshot, terminal_alternate_peer,
         terminal_transport_can_retry_same_peer, unforced_manifest_waits_for_header_dag,
         unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
-        validate_history_step_tip_future_drift,
-        validate_rebase_snapshot_selection, validate_snapshot_header_batch_admission,
+        validate_history_step_tip_future_drift, validate_rebase_snapshot_selection,
+        validate_rpc_key, validate_rpc_listener_auth, validate_snapshot_header_batch_admission,
         validate_snapshot_install_selection, validate_snapshot_staged_header_boundary, Cli,
         ManifestTerminalCapability, MiningPeerQuorum, NodeConfig, NodeMode, PostSnapshotTail,
         SnapshotFinalizationOutcome, SnapshotHeaderBoundary, SnapshotHeaderNextAction,
@@ -6077,65 +6146,79 @@ mod tests {
     }
 
     #[test]
-    fn external_mining_accepts_legacy_and_file_credentials() {
+    fn rpc_roles_accept_independent_inline_and_file_credentials() {
         use clap::Parser;
 
-        let legacy = Cli::try_parse_from([
+        let inline = Cli::try_parse_from([
             "parano1d",
             "--mode",
             "extminer",
             "--mining-key",
             "0123456789abcdef",
+            "--operator-key",
+            "fedcba9876543210",
         ])
         .unwrap();
-        assert_eq!(legacy.mode, NodeMode::Extminer);
-        assert_eq!(legacy.mining_key.as_deref(), Some("0123456789abcdef"));
-        assert!(legacy.mining_key_file.is_none());
+        assert_eq!(inline.mode, NodeMode::Extminer);
+        assert_eq!(inline.mining_key.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(inline.operator_key.as_deref(), Some("fedcba9876543210"));
+        assert!(inline.mining_key_file.is_none());
+        assert!(inline.operator_key_file.is_none());
 
         let file = Cli::try_parse_from([
             "parano1d",
-            "--mode",
-            "extminer",
             "--mining-key-file",
             "/secure/mining.key",
+            "--operator-key-file",
+            "/secure/operator.key",
         ])
         .unwrap();
-        assert_eq!(file.mode, NodeMode::Extminer);
         assert!(file.mining_key.is_none());
+        assert!(file.operator_key.is_none());
         assert_eq!(
             file.mining_key_file.as_deref(),
             Some(std::path::Path::new("/secure/mining.key"))
         );
+        assert_eq!(
+            file.operator_key_file.as_deref(),
+            Some(std::path::Path::new("/secure/operator.key"))
+        );
 
         assert!(Cli::try_parse_from([
             "parano1d",
-            "--mode",
-            "extminer",
             "--mining-key",
             "0123456789abcdef",
             "--mining-key-file",
             "/secure/mining.key",
         ])
         .is_err());
+        assert!(Cli::try_parse_from([
+            "parano1d",
+            "--operator-key",
+            "fedcba9876543210",
+            "--operator-key-file",
+            "/secure/operator.key",
+        ])
+        .is_err());
     }
 
     #[cfg(unix)]
     #[test]
-    fn mining_key_file_is_owner_only_and_trims_only_line_endings() {
+    fn rpc_key_file_is_owner_only_and_trims_only_line_endings() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("mining.key");
+        let path = temp.path().join("operator.key");
         std::fs::write(&path, b"0123456789abcdef0123456789abcdef\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         assert_eq!(
-            read_mining_key_file(&path).unwrap(),
+            read_rpc_key_file(&path, "operator").unwrap(),
             "0123456789abcdef0123456789abcdef"
         );
 
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_mining_key_file(&path)
+        assert!(read_rpc_key_file(&path, "operator")
             .unwrap_err()
             .to_string()
             .contains("group or others"));
@@ -6143,21 +6226,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn mining_key_file_rejects_symlinks_and_short_values() {
+    fn rpc_key_file_rejects_symlinks_and_short_values() {
         use std::os::unix::fs::{symlink, PermissionsExt};
 
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target.key");
         std::fs::write(&target, b"too-short\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(read_mining_key_file(&target)
+        assert!(read_rpc_key_file(&target, "operator")
             .unwrap_err()
             .to_string()
             .contains("at least 16"));
 
         let link = temp.path().join("link.key");
         symlink(&target, &link).unwrap();
-        assert!(read_mining_key_file(&link).is_err());
+        assert!(read_rpc_key_file(&link, "operator").is_err());
+    }
+
+    #[test]
+    fn rpc_keys_are_strong_and_roles_cannot_share_a_token() {
+        assert!(validate_rpc_key("too-short".into(), "operator").is_err());
+        assert!(validate_rpc_key("0123456789abcde f".into(), "operator").is_err());
+        assert!(validate_rpc_key("0123456789abcdef".into(), "operator").is_ok());
+
+        assert!(distinct_rpc_keys(Some("0123456789abcdef"), Some("0123456789abcdef")).is_err());
+        assert!(distinct_rpc_keys(Some("0123456789abcdef"), Some("fedcba9876543210")).is_ok());
+        assert!(distinct_rpc_keys(None, None).is_ok());
+    }
+
+    #[test]
+    fn unauthenticated_rpc_cannot_bind_beyond_loopback() {
+        for listen in ["127.0.0.1:9601", "127.42.0.1:9601", "[::1]:9601"] {
+            assert!(validate_rpc_listener_auth(listen.parse().unwrap(), None, None).is_ok());
+        }
+
+        for listen in ["0.0.0.0:9601", "192.168.1.20:9601", "[::]:9601"] {
+            let listen = listen.parse().unwrap();
+            assert!(validate_rpc_listener_auth(listen, None, None).is_err());
+            assert!(validate_rpc_listener_auth(listen, Some("mining"), None).is_ok());
+            assert!(validate_rpc_listener_auth(listen, None, Some("operator")).is_ok());
+        }
     }
 
     #[test]

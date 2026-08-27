@@ -35,6 +35,8 @@ Public daemon options are:
 | `--log LEVEL` | Tracing filter such as `error`, `warn`, `info` or `debug` |
 | `--mining-key TOKEN` | External-mining bearer token; retained for compatibility |
 | `--mining-key-file FILE` | Read the external-mining bearer token from an owner-only file |
+| `--operator-key TOKEN` | Separate bearer token for the fixed pool accounting/payout RPC scope |
+| `--operator-key-file FILE` | Read the pool operator token from an owner-only file |
 | `--allow-custom-coinbase` | Permit an authenticated external worker to request its payout |
 | `--purge-state` | Clear the complete chain database and synchronize it again from peers |
 | `--check-hardware` | Report production CPU support and exit without touching node data |
@@ -63,8 +65,7 @@ parano1d --mode miner --cpu-threads 12
 parano1d --mode extminer --mining-key-file ~/.parano1d/mining.key
 ```
 
-Keep RPC on loopback unless it is protected by a private or authenticated
-transport. A bearer key authenticates requests but does not encrypt them.
+Keep RPC on loopback unless it is protected by a private or authenticated transport. A bearer key authenticates requests but does not encrypt them. The operator credential can authorize `walletSend`; prefer `--operator-key-file`, use a distinct token from the mining credential, and firewall the listener. Core refuses to start a non-loopback RPC listener unless at least one scoped credential is configured. The GUI and CLI may connect from the actual TCP loopback address without a key even when scoped credentials are configured. RPC supports HTTP only and rejects WebSocket upgrades.
 
 ## External miner
 

@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 use jsonrpsee::core::async_trait;
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::server::middleware::rpc::{RpcServiceBuilder, RpcServiceT};
-use jsonrpsee::server::{MethodResponse, Server};
+use jsonrpsee::server::{serve_with_graceful_shutdown, stop_channel, MethodResponse, Server};
 use jsonrpsee::types::{ErrorObject, Request};
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
+use zeroize::Zeroize;
 
 use noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH;
 use noid_chain::consensus::pow::{
@@ -51,6 +53,10 @@ use crate::wallet_submit::{
 /// node-owned material.  The server retains exactly one attempt across its
 /// preparation, PoW, proof and commit lifecycle.
 const EXTERNAL_MINING_TEMPLATE_TTL: Duration = Duration::from_secs(30);
+
+/// Large enough for the maximum canonical transaction intent encoded as JSON
+/// hex, while rejecting jsonrpsee's otherwise unnecessary 10 MiB default.
+const RPC_MAX_REQUEST_BODY_BYTES: u32 = 1024 * 1024;
 
 type ExternalMiningTemplateId = [u8; 16];
 
@@ -3197,12 +3203,20 @@ pub async fn start_rpc_server(
     mining_template_changes: tokio::sync::broadcast::Sender<()>,
     mining_api_enabled: bool,
     mining_payout_address: Option<noid_poseidon2b::primitives::Address>,
-    mining_key: Option<String>,
+    mut mining_key: Option<String>,
+    mut operator_key: Option<String>,
     allow_custom_coinbase: bool,
 ) -> anyhow::Result<(
     jsonrpsee::server::ServerHandle,
     tokio::sync::oneshot::Receiver<()>,
 )> {
+    if !listen.ip().is_loopback() && mining_key.is_none() && operator_key.is_none() {
+        anyhow::bail!("non-loopback RPC listener {listen} requires bearer authentication");
+    }
+    if mining_key.is_some() && mining_key == operator_key {
+        anyhow::bail!("mining key and operator key must be different");
+    }
+
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let stop_tx = Arc::new(tokio::sync::Mutex::new(Some(stop_tx)));
     let wallet_submission_mempool =
@@ -3247,22 +3261,72 @@ pub async fn start_rpc_server(
 
     // Browser-originated requests are rejected before JSON-RPC dispatch so an
     // arbitrary website cannot reach a wallet through its loopback listener.
-    // When a mining key is configured, HTTP middleware authenticates it and
-    // marks the connection as mining-only. JSON-RPC middleware then restricts
-    // that capability to the two external-mining methods. The credential can
-    // never authorize wallet, node-control, or general inspection methods.
-    let expected_bearer = mining_key.as_deref().map(|k| format!("Bearer {k}"));
+    // Only fixed digests are retained for constant-time Bearer verification;
+    // successful Authorization headers are removed before jsonrpsee can trace
+    // the request. The RPC middleware then fails closed around the exact access
+    // scope attached by the HTTP middleware.
+    let expected_mining_bearer = mining_key.as_deref().map(BearerDigest::from_token);
+    let expected_operator_bearer = operator_key.as_deref().map(BearerDigest::from_token);
+    if let Some(key) = mining_key.as_mut() {
+        key.zeroize();
+    }
+    if let Some(key) = operator_key.as_mut() {
+        key.zeroize();
+    }
     let rpc_middleware =
-        RpcServiceBuilder::new().layer_fn(|inner| MiningCredentialScopeService { inner });
-    let server = Server::builder()
+        RpcServiceBuilder::new().layer_fn(|inner| CredentialScopeService { inner });
+    let service_builder = Server::builder()
+        .http_only()
+        .max_request_body_size(RPC_MAX_REQUEST_BODY_BYTES)
         .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
-            expected: expected_bearer,
+            mining: expected_mining_bearer,
+            operator: expected_operator_bearer,
         }))
         .set_rpc_middleware(rpc_middleware)
-        .build(listen)
+        .to_service_builder();
+    let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(|e| anyhow::anyhow!("build RPC server: {e}"))?;
-    let handle = server.start(handler.into_rpc());
+    let methods: jsonrpsee::server::Methods = handler.into_rpc().into();
+    let (stop_handle, handle) = stop_channel();
+    tokio::spawn(async move {
+        loop {
+            let accepted = tokio::select! {
+                accepted = listener.accept() => Some(accepted),
+                _ = stop_handle.clone().shutdown() => None,
+            };
+            let Some(accepted) = accepted else {
+                break;
+            };
+            let (socket, peer_addr) = match accepted {
+                Ok(connection) => connection,
+                Err(error) => {
+                    tracing::debug!(%error, "RPC listener failed to accept connection");
+                    continue;
+                }
+            };
+            if let Err(error) = socket.set_nodelay(true) {
+                tracing::debug!(%peer_addr, %error, "RPC connection rejected because TCP_NODELAY could not be set");
+                continue;
+            }
+
+            let service = service_builder
+                .clone()
+                .build(methods.clone(), stop_handle.clone());
+            let service = PeerAddressService {
+                inner: service,
+                peer_addr,
+            };
+            let connection_stop = stop_handle.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    serve_with_graceful_shutdown(socket, service, connection_stop.shutdown()).await
+                {
+                    tracing::debug!(%peer_addr, %error, "RPC connection ended with an error");
+                }
+            });
+        }
+    });
     tracing::debug!(%listen, "RPC server started");
     Ok((handle, stop_rx))
 }
@@ -3271,10 +3335,65 @@ pub async fn start_rpc_server(
 // Simple Bearer-token HTTP middleware
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Copy, Debug)]
+struct TcpPeerAddr(SocketAddr);
+
+#[derive(Clone)]
+struct PeerAddressService<S> {
+    inner: S,
+    peer_addr: SocketAddr,
+}
+
+impl<S, B> tower::Service<http::Request<B>> for PeerAddressService<S>
+where
+    S: tower::Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: http::Request<B>) -> Self::Future {
+        request.extensions_mut().insert(TcpPeerAddr(self.peer_addr));
+        self.inner.call(request)
+    }
+}
+
+fn peer_ip_is_loopback(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => ip.is_loopback(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+        }
+    }
+}
+
+#[derive(Clone)]
+struct BearerDigest([u8; 32]);
+
+impl BearerDigest {
+    fn from_token(token: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"Bearer ");
+        hasher.update(token.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    fn matches_header(&self, value: &http::HeaderValue) -> bool {
+        let candidate = blake3::hash(value.as_bytes());
+        bool::from(self.0.ct_eq(candidate.as_bytes()))
+    }
+}
+
 #[derive(Clone)]
 struct BearerAuthLayer {
-    /// `None` = no bearer token required. `Some(s)` = require `Authorization: <s>`.
-    expected: Option<String>,
+    /// Remote native clients require one configured credential. Originless
+    /// loopback clients without an Authorization header receive local access.
+    mining: Option<BearerDigest>,
+    operator: Option<BearerDigest>,
 }
 
 impl<S> tower::Layer<S> for BearerAuthLayer {
@@ -3282,7 +3401,8 @@ impl<S> tower::Layer<S> for BearerAuthLayer {
     fn layer(&self, inner: S) -> Self::Service {
         BearerAuthService {
             inner,
-            expected: self.expected.clone(),
+            mining: self.mining.clone(),
+            operator: self.operator.clone(),
         }
     }
 }
@@ -3290,7 +3410,8 @@ impl<S> tower::Layer<S> for BearerAuthLayer {
 #[derive(Clone)]
 struct BearerAuthService<S> {
     inner: S,
-    expected: Option<String>,
+    mining: Option<BearerDigest>,
+    operator: Option<BearerDigest>,
 }
 
 use std::future::Future;
@@ -3327,44 +3448,90 @@ where
             });
         }
 
-        // No key configured — native clients may pass without bearer auth.
-        let Some(ref expected) = self.expected else {
+        // Consume this header even when authentication is disabled. jsonrpsee
+        // traces the complete inner request at TRACE level, so no credential or
+        // unrelated proxy secret may cross this middleware boundary.
+        let authorization_count = req
+            .headers()
+            .get_all(http::header::AUTHORIZATION)
+            .iter()
+            .count();
+        let authorization = req.headers_mut().remove(http::header::AUTHORIZATION);
+
+        // A supplied credential always selects its exact role, including on
+        // loopback. This keeps a local TLS proxy or miner scoped when it
+        // forwards Authorization. Invalid and duplicate credentials fail
+        // before the local no-credential path is considered.
+        if (self.mining.is_some() || self.operator.is_some()) && authorization_count != 0 {
+            let access = (authorization_count == 1)
+                .then_some(authorization.as_ref())
+                .flatten()
+                .and_then(|authorization| {
+                    if self
+                        .mining
+                        .as_ref()
+                        .is_some_and(|expected| expected.matches_header(authorization))
+                    {
+                        Some(RpcAccess::Mining)
+                    } else if self
+                        .operator
+                        .as_ref()
+                        .is_some_and(|expected| expected.matches_header(authorization))
+                    {
+                        Some(RpcAccess::Operator)
+                    } else {
+                        None
+                    }
+                });
+
+            if let Some(access) = access {
+                req.extensions_mut().insert(access);
+                let fut = self.inner.call(req);
+                return Box::pin(fut);
+            }
+            return unauthorized_response();
+        }
+
+        // Only the peer address captured from TcpListener::accept can grant
+        // owner access. HTTP headers are deliberately irrelevant here.
+        let loopback = req
+            .extensions()
+            .get::<TcpPeerAddr>()
+            .is_some_and(|peer| peer_ip_is_loopback(peer.0));
+        if loopback {
+            req.extensions_mut().insert(RpcAccess::Local);
             let fut = self.inner.call(req);
             return Box::pin(fut);
-        };
-
-        let auth = req
-            .headers()
-            .get(http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if auth == expected {
-            req.extensions_mut().insert(MiningCredential);
-            let fut = self.inner.call(req);
-            Box::pin(fut)
-        } else {
-            Box::pin(async {
-                Ok(http::Response::builder()
-                    .status(http::StatusCode::UNAUTHORIZED)
-                    .header(
-                        http::header::WWW_AUTHENTICATE,
-                        "Bearer realm=\"paranoid-rpc\"",
-                    )
-                    .body(jsonrpsee::server::HttpBody::empty())
-                    .expect("static 401 response"))
-            })
         }
+
+        unauthorized_response()
     }
 }
 
-/// Marker propagated from the authenticated HTTP request or WebSocket
-/// handshake into each JSON-RPC request on that connection.
-#[derive(Clone, Copy, Debug)]
-struct MiningCredential;
+fn unauthorized_response<E>(
+) -> Pin<Box<dyn Future<Output = Result<http::Response<jsonrpsee::server::HttpBody>, E>> + Send>> {
+    Box::pin(async {
+        Ok(http::Response::builder()
+            .status(http::StatusCode::UNAUTHORIZED)
+            .header(
+                http::header::WWW_AUTHENTICATE,
+                "Bearer realm=\"paranoid-rpc\"",
+            )
+            .body(jsonrpsee::server::HttpBody::empty())
+            .expect("static 401 response"))
+    })
+}
+
+/// Marker propagated from the HTTP request into each JSON-RPC request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RpcAccess {
+    Local,
+    Mining,
+    Operator,
+}
 
 #[derive(Clone)]
-struct MiningCredentialScopeService<S> {
+struct CredentialScopeService<S> {
     inner: S,
 }
 
@@ -3372,7 +3539,30 @@ fn mining_credential_method_allowed(method: &str) -> bool {
     matches!(method, "paranoid_getBlockTemplate" | "paranoid_submitBlock")
 }
 
-impl<'a, S> RpcServiceT<'a> for MiningCredentialScopeService<S>
+fn operator_credential_method_allowed(method: &str) -> bool {
+    matches!(
+        method,
+        "paranoid_walletMinedBlocks"
+            | "paranoid_walletGetBalance"
+            | "paranoid_walletStatus"
+            | "paranoid_walletPlanSend"
+            | "paranoid_walletSend"
+            | "paranoid_walletPlanConsolidation"
+            | "paranoid_walletConsolidate"
+            | "paranoid_walletReceipts"
+            | "paranoid_walletExportReceipt"
+            | "paranoid_getTx"
+            | "paranoid_getMempoolEntry"
+            | "paranoid_verifyReceipt"
+            | "paranoid_submitTxIntent"
+            | "paranoid_validateAddress"
+            | "paranoid_getChainInfo"
+            | "paranoid_estimateFee"
+            | "paranoid_estimateFeeDetailed"
+    )
+}
+
+impl<'a, S> RpcServiceT<'a> for CredentialScopeService<S>
 where
     S: RpcServiceT<'a> + Send + Sync + Clone + 'static,
     S::Future: Send + 'a,
@@ -3380,19 +3570,32 @@ where
     type Future = Pin<Box<dyn Future<Output = MethodResponse> + Send + 'a>>;
 
     fn call(&self, request: Request<'a>) -> Self::Future {
-        if request.extensions().get::<MiningCredential>().is_some()
-            && !mining_credential_method_allowed(request.method_name())
-        {
+        let denial = match request.extensions().get::<RpcAccess>() {
+            Some(RpcAccess::Local) => None,
+            Some(RpcAccess::Mining) if !mining_credential_method_allowed(request.method_name()) => {
+                Some((
+                    -32001,
+                    "mining credential is restricted to getBlockTemplate and submitBlock",
+                ))
+            }
+            Some(RpcAccess::Operator)
+                if !operator_credential_method_allowed(request.method_name()) =>
+            {
+                Some((
+                    -32002,
+                    "operator credential is restricted to the accounting and payout allowlist",
+                ))
+            }
+            Some(RpcAccess::Mining | RpcAccess::Operator) => None,
+            None => Some((
+                -32003,
+                "RPC request is missing an authenticated access scope",
+            )),
+        };
+        if let Some((code, message)) = denial {
             let id = request.id();
             return Box::pin(async move {
-                MethodResponse::error(
-                    id,
-                    ErrorObject::owned(
-                        -32001,
-                        "mining credential is restricted to getBlockTemplate and submitBlock",
-                        None::<()>,
-                    ),
-                )
+                MethodResponse::error(id, ErrorObject::owned(code, message, None::<()>))
             });
         }
 
@@ -3437,9 +3640,11 @@ mod access_control_tests {
     }
 
     #[derive(Clone)]
-    struct MiningCredentialProbeService;
+    struct AccessProbeService {
+        expected: RpcAccess,
+    }
 
-    impl<B> Service<http::Request<B>> for MiningCredentialProbeService {
+    impl<B> Service<http::Request<B>> for AccessProbeService {
         type Response = http::Response<jsonrpsee::server::HttpBody>;
         type Error = Infallible;
         type Future = Ready<Result<Self::Response, Self::Error>>;
@@ -3449,7 +3654,9 @@ mod access_control_tests {
         }
 
         fn call(&mut self, request: http::Request<B>) -> Self::Future {
-            let status = if request.extensions().get::<MiningCredential>().is_some() {
+            let status = if request.extensions().get::<RpcAccess>() == Some(&self.expected)
+                && !request.headers().contains_key(http::header::AUTHORIZATION)
+            {
                 http::StatusCode::OK
             } else {
                 http::StatusCode::INTERNAL_SERVER_ERROR
@@ -3476,20 +3683,22 @@ mod access_control_tests {
         }
     }
 
-    fn rpc_request(method: &'static str, mining_credential: bool) -> Request<'static> {
+    fn rpc_request(method: &'static str, access: Option<RpcAccess>) -> Request<'static> {
         let mut request = Request::new(method.into(), None, Id::Number(1));
-        if mining_credential {
-            request.extensions_mut().insert(MiningCredential);
+        if let Some(access) = access {
+            request.extensions_mut().insert(access);
         }
         request
     }
 
-    async fn post_rpc(addr: SocketAddr, method: &str, token: &str) -> String {
-        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
-        let request = format!(
-            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
+    fn from_peer<B>(mut request: http::Request<B>, peer: &str) -> http::Request<B> {
+        request
+            .extensions_mut()
+            .insert(TcpPeerAddr(peer.parse().unwrap()));
+        request
+    }
+
+    async fn send_http_request(addr: SocketAddr, request: String) -> String {
         let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         stream.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
@@ -3497,14 +3706,114 @@ mod access_control_tests {
         String::from_utf8(response).unwrap()
     }
 
+    async fn post_rpc_body(addr: SocketAddr, body: &str, token: &str) -> String {
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        send_http_request(addr, request).await
+    }
+
+    async fn post_rpc(addr: SocketAddr, method: &str, token: &str) -> String {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
+        post_rpc_body(addr, &body, token).await
+    }
+
+    async fn post_rpc_without_authorization(addr: SocketAddr, method: &str) -> String {
+        let body = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"{method}","params":[]}}"#);
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        send_http_request(addr, request).await
+    }
+
+    async fn start_access_test_server(
+        peer_override: Option<SocketAddr>,
+    ) -> (SocketAddr, jsonrpsee::server::ServerHandle) {
+        let rpc_middleware =
+            RpcServiceBuilder::new().layer_fn(|inner| CredentialScopeService { inner });
+        let service_builder = Server::builder()
+            .http_only()
+            .max_request_body_size(RPC_MAX_REQUEST_BODY_BYTES)
+            .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
+                mining: Some(BearerDigest::from_token("mining-integration-token")),
+                operator: Some(BearerDigest::from_token("operator-integration-token")),
+            }))
+            .set_rpc_middleware(rpc_middleware)
+            .to_service_builder();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut module = RpcModule::new(());
+        module
+            .register_method("paranoid_getBlockTemplate", |_, _, _| "template")
+            .unwrap();
+        module
+            .register_method("paranoid_walletStatus", |_, _, _| "status")
+            .unwrap();
+        module
+            .register_method("paranoid_walletSend", |_, _, _| "sent")
+            .unwrap();
+        module
+            .register_method("paranoid_walletHistory", |_, _, _| "history")
+            .unwrap();
+        let methods: jsonrpsee::server::Methods = module.into();
+        let (stop_handle, server_handle) = stop_channel();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => Some(accepted),
+                    _ = stop_handle.clone().shutdown() => None,
+                };
+                let Some(Ok((socket, accepted_peer))) = accepted else {
+                    break;
+                };
+                let service = service_builder
+                    .clone()
+                    .build(methods.clone(), stop_handle.clone());
+                let service = PeerAddressService {
+                    inner: service,
+                    peer_addr: peer_override.unwrap_or(accepted_peer),
+                };
+                let connection_stop = stop_handle.clone();
+                tokio::spawn(async move {
+                    serve_with_graceful_shutdown(socket, service, connection_stop.shutdown())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        (addr, server_handle)
+    }
+
+    async fn websocket_upgrade_status(addr: SocketAddr, token: &str) -> String {
+        let request = format!(
+            "GET / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = [0u8; 4096];
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut response))
+            .await
+            .expect("HTTP-only server must answer a WebSocket upgrade")
+            .unwrap();
+        String::from_utf8_lossy(&response[..read]).into_owned()
+    }
+
     #[tokio::test]
     async fn browser_origin_is_rejected_before_rpc_dispatch() {
-        let service = BearerAuthLayer { expected: None }.layer(OkService);
+        let service = BearerAuthLayer {
+            mining: None,
+            operator: Some(BearerDigest::from_token("operator-token")),
+        }
+        .layer(OkService);
         let request = http::Request::builder()
             .header(http::header::ORIGIN, "https://attacker.example")
             .header(http::header::UPGRADE, "websocket")
+            .header(http::header::AUTHORIZATION, "Bearer operator-token")
             .body(())
             .unwrap();
+        let request = from_peer(request, "127.0.0.1:12345");
 
         let response = service.oneshot(request).await.unwrap();
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
@@ -3512,8 +3821,21 @@ mod access_control_tests {
 
     #[tokio::test]
     async fn native_originless_client_remains_available_without_a_key() {
-        let service = BearerAuthLayer { expected: None }.layer(OkService);
-        let request = http::Request::builder().body(()).unwrap();
+        let service = BearerAuthLayer {
+            mining: None,
+            operator: None,
+        }
+        .layer(AccessProbeService {
+            expected: RpcAccess::Local,
+        });
+        let request = http::Request::builder()
+            .header(
+                http::header::AUTHORIZATION,
+                "Bearer must-not-reach-inner-service",
+            )
+            .body(())
+            .unwrap();
+        let request = from_peer(request, "127.0.0.1:12345");
 
         let response = service.oneshot(request).await.unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
@@ -3522,56 +3844,179 @@ mod access_control_tests {
     #[tokio::test]
     async fn bearer_auth_remains_required_when_configured() {
         let layer = BearerAuthLayer {
-            expected: Some("Bearer correct-token".into()),
+            mining: Some(BearerDigest::from_token("correct-token")),
+            operator: None,
         };
 
         let unauthorized = layer
             .clone()
             .layer(OkService)
-            .oneshot(http::Request::builder().body(()).unwrap())
+            .oneshot(from_peer(
+                http::Request::builder().body(()).unwrap(),
+                "192.0.2.10:12345",
+            ))
             .await
             .unwrap();
         assert_eq!(unauthorized.status(), http::StatusCode::UNAUTHORIZED);
 
+        let authorized_request = http::Request::builder()
+            .header(http::header::AUTHORIZATION, "Bearer correct-token")
+            .body(())
+            .unwrap();
         let authorized = layer
             .layer(OkService)
-            .oneshot(
-                http::Request::builder()
-                    .header(http::header::AUTHORIZATION, "Bearer correct-token")
-                    .body(())
-                    .unwrap(),
-            )
+            .oneshot(from_peer(authorized_request, "192.0.2.10:12345"))
             .await
             .unwrap();
         assert_eq!(authorized.status(), http::StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn valid_bearer_marks_the_connection_as_mining_only() {
+    async fn each_valid_bearer_marks_the_connection_with_exactly_one_role() {
         let service = BearerAuthLayer {
-            expected: Some("Bearer correct-token".into()),
+            mining: Some(BearerDigest::from_token("mining-token")),
+            operator: Some(BearerDigest::from_token("operator-token")),
         }
-        .layer(MiningCredentialProbeService);
+        .layer(AccessProbeService {
+            expected: RpcAccess::Mining,
+        });
+        let request = http::Request::builder()
+            .header(http::header::AUTHORIZATION, "Bearer mining-token")
+            .body(())
+            .unwrap();
         let response = service
-            .oneshot(
-                http::Request::builder()
-                    .header(http::header::AUTHORIZATION, "Bearer correct-token")
-                    .body(())
-                    .unwrap(),
-            )
+            .oneshot(from_peer(request, "192.0.2.10:12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let service = BearerAuthLayer {
+            mining: Some(BearerDigest::from_token("mining-token")),
+            operator: Some(BearerDigest::from_token("operator-token")),
+        }
+        .layer(AccessProbeService {
+            expected: RpcAccess::Operator,
+        });
+        let request = http::Request::builder()
+            .header(http::header::AUTHORIZATION, "Bearer operator-token")
+            .body(())
+            .unwrap();
+        let response = service
+            .oneshot(from_peer(request, "192.0.2.10:12345"))
             .await
             .unwrap();
         assert_eq!(response.status(), http::StatusCode::OK);
     }
 
     #[tokio::test]
+    async fn loopback_without_authorization_receives_local_access_with_keys_configured() {
+        for peer in ["127.0.0.1:12345", "[::1]:12345", "[::ffff:127.0.0.1]:12345"] {
+            let service = BearerAuthLayer {
+                mining: Some(BearerDigest::from_token("mining-token")),
+                operator: Some(BearerDigest::from_token("operator-token")),
+            }
+            .layer(AccessProbeService {
+                expected: RpcAccess::Local,
+            });
+            let request = from_peer(http::Request::builder().body(()).unwrap(), peer);
+            let response = service.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), http::StatusCode::OK, "{peer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn supplied_authorization_is_validated_even_on_loopback() {
+        let layer = BearerAuthLayer {
+            mining: None,
+            operator: Some(BearerDigest::from_token("operator-token")),
+        };
+        let invalid = http::Request::builder()
+            .header(http::header::AUTHORIZATION, "Bearer wrong-token")
+            .body(())
+            .unwrap();
+        let response = layer
+            .clone()
+            .layer(OkService)
+            .oneshot(from_peer(invalid, "127.0.0.1:12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+
+        let valid = http::Request::builder()
+            .header(http::header::AUTHORIZATION, "Bearer operator-token")
+            .body(())
+            .unwrap();
+        let response = layer
+            .clone()
+            .layer(AccessProbeService {
+                expected: RpcAccess::Operator,
+            })
+            .oneshot(from_peer(valid, "127.0.0.1:12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+
+        let mut duplicate = http::Request::builder().body(()).unwrap();
+        duplicate.headers_mut().append(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer operator-token"),
+        );
+        duplicate.headers_mut().append(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer operator-token"),
+        );
+        let response = layer
+            .layer(OkService)
+            .oneshot(from_peer(duplicate, "127.0.0.1:12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn headers_cannot_spoof_a_loopback_peer() {
+        let service = BearerAuthLayer {
+            mining: None,
+            operator: None,
+        }
+        .layer(OkService);
+        let request = http::Request::builder()
+            .header(http::header::HOST, "127.0.0.1:9601")
+            .header("forwarded", "for=127.0.0.1")
+            .header("x-forwarded-for", "127.0.0.1")
+            .body(())
+            .unwrap();
+        let response = service
+            .oneshot(from_peer(request, "192.0.2.10:12345"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn missing_tcp_peer_address_fails_closed() {
+        let service = BearerAuthLayer {
+            mining: None,
+            operator: None,
+        }
+        .layer(OkService);
+        let response = service
+            .oneshot(http::Request::builder().body(()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn mining_credential_is_limited_to_external_mining_methods() {
-        let service = MiningCredentialScopeService {
+        let service = CredentialScopeService {
             inner: RpcOkService,
         };
 
         for method in ["paranoid_getBlockTemplate", "paranoid_submitBlock"] {
-            let response = service.call(rpc_request(method, true)).await;
+            let response = service
+                .call(rpc_request(method, Some(RpcAccess::Mining)))
+                .await;
             assert!(response.is_success(), "{method} must remain available");
         }
 
@@ -3581,52 +4026,182 @@ mod access_control_tests {
             "paranoid_stop",
             "paranoid_getChainInfo",
         ] {
-            let response = service.call(rpc_request(method, true)).await;
+            let response = service
+                .call(rpc_request(method, Some(RpcAccess::Mining)))
+                .await;
             assert_eq!(response.as_error_code(), Some(-32001), "{method}");
         }
     }
 
     #[tokio::test]
-    async fn ordinary_loopback_rpc_is_not_restricted_to_mining_methods() {
-        let service = MiningCredentialScopeService {
+    async fn operator_credential_is_limited_to_accounting_and_payout_methods() {
+        let service = CredentialScopeService {
+            inner: RpcOkService,
+        };
+
+        for method in [
+            "paranoid_walletMinedBlocks",
+            "paranoid_walletGetBalance",
+            "paranoid_walletStatus",
+            "paranoid_walletPlanSend",
+            "paranoid_walletSend",
+            "paranoid_walletPlanConsolidation",
+            "paranoid_walletConsolidate",
+            "paranoid_walletReceipts",
+            "paranoid_walletExportReceipt",
+            "paranoid_getTx",
+            "paranoid_getMempoolEntry",
+            "paranoid_verifyReceipt",
+            "paranoid_submitTxIntent",
+            "paranoid_validateAddress",
+            "paranoid_getChainInfo",
+            "paranoid_estimateFee",
+            "paranoid_estimateFeeDetailed",
+        ] {
+            let response = service
+                .call(rpc_request(method, Some(RpcAccess::Operator)))
+                .await;
+            assert!(response.is_success(), "{method} must remain available");
+        }
+
+        for method in [
+            "paranoid_getBlockTemplate",
+            "paranoid_submitBlock",
+            "paranoid_stop",
+            "paranoid_walletListUtxos",
+            "paranoid_walletHistory",
+            "paranoid_walletScan",
+            "paranoid_walletNextAddress",
+            "paranoid_walletSetActiveAddress",
+            "paranoid_getNodeStatus",
+        ] {
+            let response = service
+                .call(rpc_request(method, Some(RpcAccess::Operator)))
+                .await;
+            assert_eq!(response.as_error_code(), Some(-32002), "{method}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_loopback_rpc_is_not_restricted_without_a_credential() {
+        let service = CredentialScopeService {
             inner: RpcOkService,
         };
         let response = service
-            .call(rpc_request("paranoid_walletSend", false))
+            .call(rpc_request("paranoid_walletSend", Some(RpcAccess::Local)))
             .await;
         assert!(response.is_success());
     }
 
     #[tokio::test]
-    async fn live_server_propagates_bearer_scope_into_rpc_dispatch() {
-        let rpc_middleware =
-            RpcServiceBuilder::new().layer_fn(|inner| MiningCredentialScopeService { inner });
-        let server = Server::builder()
-            .set_http_middleware(tower::ServiceBuilder::new().layer(BearerAuthLayer {
-                expected: Some("Bearer integration-token".into()),
-            }))
-            .set_rpc_middleware(rpc_middleware)
-            .build("127.0.0.1:0")
-            .await
-            .unwrap();
-        let addr = server.local_addr().unwrap();
-        let mut module = RpcModule::new(());
-        module
-            .register_method("paranoid_getBlockTemplate", |_, _, _| "template")
-            .unwrap();
-        module
-            .register_method("paranoid_walletStatus", |_, _, _| "wallet")
-            .unwrap();
-        let handle = server.start(module);
+    async fn missing_access_scope_fails_closed() {
+        let service = CredentialScopeService {
+            inner: RpcOkService,
+        };
+        let response = service.call(rpc_request("paranoid_walletSend", None)).await;
+        assert_eq!(response.as_error_code(), Some(-32003));
+    }
 
-        let mining = post_rpc(addr, "paranoid_getBlockTemplate", "integration-token").await;
+    #[tokio::test]
+    async fn live_server_keeps_mining_and_operator_scopes_disjoint() {
+        let (addr, handle) =
+            start_access_test_server(Some("192.0.2.10:12345".parse().unwrap())).await;
+
+        let mining = post_rpc(
+            addr,
+            "paranoid_getBlockTemplate",
+            "mining-integration-token",
+        )
+        .await;
         assert!(mining.starts_with("HTTP/1.1 200"), "{mining}");
         assert!(mining.contains(r#""result":"template""#), "{mining}");
 
-        let wallet = post_rpc(addr, "paranoid_walletStatus", "integration-token").await;
+        let mining_wallet = post_rpc(addr, "paranoid_walletSend", "mining-integration-token").await;
+        assert!(mining_wallet.starts_with("HTTP/1.1 200"), "{mining_wallet}");
+        assert!(
+            mining_wallet.contains(r#""code":-32001"#),
+            "{mining_wallet}"
+        );
+        assert!(
+            !mining_wallet.contains(r#""result":"sent""#),
+            "{mining_wallet}"
+        );
+
+        let operator_wallet =
+            post_rpc(addr, "paranoid_walletSend", "operator-integration-token").await;
+        assert!(
+            operator_wallet.starts_with("HTTP/1.1 200"),
+            "{operator_wallet}"
+        );
+        assert!(
+            operator_wallet.contains(r#""result":"sent""#),
+            "{operator_wallet}"
+        );
+
+        let operator_mining = post_rpc(
+            addr,
+            "paranoid_getBlockTemplate",
+            "operator-integration-token",
+        )
+        .await;
+        assert!(
+            operator_mining.starts_with("HTTP/1.1 200"),
+            "{operator_mining}"
+        );
+        assert!(
+            operator_mining.contains(r#""code":-32002"#),
+            "{operator_mining}"
+        );
+        assert!(
+            !operator_mining.contains(r#""result":"template""#),
+            "{operator_mining}"
+        );
+
+        let operator_status =
+            post_rpc(addr, "paranoid_walletStatus", "operator-integration-token").await;
+        assert!(
+            operator_status.contains(r#""result":"status""#),
+            "{operator_status}"
+        );
+
+        let operator_other_wallet =
+            post_rpc(addr, "paranoid_walletHistory", "operator-integration-token").await;
+        assert!(
+            operator_other_wallet.contains(r#""code":-32002"#),
+            "{operator_other_wallet}"
+        );
+
+        let wrong = post_rpc(addr, "paranoid_walletSend", "wrong-token").await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+        assert!(!wrong.contains(r#""result":"sent""#), "{wrong}");
+
+        let batch = post_rpc_body(
+            addr,
+            r#"[{"jsonrpc":"2.0","id":1,"method":"paranoid_walletStatus","params":[]},{"jsonrpc":"2.0","id":2,"method":"paranoid_walletHistory","params":[]}]"#,
+            "operator-integration-token",
+        )
+        .await;
+        assert!(batch.contains(r#""result":"status""#), "{batch}");
+        assert!(batch.contains(r#""code":-32002"#), "{batch}");
+        assert!(!batch.contains(r#""result":"history""#), "{batch}");
+
+        let upgrade = websocket_upgrade_status(addr, "operator-integration-token").await;
+        assert!(!upgrade.starts_with("HTTP/1.1 101"), "{upgrade}");
+
+        handle.stop().unwrap();
+        handle.stopped().await;
+    }
+
+    #[tokio::test]
+    async fn live_server_grants_local_scope_from_accepted_loopback_peer() {
+        let (addr, handle) = start_access_test_server(None).await;
+
+        let wallet = post_rpc_without_authorization(addr, "paranoid_walletSend").await;
         assert!(wallet.starts_with("HTTP/1.1 200"), "{wallet}");
-        assert!(wallet.contains(r#""code":-32001"#), "{wallet}");
-        assert!(!wallet.contains(r#""result":"wallet""#), "{wallet}");
+        assert!(wallet.contains(r#""result":"sent""#), "{wallet}");
+
+        let history = post_rpc_without_authorization(addr, "paranoid_walletHistory").await;
+        assert!(history.contains(r#""result":"history""#), "{history}");
 
         handle.stop().unwrap();
         handle.stopped().await;

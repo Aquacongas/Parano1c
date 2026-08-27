@@ -4179,6 +4179,7 @@ name = "noid_rpc"
 version = "1.0.3"
 dependencies = [
  "anyhow",
+ "blake3",
  "hex",
  "http 1.4.1",
  "jsonrpsee",
@@ -4191,11 +4192,13 @@ dependencies = [
  "noid_tx",
  "serde",
  "serde_json",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
