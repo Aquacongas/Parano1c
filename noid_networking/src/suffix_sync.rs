@@ -24,11 +24,11 @@ use super::{
     types::{ChainPoint, FailureDomain, ObjectClaimId, PlanId},
 };
 
-/// If an exact-object primary has made no progress for this long and another
-/// failure domain advertises the exact bytes, issue one bounded hedge instead
-/// of waiting behind a producer's serving FIFO. Bodies are at most ~83 KiB;
-/// recursive terminals are roughly one MiB.
-const EXACT_OBJECT_HEDGE_NO_PROGRESS_MS: u64 = 4_000;
+/// A recursive terminal is roughly one MiB.  If its primary stream has made
+/// no progress for this long and another failure domain advertises the exact
+/// bytes, issue one bounded hedge instead of waiting behind a producer's
+/// serving FIFO.  Bodies are at most ~83 KiB and remain single-source.
+const TERMINAL_HEDGE_NO_PROGRESS_MS: u64 = 4_000;
 /// A hedge that has itself produced no complete response for this long may be
 /// replaced once by an exact provider in a third failure domain. The original
 /// primary remains alive, so a slow source is not confused with a dead one.
@@ -302,13 +302,6 @@ impl SuffixSync {
         self.plan.id()
     }
 
-    /// True after at least one exact object has passed its content-identity
-    /// check and become owned by this semantic plan. Requests which are only
-    /// in flight do not count as progress and may be superseded safely.
-    pub fn has_verified_objects(&self) -> bool {
-        !self.received.is_empty()
-    }
-
     pub fn add_offer(
         &mut self,
         peer: PeerId,
@@ -399,9 +392,12 @@ impl SuffixSync {
             }
         }
         for claim in self.plan.required_objects() {
+            if !matches!(claim, ObjectClaimId::Terminal(_)) {
+                continue;
+            }
             if let Ok(assignment) =
                 self.fetcher
-                    .start_hedge(*claim, now_ms, EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
+                    .start_hedge(*claim, now_ms, TERMINAL_HEDGE_NO_PROGRESS_MS)
             {
                 assignments.push(assignment);
             }
@@ -1089,48 +1085,16 @@ mod tests {
             .into_iter()
             .find(|request| request.objects == [terminal])
             .expect("tip terminal receives a primary request");
-        assert!(sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS - 1)
-            .is_empty());
+        assert!(sync.schedule(TERMINAL_HEDGE_NO_PROGRESS_MS - 1).is_empty());
 
         let hedge = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
             .into_iter()
             .find(|request| request.objects == [terminal])
             .expect("stalled terminal receives one bounded hedge");
         assert_ne!(hedge.peer, primary.peer);
         assert!(sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS.saturating_mul(2))
-            .is_empty());
-    }
-
-    #[test]
-    fn stalled_body_uses_one_distinct_domain_hedge() {
-        let first_peer = PeerId::random();
-        let second_peer = PeerId::random();
-        let offer = offer(&[1], 1);
-        let body = offer.objects()[0];
-        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer.clone()).unwrap();
-        sync.add_offer(second_peer, FailureDomain(2), offer)
-            .unwrap();
-
-        let primary = sync
-            .schedule(0)
-            .into_iter()
-            .find(|request| request.objects == [body])
-            .expect("body receives a primary request");
-        assert!(sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS - 1)
-            .is_empty());
-
-        let hedge = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
-            .into_iter()
-            .find(|request| request.objects == [body])
-            .expect("stalled body receives one bounded hedge");
-        assert_ne!(hedge.peer, primary.peer);
-        assert!(sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS.saturating_mul(2))
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS.saturating_mul(2))
             .is_empty());
     }
 
@@ -1150,16 +1114,16 @@ mod tests {
             .find(|request| request.objects == [terminal])
             .unwrap();
         let hedge = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
             .into_iter()
             .find(|request| request.objects == [terminal])
             .unwrap();
         assert!(sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS - 1)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS - 1)
             .is_empty());
 
         let replacement = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS)
             .into_iter()
             .find(|request| request.objects == [terminal])
             .expect("stalled hedge rotates to the remaining independent provider");
@@ -1169,7 +1133,7 @@ mod tests {
             hedge.token,
             hedge.peer,
             &hedge.objects,
-            EXACT_OBJECT_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS,
+            TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS,
         )
         .unwrap();
         assert_eq!(
@@ -1181,8 +1145,7 @@ mod tests {
         );
         assert!(sync
             .schedule(
-                EXACT_OBJECT_HEDGE_NO_PROGRESS_MS
-                    + TERMINAL_HEDGE_ROTATE_AFTER_MS.saturating_mul(2)
+                TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS.saturating_mul(2)
             )
             .is_empty());
     }
@@ -1205,12 +1168,12 @@ mod tests {
         sync.add_offer(peers[2], FailureDomain(3), offer).unwrap();
         let _primary = sync.schedule(0);
         let retired_hedge = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
             .into_iter()
             .find(|request| request.objects == [terminal])
             .unwrap();
         let replacement = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS + TERMINAL_HEDGE_ROTATE_AFTER_MS)
             .into_iter()
             .find(|request| request.objects == [terminal])
             .unwrap();
@@ -1232,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_object_hedge_never_duplicates_one_failure_domain() {
+    fn terminal_hedge_never_duplicates_one_failure_domain() {
         let first_peer = PeerId::random();
         let second_peer = PeerId::random();
         let offer = offer(&[1], 1);
@@ -1240,7 +1203,7 @@ mod tests {
         sync.add_offer(second_peer, FailureDomain(7), offer)
             .unwrap();
         let _primary = sync.schedule(0);
-        assert!(sync.schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS).is_empty());
+        assert!(sync.schedule(TERMINAL_HEDGE_NO_PROGRESS_MS).is_empty());
     }
 
     #[test]
@@ -1265,7 +1228,7 @@ mod tests {
             .find(|request| request.objects == [terminal])
             .unwrap();
         let hedge = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
+            .schedule(TERMINAL_HEDGE_NO_PROGRESS_MS)
             .into_iter()
             .find(|request| request.objects == [terminal])
             .unwrap();
@@ -1273,49 +1236,6 @@ mod tests {
         let payload = || ObjectPayload {
             object: terminal,
             bytes: Some(terminal_bytes.clone()),
-        };
-        assert_eq!(
-            sync.accept_response(hedge.token, hedge.peer, vec![payload()], None)
-                .unwrap(),
-            1
-        );
-        assert_eq!(
-            sync.accept_response(primary.token, primary.peer, vec![payload()], None)
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn late_primary_after_body_hedge_is_a_harmless_duplicate() {
-        let first_peer = PeerId::random();
-        let second_peer = PeerId::random();
-        let mut offer = offer(&[1], 1);
-        let body_bytes = vec![0x5A; 73];
-        let body = match offer.objects()[0] {
-            ObjectId::BlockBody(body) => {
-                ObjectId::BlockBody(BlockBodyObjectId::from_bytes(body.claim, &body_bytes).unwrap())
-            }
-            _ => panic!("suffix offer must begin with a body"),
-        };
-        offer.objects[0] = body;
-        let mut sync = SuffixSync::from_offer(first_peer, FailureDomain(1), offer.clone()).unwrap();
-        sync.add_offer(second_peer, FailureDomain(2), offer)
-            .unwrap();
-        let primary = sync
-            .schedule(0)
-            .into_iter()
-            .find(|request| request.objects == [body])
-            .unwrap();
-        let hedge = sync
-            .schedule(EXACT_OBJECT_HEDGE_NO_PROGRESS_MS)
-            .into_iter()
-            .find(|request| request.objects == [body])
-            .unwrap();
-
-        let payload = || ObjectPayload {
-            object: body,
-            bytes: Some(body_bytes.clone()),
         };
         assert_eq!(
             sync.accept_response(hedge.token, hedge.peer, vec![payload()], None)

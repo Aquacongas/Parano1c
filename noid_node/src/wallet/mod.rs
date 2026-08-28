@@ -1394,8 +1394,8 @@ mod tests {
         use noid_chain::consensus::receipt::generate_receipt;
         use noid_poseidon2b::primitives::Address;
         use noid_tx::{
-            PAGED_SPEND_END_BIT, PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS, Transaction, TxBody,
-            TxInput, TxOutput, output_bitmap_bit,
+            output_bitmap_bit, Transaction, TxBody, TxInput, TxOutput, PAGED_SPEND_END_BIT,
+            PAGED_SPEND_START_BIT, TX_INPUTS, TX_OUTPUTS,
         };
 
         let mut inputs = [TxInput::dummy(); TX_INPUTS];

@@ -15,6 +15,10 @@ members = [
     "noid_soundness",
     # Node Infrastructure
     "noid_mempool",
+    "noid_wallet",
+    "noid_mobile_node",
+    "noid_networking",
+    "noid_sync_apply",
     "noid_miner",
     "noid_p2p",
     "noid_rpc",
@@ -22,6 +26,8 @@ members = [
     "noid_gui",
     # External tools
     "noid_extminer",
+    "noid_history_runtime",
+    "noid_mobile_ffi",
 ]
 resolver = "2"
 
@@ -50,3 +56,6 @@ codegen-units = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+libmdbx = { path = "vendor/libmdbx" }

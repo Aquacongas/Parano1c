@@ -2657,7 +2657,10 @@ fn remember_terminal_capability(
     pinned: Option<ManifestTerminalCapability>,
 ) {
     let active_exact_inventory_is_pinned = pinned.is_some_and(|pinned| {
-        observed != pinned && capabilities.get(&peer).is_some_and(|known| *known == pinned)
+        observed != pinned
+            && capabilities
+                .get(&peer)
+                .is_some_and(|known| *known == pinned)
     });
     if !active_exact_inventory_is_pinned {
         capabilities.insert(peer, observed);
@@ -5018,16 +5021,16 @@ mod tests {
         embedded_seed_multiaddrs, ensure_network_storage_epoch, gap_requires_snapshot_sync,
         header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
         initial_sync_may_skip_peer_confirmation, is_single_header_inventory_for_point,
-        load_or_create_config,
-        manifest_candidate_selection_due, manifest_round_gap_is_resolved, manifest_round_retry_due,
-        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
-        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
-        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
-        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
-        read_rpc_key_file, record_snapshot_terminal_transport_failure,
-        remember_terminal_capability, retained_terminal_capability,
-        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
-        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
+        load_or_create_config, manifest_candidate_selection_due, manifest_round_gap_is_resolved,
+        manifest_round_retry_due, mark_initial_sync_ready, merge_active_suffix_inventory,
+        mining_quorum_probe_due, network_storage_epoch_is_current, nonfinal_header_discovery_range,
+        p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
+        persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
+        quarantine_exact_suffix_sources, read_rpc_key_file,
+        record_snapshot_terminal_transport_failure, remember_terminal_capability,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs,
+        retained_terminal_capability, rotating_manifest_peers, seed_to_multiaddr,
+        selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
         source_independent_suffix_offer, stale_gap_recovery_is_due,
@@ -5709,10 +5712,7 @@ mod tests {
 
     #[test]
     fn retained_inventory_advertises_an_older_selected_snapshot_terminal() {
-        use noid_p2p::{
-            header_protocol::HeaderInventoryRecord,
-            object_protocol::ObjectId,
-        };
+        use noid_p2p::{header_protocol::HeaderInventoryRecord, object_protocol::ObjectId};
 
         let offer = test_exact_suffix_offer(&[1], &[1]);
         let header = offer.plan().headers()[0].header;
