@@ -521,6 +521,11 @@ const MINING_PEER_CONFIRMATION_TTL: std::time::Duration = std::time::Duration::f
 /// exhausted and several fresh provider queries produced no progress.
 const EXACT_PLAN_NO_PROGRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 const EXACT_PLAN_DISCOVERY_ROUNDS: u8 = 6;
+
+fn complete_snapshot_provider_discovery_round(rounds: u8, _dispatched: usize) -> u8 {
+    rounds.saturating_add(1)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MiningTipConfirmation {
     confirmed_at: Instant,
@@ -4947,6 +4952,7 @@ mod tests {
         MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL, SNAPSHOT_HEADER_BATCH,
         SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
     };
+    use super::{complete_snapshot_provider_discovery_round, EXACT_PLAN_DISCOVERY_ROUNDS};
     use noid_rpc::types::NodeSyncStage;
 
     fn test_snapshot_id() -> noid_node::networking::SnapshotId {
@@ -7245,6 +7251,15 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>(),
             peers
         );
+    }
+
+    #[test]
+    fn empty_snapshot_provider_rounds_reach_the_extinction_threshold() {
+        let mut rounds = 0;
+        for _ in 0..EXACT_PLAN_DISCOVERY_ROUNDS {
+            rounds = complete_snapshot_provider_discovery_round(rounds, 0);
+        }
+        assert_eq!(rounds, EXACT_PLAN_DISCOVERY_ROUNDS);
     }
 
     #[test]
@@ -13624,10 +13639,10 @@ async fn handle_p2p_events(
                     .map(|pending| pending.preferred_peer)
                 {
                     let dispatched = request_snapshot_generation_providers!(original);
-                    if dispatched > 0 {
-                        snapshot_provider_discovery_rounds =
-                            snapshot_provider_discovery_rounds.saturating_add(1);
-                    }
+                    snapshot_provider_discovery_rounds = complete_snapshot_provider_discovery_round(
+                        snapshot_provider_discovery_rounds,
+                        dispatched,
+                    );
                 }
                 last_snapshot_provider_probe = now;
             }
