@@ -10427,7 +10427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_transfers_cannot_occupy_the_complete_data_plane() {
+    async fn saturated_state_slots_return_busy_admission_without_hiding_a_queue() {
         let mut admission = DataPlaneServingAdmission::new(BackgroundCapacity::Full);
         let mut active_state = Vec::new();
         for _ in 0..admission.state_slots {
@@ -10440,14 +10440,9 @@ mod tests {
                     .unwrap(),
             );
         }
-        let queued_state = tokio::spawn(
-            admission
-                .lease(PeerId::random(), DataPlaneClass::State)
-                .unwrap()
-                .acquire(),
-        );
-        tokio::task::yield_now().await;
-        assert!(!queued_state.is_finished());
+        assert!(admission
+            .lease(PeerId::random(), DataPlaneClass::State)
+            .is_none());
 
         let live = admission
             .lease(PeerId::random(), DataPlaneClass::Live)
@@ -10458,7 +10453,6 @@ mod tests {
         assert_eq!(admission.active_slots(), admission.state_slots + 1);
         drop(live);
         drop(active_state);
-        queued_state.abort();
     }
 
     #[tokio::test]
@@ -10553,6 +10547,8 @@ mod tests {
             mining.state_outstanding_slots * 2,
             full.state_outstanding_slots
         );
+        assert_eq!(full.state_outstanding_slots, full.state_slots);
+        assert_eq!(mining.state_outstanding_slots, mining.state_slots);
         assert!(mining.live_outstanding_slots > full.live_outstanding_slots);
         assert_eq!(full.live_outstanding_slots, full.live_slots * 2);
         assert_eq!(mining.live_outstanding_slots, mining.live_slots * 2);

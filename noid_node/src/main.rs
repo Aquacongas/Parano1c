@@ -180,6 +180,20 @@ impl PostSnapshotTail {
             .saturating_add(noid_chain::consensus::params::RETAINED_BLOCK_SERVING_DEPTH)
     }
 
+    /// Header requests include the local anchor. Probe the complete one-shot
+    /// serving allowance so HeaderDAG can choose the best available tail before
+    /// exact objects are committed in several artificial 19-block steps.
+    fn probe_count(self, local_height: u64) -> Option<u16> {
+        let serving_limit = self.serving_limit();
+        (local_height >= self.boundary.height && local_height <= serving_limit).then(|| {
+            serving_limit
+                .saturating_sub(local_height)
+                .saturating_add(1)
+                .min(DIRECT_SYNC_HEADER_REQUEST_CAP)
+                .min(u64::from(u16::MAX)) as u16
+        })
+    }
+
     fn allows_exact_target(self, local_height: u64, candidate_height: u64) -> bool {
         let serving_limit = self.serving_limit();
         // The first authenticated target fixes the lifetime of this allowance,
@@ -497,8 +511,9 @@ fn initial_sync_may_skip_peer_confirmation(isolated_genesis: bool) -> bool {
 }
 
 const MINING_PEER_QUORUM: usize = 1;
-const CONNECTED_TIP_PROBE_HEADERS: u16 =
-    noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2;
+const CONNECTED_TIP_PROBE_HEADERS: u16 = (noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
+    + noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL
+    + 1) as u16;
 /// A gossipsub forwarder is not necessarily the node which produced or has
 /// already stored the announced block. Probe the forwarder plus a small
 /// bounded set of maintained neighbours immediately instead of waiting for
@@ -815,6 +830,11 @@ impl MiningPeerQuorum {
 /// that layer flush a request which never opened a substream before the node
 /// starts another manifest generation.
 const STATE_MANIFEST_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(38);
+/// Do not let connection order choose an immutable snapshot generation. Keep
+/// only the strongest bounded candidate during one short discovery window;
+/// its advertised work remains a scheduling hint until native headers, PoW,
+/// the recursive terminal, and State are independently verified.
+const STATE_MANIFEST_CANDIDATE_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 /// A terminal normally arrives in about two seconds on the live seed network.
 /// libp2p starts its transport timeout only after an outbound substream opens,
 /// so a request queued behind stream capacity otherwise has no node-visible
@@ -830,6 +850,25 @@ const MINER_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs
 
 fn manifest_round_retry_due(started_at: Option<Instant>, now: Instant) -> bool {
     started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_RESPONSE_TIMEOUT)
+}
+
+fn manifest_candidate_selection_due(started_at: Option<Instant>, now: Instant) -> bool {
+    started_at.is_some_and(|started| now.duration_since(started) >= STATE_MANIFEST_CANDIDATE_SETTLE)
+}
+
+fn state_manifest_candidate_is_preferred(
+    candidate: &noid_p2p::protocol::GetStateManifestResponse,
+    current: &noid_p2p::protocol::GetStateManifestResponse,
+) -> bool {
+    matches!(
+        noid_chain::consensus::fork_choice::choose_chain_by_work(
+            &candidate.bridge_cumulative_chainwork,
+            &candidate.bridge_tip_hash,
+            &current.bridge_cumulative_chainwork,
+            &current.bridge_tip_hash,
+        ),
+        noid_chain::consensus::fork_choice::ChainChoice::A
+    )
 }
 
 fn steady_tip_probe_due(
@@ -2582,6 +2621,49 @@ impl ManifestTerminalCapability {
     }
 }
 
+fn retained_terminal_capability(
+    records: &[noid_p2p::header_protocol::HeaderInventoryRecord],
+    height: u64,
+    block_hash: [u8; 32],
+) -> Option<ManifestTerminalCapability> {
+    records.iter().find_map(|record| {
+        let terminal = record.terminal?;
+        (record.header.height == height
+            && noid_chain::block_header::block_id(&record.header) == block_hash
+            && terminal.claim.height == height
+            && terminal.claim.semantic_header_id
+                == noid_chain::block_header::semantic_header_id(&record.header))
+        .then_some(ManifestTerminalCapability {
+            boundary_height: height,
+            boundary_hash: block_hash,
+        })
+    })
+}
+
+fn is_single_header_inventory_for_point(
+    records: &[noid_p2p::header_protocol::HeaderInventoryRecord],
+    height: u64,
+    block_hash: [u8; 32],
+) -> bool {
+    records.len() == 1
+        && records[0].header.height == height
+        && noid_chain::block_header::block_id(&records[0].header) == block_hash
+}
+
+fn remember_terminal_capability(
+    capabilities: &mut std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
+    peer: libp2p::PeerId,
+    observed: ManifestTerminalCapability,
+    pinned: Option<ManifestTerminalCapability>,
+) {
+    let active_exact_inventory_is_pinned = pinned.is_some_and(|pinned| {
+        observed != pinned && capabilities.get(&peer).is_some_and(|known| *known == pinned)
+    });
+    if !active_exact_inventory_is_pinned {
+        capabilities.insert(peer, observed);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct BoundaryProofTarget {
     header: noid_chain::BlockHeader,
@@ -2764,6 +2846,7 @@ impl TerminalRequestRace {
         }
         if self.hedge_active && self.hedge == Some(request) {
             self.hedge_active = false;
+            self.hedge = None;
             return true;
         }
         false
@@ -2810,6 +2893,7 @@ impl TerminalRequestRace {
         {
             self.hedge_pending = false;
             self.hedge_active = false;
+            self.hedge = None;
             retired = true;
         }
         retired
@@ -2835,9 +2919,11 @@ fn advertised_terminal_alternate_peer(
     capabilities: &std::collections::HashMap<libp2p::PeerId, ManifestTerminalCapability>,
     rejected: &std::collections::HashSet<libp2p::PeerId>,
     exhausted: &std::collections::HashSet<SnapshotTerminalSourceKey>,
+    retry_after: &std::collections::HashMap<libp2p::PeerId, Instant>,
     requests: &TerminalRequestRace,
     height: u64,
     block_hash: [u8; 32],
+    now: Instant,
 ) -> Option<libp2p::PeerId> {
     peers
         .iter()
@@ -2851,6 +2937,7 @@ fn advertised_terminal_alternate_peer(
                 block_hash,
             })
         })
+        .filter(|peer| retry_after.get(peer).is_none_or(|until| *until <= now))
         .filter(|peer| {
             capabilities
                 .get(peer)
@@ -4877,15 +4964,22 @@ fn admit_exact_suffix_offer(
         });
     }
 
-    // A later header on the already selected ancestry is not a reason to
-    // discard verified bytes and restart against a moving target. Complete
-    // the immutable target first, then form one short follow-up plan from its
-    // committed tip. A genuinely different winning branch is still allowed
-    // to supersede the plan below.
+    // A later header on the already selected ancestry may replace a plan which
+    // has not authenticated any object yet. This coalesces concurrent bounded
+    // HeaderDAG probes without discarding verified bytes. Once object progress
+    // exists, complete the immutable target first. A genuinely different
+    // winning branch is still allowed to supersede the plan below.
     if offer.plan().target() != current.plan().target()
         && offer.plan().contains_point(current.plan().target())
     {
-        return Ok(SuffixAdmission::DeferredExtension);
+        if current.has_verified_objects() {
+            return Ok(SuffixAdmission::DeferredExtension);
+        }
+        *active = Some(
+            SuffixSync::from_offer(peer, failure_domain, offer)
+                .map_err(|error| error.to_string())?,
+        );
+        return Ok(SuffixAdmission::Replaced);
     }
 
     let candidate_work = offer
@@ -4917,25 +5011,28 @@ fn admit_exact_suffix_offer(
 mod tests {
     use super::{
         admit_exact_suffix_offer, advance_initial_sync_stage,
-        advertise_inventory_for_known_headers, advertised_terminal_peer,
-        canonical_tip_supersedes_snapshot_boundary, classify_snapshot_finalization_error,
-        classify_snapshot_session_prepare_error, competing_suffix_wins,
-        direct_header_request_within_cap, distinct_rpc_keys, embedded_seed_multiaddrs,
-        ensure_network_storage_epoch, gap_requires_snapshot_sync,
+        advertise_inventory_for_known_headers, advertised_terminal_alternate_peer,
+        advertised_terminal_peer, canonical_tip_supersedes_snapshot_boundary,
+        classify_snapshot_finalization_error, classify_snapshot_session_prepare_error,
+        competing_suffix_wins, direct_header_request_within_cap, distinct_rpc_keys,
+        embedded_seed_multiaddrs, ensure_network_storage_epoch, gap_requires_snapshot_sync,
         header_batch_exhausts_nonfinal_window, header_inventory_validation_anchor,
-        initial_sync_may_skip_peer_confirmation, load_or_create_config,
-        manifest_round_gap_is_resolved, manifest_round_retry_due, mark_initial_sync_ready,
-        merge_active_suffix_inventory, mining_quorum_probe_due, network_storage_epoch_is_current,
-        nonfinal_header_discovery_range, p2p_listen_to_multiaddr, peer_connect_bootstrap_policy,
-        persist_network_storage_epoch_marker, prune_superseded_snapshot_header_staging,
-        quarantine_exact_suffix_sources, read_rpc_key_file,
-        record_snapshot_terminal_transport_failure, resolve_embedded_seed_with_system_dns,
-        resolved_system_seed_addrs, rotating_manifest_peers, seed_to_multiaddr,
-        selected_tip_probe_range, snapshot_header_completion_base_moved,
+        initial_sync_may_skip_peer_confirmation, is_single_header_inventory_for_point,
+        load_or_create_config,
+        manifest_candidate_selection_due, manifest_round_gap_is_resolved, manifest_round_retry_due,
+        mark_initial_sync_ready, merge_active_suffix_inventory, mining_quorum_probe_due,
+        network_storage_epoch_is_current, nonfinal_header_discovery_range, p2p_listen_to_multiaddr,
+        peer_connect_bootstrap_policy, persist_network_storage_epoch_marker,
+        prune_superseded_snapshot_header_staging, quarantine_exact_suffix_sources,
+        read_rpc_key_file, record_snapshot_terminal_transport_failure,
+        remember_terminal_capability, retained_terminal_capability,
+        resolve_embedded_seed_with_system_dns, resolved_system_seed_addrs, rotating_manifest_peers,
+        seed_to_multiaddr, selected_tip_probe_range, snapshot_header_completion_base_moved,
         snapshot_header_completion_rejects_candidate, snapshot_header_next_action,
         snapshot_rebase_discovery_range, snapshot_segment_failure_scope,
-        source_independent_suffix_offer, stale_gap_recovery_is_due, steady_tip_probe_due,
-        superseded_snapshot_install, sync_target_requires_snapshot, terminal_alternate_peer,
+        source_independent_suffix_offer, stale_gap_recovery_is_due,
+        state_manifest_candidate_is_preferred, steady_tip_probe_due, superseded_snapshot_install,
+        sync_target_requires_snapshot, terminal_alternate_peer,
         terminal_transport_can_retry_same_peer, unforced_manifest_waits_for_header_dag,
         unresolved_selected_tip_probe_range, unresolved_tip_probe_range,
         validate_history_step_tip_future_drift, validate_rebase_snapshot_selection,
@@ -4950,7 +5047,8 @@ mod tests {
         HISTORY_STEP_TERMINAL_HARD_DEADLINE, HISTORY_STEP_TERMINAL_HEDGE_AFTER,
         MAX_MEMPOOL_SYNC_PEERS, MAX_SYSTEM_ADDRS_PER_SEED, MINING_PEER_CONFIRMATION_TTL,
         MINING_PEER_QUORUM, MINING_QUORUM_PROBE_INTERVAL, SNAPSHOT_HEADER_BATCH,
-        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
+        SNAPSHOT_HEADER_REQUEST_WINDOW, STATE_MANIFEST_CANDIDATE_SETTLE,
+        STATE_MANIFEST_RESPONSE_TIMEOUT, STEADY_TIP_PROBE_INTERVAL,
     };
     use super::{complete_snapshot_provider_discovery_round, EXACT_PLAN_DISCOVERY_ROUNDS};
     use noid_rpc::types::NodeSyncStage;
@@ -5062,26 +5160,24 @@ mod tests {
             };
             records.push(HeaderInventoryRecord {
                 header,
-                body: Some(BlockBodyObjectId {
-                    claim: body_claim,
-                    byte_digest: [*work_byte; 32],
-                    encoded_len: 1,
-                }),
+                body: Some(BlockBodyObjectId::from_bytes(body_claim, &[*work_byte]).unwrap()),
                 terminal: None,
             });
             headers.push(validated);
             parent = header;
         }
         let tip = headers.last().expect("test suffix is non-empty");
-        records.last_mut().unwrap().terminal = Some(TerminalObjectId {
-            claim: TerminalClaimId {
-                height: tip.header.height,
-                semantic_header_id: semantic_header_id(&tip.header),
-                proof_class: 0,
-            },
-            byte_digest: [0xEE; 32],
-            encoded_len: 1,
-        });
+        records.last_mut().unwrap().terminal = Some(
+            TerminalObjectId::from_bytes(
+                TerminalClaimId {
+                    height: tip.header.height,
+                    semantic_header_id: semantic_header_id(&tip.header),
+                    proof_class: 0,
+                },
+                &[0xEE],
+            )
+            .unwrap(),
+        );
         noid_node::networking::suffix_sync::SuffixOffer::live(base, headers, &records).unwrap()
     }
 
@@ -5322,7 +5418,42 @@ mod tests {
     }
 
     #[test]
-    fn moving_tip_does_not_mutate_an_inflight_plan() {
+    fn moving_tip_replaces_a_plan_before_exact_object_progress() {
+        let first_peer = libp2p::PeerId::random();
+        let extension_peer = libp2p::PeerId::random();
+        let pinned = test_exact_suffix_offer(&[1], &[1]);
+        let extension = test_exact_suffix_offer(&[1, 2], &[1, 2]);
+        let extension_id = extension.plan().id();
+        let mut active = None;
+
+        assert_eq!(
+            admit_exact_suffix_offer(
+                &mut active,
+                first_peer,
+                noid_node::networking::FailureDomain(1),
+                pinned,
+            )
+            .unwrap(),
+            SuffixAdmission::Started
+        );
+        assert!(!active.as_mut().unwrap().schedule(0).is_empty());
+        assert_eq!(
+            admit_exact_suffix_offer(
+                &mut active,
+                extension_peer,
+                noid_node::networking::FailureDomain(2),
+                extension,
+            )
+            .unwrap(),
+            SuffixAdmission::Replaced
+        );
+        assert_eq!(active.as_ref().unwrap().plan_id(), extension_id);
+    }
+
+    #[test]
+    fn moving_tip_preserves_a_plan_after_exact_object_progress() {
+        use noid_p2p::object_protocol::{ObjectId, ObjectPayload};
+
         let first_peer = libp2p::PeerId::random();
         let extension_peer = libp2p::PeerId::random();
         let pinned = test_exact_suffix_offer(&[1], &[1]);
@@ -5340,6 +5471,37 @@ mod tests {
             .unwrap(),
             SuffixAdmission::Started
         );
+        let body_request = active
+            .as_mut()
+            .unwrap()
+            .schedule(0)
+            .into_iter()
+            .find(|request| {
+                request
+                    .objects
+                    .iter()
+                    .all(|object| matches!(object, ObjectId::BlockBody(_)))
+            })
+            .expect("the suffix schedules its body");
+        let payloads = body_request
+            .objects
+            .iter()
+            .copied()
+            .map(|object| ObjectPayload {
+                object,
+                bytes: Some(vec![1]),
+            })
+            .collect();
+        assert_eq!(
+            active
+                .as_mut()
+                .unwrap()
+                .accept_response(body_request.token, body_request.peer, payloads, None)
+                .unwrap(),
+            1
+        );
+        assert!(active.as_ref().unwrap().has_verified_objects());
+
         assert_eq!(
             admit_exact_suffix_offer(
                 &mut active,
@@ -5543,6 +5705,136 @@ mod tests {
         assert!(successful.mark_succeeded(primary, 42));
         assert!(!successful.has_active());
         assert!(!successful.matches(alternate, 42));
+    }
+
+    #[test]
+    fn retained_inventory_advertises_an_older_selected_snapshot_terminal() {
+        use noid_p2p::{
+            header_protocol::HeaderInventoryRecord,
+            object_protocol::ObjectId,
+        };
+
+        let offer = test_exact_suffix_offer(&[1], &[1]);
+        let header = offer.plan().headers()[0].header;
+        let hash = noid_chain::block_header::block_id(&header);
+        let terminal = offer
+            .objects()
+            .iter()
+            .find_map(|object| match object {
+                ObjectId::Terminal(terminal) => Some(*terminal),
+                _ => None,
+            })
+            .unwrap();
+        let retained = [HeaderInventoryRecord {
+            header,
+            body: None,
+            terminal: Some(terminal),
+        }];
+
+        assert_eq!(
+            retained_terminal_capability(&retained, header.height, hash),
+            Some(ManifestTerminalCapability {
+                boundary_height: header.height,
+                boundary_hash: hash,
+            })
+        );
+        assert!(is_single_header_inventory_for_point(
+            &retained,
+            header.height,
+            hash
+        ));
+
+        let header_only = [HeaderInventoryRecord::header_only(header)];
+        assert_eq!(
+            retained_terminal_capability(&header_only, header.height, hash),
+            None
+        );
+        assert!(is_single_header_inventory_for_point(
+            &header_only,
+            header.height,
+            hash
+        ));
+    }
+
+    #[test]
+    fn active_snapshot_terminal_inventory_survives_a_newer_manifest_response() {
+        let peer = libp2p::PeerId::random();
+        let selected = ManifestTerminalCapability {
+            boundary_height: 72,
+            boundary_hash: [0x72; 32],
+        };
+        let newer = ManifestTerminalCapability {
+            boundary_height: 78,
+            boundary_hash: [0x78; 32],
+        };
+        let mut capabilities = std::collections::HashMap::from([(peer, selected)]);
+
+        remember_terminal_capability(&mut capabilities, peer, newer, Some(selected));
+        assert_eq!(capabilities.get(&peer), Some(&selected));
+
+        remember_terminal_capability(&mut capabilities, peer, newer, None);
+        assert_eq!(capabilities.get(&peer), Some(&newer));
+    }
+
+    #[test]
+    fn failed_terminal_hedge_rotates_without_abandoning_the_primary() {
+        let primary = libp2p::PeerId::random();
+        let failed_hedge = libp2p::PeerId::random();
+        let replacement = libp2p::PeerId::random();
+        let height = 77;
+        let block_hash = [7; 32];
+        let mut requests = TerminalRequestRace::new(primary, 43);
+        assert!(requests.mark_dispatched(primary, 43));
+        requests.install_hedge(failed_hedge);
+        assert!(requests.mark_dispatched(failed_hedge, 43));
+
+        assert!(requests.mark_failed(failed_hedge, 43));
+        assert!(requests.matches(primary, 43));
+        assert!(requests.hedge.is_none());
+
+        let peers = std::collections::HashSet::from([primary, failed_hedge, replacement]);
+        let capabilities = peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                (
+                    peer,
+                    ManifestTerminalCapability {
+                        boundary_height: height,
+                        boundary_hash: block_hash,
+                    },
+                )
+            })
+            .collect();
+        let rejected = std::collections::HashSet::new();
+        let exhausted = std::collections::HashSet::new();
+        let now = std::time::Instant::now();
+        let retry_after = std::collections::HashMap::from([(
+            failed_hedge,
+            now + std::time::Duration::from_secs(3),
+        )]);
+        assert_eq!(
+            advertised_terminal_alternate_peer(
+                &peers,
+                &capabilities,
+                &rejected,
+                &exhausted,
+                &retry_after,
+                &requests,
+                height,
+                block_hash,
+                now,
+            ),
+            Some(replacement)
+        );
+
+        requests.install_hedge(replacement);
+        assert!(requests.mark_dispatched(replacement, 43));
+        assert!(requests.matches(primary, 43));
+        assert!(requests.matches(replacement, 43));
+        assert!(requests.retire_peer(replacement));
+        assert!(requests.matches(primary, 43));
+        assert!(requests.hedge.is_none());
     }
 
     #[test]
@@ -6309,6 +6601,11 @@ mod tests {
             target: None,
         };
 
+        assert_eq!(tail.probe_count(100), Some(43));
+        assert_eq!(tail.probe_count(118), Some(25));
+        assert_eq!(tail.probe_count(142), Some(1));
+        assert_eq!(tail.probe_count(99), None);
+        assert_eq!(tail.probe_count(143), None);
         assert!(!sync_target_requires_snapshot(100, 119, None));
         assert!(sync_target_requires_snapshot(100, 120, None));
         assert!(!sync_target_requires_snapshot(100, 142, Some(tail)));
@@ -6497,12 +6794,27 @@ mod tests {
     }
 
     #[test]
-    fn connected_tip_probe_covers_only_the_retained_decision_window() {
+    fn connected_tip_probe_reaches_every_first_usable_snapshot_boundary() {
         assert_eq!(
-            CONNECTED_TIP_PROBE_HEADERS,
-            noid_chain::consensus::params::RECENT_BLOCK_RETENTION_DEPTH as u16 + 2
+            u64::from(CONNECTED_TIP_PROBE_HEADERS),
+            noid_chain::consensus::params::CONSENSUS_FINALITY_DEPTH
+                + noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL
+                + 1
         );
-        assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 20);
+        assert_eq!(CONNECTED_TIP_PROBE_HEADERS, 25);
+
+        // The response includes the committed anchor, leaving 24 descendant
+        // headers. That reaches the first usable snapshot boundary for every
+        // possible six-block boundary alignment.
+        let visible_descendants = u64::from(CONNECTED_TIP_PROBE_HEADERS) - 1;
+        for local_height in 96..102 {
+            let first_snapshot_gap = (1..=visible_descendants)
+                .find(|gap| {
+                    gap_requires_snapshot_sync(local_height, local_height.saturating_add(*gap))
+                })
+                .expect("connected probe reaches a usable snapshot boundary");
+            assert_eq!(first_snapshot_gap, 24 - local_height % 6);
+        }
     }
 
     #[test]
@@ -7234,6 +7546,65 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_manifest_selection_waits_for_the_bounded_discovery_window() {
+        let started = std::time::Instant::now();
+        assert!(!manifest_candidate_selection_due(
+            None,
+            started + STATE_MANIFEST_CANDIDATE_SETTLE,
+        ));
+        assert!(!manifest_candidate_selection_due(
+            Some(started),
+            started + STATE_MANIFEST_CANDIDATE_SETTLE - std::time::Duration::from_millis(1),
+        ));
+        assert!(manifest_candidate_selection_due(
+            Some(started),
+            started + STATE_MANIFEST_CANDIDATE_SETTLE,
+        ));
+    }
+
+    #[test]
+    fn snapshot_manifest_selection_replaces_the_first_stale_candidate() {
+        let mut first = noid_p2p::protocol::GetStateManifestResponse::default();
+        first.tip_height = 27_072;
+        first.tip_hash = [0x22; 32];
+        first.cumulative_chainwork[0] = 1;
+        first.bridge_tip_height = 27_091;
+        first.bridge_tip_hash = [0x33; 32];
+        first.bridge_cumulative_chainwork[0] = 2;
+
+        let mut fresher = first.clone();
+        fresher.tip_height = 27_078;
+        fresher.tip_hash = [0x11; 32];
+        fresher.cumulative_chainwork[0] = 2;
+        fresher.bridge_tip_height = 27_097;
+        fresher.bridge_tip_hash = [0x10; 32];
+        fresher.bridge_cumulative_chainwork[0] = 3;
+
+        assert!(state_manifest_candidate_is_preferred(&fresher, &first));
+        assert!(!state_manifest_candidate_is_preferred(&first, &fresher));
+    }
+
+    #[test]
+    fn snapshot_manifest_selection_uses_the_canonical_hash_tiebreak() {
+        let mut current = noid_p2p::protocol::GetStateManifestResponse::default();
+        current.bridge_tip_height = 27_091;
+        current.bridge_tip_hash = [0x22; 32];
+        current.bridge_cumulative_chainwork[0] = 2;
+
+        let mut better_hash = current.clone();
+        better_hash.bridge_tip_hash = [0x10; 32];
+
+        assert!(state_manifest_candidate_is_preferred(
+            &better_hash,
+            &current,
+        ));
+        assert!(!state_manifest_candidate_is_preferred(
+            &current,
+            &better_hash,
+        ));
+    }
+
+    #[test]
     fn bounded_manifest_retries_rotate_across_six_peers() {
         let peers = (0..6)
             .map(|_| libp2p::PeerId::random())
@@ -7568,6 +7939,11 @@ async fn handle_p2p_events(
         offer: noid_node::networking::snapshot_sync::SnapshotOffer,
         history_step: Option<VerifiedHistoryStepSnapshot>,
     }
+    struct SnapshotManifestCandidate {
+        from: libp2p::PeerId,
+        manifest: noid_p2p::protocol::VerifiedStateManifest,
+        rebase_anchor: Option<SnapshotRebaseAnchor>,
+    }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotHeaderStagingOperationKey {
         Prepare {
@@ -7711,6 +8087,12 @@ async fn handle_p2p_events(
         result: Result<AppliedVerifiedSnapshot, SnapshotInstallError>,
     }
     let mut pending_manifest: Option<PendingManifest> = None;
+    // One bounded pre-install selection prevents response order from fixing an
+    // obsolete generation. Only the strongest manifest body is retained, and
+    // every claimed chain field is still checked against native headers before
+    // the candidate can authorize State.
+    let mut best_manifest_candidate: Option<SnapshotManifestCandidate> = None;
+    let mut manifest_candidate_started_at: Option<std::time::Instant> = None;
     let mut active_snapshot_sync: Option<noid_node::networking::snapshot_sync::SnapshotSync> = None;
     let mut candidate_manifest_providers: std::collections::HashSet<libp2p::PeerId> =
         std::collections::HashSet::new();
@@ -7879,6 +8261,8 @@ async fn handle_p2p_events(
             manifest_response_count = 0;
             manifest_round_started_at = None;
             candidate_manifest_providers.clear();
+            best_manifest_candidate = None;
+            manifest_candidate_started_at = None;
         }};
     }
 
@@ -7994,27 +8378,22 @@ async fn handle_p2p_events(
                 && history_step_verification_inflight.is_none()
                 && prefetched_snapshot_boundary_terminal.is_none()
             {
-                let ready = retained_snapshot_headers
+                // The exact terminal is independently content-addressed and
+                // inbound-memory-bounded. Fetch it as soon as the immutable
+                // manifest is selected, then verify it only after native header
+                // staging reaches the boundary. This overlaps transport with
+                // O(height) header validation without weakening authority.
+                let ready = pending_manifest
                     .as_ref()
-                    .and_then(|authority| {
-                        pending_manifest.as_ref().and_then(|pending| {
-                            (pending.offer.snapshot_id() == authority.snapshot).then_some((
-                                authority.snapshot,
-                                pending.preferred_peer,
-                                authority.snapshot.boundary.height,
-                                authority.snapshot.boundary.hash,
-                            ))
-                        })
-                    })
-                    .or_else(|| {
-                        pending_snapshot_header_sync.as_ref().and_then(|sync| {
-                            (sync.next_height == sync.target_height.saturating_add(1)).then_some((
-                                sync.snapshot,
-                                sync.preferred_peer,
-                                sync.manifest.tip_height,
-                                sync.manifest.tip_hash,
-                            ))
-                        })
+                    .filter(|pending| pending.history_step.is_none())
+                    .map(|pending| {
+                        let snapshot = pending.offer.snapshot_id();
+                        (
+                            snapshot,
+                            pending.preferred_peer,
+                            snapshot.boundary.height,
+                            snapshot.boundary.hash,
+                        )
                     });
                 if let Some((snapshot, preferred, height, block_hash)) = ready {
                     if let Some(peer) = advertised_terminal_peer(
@@ -8160,7 +8539,8 @@ async fn handle_p2p_events(
 
     macro_rules! snapshot_plan_active {
         () => {{
-            pending_manifest.is_some()
+            best_manifest_candidate.is_some()
+                || pending_manifest.is_some()
                 || pending_snapshot_header_sync.is_some()
                 || retained_snapshot_headers.is_some()
                 || snapshot_header_staging_inflight.is_some()
@@ -8192,7 +8572,10 @@ async fn handle_p2p_events(
                 let ctx = chain.read().await;
                 ctx.tip_height()
             };
-            let excluded = std::collections::HashSet::from([failed_peer]);
+            let mut excluded = std::collections::HashSet::from([failed_peer]);
+            if let Some(pending) = pending_manifest.as_ref() {
+                excluded.extend(pending.providers.iter().copied());
+            }
             let requested_manifest_digest = pending_manifest
                 .as_ref()
                 .map(|pending| pending.manifest.manifest_digest)
@@ -8283,7 +8666,7 @@ async fn handle_p2p_events(
     }
 
     macro_rules! begin_snapshot_header_staging {
-        ($from:expr, $manifest:expr, $rebase_anchor:expr) => {{
+        ($from:expr, $manifest:expr, $rebase_anchor:expr, $fetches:expr, $recent:expr) => {{
             sync_phase_telemetry.begin_snapshot();
             let from = $from;
             let manifest = $manifest;
@@ -8315,9 +8698,14 @@ async fn handle_p2p_events(
             // admission ends at that exact boundary. Any later live tip is a
             // separate HeaderDAG-selected exact suffix, never a peer-owned
             // bridge hidden inside this snapshot session.
+            let providers = if candidate_manifest_providers.contains(&from) {
+                candidate_manifest_providers.clone()
+            } else {
+                std::iter::once(from).collect()
+            };
             pending_manifest = Some(PendingManifest {
                 preferred_peer: from,
-                providers: std::iter::once(from).collect(),
+                providers,
                 rebase_base,
                 manifest,
                 offer: snapshot_offer,
@@ -8325,6 +8713,56 @@ async fn handle_p2p_events(
             });
             snapshot_plan_last_progress = Some(Instant::now());
             snapshot_provider_discovery_rounds = 0;
+
+            // A peer may already publish a newer snapshot generation while the
+            // selected boundary terminal remains inside its retained-object
+            // window. Ask for the one exact boundary inventory record before
+            // considering a near-megabyte terminal transfer. This preserves the
+            // advertised-source rule without tying proof availability to State
+            // generation equality.
+            let selected_terminal = ManifestTerminalCapability {
+                boundary_height: snapshot.boundary.height,
+                boundary_hash: snapshot.boundary.hash,
+            };
+            let mut terminal_probe_excluded = rejected_terminal_peers.clone();
+            terminal_probe_excluded.insert(from);
+            terminal_probe_excluded.extend(
+                manifest_terminal_capabilities
+                    .iter()
+                    .filter_map(|(peer, capability)| {
+                        (*capability == selected_terminal).then_some(*peer)
+                    }),
+            );
+            terminal_probe_excluded.extend(snapshot_terminal_exhausted.iter().filter_map(
+                |source| {
+                    (source.height == snapshot.boundary.height
+                        && source.block_hash == snapshot.boundary.hash)
+                        .then_some(source.peer)
+                },
+            ));
+            let terminal_probe_peers = rotating_manifest_peers(
+                &locally_selected_peers,
+                &terminal_probe_excluded,
+                None,
+                false,
+                &mut exact_inventory_probe_cursor,
+                EXACT_INVENTORY_PROBE_LANES.saturating_sub(1),
+            );
+            for peer in terminal_probe_peers {
+                let _ = try_dispatch_header_fetch(
+                    &p2p_cmd,
+                    $fetches,
+                    $recent,
+                    peer,
+                    snapshot.boundary.height,
+                    1,
+                    Instant::now(),
+                );
+            }
+            if candidate_manifest_providers.len() < EXACT_INVENTORY_PROBE_LANES {
+                let _ = request_snapshot_generation_providers!(from);
+            }
+            ensure_snapshot_boundary_terminal_request!();
 
             snapshot_header_staging_token = snapshot_header_staging_token.wrapping_add(1);
             let key = SnapshotHeaderStagingOperationKey::Prepare {
@@ -9137,7 +9575,9 @@ async fn handle_p2p_events(
                 && local_height >= highest_announced
                 && manifest_peers.contains(&peer)
             {
-                let count = CONNECTED_TIP_PROBE_HEADERS;
+                let count = post_snapshot_tail
+                    .and_then(|tail| tail.probe_count(local_height))
+                    .unwrap_or(CONNECTED_TIP_PROBE_HEADERS);
                 let request_key = (peer, local_height, count);
                 let recently_requested = recent_header_fetches
                     .get(&request_key)
@@ -9174,6 +9614,7 @@ async fn handle_p2p_events(
                 && !manifest_peers.is_empty()
                 && manifest_requested_peers.is_empty()
                 && manifest_round_started_at.is_none()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -10013,24 +10454,46 @@ async fn handle_p2p_events(
                         try_request_manifest!(peer, our_height, [0; 32]);
                     }
 
-                    // A new outbound connection has no fresh gossip yet, so
-                    // probe its exact tip with the bounded header protocol.
+                    // During snapshot admission, the selected boundary record
+                    // is more useful than another genesis-anchored tip probe:
+                    // it advertises whether this peer still retains the exact
+                    // terminal even when it publishes a newer State generation.
+                    let snapshot_terminal_probe = pending_manifest
+                        .as_ref()
+                        .filter(|pending| pending.history_step.is_none())
+                        .filter(|_| {
+                            history_step_verification_inflight.is_none()
+                                && prefetched_snapshot_boundary_terminal.is_none()
+                        })
+                        .map(|pending| pending.offer.snapshot_id().boundary);
+                    let (probe_start_height, probe_count) = snapshot_terminal_probe
+                        .map_or((our_height, CONNECTED_TIP_PROBE_HEADERS), |boundary| {
+                            (boundary.height, 1)
+                        });
                     let now = Instant::now();
                     if try_dispatch_header_fetch(
                         &p2p_cmd,
                         &mut fetch_in_progress,
                         &mut recent_header_fetches,
                         peer,
-                        our_height,
-                        CONNECTED_TIP_PROBE_HEADERS,
+                        probe_start_height,
+                        probe_count,
                         now,
                     ) {
-                        mining_peer_quorum.mark_probe_sent(peer, now);
-                        tracing::debug!(
-                            peer = %peer,
-                            start_height = our_height,
-                            "probing connected peer tip with anchored headers"
-                        );
+                        if snapshot_terminal_probe.is_some() {
+                            tracing::debug!(
+                                peer = %peer,
+                                boundary_height = probe_start_height,
+                                "probing connected peer for retained snapshot terminal"
+                            );
+                        } else {
+                            mining_peer_quorum.mark_probe_sent(peer, now);
+                            tracing::debug!(
+                                peer = %peer,
+                                start_height = our_height,
+                                "probing connected peer tip with anchored headers"
+                            );
+                        }
                     }
                 }
 
@@ -10060,12 +10523,21 @@ async fn handle_p2p_events(
                         && boundary.height % noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL == 0
                         && boundary.hash != [0; 32]
                 }) {
-                    manifest_terminal_capabilities.insert(
+                    let pinned = pending_manifest
+                        .as_ref()
+                        .filter(|pending| pending.history_step.is_none())
+                        .map(|pending| ManifestTerminalCapability {
+                            boundary_height: pending.manifest.tip_height,
+                            boundary_hash: pending.manifest.tip_hash,
+                        });
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
                         from,
                         ManifestTerminalCapability {
                             boundary_height: boundary.height,
                             boundary_hash: boundary.hash,
                         },
+                        pinned,
                     );
                 }
                 let Some(pipeline) = snapshot_header_pipeline.as_mut() else {
@@ -10282,22 +10754,67 @@ async fn handle_p2p_events(
                 snapshot_boundary,
             }) => {
                 suffix_inventory_probe_peers.remove(&from);
+                let pinned_terminal = pending_manifest
+                    .as_ref()
+                    .filter(|pending| pending.history_step.is_none())
+                    .map(|pending| ManifestTerminalCapability {
+                        boundary_height: pending.manifest.tip_height,
+                        boundary_hash: pending.manifest.tip_hash,
+                    });
+                let retained_terminal = pinned_terminal.and_then(|target| {
+                    retained_terminal_capability(
+                        &records,
+                        target.boundary_height,
+                        target.boundary_hash,
+                    )
+                });
+                let exact_boundary_probe = pinned_terminal.is_some_and(|target| {
+                    is_single_header_inventory_for_point(
+                        &records,
+                        target.boundary_height,
+                        target.boundary_hash,
+                    )
+                });
                 if let Some(boundary) = snapshot_boundary.filter(|boundary| {
                     boundary.height > 0
                         && boundary.height % noid_p2p::protocol::SNAPSHOT_BOUNDARY_INTERVAL == 0
                         && boundary.hash != [0; 32]
                 }) {
-                    manifest_terminal_capabilities.insert(
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
                         from,
                         ManifestTerminalCapability {
                             boundary_height: boundary.height,
                             boundary_hash: boundary.hash,
                         },
+                        pinned_terminal,
                     );
                 }
                 let header_count = records.len();
                 // Headers batch arrived — clear the in-progress guard.
                 fetch_in_progress.remove(&from);
+                if let Some(capability) = retained_terminal
+                    .filter(|_| !rejected_terminal_peers.contains(&from))
+                {
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
+                        from,
+                        capability,
+                        pinned_terminal,
+                    );
+                    snapshot_plan_last_progress = Some(Instant::now());
+                    snapshot_provider_discovery_rounds = 0;
+                }
+                if exact_boundary_probe {
+                    ensure_snapshot_boundary_terminal_request!();
+                    tracing::debug!(
+                        peer = %from,
+                        boundary_height = pinned_terminal.map(|target| target.boundary_height),
+                        terminal = retained_terminal.is_some(),
+                        "retained snapshot boundary inventory received"
+                    );
+                    continue;
+                }
                 if !rejected_suffix_object_peers.contains(&from) {
                     let domain = peer_failure_domains
                         .get(&from)
@@ -10953,12 +11470,21 @@ async fn handle_p2p_events(
                     None
                 };
                 if manifest.tip_height > 0 {
-                    manifest_terminal_capabilities.insert(
+                    let pinned = pending_manifest
+                        .as_ref()
+                        .filter(|pending| pending.history_step.is_none())
+                        .map(|pending| ManifestTerminalCapability {
+                            boundary_height: pending.manifest.tip_height,
+                            boundary_hash: pending.manifest.tip_hash,
+                        });
+                    remember_terminal_capability(
+                        &mut manifest_terminal_capabilities,
                         from,
                         ManifestTerminalCapability {
                             boundary_height: manifest.tip_height,
                             boundary_hash: manifest.tip_hash,
                         },
+                        pinned,
                     );
                     if pending_manifest
                         .as_ref()
@@ -11008,6 +11534,7 @@ async fn handle_p2p_events(
                             "manifest snapshot boundary not ahead"
                         );
                         if manifest_round_gap_is_resolved(our_height, highest_announced)
+                            && best_manifest_candidate.is_none()
                             && pending_manifest.is_none()
                             && pending_snapshot_header_sync.is_none()
                             && snapshot_header_staging_inflight.is_none()
@@ -11071,16 +11598,52 @@ async fn handle_p2p_events(
                     && snapshot_staging_inflight.is_none()
                     && snapshot_install_inflight.is_none()
                 {
-                    tracing::info!(
-                        from = %from,
-                        tip = manifest.tip_height,
-                        segments = manifest.segment_ids.len(),
-                        "validating the first bounded snapshot generation without an election delay"
-                    );
-                    candidate_manifest_providers.clear();
-                    candidate_manifest_providers.insert(from);
-                    manifest_round_started_at = None;
-                    begin_snapshot_header_staging!(from, manifest, rebase_anchor);
+                    let same_candidate = best_manifest_candidate.as_ref().is_some_and(|current| {
+                        current.manifest.as_ref() == manifest.as_ref()
+                    });
+                    if same_candidate {
+                        if let Some(current) = best_manifest_candidate.as_mut() {
+                            current.rebase_anchor = rebase_anchor;
+                        }
+                        candidate_manifest_providers.insert(from);
+                        tracing::debug!(
+                            from = %from,
+                            tip = manifest.tip_height,
+                            providers = candidate_manifest_providers.len(),
+                            "registered another provider for the bounded snapshot candidate"
+                        );
+                    } else {
+                        let replace = best_manifest_candidate.as_ref().is_none_or(|current| {
+                            state_manifest_candidate_is_preferred(
+                                manifest.as_ref(),
+                                current.manifest.as_ref(),
+                            )
+                        });
+                        if replace {
+                            tracing::info!(
+                                from = %from,
+                                tip = manifest.tip_height,
+                                bridge_tip = manifest.bridge_tip_height,
+                                segments = manifest.segment_ids.len(),
+                                "stronger snapshot manifest entered bounded candidate selection"
+                            );
+                            best_manifest_candidate = Some(SnapshotManifestCandidate {
+                                from,
+                                manifest,
+                                rebase_anchor,
+                            });
+                            candidate_manifest_providers.clear();
+                            candidate_manifest_providers.insert(from);
+                        } else {
+                            tracing::debug!(
+                                from = %from,
+                                tip = manifest.tip_height,
+                                bridge_tip = manifest.bridge_tip_height,
+                                "weaker snapshot manifest ignored during bounded candidate selection"
+                            );
+                        }
+                    }
+                    manifest_candidate_started_at.get_or_insert_with(Instant::now);
                 } else if manifest.tip_height > 0 {
                     // Manifest chainwork is only a claim until its exact native
                     // header chain has been validated. Never interrupt useful
@@ -11350,9 +11913,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 height,
                                 block_hash,
+                                Instant::now(),
                             );
                             if let Some(alternate) = alternate {
                                 pending.requests.install_hedge(alternate);
@@ -11405,6 +11970,16 @@ async fn handle_p2p_events(
                 };
                 if terminal_bytes.is_empty() {
                     drop(inbound_memory_permit);
+                    let source_key = SnapshotTerminalSourceKey {
+                        peer: from,
+                        height,
+                        block_hash,
+                    };
+                    snapshot_terminal_exhausted.insert(source_key);
+                    snapshot_terminal_transport_failures.remove(&source_key);
+                    manifest_terminal_capabilities.remove(&from);
+                    snapshot_terminal_retry_after
+                        .insert(from, Instant::now() + Duration::from_secs(5));
                     let mut pending = snapshot_boundary_terminal_inflight
                         .take()
                         .expect("correlated boundary terminal is present");
@@ -11421,9 +11996,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 height,
                                 block_hash,
+                                Instant::now(),
                             )
                         })
                         .flatten();
@@ -11444,16 +12021,6 @@ async fn handle_p2p_events(
                         height,
                         "snapshot boundary terminal is unavailable; exact plan remains active"
                     );
-                    let source_key = SnapshotTerminalSourceKey {
-                        peer: from,
-                        height,
-                        block_hash,
-                    };
-                    snapshot_terminal_exhausted.insert(source_key);
-                    snapshot_terminal_transport_failures.remove(&source_key);
-                    manifest_terminal_capabilities.remove(&from);
-                    snapshot_terminal_retry_after
-                        .insert(from, Instant::now() + Duration::from_secs(5));
                     request_snapshot_generation_providers!(from);
                     ensure_snapshot_boundary_terminal_request!();
                     continue;
@@ -11562,9 +12129,11 @@ async fn handle_p2p_events(
                             &manifest_terminal_capabilities,
                             &rejected_terminal_peers,
                             &snapshot_terminal_exhausted,
+                            &snapshot_terminal_retry_after,
                             &pending.requests,
                             height,
                             block_hash,
+                            Instant::now(),
                         );
                         if let Some(alternate) = alternate {
                             pending.requests.install_hedge(alternate);
@@ -11637,6 +12206,18 @@ async fn handle_p2p_events(
                     }
                 };
 
+                if !source_exhausted {
+                    snapshot_terminal_retry_after.insert(
+                        from,
+                        Instant::now()
+                            + if terminal_transport_can_retry_same_peer(kind) {
+                                Duration::from_secs(3)
+                            } else {
+                                Duration::from_secs(10)
+                            },
+                    );
+                }
+
                 let pending = snapshot_boundary_terminal_inflight
                     .as_mut()
                     .expect("correlated boundary terminal is present");
@@ -11647,7 +12228,7 @@ async fn handle_p2p_events(
                         peer = %from,
                         height,
                         ?kind,
-                        "one HistoryStep terminal request failed — alternate remains active"
+                        "one HistoryStep terminal request failed; exact race remains active"
                     );
                     continue;
                 }
@@ -11660,9 +12241,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 height,
                                 block_hash,
+                                Instant::now(),
                             )
                         })
                         .flatten()
@@ -11684,17 +12267,6 @@ async fn handle_p2p_events(
                 }
 
                 snapshot_boundary_terminal_inflight = None;
-                if !source_exhausted {
-                    snapshot_terminal_retry_after.insert(
-                        from,
-                        Instant::now()
-                            + if terminal_transport_can_retry_same_peer(kind) {
-                                Duration::from_secs(3)
-                            } else {
-                                Duration::from_secs(10)
-                            },
-                    );
-                }
                 tracing::warn!(
                     peer = %from,
                     height,
@@ -11734,9 +12306,11 @@ async fn handle_p2p_events(
                             &manifest_terminal_capabilities,
                             &rejected_terminal_peers,
                             &snapshot_terminal_exhausted,
+                            &snapshot_terminal_retry_after,
                             &pending.requests,
                             height,
                             block_hash,
+                            Instant::now(),
                         ) {
                             pending.requests.install_hedge(alternate);
                             dispatch_boundary_proof_maintenance_requests!();
@@ -11774,9 +12348,11 @@ async fn handle_p2p_events(
                     &manifest_terminal_capabilities,
                     &rejected_terminal_peers,
                     &snapshot_terminal_exhausted,
+                    &snapshot_terminal_retry_after,
                     &pending.requests,
                     height,
                     block_hash,
+                    Instant::now(),
                 ) {
                     pending.requests.install_hedge(alternate);
                     dispatch_pending_boundary_terminal_requests!();
@@ -11878,9 +12454,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 pending.target.height(),
                                 pending.target.block_hash(),
+                                Instant::now(),
                             )
                         })
                     })
@@ -11926,9 +12504,11 @@ async fn handle_p2p_events(
                                 &manifest_terminal_capabilities,
                                 &rejected_terminal_peers,
                                 &snapshot_terminal_exhausted,
+                                &snapshot_terminal_retry_after,
                                 &pending.requests,
                                 pending.height,
                                 pending.block_hash,
+                                Instant::now(),
                             )
                         })
                     })
@@ -12974,7 +13554,7 @@ async fn handle_p2p_events(
                         applied.block_hash,
                     );
                     let _ = template_changes.send(());
-                    let followup_peer = deferred_sync_peer
+                    let preferred_probe_peer = deferred_sync_peer
                         .take()
                         .filter(|peer| manifest_peers.contains(peer))
                         .or_else(|| {
@@ -12982,16 +13562,35 @@ async fn handle_p2p_events(
                                 .then_some(last_announcement_peer)
                                 .flatten()
                                 .filter(|peer| manifest_peers.contains(peer))
+                        })
+                        .or_else(|| {
+                            manifest_peers
+                                .contains(&completed.key.observer_peer)
+                                .then_some(completed.key.observer_peer)
                         });
-                    if let Some(peer) = followup_peer {
-                        let count = if highest_announced > height {
-                            (highest_announced - height + 1)
-                                .min(u64::from(CONNECTED_TIP_PROBE_HEADERS))
-                                as u16
-                        } else {
-                            CONNECTED_TIP_PROBE_HEADERS
-                        };
-                        try_dispatch_header_fetch(
+                    let mut probe_peers = preferred_probe_peer.into_iter().collect::<Vec<_>>();
+                    let excluded = std::collections::HashSet::new();
+                    for peer in rotating_manifest_peers(
+                        &manifest_peers,
+                        &excluded,
+                        None,
+                        false,
+                        &mut exact_inventory_probe_cursor,
+                        EXACT_INVENTORY_PROBE_LANES,
+                    ) {
+                        if !probe_peers.contains(&peer) {
+                            probe_peers.push(peer);
+                        }
+                        if probe_peers.len() >= EXACT_INVENTORY_PROBE_LANES {
+                            break;
+                        }
+                    }
+                    let count = post_snapshot_tail
+                        .and_then(|tail| tail.probe_count(height))
+                        .unwrap_or(CONNECTED_TIP_PROBE_HEADERS);
+                    let mut dispatched = 0usize;
+                    for peer in probe_peers {
+                        if try_dispatch_header_fetch(
                             &p2p_cmd,
                             &mut fetch_in_progress,
                             &mut recent_header_fetches,
@@ -12999,12 +13598,17 @@ async fn handle_p2p_events(
                             height,
                             count,
                             Instant::now(),
-                        );
+                        ) {
+                            dispatched = dispatched.saturating_add(1);
+                        }
+                    }
+                    if dispatched > 0 {
                         tracing::debug!(
-                            peer = %peer,
                             from_height = height,
+                            count,
+                            dispatched,
                             highest_announced,
-                            "probing concurrent fork choice immediately after snapshot install"
+                            "probing the complete bounded tail immediately after snapshot install"
                         );
                     } else {
                         request_exact_tip_confirmation!(completed.key.observer_peer, height);
@@ -13097,7 +13701,9 @@ async fn handle_p2p_events(
                                 .then_some(completed.key.observer_peer)
                         });
                     if let Some(peer) = recovery_peer {
-                        let count = CONNECTED_TIP_PROBE_HEADERS;
+                        let count = post_snapshot_tail
+                            .and_then(|tail| tail.probe_count(height))
+                            .unwrap_or(CONNECTED_TIP_PROBE_HEADERS);
                         try_dispatch_header_fetch(
                             &p2p_cmd,
                             &mut fetch_in_progress,
@@ -13500,8 +14106,54 @@ async fn handle_p2p_events(
                 }
             }
             retire_post_snapshot_tail_if_finished!(our_height);
+
+            if manifest_candidate_selection_due(manifest_candidate_started_at, now)
+                && pending_manifest.is_none()
+                && pending_snapshot_header_sync.is_none()
+                && snapshot_header_staging_inflight.is_none()
+                && history_step_verification_inflight.is_none()
+                && snapshot_staging_inflight.is_none()
+                && snapshot_install_inflight.is_none()
+            {
+                let candidate = best_manifest_candidate
+                    .take()
+                    .expect("settled manifest selection has a candidate");
+                manifest_candidate_started_at = None;
+                let responses_considered = manifest_response_count;
+                manifest_requested_peers.clear();
+                manifest_force_snapshot_peers.clear();
+                manifest_response_count = 0;
+                manifest_round_started_at = None;
+                if candidate.manifest.tip_height > our_height {
+                    tracing::info!(
+                        from = %candidate.from,
+                        tip = candidate.manifest.tip_height,
+                        bridge_tip = candidate.manifest.bridge_tip_height,
+                        providers = candidate_manifest_providers.len(),
+                        responses_considered,
+                        "bounded snapshot candidate selection settled"
+                    );
+                    begin_snapshot_header_staging!(
+                        candidate.from,
+                        candidate.manifest,
+                        candidate.rebase_anchor,
+                        &mut fetch_in_progress,
+                        &mut recent_header_fetches
+                    );
+                } else {
+                    candidate_manifest_providers.clear();
+                    tracing::debug!(
+                        from = %candidate.from,
+                        tip = candidate.manifest.tip_height,
+                        our_height,
+                        "snapshot manifest candidate became obsolete before selection settled"
+                    );
+                }
+            }
+
             if !*initial_sync_ready.borrow() {
-                let state_active = retained_snapshot_headers.is_some()
+                let state_active = best_manifest_candidate.is_some()
+                    || retained_snapshot_headers.is_some()
                     || history_step_verification_inflight.is_some()
                     || active_snapshot_sync.is_some()
                     || snapshot_staging.is_some()
@@ -13526,6 +14178,7 @@ async fn handle_p2p_events(
             let unresolved_canonical_work = active_suffix_sync.is_some()
                 || exact_suffix_apply_inflight.is_some()
                 || header_dag_faulted
+                || best_manifest_candidate.is_some()
                 || pending_manifest.is_some()
                 || pending_snapshot_header_sync.is_some()
                 || snapshot_header_staging_inflight.is_some()
@@ -13568,7 +14221,6 @@ async fn handle_p2p_events(
                 || snapshot_staging_inflight.is_some()
                 || snapshot_install_inflight.is_some()
                 || queued_segment_response.is_some()
-                || prefetched_snapshot_boundary_terminal.is_some()
                 || finalized_snapshot_waiting.is_some();
             let snapshot_header_parked = snapshot_header_pipeline
                 .as_ref()
@@ -13634,6 +14286,42 @@ async fn handle_p2p_events(
                 && now.saturating_duration_since(last_snapshot_provider_probe)
                     >= Duration::from_secs(5)
             {
+                if let Some((height, _)) = snapshot_terminal_target {
+                    let mut excluded = rejected_terminal_peers.clone();
+                    if let Some(pending) = snapshot_boundary_terminal_inflight.as_ref() {
+                        excluded.extend(
+                            manifest_peers
+                                .iter()
+                                .copied()
+                                .filter(|peer| pending.requests.used_peer(*peer)),
+                        );
+                    }
+                    let candidates = rotating_manifest_peers(
+                        &locally_selected_peers,
+                        &excluded,
+                        None,
+                        false,
+                        &mut exact_inventory_probe_cursor,
+                        EXACT_INVENTORY_PROBE_LANES.saturating_sub(1),
+                    );
+                    for peer in candidates {
+                        let request_key = (peer, height, 1);
+                        let recently_requested = recent_header_fetches
+                            .get(&request_key)
+                            .is_some_and(|requested| requested.elapsed() < FETCH_DEDUP_TTL);
+                        if !recently_requested {
+                            let _ = try_dispatch_header_fetch(
+                                &p2p_cmd,
+                                &mut fetch_in_progress,
+                                &mut recent_header_fetches,
+                                peer,
+                                height,
+                                1,
+                                now,
+                            );
+                        }
+                    }
+                }
                 if let Some(original) = pending_manifest
                     .as_ref()
                     .map(|pending| pending.preferred_peer)
@@ -13936,6 +14624,7 @@ async fn handle_p2p_events(
             // closed until that exact canonical transition has completed.
             let canonical_sync_idle = active_suffix_sync.is_none()
                 && exact_suffix_apply_inflight.is_none()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_pipeline.is_none()
@@ -14134,9 +14823,11 @@ async fn handle_p2p_events(
                         &manifest_terminal_capabilities,
                         &rejected_terminal_peers,
                         &snapshot_terminal_exhausted,
+                        &snapshot_terminal_retry_after,
                         &pending.requests,
                         pending.target.height(),
                         pending.target.block_hash(),
+                        now,
                     )
                 });
             if let Some(alternate) = maintenance_hedge {
@@ -14198,9 +14889,11 @@ async fn handle_p2p_events(
                         &manifest_terminal_capabilities,
                         &rejected_terminal_peers,
                         &snapshot_terminal_exhausted,
+                        &snapshot_terminal_retry_after,
                         &pending.requests,
                         pending.height,
                         pending.block_hash,
+                        now,
                     )
                     .map(|alternate| {
                         (pending.requests.primary.peer, alternate, pending.height)
@@ -14228,6 +14921,7 @@ async fn handle_p2p_events(
             // outstanding round has the same bounded recovery path.
             if manifest_round_started_at.is_none()
                 && !manifest_requested_peers.is_empty()
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
@@ -14247,6 +14941,7 @@ async fn handle_p2p_events(
             // a bounded peer set; with a single seed there is no second
             // PeerConnected event to save us.
             if manifest_round_retry_due(manifest_round_started_at, now)
+                && best_manifest_candidate.is_none()
                 && pending_manifest.is_none()
                 && pending_snapshot_header_sync.is_none()
                 && snapshot_header_staging_inflight.is_none()
