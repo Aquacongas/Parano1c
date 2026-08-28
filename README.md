@@ -6,14 +6,19 @@ The current Parano1c Android release is built against:
 
 Parano1d v1.0.3
 
-Upstream project:
+## Android-specific source adaptations
 
+Parano1c is based on the Parano1d source code, but some upstream files have been adapted specifically for Android/mobile operation.
+
+These changes are limited to platform-specific compatibility and runtime handling required by Android. They do not represent an attempt to change the underlying Parano1d consensus rules or network protocol.
+
+Where applicable, the modified files can be compared directly with the original Parano1d sources to review the Android-specific differences.
+
+Upstream project:
 https://github.com/ignotusnemo/parano1d
 
-Parano1c Android:
-
+This repository:
 https://github.com/Aquacongas/Parano1c
-
 
 ## Current Status
 
