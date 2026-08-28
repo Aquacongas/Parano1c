@@ -1,0 +1,64 @@
+[package]
+name = "bench_prover"
+version.workspace = true
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+noid_core = { path = "../noid_core" }
+noid_fri = { path = "../noid_fri" }
+noid_fri_binius = { path = "../noid_fri_binius" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_gkr = { path = "../noid_gkr" }
+noid_tx = { path = "../noid_tx" }
+noid_chain = { path = "../noid_chain" }
+noid_block = { path = "../noid_block" }
+noid_recursive = { path = "../noid_recursive" }
+noid_miner = { path = "../noid_miner" }
+noid-ivc-core = { path = "../noid_ivc_core" }
+noid-ivc-prover = { path = "../noid_ivc_prover" }
+rayon = "1.10"
+bincode = "1"
+hex = "0.4"
+zstd = { version = "0.13", features = ["zstdmt"] }
+tracing-subscriber = { workspace = true }
+
+[[bench]]
+name = "alice_sends_bob"
+harness = false
+
+[[bench]]
+name = "killshot_components"
+harness = false
+
+[[bench]]
+name = "poseidon_pow_mining"
+harness = false
+
+[[bench]]
+name = "field_r1cs_g1"
+harness = false
+
+[[bench]]
+name = "poseidon2b_kernel"
+harness = false
+
+[[bench]]
+name = "self_verify_rows"
+harness = false
+
+[[bench]]
+name = "action_compactor"
+harness = false
+
+[[bench]]
+name = "pcs_roofline"
+harness = false
+
+[[bench]]
+name = "history_step_proof"
+harness = false
+
+[[bench]]
+name = "matrix_claim_c1"
+harness = false

@@ -1,0 +1,622 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (C) 2026 Paranoid Zero.
+
+//! Allocation-bounded snapshot-segment wire codec.
+//!
+//! The fixed header authenticates all lengths before allocation. Payload bytes
+//! are streamed directly from/to the response Vec, avoiding the second full
+//! serialization buffer used by the generic CBOR codec.
+
+use std::{io, sync::Arc};
+
+use async_trait::async_trait;
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use libp2p::{request_response, swarm::StreamProtocol};
+use noid_chain::{
+    consensus::wire_limits::MAX_SEGMENT_BYTES,
+    storage::{encoded_segment_live_count_from_len, max_encoded_segment_len_for_eff_log},
+};
+
+#[cfg(test)]
+use noid_chain::storage::encoded_segment_len_for_live_count;
+
+use crate::{
+    inbound_budget::process_global_inbound_budget,
+    object_protocol::DataResponseStatus,
+    outbound_budget::OutboundResponseBudget,
+    protocol::{GetStateSegmentRequest, GetStateSegmentResponse},
+};
+
+const REQUEST_MAGIC: [u8; 4] = *b"NSR5";
+const RESPONSE_MAGIC: [u8; 4] = *b"NSS6";
+const REQUEST_HEADER_BYTES: usize = 80;
+const RESPONSE_HEADER_BYTES: usize = 86;
+const NONE_LEN: u32 = u32::MAX;
+#[derive(Debug, Clone)]
+pub struct StateSegmentCodec {
+    inbound_budget: Arc<tokio::sync::Semaphore>,
+    outbound_budget: OutboundResponseBudget,
+}
+
+impl Default for StateSegmentCodec {
+    fn default() -> Self {
+        Self {
+            inbound_budget: process_global_inbound_budget(),
+            outbound_budget: OutboundResponseBudget::process_global(),
+        }
+    }
+}
+
+impl StateSegmentCodec {
+    #[cfg(test)]
+    fn with_inbound_budget(bytes: usize) -> Self {
+        Self {
+            inbound_budget: Arc::new(tokio::sync::Semaphore::new(bytes)),
+            outbound_budget: OutboundResponseBudget::process_global(),
+        }
+    }
+
+    async fn acquire_inbound(
+        &self,
+        bytes: usize,
+    ) -> io::Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>> {
+        if bytes == 0 {
+            return Ok(None);
+        }
+        let permits =
+            u32::try_from(bytes).map_err(|_| invalid_data("state-segment byte budget overflow"))?;
+        let permit = self
+            .inbound_budget
+            .clone()
+            .acquire_many_owned(permits)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "state-segment budget closed")
+            })?;
+        Ok(Some(Arc::new(permit)))
+    }
+}
+
+#[async_trait]
+impl request_response::Codec for StateSegmentCodec {
+    type Protocol = StreamProtocol;
+    type Request = GetStateSegmentRequest;
+    type Response = GetStateSegmentResponse;
+
+    async fn read_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Request>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut header = [0u8; REQUEST_HEADER_BYTES];
+        io.read_exact(&mut header).await?;
+        if header[..4] != REQUEST_MAGIC {
+            return Err(invalid_data("invalid state-segment request magic/version"));
+        }
+        if header[6..8] != [0, 0] {
+            return Err(invalid_data(
+                "non-zero state-segment request reserved bytes",
+            ));
+        }
+        if header[48..80] == [0; 32] {
+            return Err(invalid_data(
+                "state-segment request has no manifest identity",
+            ));
+        }
+        ensure_eof(io).await?;
+        Ok(GetStateSegmentRequest {
+            segment_id: u16::from_le_bytes(header[4..6].try_into().expect("fixed segment id")),
+            expected_tip_height: u64::from_le_bytes(
+                header[8..16].try_into().expect("fixed tip height"),
+            ),
+            expected_tip_hash: header[16..48].try_into().expect("fixed tip hash"),
+            manifest_digest: header[48..80].try_into().expect("fixed manifest digest"),
+        })
+    }
+
+    async fn read_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+    ) -> io::Result<Self::Response>
+    where
+        T: AsyncRead + Unpin + Send,
+    {
+        let mut header = [0u8; RESPONSE_HEADER_BYTES];
+        io.read_exact(&mut header).await?;
+        let fields = parse_response_header(&header)?;
+        let payload_len = decoded_len(fields.encoded_len);
+        let inbound_memory_permit = self.acquire_inbound(payload_len).await?;
+        let data = if fields.encoded_len == NONE_LEN {
+            None
+        } else {
+            let mut bytes = Vec::new();
+            bytes.try_reserve_exact(payload_len).map_err(|_| {
+                io::Error::new(io::ErrorKind::OutOfMemory, "segment allocation failed")
+            })?;
+            bytes.resize(payload_len, 0);
+            io.read_exact(&mut bytes).await?;
+            Some(bytes)
+        };
+        ensure_eof(io).await?;
+        Ok(GetStateSegmentResponse {
+            segment_id: fields.segment_id,
+            expected_tip_height: fields.expected_tip_height,
+            expected_tip_hash: fields.expected_tip_hash,
+            manifest_digest: fields.manifest_digest,
+            status: fields.status,
+            eff_log: fields.eff_log,
+            data,
+            inbound_memory_permit,
+            outbound_memory_permit: None,
+        })
+    }
+
+    async fn write_request<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        request: Self::Request,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let mut header = [0u8; REQUEST_HEADER_BYTES];
+        header[..4].copy_from_slice(&REQUEST_MAGIC);
+        header[4..6].copy_from_slice(&request.segment_id.to_le_bytes());
+        header[8..16].copy_from_slice(&request.expected_tip_height.to_le_bytes());
+        header[16..48].copy_from_slice(&request.expected_tip_hash);
+        header[48..80].copy_from_slice(&request.manifest_digest);
+        io.write_all(&header).await
+    }
+
+    async fn write_response<T>(
+        &mut self,
+        _protocol: &Self::Protocol,
+        io: &mut T,
+        response: Self::Response,
+    ) -> io::Result<()>
+    where
+        T: AsyncWrite + Unpin + Send,
+    {
+        let GetStateSegmentResponse {
+            segment_id,
+            expected_tip_height,
+            expected_tip_hash,
+            manifest_digest,
+            status,
+            eff_log,
+            data,
+            inbound_memory_permit,
+            outbound_memory_permit,
+        } = response;
+        if !status.is_canonical() {
+            return Err(invalid_data("non-canonical state-segment response status"));
+        }
+        if matches!(status, DataResponseStatus::Busy { .. }) && data.is_some() {
+            return Err(invalid_data("busy state-segment response carries data"));
+        }
+        let encoded_len = optional_len(data.as_deref())?;
+        validate_response_length(eff_log, encoded_len)?;
+        let payload_len = decoded_len(encoded_len);
+        let outbound_memory_permit = match outbound_memory_permit {
+            Some(permit) => Some(permit),
+            None => self.outbound_budget.acquire(payload_len).await?,
+        };
+        // Both permits (the latter normally only exists for locally-served
+        // responses) remain in scope until the final write resolves.
+        let _memory_permits = (inbound_memory_permit, outbound_memory_permit);
+
+        let mut header = [0u8; RESPONSE_HEADER_BYTES];
+        header[..4].copy_from_slice(&RESPONSE_MAGIC);
+        header[4..6].copy_from_slice(&segment_id.to_le_bytes());
+        header[6] = eff_log;
+        header[8..16].copy_from_slice(&expected_tip_height.to_le_bytes());
+        header[16..48].copy_from_slice(&expected_tip_hash);
+        header[48..52].copy_from_slice(&encoded_len.to_le_bytes());
+        header[52..84].copy_from_slice(&manifest_digest);
+        if let DataResponseStatus::Busy { retry_after_ms } = status {
+            header[7] = 1;
+            header[84..86].copy_from_slice(&retry_after_ms.to_le_bytes());
+        }
+        io.write_all(&header).await?;
+        if let Some(bytes) = data {
+            io.write_all(&bytes).await?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResponseHeaderFields {
+    segment_id: u16,
+    expected_tip_height: u64,
+    expected_tip_hash: [u8; 32],
+    manifest_digest: [u8; 32],
+    eff_log: u8,
+    encoded_len: u32,
+    status: DataResponseStatus,
+}
+
+fn parse_response_header(header: &[u8; RESPONSE_HEADER_BYTES]) -> io::Result<ResponseHeaderFields> {
+    if header[..4] != RESPONSE_MAGIC {
+        return Err(invalid_data("invalid state-segment response magic/version"));
+    }
+    let segment_id = u16::from_le_bytes(header[4..6].try_into().expect("fixed segment id"));
+    let eff_log = header[6];
+    let expected_tip_height =
+        u64::from_le_bytes(header[8..16].try_into().expect("fixed tip height"));
+    let expected_tip_hash = header[16..48].try_into().expect("fixed tip hash");
+    let encoded_len = u32::from_le_bytes(header[48..52].try_into().expect("fixed length"));
+    let manifest_digest = header[52..84].try_into().expect("fixed manifest digest");
+    let retry_after_ms = u16::from_le_bytes(header[84..86].try_into().unwrap());
+    let status = match header[7] {
+        0 if retry_after_ms == 0 => DataResponseStatus::Ready,
+        1 => DataResponseStatus::Busy { retry_after_ms },
+        _ => return Err(invalid_data("invalid state-segment response status")),
+    };
+    if !status.is_canonical() {
+        return Err(invalid_data("non-canonical state-segment response status"));
+    }
+    if manifest_digest == [0; 32] {
+        return Err(invalid_data(
+            "state-segment response has no manifest identity",
+        ));
+    }
+    validate_response_length(eff_log, encoded_len)?;
+    if matches!(status, DataResponseStatus::Busy { .. })
+        && (encoded_len != NONE_LEN || eff_log != 0)
+    {
+        return Err(invalid_data("busy state-segment response carries data"));
+    }
+    Ok(ResponseHeaderFields {
+        segment_id,
+        expected_tip_height,
+        expected_tip_hash,
+        manifest_digest,
+        eff_log,
+        encoded_len,
+        status,
+    })
+}
+
+fn validate_response_length(eff_log: u8, encoded_len: u32) -> io::Result<()> {
+    if encoded_len == NONE_LEN {
+        return if eff_log == 0 {
+            Ok(())
+        } else {
+            Err(invalid_data(
+                "unavailable segment has non-zero effective log",
+            ))
+        };
+    }
+    let len = encoded_len as usize;
+    if len > MAX_SEGMENT_BYTES {
+        return Err(invalid_data("declared state segment exceeds wire cap"));
+    }
+    let maximum = max_encoded_segment_len_for_eff_log(eff_log)
+        .ok_or_else(|| invalid_data("invalid state-segment effective log"))?;
+    if maximum > MAX_SEGMENT_BYTES {
+        return Err(invalid_data("state-segment geometry exceeds wire cap"));
+    }
+    if encoded_segment_live_count_from_len(eff_log, len).is_none_or(|live_count| live_count == 0) {
+        return Err(invalid_data(
+            "declared state-segment length is not canonical sparse framing",
+        ));
+    }
+    Ok(())
+}
+
+fn optional_len(data: Option<&[u8]>) -> io::Result<u32> {
+    match data {
+        Some(bytes) => u32::try_from(bytes.len())
+            .map_err(|_| invalid_data("state-segment length does not fit u32")),
+        None => Ok(NONE_LEN),
+    }
+}
+
+#[inline]
+fn decoded_len(encoded_len: u32) -> usize {
+    if encoded_len == NONE_LEN {
+        0
+    } else {
+        encoded_len as usize
+    }
+}
+
+async fn ensure_eof<T: AsyncRead + Unpin + Send>(io: &mut T) -> io::Result<()> {
+    let mut trailing = [0u8; 1];
+    if io.read(&mut trailing).await? != 0 {
+        return Err(invalid_data("trailing bytes in state-segment message"));
+    }
+    Ok(())
+}
+
+fn invalid_data(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        },
+        task::{Context, Poll, Waker},
+    };
+
+    use futures::io::Cursor;
+    use libp2p::request_response::Codec;
+
+    use super::*;
+
+    fn protocol() -> StreamProtocol {
+        StreamProtocol::new("/noid/test/sync/segment/5")
+    }
+
+    fn response_header(eff_log: u8, encoded_len: u32) -> Vec<u8> {
+        let mut header = vec![0u8; RESPONSE_HEADER_BYTES];
+        header[..4].copy_from_slice(&RESPONSE_MAGIC);
+        header[4..6].copy_from_slice(&7u16.to_le_bytes());
+        header[6] = eff_log;
+        header[8..16].copy_from_slice(&77u64.to_le_bytes());
+        header[16..48].copy_from_slice(&[0xA5; 32]);
+        header[48..52].copy_from_slice(&encoded_len.to_le_bytes());
+        header[52..84].copy_from_slice(&[0xB6; 32]);
+        header
+    }
+
+    #[test]
+    fn production_codecs_share_one_process_inbound_budget() {
+        let first = StateSegmentCodec::default();
+        let second = StateSegmentCodec::default();
+        let shared = process_global_inbound_budget();
+        assert!(Arc::ptr_eq(&first.inbound_budget, &second.inbound_budget));
+        assert!(Arc::ptr_eq(&first.inbound_budget, &shared));
+    }
+
+    #[tokio::test]
+    async fn request_round_trip_binds_segment_and_exact_snapshot_boundary() {
+        let request = GetStateSegmentRequest {
+            segment_id: 0x1234,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+        };
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_request(&protocol(), &mut wire, request)
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref().len(), REQUEST_HEADER_BYTES);
+        wire.set_position(0);
+        let decoded = StateSegmentCodec::default()
+            .read_request(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.segment_id, 0x1234);
+        assert_eq!(decoded.expected_tip_height, 77);
+        assert_eq!(decoded.expected_tip_hash, [0xA5; 32]);
+        assert_eq!(decoded.manifest_digest, [0xB6; 32]);
+
+        let mut noncanonical = wire.into_inner();
+        noncanonical[6] = 1;
+        let error = StateSegmentCodec::default()
+            .read_request(&protocol(), &mut Cursor::new(noncanonical))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    struct GatedWriter {
+        started: Arc<AtomicBool>,
+        released: Arc<AtomicBool>,
+        waker: Arc<Mutex<Option<Waker>>>,
+    }
+
+    impl AsyncWrite for GatedWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.started.store(true, Ordering::SeqCst);
+            if !self.released.load(Ordering::SeqCst) {
+                *self.waker.lock().unwrap() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn round_trip_streams_one_canonical_segment() {
+        let len = encoded_segment_len_for_live_count(10, 3).unwrap();
+        let response = GetStateSegmentResponse {
+            segment_id: 7,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Ready,
+            eff_log: 10,
+            data: Some(vec![0x5a; len]),
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref().len(), RESPONSE_HEADER_BYTES + len);
+        wire.set_position(0);
+        let decoded = StateSegmentCodec::default()
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.segment_id, 7);
+        assert_eq!(decoded.expected_tip_height, 77);
+        assert_eq!(decoded.expected_tip_hash, [0xA5; 32]);
+        assert_eq!(decoded.manifest_digest, [0xB6; 32]);
+        assert_eq!(decoded.data.unwrap(), vec![0x5a; len]);
+    }
+
+    #[tokio::test]
+    async fn busy_response_is_not_decoded_as_unavailable() {
+        let response = GetStateSegmentResponse {
+            segment_id: 7,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Busy {
+                retry_after_ms: 800,
+            },
+            eff_log: 0,
+            data: None,
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        };
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol(), &mut wire, response)
+            .await
+            .unwrap();
+        wire.set_position(0);
+        let decoded = StateSegmentCodec::default()
+            .read_response(&protocol(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded.status,
+            DataResponseStatus::Busy {
+                retry_after_ms: 800
+            }
+        );
+        assert!(decoded.data.is_none());
+    }
+
+    #[tokio::test]
+    async fn malicious_length_is_rejected_before_payload_read_or_allocation() {
+        let declared = max_encoded_segment_len_for_eff_log(16).unwrap() + 1;
+        let error = StateSegmentCodec::default()
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(response_header(16, declared as u32)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not canonical"));
+
+        let empty_sparse_len = encoded_segment_len_for_live_count(16, 0).unwrap();
+        let error = StateSegmentCodec::default()
+            .read_response(
+                &protocol(),
+                &mut Cursor::new(response_header(16, empty_sparse_len as u32)),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not canonical"));
+    }
+
+    #[tokio::test]
+    async fn inbound_budget_blocks_second_segment_until_first_is_consumed() {
+        let len = encoded_segment_len_for_live_count(6, 3).unwrap();
+        let codec = StateSegmentCodec::with_inbound_budget(len);
+        let mut first_wire = response_header(6, len as u32);
+        first_wire.extend(std::iter::repeat_n(1u8, len));
+        let first = codec
+            .clone()
+            .read_response(&protocol(), &mut Cursor::new(first_wire))
+            .await
+            .unwrap();
+
+        let mut second_wire = response_header(6, len as u32);
+        second_wire.extend(std::iter::repeat_n(2u8, len));
+        let mut second_codec = codec.clone();
+        let second = tokio::spawn(async move {
+            second_codec
+                .read_response(&protocol(), &mut Cursor::new(second_wire))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!second.is_finished());
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), second)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.data.unwrap()[0], 2);
+    }
+
+    #[tokio::test]
+    async fn outbound_permit_lives_until_codec_write_completes() {
+        let len = encoded_segment_len_for_live_count(6, 3).unwrap();
+        let budget = OutboundResponseBudget::with_capacity(len);
+        let permit = budget.acquire(len).await.unwrap().unwrap();
+        let response = GetStateSegmentResponse {
+            segment_id: 3,
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Ready,
+            eff_log: 6,
+            data: Some(vec![0x33; len]),
+            inbound_memory_permit: None,
+            outbound_memory_permit: Some(permit),
+        };
+        let started = Arc::new(AtomicBool::new(false));
+        let released = Arc::new(AtomicBool::new(false));
+        let waker = Arc::new(Mutex::new(None));
+        let writer = GatedWriter {
+            started: started.clone(),
+            released: released.clone(),
+            waker: waker.clone(),
+        };
+        let write = tokio::spawn(async move {
+            let mut writer = writer;
+            StateSegmentCodec::default()
+                .write_response(&protocol(), &mut writer, response)
+                .await
+        });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(budget.available_bytes(), 0);
+        assert!(!write.is_finished());
+
+        let waiter_budget = budget.clone();
+        let waiter = tokio::spawn(async move { waiter_budget.acquire(len).await.unwrap() });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        released.store(true, Ordering::SeqCst);
+        if let Some(waker) = waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        write.await.unwrap().unwrap();
+        let second_permit = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.available_bytes(), 0);
+        drop(second_permit);
+        assert_eq!(budget.available_bytes(), len);
+    }
+}

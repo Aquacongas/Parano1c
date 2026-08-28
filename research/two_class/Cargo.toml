@@ -1,0 +1,36 @@
+[package]
+name = "paranoid-two-class-research"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# This empty workspace deliberately breaks inheritance from the production
+# workspace two directories above. Root `cargo test --workspace` and release
+# tooling therefore cannot discover or build this crate.
+[workspace]
+resolver = "2"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+noid_chain = { path = "../../noid_chain" }
+noid_core = { path = "../../noid_core" }
+noid_fri = { path = "../../noid_fri" }
+noid_fri_binius = { path = "../../noid_fri_binius" }
+noid_gkr = { path = "../../noid_gkr" }
+noid-ivc-core = { path = "../../noid_ivc_core" }
+noid_poseidon2b = { path = "../../noid_poseidon2b" }
+noid_recursive = { path = "../../noid_recursive" }
+noid_tx = { path = "../../noid_tx" }
+
+[[bin]]
+name = "two-class-census"
+path = "src/bin/census.rs"
+
+[[bin]]
+name = "two-class-wallet-bench"
+path = "src/bin/wallet_bench.rs"
+
+[profile.release]
+debug = true

@@ -1,0 +1,14 @@
+[package]
+name = "frost-gkr-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Keep the paper artifact out of the production workspace and its default
+# build/test graph. The runner copies this crate into the pinned worktree.
+[workspace]
+
+[dependencies]
+noid_core = { path = "../../noid_core" }
+noid_gkr = { path = "../../noid_gkr" }
+noid_poseidon2b = { path = "../../noid_poseidon2b" }

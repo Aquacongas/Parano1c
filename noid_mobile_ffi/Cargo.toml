@@ -1,0 +1,25 @@
+[package]
+name = "noid_mobile_ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tracing = "0.1"
+noid_mobile_node = { path = "../noid_mobile_node" }
+noid_p2p = { path = "../noid_p2p" }
+libp2p = "0.56"
+noid_chain = { path = "../noid_chain" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+
+anyhow = { workspace = true }
+hex = "0.4"
+tokio = { workspace = true }
+
+jni = "0.21"
+once_cell = "1"
+serde = { workspace = true }
+serde_json = { workspace = true }

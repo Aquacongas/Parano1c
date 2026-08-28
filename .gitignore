@@ -1,62 +1,109 @@
+# ============================================================
+# Rust
+# ============================================================
+
 /target/
 **/target/
+
+
+# ============================================================
+# IDE / editors
+# ============================================================
+
 .idea/
 .vscode/
+*.iml
+
 *.swp
 *.swo
 *~
+
 .DS_Store
-__pycache__/
-*.py[cod]
-/target/
-**/target/
-.idea/
-.vscode/
-*.swp
-*.swo
-*~
-.DS_Store
+Thumbs.db
+desktop.ini
+
+
+# ============================================================
+# Python
+# ============================================================
+
 __pycache__/
 *.py[cod]
 
-# Android / Gradle
+
+# ============================================================
+# Android / Gradle build output
+# ============================================================
+
 android/.gradle/
 android/build/
 android/app/build/
 android/local.properties
-android/app/src/main/jniLibs/**/*.so
-# Android Studio
-*.iml
 
-# Release artifacts
+**/.gradle/
+**/build/
+
+
+# ============================================================
+# Generated Android release files
+# ============================================================
+
 *.apk
 *.aab
 
-# Signing keys
+
+# ============================================================
+# Android signing material - NEVER COMMIT
+# ============================================================
+
 *.jks
 *.keystore
 *.p12
 *.pem
 *.key
 
+
+# ============================================================
 # Generated native Android library
+# ============================================================
+
 android/app/src/main/jniLibs/arm64-v8a/libnoid_mobile_ffi.so
 
-# Backups / temporary files
+
+# ============================================================
+# HistoryStep pack
+#
+# Download the correct pack from the matching Parano1d release.
+# Do not commit the locally extracted pack.
+# ============================================================
+
+/release-assets/history-step/pack/
+
+
+# ============================================================
+# Secrets / local environment
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+
+# ============================================================
+# Backup / temporary files
+# ============================================================
+
 *.before-*
 *.bak
 *.backup
 *.old
 *.tmp
-*.orig
 
+*:Zone.Identifier
+
+
+# ============================================================
 # Logs
+# ============================================================
+
 *.log
-
-# Environment / secrets
-.env
-.env.*
-!.env.example
-
-# Windows junk
-Thumbs.db

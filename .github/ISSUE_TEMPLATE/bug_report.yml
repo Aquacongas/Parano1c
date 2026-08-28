@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a reproducible non-security problem in Parano1d
+title: ""
+body:
+  - type: checkboxes
+    attributes:
+      label: Security check
+      options:
+        - label: This report does not disclose an unpatched security vulnerability. I will use the private reporting instructions for security issues.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Release version or commit hash
+      placeholder: v1.0.1
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Operating system, architecture, and relevant CPU backend
+      placeholder: Linux x86-64, avx2+vpclmul
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Node
+        - Synchronization or networking
+        - GUI wallet
+        - CLI wallet
+        - External miner
+        - Proof or consensus
+        - Build or installation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction
+      description: Provide the shortest reliable sequence that reproduces the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove wallet secrets, credentials, private addresses, and unrelated data.
+      render: text

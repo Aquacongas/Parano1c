@@ -1,0 +1,80 @@
+[package]
+name = "noid_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# --- Daemon ---
+[[bin]]
+name = "parano1d"
+path = "src/main.rs"
+
+# --- CLI client ---
+[[bin]]
+name = "parano1d-cli"
+path = "src/bin/noid_cli.rs"
+
+[dependencies]
+noid_chain      = { path = "../noid_chain" }
+noid_block      = { path = "../noid_block" }
+noid_recursive  = { path = "../noid_recursive" }
+noid_tx         = { path = "../noid_tx" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_gkr        = { path = "../noid_gkr" }
+noid_core       = { path = "../noid_core" }
+noid_mempool    = { path = "../noid_mempool" }
+noid_miner      = { path = "../noid_miner" }
+noid-ivc-core   = { path = "../noid_ivc_core" }
+noid_p2p        = { path = "../noid_p2p" }
+noid_networking = { path = "../noid_networking" }
+noid_rpc        = { path = "../noid_rpc" }
+noid_wallet     = { path = "../noid_wallet" }
+
+# Async runtime
+tokio              = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Serialization
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+bincode            = "1"
+
+# Error handling
+anyhow             = { workspace = true }
+thiserror          = { workspace = true }
+
+# CLI
+clap    = { version = "4", features = ["derive", "env"] }
+toml    = "0.8"
+hex     = "0.4"
+blake3  = "1"
+
+# Networking
+libp2p  = { version = "0.55", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+futures = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Wallet security: key derivation, zeroization, and owner-only file handling
+rand             = "0.8"
+zeroize          = { version = "1", features = ["zeroize_derive"] }
+libc             = "0.2"
+
+# Memory: jemalloc as global allocator.
+# glibc malloc retains freed pages from large proof-generation allocations (FRI/NTT Vecs)
+# indefinitely, causing 3-4 GB RSS on full nodes. jemalloc returns memory to
+# the OS aggressively via background threads (dirty_decay_ms=1000).
+
+[target.'cfg(unix)'.dependencies]
+tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
+
+[dev-dependencies]
+bench_prover = { path = "../bench_prover" }
+tempfile = "3"
+static_assertions = "1.1"
+
+[build-dependencies]
+noid_recursive  = { path = "../noid_recursive" }
+noid_miner      = { path = "../noid_miner" }
+noid-ivc-core   = { path = "../noid_ivc_core" }
+zstd            = "0.13"

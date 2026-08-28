@@ -1,0 +1,5 @@
+# Every build keeps a portable process-wide baseline so the executable can
+# inspect CPU capabilities before proof code runs. Production then requires
+# SSE4.1 + PCLMULQDQ on x86-64 or NEON + PMULL on AArch64 and selects wider
+# AVX2+VPCLMULQDQ/AVX-512 kernels at runtime. The scalar path remains available
+# only to differential tests.
