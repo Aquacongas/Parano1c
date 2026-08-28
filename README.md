@@ -81,6 +81,32 @@ Current configuration:
 - Target SDK: 35
 - Architecture: ARM64-v8a
 
+## Android Storage Limitation
+
+The current Android wallet uses MDBX for persistent local storage.
+
+For the mobile build, the maximum MDBX database size has been reduced from approximately 1 TB to 64 GB.
+
+This does not mean that the application immediately reserves or consumes 64 GB of storage. The database grows gradually as data is stored. The 64 GB value is the maximum configured size of the local MDBX database.
+
+For normal wallet usage, this limit is expected to provide substantial headroom and the wallet can operate normally as long as the local database remains below this limit.
+
+If the local MDBX database were ever to reach the configured 64 GB maximum, additional database writes could fail until the storage architecture is changed or the limit is increased.
+
+This limitation does not directly limit:
+
+- wallet balance
+- number of addresses
+- blockchain height
+- number of transactions that can exist on the network
+- cryptographic security
+
+It only limits the maximum size of the local MDBX database used by the Android application.
+
+The Android storage architecture is still being developed. A future version is planned to reduce the amount of persistent blockchain data required by the mobile wallet, remove unnecessary full-node storage dependencies, or otherwise provide a more suitable storage model for mobile devices.
+
+If future Android devices routinely support significantly larger practical storage and memory-mapping requirements, the database limit may also be increased where appropriate.
+
 ## Releases
 
 Official signed Android APK files are published in the GitHub Releases section.

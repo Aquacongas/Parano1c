@@ -1,0 +1,62 @@
+/target/
+**/target/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+__pycache__/
+*.py[cod]
+/target/
+**/target/
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/jniLibs/**/*.so
+# Android Studio
+*.iml
+
+# Release artifacts
+*.apk
+*.aab
+
+# Signing keys
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+
+# Generated native Android library
+android/app/src/main/jniLibs/arm64-v8a/libnoid_mobile_ffi.so
+
+# Backups / temporary files
+*.before-*
+*.bak
+*.backup
+*.old
+*.tmp
+*.orig
+
+# Logs
+*.log
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Windows junk
+Thumbs.db

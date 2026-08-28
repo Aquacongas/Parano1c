@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <color name="parano_background">#0B0E16</color>
+    <color name="parano_surface">#1E2230</color>
+    <color name="parano_surface_alt">#252A3A</color>
+
+    <color name="parano_border">#343A4D</color>
+
+    <color name="parano_green">#39E67A</color>
+    <color name="parano_cyan">#55D8F5</color>
+    <color name="parano_magenta">#D455D9</color>
+    <color name="parano_yellow">#F1DF3A</color>
+
+    <color name="parano_text">#F0F0F4</color>
+    <color name="parano_muted">#9296A7</color>
+    <color name="parano_danger">#FF5A68</color>
+
+</resources>

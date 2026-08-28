@@ -1,0 +1,34 @@
+[package]
+name = "noid_mobile_node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noid-ivc-core = { path = "../noid_ivc_core" }
+noid_history_runtime = { path = "../noid_history_runtime" }
+noid_wallet  = { path = "../noid_wallet" }
+noid_chain   = { path = "../noid_chain" }
+noid_mempool = { path = "../noid_mempool" }
+noid_core    = { path = "../noid_core" }
+noid_tx      = { path = "../noid_tx" }
+noid_p2p     = { path = "../noid_p2p" }
+noid_networking = { path = "../noid_networking" }
+noid_sync_apply = { path = "../noid_sync_apply" }
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+
+anyhow  = "1"
+tokio   = { workspace = true }
+tracing = "0.1"
+
+libp2p = { version = "0.55", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+
+noid_recursive = { path = "../noid_recursive" }
+
+hex = "0.4"
+
+[build-dependencies]
+zstd = "0.13"
+noid-ivc-core = { path = "../noid_ivc_core" }
+noid_recursive = { path = "../noid_recursive" }
+noid_history_runtime = { path = "../noid_history_runtime" }
