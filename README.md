@@ -29,11 +29,38 @@ Android:
 - Java 17
 - Gradle wrapper included in android/
 
-## Building
+## Android Build Integration
 
-From the project root:
+The Android source is not intended to be built as a completely standalone repository.
 
-    cd ~/parano1d-mobile-full
+To build Parano1c Android from source, the following directories must be placed inside the main Parano1d repository:
+
+- android/
+- noid_mobile_node/
+
+The build also depends on the Parano1d workspace and its Rust crates.
+
+Expected layout:
+
+Parano1d/
+├── Cargo.toml
+├── Cargo.lock
+├── rust-toolchain.toml
+├── release-assets/
+├── noid_wallet/
+├── noid_mobile_ffi/
+├── noid_mobile_node/
+├── noid_networking/
+├── noid_p2p/
+├── noid_chain/
+├── noid_core/
+├── noid_recursive/
+├── android/
+└── ...
+
+## Building the Android Wallet
+
+From the root of the Parano1d repository:
 
     HISTORY_PACK_DIR="$PWD/release-assets/history-step/pack/history-step-pack-v1"
 
@@ -43,7 +70,7 @@ From the project root:
 
     export NOID_HISTORY_STEP_PACK_DIR="$HISTORY_PACK_DIR"
 
-Check Rust components:
+Format and check the Rust components:
 
     cargo fmt
 
@@ -53,21 +80,32 @@ Check Rust components:
       -p noid_mobile_ffi \
       -j16
 
-Build Android ARM64 native library:
+Build the Android ARM64 native library:
 
     NOID_HISTORY_STEP_PACK_DIR="$HISTORY_PACK_DIR" \
     cargo ndk -t arm64-v8a \
       -o android/app/src/main/jniLibs \
       build --release -p noid_mobile_ffi -j16
 
-Build debug APK:
+Build the Android APK:
 
     cd android
+
+Debug build:
+
     ./gradlew assembleDebug
 
-Build release APK:
+Signed release build:
 
     ./gradlew assembleRelease
+
+The generated release APK will be available under:
+
+    android/app/build/outputs/apk/release/
+
+The current release artifact is named:
+
+    parano1c-release.apk
 
 ## Android Configuration
 
