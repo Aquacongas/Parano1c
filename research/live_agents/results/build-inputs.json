@@ -1,0 +1,17 @@
+{
+  "profile": "isolated-v2-fork-testnet",
+  "activation_heights": [
+    5,
+    10
+  ],
+  "environment": {
+    "NOID_HISTORY_STEP_PACK_DIR": "/home/neo/rust/parano1d-artifacts/mainnet-v1/history-step-pack-v1",
+    "NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST": "ad463bd76e27df3c0f414f4fd7640cfb5c45cc7f3a09e44a2f7bc7a8b869485b",
+    "NOID_V2_PACK_DIR": "/home/neo/rust/parano1d-artifacts/v2-common-p63-p206-i504-c63-pack-20260925-a",
+    "NOID_V2_RELEASE_BANK": "be82f3bec102f03c63715dac9bb4a939cb9aa5b21d013e38402b321fd8a41fa9",
+    "NOID_RETIREMENT_KEYS_DIR": "/home/neo/rust/parano1d-artifacts/v2-common-live-retirement-20260925-a",
+    "NOID_RETIREMENT_KEY_0_PIN": "0651ce507810b61213cbdc0e9f99436aec3a7922cc662bfba6128b466453c8b2",
+    "NOID_RETIREMENT_KEY_1_PIN": "c301274d50dc02fd5c383f2e71629075729a954a768f5051388ec2040bce0267"
+  },
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)"
+}

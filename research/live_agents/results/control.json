@@ -1,0 +1,32 @@
+{
+  "clients": 8,
+  "attempts_per_client": 10,
+  "initial_quota": 10,
+  "copied_stores": {
+    "accepted": 80,
+    "by_client": [
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10,
+      10
+    ]
+  },
+  "shared_transactional_store": {
+    "accepted": 10,
+    "by_client": [
+      10,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ]
+  },
+  "interpretation": "A conventional shared database correctly enforces a global quota. Independent copies do not."
+}

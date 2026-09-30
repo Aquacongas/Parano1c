@@ -1,0 +1,17 @@
+{
+  "date": "2026-09-30",
+  "kernel": "Linux-7.0.0-30-generic-x86_64-with-glibc2.39",
+  "python": "3.12.3",
+  "cpu_model": "13th Gen Intel(R) Core(TM) i7-1365U",
+  "logical_cpus": 12,
+  "memory_total_kib": 32507780,
+  "cpu_affinity": {
+    "issuer": "0-5",
+    "agent-a": "6-8",
+    "agent-b": "9-11",
+    "late-verifier": "6-8"
+  },
+  "memory_cap_applied": false,
+  "transport": "loopback-only Linux network namespace",
+  "cold_sync_definition": "fresh node data directory; OS page cache not flushed"
+}

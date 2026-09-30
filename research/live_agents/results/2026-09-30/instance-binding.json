@@ -1,0 +1,10 @@
+{
+  "status": "passed",
+  "network_valid": true,
+  "original_opening_equals_enrolled_opening": true,
+  "input_matches_enrolled_instance": false,
+  "gateway_result": "outside_enrolled_instance_lineage",
+  "txid": "28212b7c9b167dade38a2eacb197dc417c50114f79482261ccb4614ba1bfc5e8",
+  "script_sha256": "924970cca82ef3432c87d3655944cd1c634299d2e45f75fd3b2a5cdd30764319",
+  "receipt_sha256": "b4959222a86bdc58110f884bda5343efb5f8421db531abe67b92c9b1444d82e5"
+}
