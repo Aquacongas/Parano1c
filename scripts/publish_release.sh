@@ -96,7 +96,7 @@ dispatch_workflow() {
   local run_id run_url
 
   existing_ids=$(
-    gh run list \
+    gh run list --repo "$GH_REPO" \
       --workflow "$workflow" \
       --event workflow_dispatch \
       --limit 100 \
@@ -104,7 +104,7 @@ dispatch_workflow() {
       jq '[.[].databaseId]'
   )
 
-  dispatch_output=$(gh workflow run "$workflow" --ref "$ref" "$@")
+  dispatch_output=$(gh workflow run "$workflow" --repo "$GH_REPO" --ref "$ref" "$@")
   run_url=$(
     printf '%s\n' "$dispatch_output" |
       sed -nE 's#.*(https://github\.com/[^[:space:]]+/actions/runs/[0-9]+).*#\1#p' |
@@ -120,7 +120,7 @@ dispatch_workflow() {
   printf 'Workflow dispatch accepted; waiting for GitHub to expose its run ID.\n'
   for _ in {1..30}; do
     candidates=$(
-      gh run list \
+      gh run list --repo "$GH_REPO" \
         --workflow "$workflow" \
         --event workflow_dispatch \
         --limit 20 \
@@ -190,11 +190,11 @@ for remote in "${RELEASE_REMOTES[@]}"; do
     *) release_die "could not check tag $TAG on $remote" ;;
   esac
 done
-if gh release view "$TAG" >/dev/null 2>&1; then
+if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
   release_die "GitHub release already exists: $TAG"
 fi
 gh auth status >/dev/null
-[[ $(gh repo view --json visibility --jq .visibility) == PUBLIC ]] || \
+[[ $(gh repo view "$GH_REPO" --json visibility --jq .visibility) == PUBLIC ]] || \
   release_die "make the GitHub repository public before opening the release window"
 
 release_build_pack_tools 0
@@ -228,9 +228,9 @@ dispatch_workflow "$PLATFORM_CI_WORKFLOW" main "$LOCAL_HEAD"
 PLATFORM_CI_URL=$DISPATCHED_WORKFLOW_URL
 PLATFORM_CI_RUN_ID=$DISPATCHED_WORKFLOW_RUN_ID
 printf 'Platform CI: %s\n' "$PLATFORM_CI_URL"
-gh run watch "$PLATFORM_CI_RUN_ID" --exit-status
+gh run watch "$PLATFORM_CI_RUN_ID" --repo "$GH_REPO" --exit-status
 PLATFORM_CI_RESULT=$(gh run view "$PLATFORM_CI_RUN_ID" \
-  --json conclusion,headSha,status,workflowName)
+  --repo "$GH_REPO" --json conclusion,headSha,status,workflowName)
 [[ $(jq -r .status <<<"$PLATFORM_CI_RESULT") == completed ]] || \
   release_die "Platform CI did not complete"
 [[ $(jq -r .conclusion <<<"$PLATFORM_CI_RESULT") == success ]] || \
@@ -266,6 +266,7 @@ done
 
 printf '\n==> Creating draft release and uploading the canonical pack\n'
 gh release create "$TAG" "$PACK_ARCHIVE" "$V2_PACK_ARCHIVE" \
+  --repo "$GH_REPO" \
   --verify-tag \
   --draft \
   --title "$TITLE" \
@@ -283,10 +284,10 @@ WORKFLOW_RUN_ID=$DISPATCHED_WORKFLOW_RUN_ID
 
 printf '\n==> Waiting for every Core and GUI deliverable\n'
 printf 'Workflow: %s\n' "$WORKFLOW_URL"
-gh run watch "$WORKFLOW_RUN_ID" --exit-status
+gh run watch "$WORKFLOW_RUN_ID" --repo "$GH_REPO" --exit-status
 
 RELEASE_STATE=$(gh release view "$TAG" \
-  --json assets,isDraft,isPrerelease,name,tagName,url)
+  --repo "$GH_REPO" --json assets,isDraft,isPrerelease,name,tagName,url)
 [[ $(jq -r .isDraft <<<"$RELEASE_STATE") == false ]] || \
   release_die "Native Release completed but the GitHub release is still a draft"
 [[ $(jq -r .tagName <<<"$RELEASE_STATE") == "$TAG" ]] || \
@@ -326,7 +327,7 @@ done
 printf '\n==> Downloading and verifying the published release\n'
 VERIFY_DIR="$TEMP_DIR/published"
 mkdir -- "$VERIFY_DIR"
-gh release download "$TAG" --dir "$VERIFY_DIR"
+gh release download "$TAG" --repo "$GH_REPO" --dir "$VERIFY_DIR"
 mapfile -t DOWNLOADED_ASSETS < <(
   find "$VERIFY_DIR" -maxdepth 1 -type f -printf '%f\n'
 )
