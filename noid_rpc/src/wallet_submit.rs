@@ -602,6 +602,45 @@ mod tests {
     }
 
     #[test]
+    fn scarce_holes_remain_usable_without_returning_reserved_slots() {
+        use noid_chain::fri_state::SlotValue;
+        use noid_poseidon2b::primitives::Address;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut chain = MdbxChainContext::open_or_create(directory.path()).unwrap();
+        let owner = Address([0x6b; 32]);
+        let live_slots = (0u32..64)
+            .filter(|slot| ![5, 47].contains(slot))
+            .map(|slot| {
+                (
+                    slot,
+                    SlotValue::with_owner_fields(1, u64::from(slot) + 1, owner.as_fields()),
+                )
+            })
+            .collect::<Vec<_>>();
+        chain.state = noid_chain::ChainState::from_sparse_utxos(6, &live_slots, 64)
+            .expect("one nearly full segment with no other allocation space");
+
+        for seed in [0, 11, 29, u64::MAX] {
+            let hints = collect_empty_slot_hints(&chain, &HashSet::new(), seed, 2).unwrap();
+            assert_eq!(
+                hints.into_iter().collect::<HashSet<_>>(),
+                HashSet::from([5, 47])
+            );
+            assert_eq!(
+                collect_empty_slot_hints(&chain, &HashSet::from([5]), seed, 2).unwrap(),
+                vec![47],
+                "reserved slots must stay excluded in the last-resort segment"
+            );
+            assert!(
+                collect_empty_slot_hints(&chain, &HashSet::from([5, 47]), seed, 2)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
     fn production_allocator_prefers_headroom_over_scarce_holes() {
         use noid_chain::fri_state::SlotValue;
         use noid_poseidon2b::primitives::Address;
