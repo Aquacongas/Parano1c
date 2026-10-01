@@ -397,8 +397,8 @@ def main():
                     "B": n2.balance(),
                     "C": n3.balance(),
                 }
-                if n2.balance()["total_micronoid"] > 0
-                and n3.balance()["total_micronoid"] > 0
+                if n2.balance()["balance_micronoid"] > 0
+                and n3.balance()["balance_micronoid"] > 0
                 else False
             ),
             timeout=120,
@@ -414,7 +414,7 @@ def main():
                     print(f"[skip] {src.name} spendable too low: {bal}", flush=True)
                     continue
                 amount = 20_000 + r * 1_000 + j * 500
-                pre_dst = dst.balance()["total_micronoid"]
+                pre_dst = dst.balance()["balance_micronoid"]
                 hints_before = rpc(src.rpc_url, "getSlotHints", [8], timeout=10)
                 assert_true(
                     len(hints_before) >= 2,
@@ -469,8 +469,8 @@ def main():
                 wait_until(
                     f"{dst.name} balance increases without rescan",
                     lambda: (
-                        dst.balance()["total_micronoid"]
-                        if dst.balance()["total_micronoid"] >= pre_dst + amount
+                        dst.balance()["balance_micronoid"]
+                        if dst.balance()["balance_micronoid"] >= pre_dst + amount
                         else False
                     ),
                     timeout=120,

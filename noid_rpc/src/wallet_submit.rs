@@ -19,6 +19,12 @@ use crate::wallet_ops::WalletOps;
 
 pub type WalletOperationGate = Arc<Mutex<()>>;
 
+// Wallets must not compete for the last few holes of the same live segment.
+// At production depth this leaves 4,096 candidate slots before moving to
+// another segment, allowing up to 93.75% occupancy before moving on. Scarce
+// segments remain a last resort when the state has no room left.
+const WALLET_SEGMENT_HEADROOM_DIVISOR: u32 = 16;
+
 /// Owned wallet reservation around an async admission future. Dropping the
 /// future at any await point synchronously rolls back inputs, outputs, and the
 /// pending history record. `commit` disarms it after successful admission.
@@ -85,10 +91,10 @@ pub(crate) fn collect_empty_slot_hints(
     let mut rng = seed;
     let mut hints = Vec::with_capacity(count);
 
-    // First refill holes in durable live segments. This is the important
-    // density invariant: restart eviction must not turn salted wallet hints
-    // back into one random 3-MiB segment per send. Salt rotates equal-density
-    // choices and the local scan, while compact live counts choose the segment.
+    // Refill durable live segments with enough free slots for independent
+    // wallets to choose different outputs. Near-full segments are deferred:
+    // their few holes otherwise turn concurrent sends into frequent conflicts.
+    // Salt still rotates equal-density choices and the local scan.
     let mut partial_segments = (0..state.num_segments())
         .map(|segment| segment as u16)
         .filter(|segment| {
@@ -108,12 +114,24 @@ pub(crate) fn collect_empty_slot_hints(
         });
     }
 
-    for segment_id in partial_segments {
-        let local_start = (splitmix64(&mut rng) as u32) & local_mask;
+    let minimum_headroom =
+        (segment_full / WALLET_SEGMENT_HEADROOM_DIVISOR).max(count.min(segment_size) as u32);
+    let mut scarce_segments = Vec::new();
+    partial_segments.retain(|segment_id| {
+        if segment_full - state.segment_live_count(*segment_id) < minimum_headroom {
+            scarce_segments.push(*segment_id);
+            false
+        } else {
+            true
+        }
+    });
+
+    let scan_live_segment = |hints: Vec<u32>, segment_id: u16, rng: &mut u64| {
+        let local_start = (splitmix64(rng) as u32) & local_mask;
         let base = u32::from(segment_id) << segment_log;
         let candidates = (0..segment_size)
             .map(move |step| base | (local_start.wrapping_add(step as u32) & local_mask));
-        hints = collect_empty_slot_hints_streaming(
+        collect_empty_slot_hints_streaming(
             hints,
             reserved,
             count,
@@ -123,15 +141,19 @@ pub(crate) fn collect_empty_slot_hints(
             |candidate_segment| state.is_evicted(candidate_segment),
             |index| state.slot(index) == noid_chain::fri_state::SlotValue::EMPTY,
             |candidate_segment| load_durable_segment(chain, candidate_segment, segment_log),
-        )?;
+        )
+    };
+
+    for &segment_id in &partial_segments {
+        hints = scan_live_segment(hints, segment_id, &mut rng)?;
         if hints.len() == count {
             return Ok(hints);
         }
     }
 
-    // No durable hole was sufficient. Open a virtual-zero segment in the
-    // allocator's zone order, derived from the real monotone alloc_counter —
-    // never from the wallet salt. Full zones are skipped in O(segment_count).
+    // Open a virtual-zero segment before reusing a scarce hole. This may add
+    // one segment, but avoids making every wallet race for the same last slot.
+    // The allocator's zone order comes from the monotone alloc_counter.
     for segment_id in generate_zone_segment_hints(
         chain.state.alloc_counter,
         state.log_slots() as u32,
@@ -161,6 +183,15 @@ pub(crate) fn collect_empty_slot_hints(
                 unreachable!("virtual-zero segment cannot require a durable load")
             },
         )?;
+        if hints.len() == count {
+            return Ok(hints);
+        }
+    }
+
+    // A full domain still permits the last holes to be used safely. Exact
+    // slot reads and mempool admission continue to reject stale choices.
+    for segment_id in scarce_segments {
+        hints = scan_live_segment(hints, segment_id, &mut rng)?;
         if hints.len() == count {
             break;
         }
@@ -571,7 +602,7 @@ mod tests {
     }
 
     #[test]
-    fn production_allocator_returns_the_freed_slot_before_opening_a_new_segment() {
+    fn production_allocator_prefers_headroom_over_scarce_holes() {
         use noid_chain::fri_state::SlotValue;
         use noid_poseidon2b::primitives::Address;
         use noid_tx::{TxBody, TxInput, TxOutput, TX_INPUTS, TX_OUTPUTS};
@@ -617,8 +648,8 @@ mod tests {
         .unwrap();
 
         let hint = collect_empty_slot_hints(&chain, &HashSet::new(), 0xdecafbad, 1)
-            .expect("the sole durable hole must be reusable");
-        assert_eq!(hint, vec![FREED_SLOT]);
+            .expect("a virtual-zero segment remains available");
+        assert_ne!(hint[0] >> 16, 0, "avoid the sole contested hole");
         assert_eq!(
             chain
                 .state
@@ -626,9 +657,41 @@ mod tests {
                 .materialized_segment_ids()
                 .collect::<Vec<_>>(),
             vec![0],
-            "slot reuse must not materialize another production segment"
+            "issuing a virtual-zero hint must not materialize its segment"
         );
         assert_eq!(chain.state.state.segment_live_count(0), SEGMENT_SIZE - 1);
+
+        // A less dense live segment is preferable to both the scarce hole and
+        // a new virtual-zero segment.
+        let mint = TxBody {
+            epoch_anchor: [0; 32],
+            fee: 0,
+            input_owner: Address([0; 32]),
+            inputs: [TxInput::dummy(); TX_INPUTS],
+            outputs: [
+                TxOutput {
+                    slot_index: SEGMENT_SIZE + 7,
+                    amount: 1,
+                    owner,
+                },
+                TxOutput::dummy(),
+            ],
+            validity_bitmap: noid_tx::output_bitmap_bit(0),
+            is_coinbase: true,
+        };
+        noid_chain::apply_tx_at(&mut chain.state, &mint, 1).unwrap();
+        let hints = collect_empty_slot_hints(&chain, &HashSet::new(), 0xdecafbad, 2)
+            .expect("the less dense segment has ample headroom");
+        assert_eq!(hints.len(), 2);
+        assert!(hints.iter().all(|slot| slot >> 16 == 1));
+        let salted_first_slots = (0..96)
+            .map(|seed| collect_empty_slot_hints(&chain, &HashSet::new(), seed, 1).unwrap()[0])
+            .collect::<HashSet<_>>();
+        assert!(salted_first_slots.iter().all(|slot| slot >> 16 == 1));
+        assert!(
+            salted_first_slots.len() >= 90,
+            "independent wallets should not converge on a scarce hole"
+        );
 
         // Once the last live value is spent, the segment is dematerialized and
         // becomes indistinguishable from any other virtual-zero segment. When
