@@ -377,12 +377,18 @@ impl NodeBehaviour {
         // The server cap bounds aggregate inbound work from concurrent peers;
         // one snapshot client uses a single transfer lane.
         let state_segment_sync = request_response::Behaviour::new(
-            [(
-                // v3 additionally echoes the exact snapshot boundary in every
-                // response, while retaining pre-allocation length validation.
-                StreamProtocol::try_from_owned(format!("{}/sync/segment/5", protocol_id))?,
-                ProtocolSupport::Full,
-            )],
+            [
+                (
+                    // Transport-only compression; the canonical SGS1 bytes,
+                    // snapshot identity and verification rules are unchanged.
+                    StreamProtocol::try_from_owned(format!("{}/sync/segment/6", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+                (
+                    StreamProtocol::try_from_owned(format!("{}/sync/segment/5", protocol_id))?,
+                    ProtocolSupport::Full,
+                ),
+            ],
             request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(60))
                 .with_max_concurrent_streams(8),

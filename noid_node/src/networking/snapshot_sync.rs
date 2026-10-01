@@ -116,6 +116,7 @@ pub struct SnapshotSync {
     offer: SnapshotOffer,
     plan: SyncPlan,
     fetcher: ObjectFetcher,
+    batch_peers: std::collections::HashSet<PeerId>,
 }
 
 impl SnapshotSync {
@@ -143,6 +144,7 @@ impl SnapshotSync {
             offer,
             plan,
             fetcher: ObjectFetcher::new(),
+            batch_peers: Default::default(),
         };
         for segment in sync.offer.segments.iter().copied() {
             sync.fetcher.want(ObjectClaimId::StateSegment(segment));
@@ -217,6 +219,99 @@ impl SnapshotSync {
         Ok(())
     }
 
+    pub fn note_transport(&mut self, peer: PeerId, version: u8) {
+        if version == 6 {
+            self.batch_peers.insert(peer);
+        } else {
+            self.batch_peers.remove(&peer);
+        }
+    }
+
+    /// One wire request can collect small exact objects from one known-v6
+    /// provider. It keeps the existing single State transfer lane.
+    pub fn schedule_batch(&mut self, now_ms: u64) -> Vec<SnapshotSegmentRequest> {
+        let mut requests = self.schedule(now_ms, 1);
+        let Some(first) = requests.first().copied() else {
+            return requests;
+        };
+        let mut bytes = first.segment.encoded_len as usize;
+        if !self.batch_peers.contains(&first.peer)
+            || bytes >= noid_p2p::protocol::MAX_STATE_SEGMENT_BATCH_BYTES
+        {
+            return requests;
+        }
+        for segment in self.offer.segments.iter().copied() {
+            if requests.len() == noid_p2p::protocol::MAX_STATE_SEGMENT_BATCH {
+                break;
+            }
+            if segment.segment_id <= first.segment.segment_id
+                || bytes + segment.encoded_len as usize
+                    > noid_p2p::protocol::MAX_STATE_SEGMENT_BATCH_BYTES
+                || self.fetcher.state(ObjectClaimId::StateSegment(segment))
+                    != Some(FetchState::Wanted)
+            {
+                continue;
+            }
+            if self
+                .fetcher
+                .start_primary_for_peer(ObjectClaimId::StateSegment(segment), first.peer, now_ms)
+                .is_ok()
+            {
+                bytes += segment.encoded_len as usize;
+                requests.push(SnapshotSegmentRequest {
+                    peer: first.peer,
+                    segment,
+                });
+            }
+        }
+        requests
+    }
+
+    /// Validate all lengths and source leases before admitting any member.
+    pub fn accept_batch(
+        &mut self,
+        peer: PeerId,
+        parts: &[(StateSegmentId, usize)],
+    ) -> Result<(), SnapshotSyncError> {
+        if parts.is_empty()
+            || parts.len() > noid_p2p::protocol::MAX_STATE_SEGMENT_BATCH
+            || parts
+                .windows(2)
+                .any(|pair| pair[0].0.segment_id >= pair[1].0.segment_id)
+        {
+            return Err(SnapshotSyncError::CorrelationMismatch);
+        }
+        for (segment, len) in parts {
+            self.require_segment(*segment)?;
+            if *len != segment.encoded_len as usize {
+                return Err(SnapshotSyncError::ResponseLengthMismatch);
+            }
+            self.fetcher.validate_receive(
+                ObjectClaimId::StateSegment(*segment),
+                peer,
+                ObjectId::StateSegment(*segment),
+            )?;
+        }
+        for (segment, len) in parts {
+            self.accept_response(peer, *segment, *len)?;
+        }
+        Ok(())
+    }
+
+    pub fn reject_provider_batch(
+        &mut self,
+        peer: PeerId,
+        segments: &[StateSegmentId],
+    ) -> Result<(), SnapshotSyncError> {
+        for segment in segments {
+            self.require_segment(*segment)?;
+            self.fetcher
+                .reject_source_object(ObjectClaimId::StateSegment(*segment), peer)?;
+        }
+        self.quarantine_provider(peer);
+        Ok(())
+    }
+
     pub fn request_failed(
         &mut self,
         peer: PeerId,
@@ -272,6 +367,7 @@ impl SnapshotSync {
     /// exact manifest service has proved malformed. No verified object or
     /// other provider is disturbed.
     pub fn quarantine_provider(&mut self, peer: PeerId) {
+        self.batch_peers.remove(&peer);
         self.fetcher.quarantine_source(peer);
     }
 
@@ -306,7 +402,22 @@ impl SnapshotSync {
         Ok(())
     }
 
+    /// Called only after local SGS1 bytes have passed the same verifier and
+    /// durable staging publication as a network segment, before dispatch.
+    pub fn mark_local_verified(
+        &mut self,
+        segment: StateSegmentId,
+    ) -> Result<(), SnapshotSyncError> {
+        self.require_segment(segment)?;
+        self.fetcher.import_verified(
+            ObjectClaimId::StateSegment(segment),
+            ObjectId::StateSegment(segment),
+        )?;
+        Ok(())
+    }
+
     pub fn disconnect(&mut self, peer: PeerId) {
+        self.batch_peers.remove(&peer);
         self.fetcher.disconnect(peer);
     }
 
@@ -334,13 +445,13 @@ impl SnapshotSync {
     pub fn segment(&self, segment_id: u16) -> Option<StateSegmentId> {
         self.offer
             .segments
-            .iter()
-            .copied()
-            .find(|segment| segment.segment_id == segment_id)
+            .binary_search_by_key(&segment_id, |segment| segment.segment_id)
+            .ok()
+            .map(|index| self.offer.segments[index])
     }
 
     fn require_segment(&self, segment: StateSegmentId) -> Result<(), SnapshotSyncError> {
-        if segment.snapshot != self.offer.snapshot || !self.offer.segments.contains(&segment) {
+        if self.segment(segment.segment_id) != Some(segment) {
             return Err(SnapshotSyncError::UnknownSegment);
         }
         Ok(())
@@ -381,6 +492,106 @@ mod tests {
             .unwrap()
             .encode_prefix()
             .to_vec()
+    }
+
+    #[test]
+    fn batch_admission_is_atomic_and_bad_member_preserves_verified_sibling() {
+        let peer = PeerId::random();
+        let other = PeerId::random();
+        let offer = SnapshotOffer::from_manifest(manifest()).unwrap();
+        let terminal = terminal_bytes(&offer, [6; 32]);
+        let mut sync =
+            SnapshotSync::new(peer, FailureDomain(1), offer.clone(), &terminal, [6; 32]).unwrap();
+        sync.note_transport(peer, 6);
+        let requests = sync.schedule_batch(0);
+        assert_eq!(requests.len(), 2);
+        let segments = requests
+            .iter()
+            .map(|request| request.segment)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sync.accept_batch(peer, &[(segments[0], 59), (segments[1], 60)]),
+            Err(SnapshotSyncError::ResponseLengthMismatch)
+        );
+        assert_eq!(sync.counts().received, 0);
+        assert_eq!(sync.counts().in_flight, 2);
+        sync.accept_batch(peer, &[(segments[0], 59), (segments[1], 59)])
+            .unwrap();
+        sync.mark_verified(segments[0]).unwrap();
+        sync.reject_provider_batch(peer, &[segments[1]]).unwrap();
+        sync.add_provider(other, FailureDomain(2), offer).unwrap();
+        let retry = sync.schedule_batch(1);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].segment, segments[1]);
+        assert_eq!(retry[0].peer, other);
+        assert_eq!(sync.counts().verified, 1);
+    }
+
+    #[test]
+    fn batching_requires_known_v6_and_never_exceeds_caps() {
+        let peer = PeerId::random();
+        let mut value = manifest();
+        value.segment_ids = (0..130).collect();
+        value.segment_roots = vec![[7; 32]; 130];
+        value.segment_lengths = vec![1059; 130];
+        value.active_slot_count = 130 * 21;
+        value.alloc_counter = value.active_slot_count;
+        assert!(value.seal_manifest_digest());
+        let offer = SnapshotOffer::from_manifest(value).unwrap();
+        let terminal = terminal_bytes(&offer, [6; 32]);
+        let mut sync =
+            SnapshotSync::new(peer, FailureDomain(1), offer, &terminal, [6; 32]).unwrap();
+        let single = sync.schedule_batch(0);
+        assert_eq!(single.len(), 1);
+        sync.defer_request(single[0]).unwrap();
+        sync.note_transport(peer, 6);
+        let batch = sync.schedule_batch(1);
+        assert_eq!(batch.len(), 61);
+        assert!(batch.iter().all(|request| request.peer == peer));
+        for request in batch {
+            sync.defer_request(request).unwrap();
+        }
+        sync.note_transport(peer, 5);
+        assert_eq!(sync.schedule_batch(2).len(), 1);
+    }
+
+    #[test]
+    fn locally_verified_segments_survive_disconnect_and_are_never_requested() {
+        let first = PeerId::random();
+        let second = PeerId::random();
+        let offer = SnapshotOffer::from_manifest(manifest()).unwrap();
+        let terminal = terminal_bytes(&offer, [6; 32]);
+        let mut sync =
+            SnapshotSync::new(first, FailureDomain(1), offer.clone(), &terminal, [6; 32]).unwrap();
+        sync.add_provider(second, FailureDomain(2), offer.clone())
+            .unwrap();
+        let local = offer.segments()[0];
+        let mut wrong_root = local;
+        wrong_root.segment_root[0] ^= 1;
+        assert_eq!(
+            sync.mark_local_verified(wrong_root),
+            Err(SnapshotSyncError::UnknownSegment)
+        );
+        sync.mark_local_verified(local).unwrap();
+        assert_eq!(sync.counts().verified, 1);
+        assert_eq!(sync.counts().received, 0);
+        sync.disconnect(first);
+        let request = sync.schedule(0, 1).pop().unwrap();
+        assert_ne!(request.segment, local);
+        assert_eq!(request.peer, second);
+        assert_eq!(
+            sync.mark_local_verified(request.segment),
+            Err(SnapshotSyncError::Fetch(FetchError::InvalidState))
+        );
+        sync.accept_response(
+            second,
+            request.segment,
+            request.segment.encoded_len as usize,
+        )
+        .unwrap();
+        sync.mark_verified(request.segment).unwrap();
+        assert!(sync.all_segments_verified());
+        assert!(sync.schedule(1, 8).is_empty());
     }
 
     #[test]

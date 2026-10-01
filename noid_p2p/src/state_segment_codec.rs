@@ -3,9 +3,10 @@
 
 //! Allocation-bounded snapshot-segment wire codec.
 //!
-//! The fixed header authenticates all lengths before allocation. Payload bytes
-//! are streamed directly from/to the response Vec, avoiding the second full
-//! serialization buffer used by the generic CBOR codec.
+//! Lengths are bounded by sparse geometry before allocation. Protocol 5 keeps
+//! its exact original framing; protocol 6 optionally wraps canonical SGS1
+//! bytes in one bounded zstd frame. The node still authenticates those bytes
+//! against the immutable snapshot descriptor before accepting them.
 
 use std::{io, sync::Arc};
 
@@ -24,7 +25,10 @@ use crate::{
     inbound_budget::process_global_inbound_budget,
     object_protocol::DataResponseStatus,
     outbound_budget::OutboundResponseBudget,
-    protocol::{GetStateSegmentRequest, GetStateSegmentResponse},
+    protocol::{
+        GetStateSegmentRequest, GetStateSegmentResponse, StateSegmentPayload,
+        StateSegmentTransport, MAX_STATE_SEGMENT_BATCH, MAX_STATE_SEGMENT_BATCH_BYTES,
+    },
 };
 
 const REQUEST_MAGIC: [u8; 4] = *b"NSR5";
@@ -32,6 +36,52 @@ const RESPONSE_MAGIC: [u8; 4] = *b"NSS6";
 const REQUEST_HEADER_BYTES: usize = 80;
 const RESPONSE_HEADER_BYTES: usize = 86;
 const NONE_LEN: u32 = u32::MAX;
+const COMPRESSED_REQUEST_MAGIC: [u8; 4] = *b"NSR6";
+const COMPRESSED_RESPONSE_MAGIC: [u8; 4] = *b"NSS7";
+const TRANSPORT_HEADER_BYTES: usize = 5;
+const RAW: u8 = 0;
+const ZSTD: u8 = 1;
+const BATCH_RAW: u8 = 2;
+const BATCH_ZSTD: u8 = 3;
+const COMPRESSION_LEVEL: i32 = 3;
+const ZSTD_WINDOW_LOG_MAX: u32 = 22;
+
+/// Reserve both buffers in one admission operation before the storage read.
+/// Server requests do not expose the negotiated version, so this conservative
+/// reservation also covers v5. It never increases the shared 64 MiB budget.
+pub(crate) fn outbound_reservation_bytes(canonical_len: usize) -> usize {
+    if canonical_len == 0 {
+        0
+    } else {
+        canonical_len + zstd::zstd_safe::compress_bound(canonical_len)
+    }
+}
+
+pub(crate) fn batch_outbound_reservation_bytes(canonical_len: usize, count: usize) -> usize {
+    outbound_reservation_bytes(canonical_len) + if count > 1 { canonical_len } else { 0 }
+}
+
+fn validate_batch_ids(first: u16, additional: &[u16]) -> io::Result<()> {
+    if additional.len() >= MAX_STATE_SEGMENT_BATCH
+        || additional.first().is_some_and(|id| *id <= first)
+        || additional.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(invalid_data(
+            "invalid bounded ascending State segment batch",
+        ));
+    }
+    Ok(())
+}
+
+fn compressed_protocol(protocol: &StreamProtocol) -> io::Result<bool> {
+    if protocol.as_ref().ends_with("/sync/segment/6") {
+        Ok(true)
+    } else if protocol.as_ref().ends_with("/sync/segment/5") {
+        Ok(false)
+    } else {
+        Err(invalid_data("unsupported state-segment protocol"))
+    }
+}
 #[derive(Debug, Clone)]
 pub struct StateSegmentCodec {
     inbound_budget: Arc<tokio::sync::Semaphore>,
@@ -85,7 +135,7 @@ impl request_response::Codec for StateSegmentCodec {
 
     async fn read_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Request>
     where
@@ -93,10 +143,17 @@ impl request_response::Codec for StateSegmentCodec {
     {
         let mut header = [0u8; REQUEST_HEADER_BYTES];
         io.read_exact(&mut header).await?;
-        if header[..4] != REQUEST_MAGIC {
+        let compressed = compressed_protocol(protocol)?;
+        let magic = if compressed {
+            COMPRESSED_REQUEST_MAGIC
+        } else {
+            REQUEST_MAGIC
+        };
+        if header[..4] != magic {
             return Err(invalid_data("invalid state-segment request magic/version"));
         }
-        if header[6..8] != [0, 0] {
+        let additional_count = u16::from_le_bytes(header[6..8].try_into().unwrap()) as usize;
+        if (!compressed && additional_count != 0) || additional_count >= MAX_STATE_SEGMENT_BATCH {
             return Err(invalid_data(
                 "non-zero state-segment request reserved bytes",
             ));
@@ -106,9 +163,18 @@ impl request_response::Codec for StateSegmentCodec {
                 "state-segment request has no manifest identity",
             ));
         }
+        let segment_id = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        let mut additional_segments = Vec::with_capacity(additional_count);
+        for _ in 0..additional_count {
+            let mut id = [0; 2];
+            io.read_exact(&mut id).await?;
+            additional_segments.push(u16::from_le_bytes(id));
+        }
+        validate_batch_ids(segment_id, &additional_segments)?;
         ensure_eof(io).await?;
         Ok(GetStateSegmentRequest {
-            segment_id: u16::from_le_bytes(header[4..6].try_into().expect("fixed segment id")),
+            segment_id,
+            additional_segments,
             expected_tip_height: u64::from_le_bytes(
                 header[8..16].try_into().expect("fixed tip height"),
             ),
@@ -119,37 +185,119 @@ impl request_response::Codec for StateSegmentCodec {
 
     async fn read_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Response>
     where
         T: AsyncRead + Unpin + Send,
     {
+        let compressed_protocol = compressed_protocol(protocol)?;
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
         io.read_exact(&mut header).await?;
+        if compressed_protocol {
+            if header[..4] != COMPRESSED_RESPONSE_MAGIC {
+                return Err(invalid_data("invalid state-segment response magic/version"));
+            }
+            // The remaining fields retain their v5 positions and invariants.
+            header[..4].copy_from_slice(&RESPONSE_MAGIC);
+        }
         let fields = parse_response_header(&header)?;
-        let payload_len = decoded_len(fields.encoded_len);
-        let inbound_memory_permit = self.acquire_inbound(payload_len).await?;
-        let data = if fields.encoded_len == NONE_LEN {
+        let first_len = decoded_len(fields.encoded_len);
+        let mut payload_len = first_len;
+        let mut extra = Vec::new();
+        let (encoding, wire_len) = if compressed_protocol {
+            let mut transport = [0u8; TRANSPORT_HEADER_BYTES];
+            io.read_exact(&mut transport).await?;
+            let encoding = transport[0];
+            let wire_len = u32::from_le_bytes(transport[1..5].try_into().unwrap()) as usize;
+            if matches!(encoding, BATCH_RAW | BATCH_ZSTD) {
+                let mut count = [0; 2];
+                io.read_exact(&mut count).await?;
+                let count = u16::from_le_bytes(count) as usize;
+                if !(2..=MAX_STATE_SEGMENT_BATCH).contains(&count) || fields.encoded_len == NONE_LEN
+                {
+                    return Err(invalid_data("invalid State segment batch count"));
+                }
+                let mut previous = fields.segment_id;
+                for _ in 1..count {
+                    let mut part = [0; 6];
+                    io.read_exact(&mut part).await?;
+                    let id = u16::from_le_bytes(part[..2].try_into().unwrap());
+                    let len = u32::from_le_bytes(part[2..].try_into().unwrap());
+                    validate_response_length(fields.eff_log, len)?;
+                    if id <= previous || len == NONE_LEN {
+                        return Err(invalid_data("invalid State segment batch descriptor"));
+                    }
+                    previous = id;
+                    payload_len += len as usize;
+                    extra.push((id, len as usize));
+                }
+                if payload_len > MAX_STATE_SEGMENT_BATCH_BYTES {
+                    return Err(invalid_data(
+                        "State segment batch exceeds aggregate byte cap",
+                    ));
+                }
+            }
+            match encoding {
+                RAW | BATCH_RAW if wire_len == payload_len => {}
+                ZSTD | BATCH_ZSTD if wire_len > 0 && wire_len < payload_len => {}
+                _ => {
+                    return Err(invalid_data(
+                        "invalid state-segment transport length/encoding",
+                    ))
+                }
+            }
+            (encoding, wire_len)
+        } else {
+            (RAW, payload_len)
+        };
+        let is_zstd = matches!(encoding, ZSTD | BATCH_ZSTD);
+        let reserved = payload_len
+            + if is_zstd { wire_len } else { 0 }
+            + if extra.is_empty() { 0 } else { payload_len };
+        let inbound_memory_permit = self.acquire_inbound(reserved).await?;
+        let mut data = if fields.encoded_len == NONE_LEN {
             None
         } else {
             let mut bytes = Vec::new();
-            bytes.try_reserve_exact(payload_len).map_err(|_| {
+            bytes.try_reserve_exact(wire_len).map_err(|_| {
                 io::Error::new(io::ErrorKind::OutOfMemory, "segment allocation failed")
             })?;
-            bytes.resize(payload_len, 0);
+            bytes.resize(wire_len, 0);
             io.read_exact(&mut bytes).await?;
-            Some(bytes)
+            if is_zstd {
+                Some(decompress_segment(&bytes, payload_len)?)
+            } else {
+                Some(bytes)
+            }
         };
         ensure_eof(io).await?;
+        let mut additional_segments = Vec::with_capacity(extra.len());
+        if !extra.is_empty() {
+            let bytes = data.as_mut().expect("batch payload is present");
+            let mut offset = first_len;
+            for (segment_id, len) in extra {
+                additional_segments.push(StateSegmentPayload {
+                    segment_id,
+                    data: bytes[offset..offset + len].to_vec(),
+                });
+                offset += len;
+            }
+            bytes.truncate(first_len);
+        }
         Ok(GetStateSegmentResponse {
             segment_id: fields.segment_id,
+            additional_segments,
             expected_tip_height: fields.expected_tip_height,
             expected_tip_hash: fields.expected_tip_hash,
             manifest_digest: fields.manifest_digest,
             status: fields.status,
             eff_log: fields.eff_log,
             data,
+            transport: StateSegmentTransport {
+                version: if compressed_protocol { 6 } else { 5 },
+                payload_bytes: wire_len as u64,
+            },
             inbound_memory_permit,
             outbound_memory_permit: None,
         })
@@ -157,7 +305,7 @@ impl request_response::Codec for StateSegmentCodec {
 
     async fn write_request<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         request: Self::Request,
     ) -> io::Result<()>
@@ -165,17 +313,33 @@ impl request_response::Codec for StateSegmentCodec {
         T: AsyncWrite + Unpin + Send,
     {
         let mut header = [0u8; REQUEST_HEADER_BYTES];
-        header[..4].copy_from_slice(&REQUEST_MAGIC);
+        let compressed = compressed_protocol(protocol)?;
+        validate_batch_ids(request.segment_id, &request.additional_segments)?;
+        let magic = if compressed {
+            COMPRESSED_REQUEST_MAGIC
+        } else {
+            REQUEST_MAGIC
+        };
+        header[..4].copy_from_slice(&magic);
         header[4..6].copy_from_slice(&request.segment_id.to_le_bytes());
+        if compressed {
+            header[6..8].copy_from_slice(&(request.additional_segments.len() as u16).to_le_bytes());
+        }
         header[8..16].copy_from_slice(&request.expected_tip_height.to_le_bytes());
         header[16..48].copy_from_slice(&request.expected_tip_hash);
         header[48..80].copy_from_slice(&request.manifest_digest);
-        io.write_all(&header).await
+        io.write_all(&header).await?;
+        if compressed {
+            for id in request.additional_segments {
+                io.write_all(&id.to_le_bytes()).await?;
+            }
+        }
+        Ok(())
     }
 
     async fn write_response<T>(
         &mut self,
-        _protocol: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         response: Self::Response,
     ) -> io::Result<()>
@@ -184,12 +348,14 @@ impl request_response::Codec for StateSegmentCodec {
     {
         let GetStateSegmentResponse {
             segment_id,
+            additional_segments,
             expected_tip_height,
             expected_tip_hash,
             manifest_digest,
             status,
             eff_log,
             data,
+            transport: _,
             inbound_memory_permit,
             outbound_memory_permit,
         } = response;
@@ -201,17 +367,59 @@ impl request_response::Codec for StateSegmentCodec {
         }
         let encoded_len = optional_len(data.as_deref())?;
         validate_response_length(eff_log, encoded_len)?;
-        let payload_len = decoded_len(encoded_len);
+        let mut payload_len = decoded_len(encoded_len);
+        let compressed_protocol = compressed_protocol(protocol)?;
+        let is_batch = !additional_segments.is_empty();
+        if is_batch {
+            validate_batch_ids(
+                segment_id,
+                &additional_segments
+                    .iter()
+                    .map(|part| part.segment_id)
+                    .collect::<Vec<_>>(),
+            )?;
+            if !compressed_protocol
+                || data.is_none()
+                || !matches!(status, DataResponseStatus::Ready)
+            {
+                return Err(invalid_data(
+                    "State batch requires protocol 6 and complete Ready payloads",
+                ));
+            }
+            for part in &additional_segments {
+                validate_response_length(eff_log, optional_len(Some(&part.data))?)?;
+                payload_len += part.data.len();
+            }
+            if payload_len > MAX_STATE_SEGMENT_BATCH_BYTES {
+                return Err(invalid_data(
+                    "State segment batch exceeds aggregate byte cap",
+                ));
+            }
+        }
+        let reserved = if compressed_protocol {
+            batch_outbound_reservation_bytes(payload_len, additional_segments.len() + 1)
+        } else {
+            payload_len
+        };
         let outbound_memory_permit = match outbound_memory_permit {
-            Some(permit) => Some(permit),
-            None => self.outbound_budget.acquire(payload_len).await?,
+            Some(permit) if permit.reserved_bytes() >= reserved => Some(permit),
+            Some(_) => {
+                return Err(invalid_data(
+                    "insufficient state-segment outbound reservation",
+                ))
+            }
+            None => self.outbound_budget.acquire(reserved).await?,
         };
         // Both permits (the latter normally only exists for locally-served
         // responses) remain in scope until the final write resolves.
         let _memory_permits = (inbound_memory_permit, outbound_memory_permit);
 
         let mut header = [0u8; RESPONSE_HEADER_BYTES];
-        header[..4].copy_from_slice(&RESPONSE_MAGIC);
+        header[..4].copy_from_slice(&if compressed_protocol {
+            COMPRESSED_RESPONSE_MAGIC
+        } else {
+            RESPONSE_MAGIC
+        });
         header[4..6].copy_from_slice(&segment_id.to_le_bytes());
         header[6] = eff_log;
         header[8..16].copy_from_slice(&expected_tip_height.to_le_bytes());
@@ -222,9 +430,50 @@ impl request_response::Codec for StateSegmentCodec {
             header[7] = 1;
             header[84..86].copy_from_slice(&retry_after_ms.to_le_bytes());
         }
+        let combined = if is_batch {
+            let mut bytes = Vec::with_capacity(payload_len);
+            bytes.extend_from_slice(data.as_deref().unwrap());
+            for part in &additional_segments {
+                bytes.extend_from_slice(&part.data);
+            }
+            Some(bytes)
+        } else {
+            None
+        };
+        let canonical = combined.as_deref().or(data.as_deref());
+        let compressed = if compressed_protocol {
+            canonical
+                .map(|bytes| zstd::bulk::compress(bytes, COMPRESSION_LEVEL))
+                .transpose()?
+                .filter(|bytes| bytes.len() < payload_len)
+        } else {
+            None
+        };
+        let wire_payload = compressed.as_deref().or(canonical);
         io.write_all(&header).await?;
-        if let Some(bytes) = data {
-            io.write_all(&bytes).await?;
+        if compressed_protocol {
+            let mut transport = [0u8; TRANSPORT_HEADER_BYTES];
+            transport[0] = match (is_batch, compressed.is_some()) {
+                (false, false) => RAW,
+                (false, true) => ZSTD,
+                (true, false) => BATCH_RAW,
+                (true, true) => BATCH_ZSTD,
+            };
+            transport[1..5]
+                .copy_from_slice(&(wire_payload.map_or(0, <[u8]>::len) as u32).to_le_bytes());
+            io.write_all(&transport).await?;
+            if is_batch {
+                io.write_all(&((additional_segments.len() + 1) as u16).to_le_bytes())
+                    .await?;
+                for part in &additional_segments {
+                    io.write_all(&part.segment_id.to_le_bytes()).await?;
+                    io.write_all(&(part.data.len() as u32).to_le_bytes())
+                        .await?;
+                }
+            }
+        }
+        if let Some(bytes) = wire_payload {
+            io.write_all(bytes).await?;
         }
         Ok(())
     }
@@ -318,6 +567,34 @@ fn optional_len(data: Option<&[u8]>) -> io::Result<u32> {
     }
 }
 
+fn decompress_segment(compressed: &[u8], canonical_len: usize) -> io::Result<Vec<u8>> {
+    let frame_len = zstd::zstd_safe::find_frame_compressed_size(compressed)
+        .map_err(|_| invalid_data("invalid state-segment zstd frame"))?;
+    if frame_len != compressed.len() {
+        return Err(invalid_data(
+            "state segment must contain exactly one zstd frame",
+        ));
+    }
+    let content_size = zstd::zstd_safe::get_frame_content_size(compressed)
+        .map_err(|_| invalid_data("invalid state-segment zstd content size"))?;
+    if content_size != Some(canonical_len as u64) {
+        return Err(invalid_data(
+            "state-segment zstd content size differs from canonical length",
+        ));
+    }
+    let mut decoder = zstd::bulk::Decompressor::new()?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_MAX)?;
+    let decoded = decoder
+        .decompress(compressed, canonical_len)
+        .map_err(|_| invalid_data("state-segment zstd decompression failed"))?;
+    if decoded.len() != canonical_len {
+        return Err(invalid_data(
+            "state-segment decompressed length differs from canonical length",
+        ));
+    }
+    Ok(decoded)
+}
+
 #[inline]
 fn decoded_len(encoded_len: u32) -> usize {
     if encoded_len == NONE_LEN {
@@ -348,6 +625,7 @@ mod tests {
             Arc, Mutex,
         },
         task::{Context, Poll, Waker},
+        time::Duration,
     };
 
     use futures::io::Cursor;
@@ -357,6 +635,327 @@ mod tests {
 
     fn protocol() -> StreamProtocol {
         StreamProtocol::new("/noid/test/sync/segment/5")
+    }
+
+    fn protocol_v6() -> StreamProtocol {
+        StreamProtocol::new("/noid/test/sync/segment/6")
+    }
+
+    fn response(data: Option<Vec<u8>>, eff_log: u8) -> GetStateSegmentResponse {
+        GetStateSegmentResponse {
+            segment_id: 7,
+            additional_segments: Vec::new(),
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+            status: DataResponseStatus::Ready,
+            eff_log,
+            data,
+            transport: Default::default(),
+            inbound_memory_permit: None,
+            outbound_memory_permit: None,
+        }
+    }
+
+    fn v6_wire(eff_log: u8, canonical_len: u32, encoding: u8, payload: &[u8]) -> Vec<u8> {
+        let mut wire = response_header(eff_log, canonical_len);
+        wire[..4].copy_from_slice(&COMPRESSED_RESPONSE_MAGIC);
+        wire.push(encoding);
+        wire.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        wire.extend_from_slice(payload);
+        wire
+    }
+
+    #[tokio::test]
+    async fn batch_round_trip_keeps_exact_payloads_and_charges_split_buffers() {
+        let mut value = response(Some(vec![7; 59]), 16);
+        value.additional_segments = (8..71)
+            .map(|segment_id| StateSegmentPayload {
+                segment_id,
+                data: vec![segment_id as u8; 59],
+            })
+            .collect();
+        let canonical = value
+            .payloads()
+            .map(|(id, data)| (id, data.to_vec()))
+            .collect::<Vec<_>>();
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol_v6(), &mut wire, value)
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref()[RESPONSE_HEADER_BYTES], BATCH_ZSTD);
+        let wire_len = u32::from_le_bytes(wire.get_ref()[87..91].try_into().unwrap()) as usize;
+        let charged = 2 * 64 * 59 + wire_len;
+        let mut codec = StateSegmentCodec::with_inbound_budget(charged);
+        let decoded = codec
+            .read_response(&protocol_v6(), &mut Cursor::new(wire.into_inner()))
+            .await
+            .unwrap();
+        assert_eq!(
+            decoded
+                .payloads()
+                .map(|(id, data)| (id, data.to_vec()))
+                .collect::<Vec<_>>(),
+            canonical
+        );
+        assert_eq!(codec.inbound_budget.available_permits(), 0);
+        drop(decoded);
+        assert_eq!(codec.inbound_budget.available_permits(), charged);
+    }
+
+    #[tokio::test]
+    async fn malformed_batches_fail_before_payload_admission() {
+        for (count, second_id, second_len) in [
+            (0u16, 8u16, 59u32),
+            (1, 8, 59),
+            (65, 8, 59),
+            (2, 7, 59),
+            (2, 8, 60),
+            (2, 8, 65509),
+        ] {
+            let mut wire = v6_wire(16, 59, BATCH_RAW, &[]);
+            wire[87..91].copy_from_slice(&(59u32 + second_len).to_le_bytes());
+            wire.extend_from_slice(&count.to_le_bytes());
+            wire.extend_from_slice(&second_id.to_le_bytes());
+            wire.extend_from_slice(&second_len.to_le_bytes());
+            let mut codec = StateSegmentCodec::with_inbound_budget(0);
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                codec.read_response(&protocol_v6(), &mut Cursor::new(wire)),
+            )
+            .await;
+            assert!(result.unwrap().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_request_round_trip_and_legacy_fallback() {
+        let request = GetStateSegmentRequest {
+            segment_id: 7,
+            additional_segments: vec![8, 9],
+            expected_tip_height: 77,
+            expected_tip_hash: [0xA5; 32],
+            manifest_digest: [0xB6; 32],
+        };
+        for (protocol, ids, bytes) in [(protocol_v6(), vec![8, 9], 84), (protocol(), vec![], 80)] {
+            let mut wire = Cursor::new(Vec::new());
+            let mut codec = StateSegmentCodec::default();
+            codec
+                .write_request(&protocol, &mut wire, request.clone())
+                .await
+                .unwrap();
+            assert_eq!(wire.get_ref().len(), bytes);
+            let decoded = codec
+                .read_request(&protocol, &mut Cursor::new(wire.into_inner()))
+                .await
+                .unwrap();
+            assert_eq!(decoded.additional_segments, ids);
+        }
+        let mut codec = StateSegmentCodec::default();
+        for ids in [vec![7], vec![9, 8], (8..72).collect()] {
+            let mut bad = request.clone();
+            bad.additional_segments = ids;
+            assert!(codec
+                .write_request(&protocol_v6(), &mut Cursor::new(Vec::new()), bad)
+                .await
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn v5_wire_is_byte_identical_to_original_framing() {
+        let data = vec![0x5a; encoded_segment_len_for_live_count(10, 3).unwrap()];
+        let mut expected = response_header(10, data.len() as u32);
+        expected.extend_from_slice(&data);
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol(), &mut wire, response(Some(data), 10))
+            .await
+            .unwrap();
+        assert_eq!(wire.into_inner(), expected);
+    }
+
+    #[tokio::test]
+    async fn v6_full_segment_round_trip_charges_both_buffers_until_consumption() {
+        let len = max_encoded_segment_len_for_eff_log(16).unwrap();
+        let data = vec![0x5a; len];
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol_v6(), &mut wire, response(Some(data.clone()), 16))
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref()[RESPONSE_HEADER_BYTES], ZSTD);
+        let payload_len = wire.get_ref().len() - RESPONSE_HEADER_BYTES - TRANSPORT_HEADER_BYTES;
+        assert!(payload_len < len / 10);
+        let reserved = len + payload_len;
+        let mut codec = StateSegmentCodec::with_inbound_budget(reserved);
+        wire.set_position(0);
+        let decoded = codec
+            .read_response(&protocol_v6(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.data.as_deref(), Some(data.as_slice()));
+        assert_eq!(decoded.transport.version, 6);
+        assert_eq!(decoded.transport.payload_bytes, payload_len as u64);
+        assert_eq!(codec.inbound_budget.available_permits(), 0);
+        drop(decoded);
+        assert_eq!(codec.inbound_budget.available_permits(), reserved);
+    }
+
+    #[tokio::test]
+    async fn v6_uses_raw_when_compression_would_expand_a_small_segment() {
+        let len = encoded_segment_len_for_live_count(16, 1).unwrap();
+        let data: Vec<u8> = (0..len).map(|index| index as u8).collect();
+        let mut wire = Cursor::new(Vec::new());
+        StateSegmentCodec::default()
+            .write_response(&protocol_v6(), &mut wire, response(Some(data.clone()), 16))
+            .await
+            .unwrap();
+        assert_eq!(wire.get_ref()[RESPONSE_HEADER_BYTES], RAW);
+        assert_eq!(
+            wire.get_ref().len(),
+            RESPONSE_HEADER_BYTES + TRANSPORT_HEADER_BYTES + len
+        );
+        wire.set_position(0);
+        let decoded = StateSegmentCodec::default()
+            .read_response(&protocol_v6(), &mut wire)
+            .await
+            .unwrap();
+        assert_eq!(decoded.data.unwrap(), data);
+        assert_eq!(decoded.transport.payload_bytes, len as u64);
+    }
+
+    #[tokio::test]
+    async fn v6_preserves_busy_and_unavailable_without_payload_allocation() {
+        for status in [
+            DataResponseStatus::Ready,
+            DataResponseStatus::Busy {
+                retry_after_ms: 800,
+            },
+        ] {
+            let mut value = response(None, 0);
+            value.status = status;
+            let mut wire = Cursor::new(Vec::new());
+            StateSegmentCodec::default()
+                .write_response(&protocol_v6(), &mut wire, value)
+                .await
+                .unwrap();
+            wire.set_position(0);
+            let decoded = StateSegmentCodec::with_inbound_budget(0)
+                .read_response(&protocol_v6(), &mut wire)
+                .await
+                .unwrap();
+            assert_eq!(decoded.status, status);
+            assert!(decoded.data.is_none());
+            assert!(decoded.inbound_memory_permit.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_rejects_invalid_transport_lengths_before_admission() {
+        let len = encoded_segment_len_for_live_count(16, 1).unwrap();
+        for (encoding, wire_len) in [(RAW, len + 1), (ZSTD, len), (ZSTD, 0), (4, 1)] {
+            let wire = v6_wire(16, len as u32, encoding, &vec![0; wire_len]);
+            let mut codec = StateSegmentCodec::with_inbound_budget(0);
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                codec.read_response(&protocol_v6(), &mut Cursor::new(wire)),
+            )
+            .await
+            .expect("invalid framing must not wait for byte admission");
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[tokio::test]
+    async fn v6_rejects_wrong_content_size_concatenation_truncation_and_trailing_data() {
+        let len = encoded_segment_len_for_live_count(16, 20).unwrap();
+        let compressed = zstd::bulk::compress(&vec![0x5a; len], COMPRESSION_LEVEL).unwrap();
+        let mut concatenated = compressed.clone();
+        concatenated.extend_from_slice(&compressed);
+        let mut trailing = compressed.clone();
+        trailing.push(0);
+        let wrong_size = zstd::bulk::compress(&vec![0; len - 50], COMPRESSION_LEVEL).unwrap();
+        for payload in [
+            concatenated,
+            trailing,
+            wrong_size,
+            compressed[..compressed.len() - 1].to_vec(),
+        ] {
+            let mut codec = StateSegmentCodec::with_inbound_budget(len * 2);
+            let error = codec
+                .read_response(
+                    &protocol_v6(),
+                    &mut Cursor::new(v6_wire(16, len as u32, ZSTD, &payload)),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(codec.inbound_budget.available_permits(), len * 2);
+        }
+        let mut truncated_wire = v6_wire(16, len as u32, ZSTD, &compressed);
+        truncated_wire.pop();
+        let mut codec = StateSegmentCodec::with_inbound_budget(len * 2);
+        assert_eq!(
+            codec
+                .read_response(&protocol_v6(), &mut Cursor::new(truncated_wire))
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+        assert_eq!(codec.inbound_budget.available_permits(), len * 2);
+    }
+
+    #[tokio::test]
+    async fn protocol_versions_cannot_be_cross_decoded() {
+        let data = vec![0; encoded_segment_len_for_live_count(16, 1).unwrap()];
+        for (sender, receiver) in [(protocol(), protocol_v6()), (protocol_v6(), protocol())] {
+            let mut wire = Cursor::new(Vec::new());
+            StateSegmentCodec::default()
+                .write_response(&sender, &mut wire, response(Some(data.clone()), 16))
+                .await
+                .unwrap();
+            wire.set_position(0);
+            assert_eq!(
+                StateSegmentCodec::default()
+                    .read_response(&receiver, &mut wire)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_write_uses_one_precharged_reservation_without_waiting_for_more() {
+        let len = encoded_segment_len_for_live_count(16, 100).unwrap();
+        let reserved = outbound_reservation_bytes(len);
+        let budget = OutboundResponseBudget::with_capacity(reserved);
+        let serving = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = budget
+            .acquire_with_serving(reserved, vec![serving.clone().try_acquire_owned().unwrap()])
+            .await
+            .unwrap();
+        let mut value = response(Some(vec![0x5a; len]), 16);
+        value.outbound_memory_permit = permit;
+        let mut codec = StateSegmentCodec {
+            outbound_budget: budget.clone(),
+            ..Default::default()
+        };
+        let mut wire = Cursor::new(Vec::new());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            codec.write_response(&protocol_v6(), &mut wire, value),
+        )
+        .await
+        .expect("compression must not wait for a second reservation while holding the first")
+        .unwrap();
+        assert_eq!(wire.get_ref()[RESPONSE_HEADER_BYTES], ZSTD);
+        assert_eq!(budget.available_bytes(), reserved);
+        assert_eq!(serving.available_permits(), 1);
     }
 
     fn response_header(eff_log: u8, encoded_len: u32) -> Vec<u8> {
@@ -384,6 +983,7 @@ mod tests {
     async fn request_round_trip_binds_segment_and_exact_snapshot_boundary() {
         let request = GetStateSegmentRequest {
             segment_id: 0x1234,
+            additional_segments: Vec::new(),
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
             manifest_digest: [0xB6; 32],
@@ -447,12 +1047,14 @@ mod tests {
         let len = encoded_segment_len_for_live_count(10, 3).unwrap();
         let response = GetStateSegmentResponse {
             segment_id: 7,
+            additional_segments: Vec::new(),
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
             manifest_digest: [0xB6; 32],
             status: DataResponseStatus::Ready,
             eff_log: 10,
             data: Some(vec![0x5a; len]),
+            transport: Default::default(),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -478,6 +1080,7 @@ mod tests {
     async fn busy_response_is_not_decoded_as_unavailable() {
         let response = GetStateSegmentResponse {
             segment_id: 7,
+            additional_segments: Vec::new(),
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
             manifest_digest: [0xB6; 32],
@@ -486,6 +1089,7 @@ mod tests {
             },
             eff_log: 0,
             data: None,
+            transport: Default::default(),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -571,12 +1175,14 @@ mod tests {
         let permit = budget.acquire(len).await.unwrap().unwrap();
         let response = GetStateSegmentResponse {
             segment_id: 3,
+            additional_segments: Vec::new(),
             expected_tip_height: 77,
             expected_tip_hash: [0xA5; 32],
             manifest_digest: [0xB6; 32],
             status: DataResponseStatus::Ready,
             eff_log: 6,
             data: Some(vec![0x33; len]),
+            transport: Default::default(),
             inbound_memory_permit: None,
             outbound_memory_permit: Some(permit),
         };

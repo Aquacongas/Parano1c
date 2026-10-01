@@ -6,7 +6,7 @@
 //! This deliberately retains only scalar totals for the currently active
 //! sync.  It never stores per-header, per-segment, or per-block samples.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SyncPhase {
@@ -111,6 +111,21 @@ pub(crate) struct SnapshotSyncTelemetry {
     suffix: PhaseAccumulator,
     suffix_target_height: u64,
     suffix_active: bool,
+    transfer: StateTransferAccumulator,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StateTransferAccumulator {
+    started: Option<Instant>,
+    network_requests: u64,
+    network_segments: u64,
+    canonical_download_bytes: u64,
+    wire_payload_bytes: u64,
+    v5_segments: u64,
+    v6_segments: u64,
+    compressed_segments: u64,
+    reused_segments: u64,
+    reused_bytes: u64,
 }
 
 impl SnapshotSyncTelemetry {
@@ -138,6 +153,69 @@ impl SnapshotSyncTelemetry {
 
     pub(crate) fn record_state_segment(&mut self, bytes: u64, elapsed: Duration) {
         self.state.add_item(bytes, elapsed);
+    }
+
+    pub(crate) fn begin_state_transfer(&mut self) {
+        self.transfer = StateTransferAccumulator {
+            started: Some(Instant::now()),
+            ..Default::default()
+        };
+    }
+
+    pub(crate) fn record_state_download(
+        &mut self,
+        transport: noid_p2p::protocol::StateSegmentTransport,
+        canonical_bytes: u64,
+        segments: u64,
+    ) {
+        self.transfer.network_requests = self.transfer.network_requests.saturating_add(1);
+        self.transfer.network_segments = self.transfer.network_segments.saturating_add(segments);
+        self.transfer.canonical_download_bytes = self
+            .transfer
+            .canonical_download_bytes
+            .saturating_add(canonical_bytes);
+        self.transfer.wire_payload_bytes = self
+            .transfer
+            .wire_payload_bytes
+            .saturating_add(transport.payload_bytes);
+        if transport.version == 5 {
+            self.transfer.v5_segments = self.transfer.v5_segments.saturating_add(segments);
+        } else if transport.version == 6 {
+            self.transfer.v6_segments = self.transfer.v6_segments.saturating_add(segments);
+            if transport.payload_bytes < canonical_bytes {
+                self.transfer.compressed_segments =
+                    self.transfer.compressed_segments.saturating_add(segments);
+            }
+        }
+    }
+
+    pub(crate) fn record_state_reuse(&mut self, count: u64, bytes: u64, elapsed: Duration) {
+        self.transfer.reused_segments = self.transfer.reused_segments.saturating_add(count);
+        self.transfer.reused_bytes = self.transfer.reused_bytes.saturating_add(bytes);
+        self.state.count = self.state.count.saturating_add(count);
+        self.state.bytes = self.state.bytes.saturating_add(bytes);
+        self.state.add_work(elapsed);
+    }
+
+    pub(crate) fn log_state_transfer(&mut self) {
+        let transfer = std::mem::take(&mut self.transfer);
+        if let Some(started) = transfer.started {
+            tracing::info!(
+                phase = "snapshot_state_transfer",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                timing_basis = "wall",
+                network_requests = transfer.network_requests,
+                network_segments = transfer.network_segments,
+                canonical_download_bytes = transfer.canonical_download_bytes,
+                wire_payload_bytes = transfer.wire_payload_bytes,
+                v5_segments = transfer.v5_segments,
+                v6_segments = transfer.v6_segments,
+                compressed_segments = transfer.compressed_segments,
+                reused_segments = transfer.reused_segments,
+                reused_bytes = transfer.reused_bytes,
+                "snapshot State transfer and local reuse completed"
+            );
+        }
     }
 
     pub(crate) fn record_state_work(&mut self, elapsed: Duration) {

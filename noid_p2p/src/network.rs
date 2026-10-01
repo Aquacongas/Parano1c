@@ -2100,11 +2100,23 @@ type SnapshotExportDisconnectGrace = std::collections::HashMap<SnapshotExportKey
 struct PendingStateSegmentRequest {
     peer: PeerId,
     segment_id: u16,
+    additional_segments: [u16; crate::protocol::MAX_STATE_SEGMENT_BATCH - 1],
+    additional_count: u8,
     expected_tip_height: u64,
     expected_tip_hash: [u8; 32],
     manifest_digest: [u8; 32],
     issued_at: Instant,
     notify_node: bool,
+}
+
+impl PendingStateSegmentRequest {
+    fn segment_ids(&self) -> impl Iterator<Item = u16> + '_ {
+        std::iter::once(self.segment_id).chain(
+            self.additional_segments[..self.additional_count as usize]
+                .iter()
+                .copied(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2437,6 +2449,11 @@ fn state_segment_response_matches_pending(
         && pending.expected_tip_height == response.expected_tip_height
         && pending.expected_tip_hash == response.expected_tip_hash
         && pending.manifest_digest == response.manifest_digest
+        && (response.data.is_none()
+            || response.transport.version == 5
+            || pending
+                .segment_ids()
+                .eq(response.payloads().map(|(id, _)| id)))
 }
 
 fn schedule_manifest_page_requests(
@@ -2717,12 +2734,14 @@ fn start_manifest_assembly_if_ready(
 fn unavailable_state_segment_response(request: &GetStateSegmentRequest) -> GetStateSegmentResponse {
     GetStateSegmentResponse {
         segment_id: request.segment_id,
+        additional_segments: Vec::new(),
         expected_tip_height: request.expected_tip_height,
         expected_tip_hash: request.expected_tip_hash,
         manifest_digest: request.manifest_digest,
         status: crate::object_protocol::DataResponseStatus::Ready,
         eff_log: 0,
         data: None,
+        transport: Default::default(),
         inbound_memory_permit: None,
         outbound_memory_permit: None,
     }
@@ -2734,12 +2753,14 @@ fn busy_state_segment_response(
 ) -> GetStateSegmentResponse {
     GetStateSegmentResponse {
         segment_id: request.segment_id,
+        additional_segments: Vec::new(),
         expected_tip_height: request.expected_tip_height,
         expected_tip_hash: request.expected_tip_hash,
         manifest_digest: request.manifest_digest,
         status: DataResponseStatus::Busy { retry_after_ms },
         eff_log: 0,
         data: None,
+        transport: Default::default(),
         inbound_memory_permit: None,
         outbound_memory_permit: None,
     }
@@ -3175,6 +3196,7 @@ pub enum NetworkCommand {
     RequestStateSegment {
         peer: PeerId,
         segment_id: u16,
+        additional_segments: Vec<u16>,
         expected_tip_height: u64,
         expected_tip_hash: [u8; 32],
         manifest_digest: [u8; 32],
@@ -3624,6 +3646,7 @@ impl P2PNetwork {
             .send(NetworkCommand::RequestStateSegment {
                 peer,
                 segment_id,
+                additional_segments: Vec::new(),
                 expected_tip_height,
                 expected_tip_hash,
                 manifest_digest,
@@ -4080,13 +4103,14 @@ async fn run_swarm(
             encoded = segment_response_rx.recv() => {
                 if let Some(encoded) = encoded {
                     let served_exact_snapshot_segment = encoded.response.data.is_some();
-                    let segment_id = encoded.response.segment_id;
+                    let segment_ids = encoded.response.payloads().map(|(id, _)| id).collect::<Vec<_>>();
                     let queued = swarm
                         .behaviour_mut()
                         .state_segment_sync
                         .send_response(encoded.channel, encoded.response);
                     if queued.is_ok() && served_exact_snapshot_segment {
                         if let Some((key, manifest_digest)) = encoded.snapshot_lease {
+                            for segment_id in segment_ids {
                             refresh_snapshot_export_lease_after_service(
                                 &mut snapshot_export_leases,
                                 encoded.peer,
@@ -4094,6 +4118,7 @@ async fn run_swarm(
                                 Some(manifest_digest),
                                 SnapshotLeaseProgress::Segment(segment_id),
                             );
+                            }
                         }
                     }
                 }
@@ -4687,16 +4712,18 @@ async fn run_swarm(
                         wedged_sync_peers.insert(request.peer);
                     }
                     if request.notify_node {
+                        for segment_id in request.segment_ids() {
                         let _ = required_event_tx
                             .send(NetworkEvent::StateSegmentRequestFailed {
                                 from: request.peer,
-                                segment_id: request.segment_id,
+                                segment_id,
                                 expected_tip_height: request.expected_tip_height,
                                 expected_tip_hash: request.expected_tip_hash,
                                 manifest_digest: request.manifest_digest,
                                 kind: RequestFailureKind::Timeout,
                             })
                             .await;
+                        }
                     }
                 }
 
@@ -6016,21 +6043,26 @@ async fn handle_network_command(
         NetworkCommand::RequestStateSegment {
             peer,
             segment_id,
+            additional_segments,
             expected_tip_height,
             expected_tip_hash,
             manifest_digest,
         } => {
             if !sync_paths.is_dispatchable(peer) {
-                let _ = required_event_tx
-                    .send(NetworkEvent::StateSegmentRequestFailed {
-                        from: peer,
-                        segment_id,
-                        expected_tip_height,
-                        expected_tip_hash,
-                        manifest_digest,
-                        kind: RequestFailureKind::ConnectionClosed,
-                    })
-                    .await;
+                for segment_id in
+                    std::iter::once(segment_id).chain(additional_segments.iter().copied())
+                {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::StateSegmentRequestFailed {
+                            from: peer,
+                            segment_id,
+                            expected_tip_height,
+                            expected_tip_hash,
+                            manifest_digest,
+                            kind: RequestFailureKind::ConnectionClosed,
+                        })
+                        .await;
+                }
                 return;
             }
             // Exact peer, segment and tip correlation makes superseded
@@ -6053,22 +6085,33 @@ async fn handle_network_command(
                     limit = MAX_PENDING_STATE_SEGMENT_REQUESTS,
                     "state-segment request correlation table full"
                 );
-                let _ = required_event_tx
-                    .send(NetworkEvent::StateSegmentRequestFailed {
-                        from: peer,
-                        segment_id,
-                        expected_tip_height,
-                        expected_tip_hash,
-                        manifest_digest,
-                        kind: RequestFailureKind::LocalCapacity,
-                    })
-                    .await;
+                for segment_id in
+                    std::iter::once(segment_id).chain(additional_segments.iter().copied())
+                {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::StateSegmentRequestFailed {
+                            from: peer,
+                            segment_id,
+                            expected_tip_height,
+                            expected_tip_hash,
+                            manifest_digest,
+                            kind: RequestFailureKind::LocalCapacity,
+                        })
+                        .await;
+                }
                 return;
             }
+            if additional_segments.len() >= crate::protocol::MAX_STATE_SEGMENT_BATCH {
+                return;
+            }
+            let mut additional = [0; crate::protocol::MAX_STATE_SEGMENT_BATCH - 1];
+            additional[..additional_segments.len()].copy_from_slice(&additional_segments);
+            let additional_count = additional_segments.len() as u8;
             let request_id = swarm.behaviour_mut().state_segment_sync.send_request(
                 &peer,
                 crate::protocol::GetStateSegmentRequest {
                     segment_id,
+                    additional_segments,
                     expected_tip_height,
                     expected_tip_hash,
                     manifest_digest,
@@ -6079,6 +6122,8 @@ async fn handle_network_command(
                 PendingStateSegmentRequest {
                     peer,
                     segment_id,
+                    additional_segments: additional,
+                    additional_count,
                     expected_tip_height,
                     expected_tip_hash,
                     manifest_digest,
@@ -6391,16 +6436,18 @@ async fn handle_swarm_event(
         ($pending:expr, $kind:expr) => {{
             let pending = $pending;
             if pending.notify_node {
-                let _ = required_event_tx
-                    .send(NetworkEvent::StateSegmentRequestFailed {
-                        from: pending.peer,
-                        segment_id: pending.segment_id,
-                        expected_tip_height: pending.expected_tip_height,
-                        expected_tip_hash: pending.expected_tip_hash,
-                        manifest_digest: pending.manifest_digest,
-                        kind: $kind,
-                    })
-                    .await;
+                for segment_id in pending.segment_ids() {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::StateSegmentRequestFailed {
+                            from: pending.peer,
+                            segment_id,
+                            expected_tip_height: pending.expected_tip_height,
+                            expected_tip_hash: pending.expected_tip_hash,
+                            manifest_digest: pending.manifest_digest,
+                            kind: $kind,
+                        })
+                        .await;
+                }
             }
         }};
     }
@@ -8499,10 +8546,32 @@ async fn handle_swarm_event(
                 return;
             };
             let effective_log = export.manifest().effective_log_segment_size;
-            let declared_len = descriptor.encoded_len as usize;
-            if declared_len > MAX_SEGMENT_BYTES
-                || encoded_segment_live_count_from_len(effective_log, declared_len)
-                    .is_none_or(|live_count| live_count == 0)
+            let mut descriptors = vec![descriptor];
+            for id in &request.additional_segments {
+                let Some(part) = export.manifest().segment(*id).copied() else {
+                    let _ = swarm
+                        .behaviour_mut()
+                        .state_segment_sync
+                        .send_response(channel, unavailable_state_segment_response(&request));
+                    return;
+                };
+                descriptors.push(part);
+            }
+            let declared_len = descriptors
+                .iter()
+                .map(|part| part.encoded_len as usize)
+                .sum::<usize>();
+            if descriptors.len() > crate::protocol::MAX_STATE_SEGMENT_BATCH
+                || (descriptors.len() > 1
+                    && declared_len > crate::protocol::MAX_STATE_SEGMENT_BATCH_BYTES)
+                || descriptors.iter().any(|part| {
+                    part.encoded_len as usize > MAX_SEGMENT_BYTES
+                        || encoded_segment_live_count_from_len(
+                            effective_log,
+                            part.encoded_len as usize,
+                        )
+                        .is_none_or(|live_count| live_count == 0)
+                })
             {
                 tracing::warn!(
                     segment = descriptor.segment_id,
@@ -8541,40 +8610,65 @@ async fn handle_swarm_event(
                     return;
                 };
                 let Ok(Some(outbound_memory_permit)) = budget
-                    .acquire_with_serving(declared_len, serving_permits)
+                    .acquire_with_serving(
+                        crate::state_segment_codec::batch_outbound_reservation_bytes(
+                            declared_len,
+                            descriptors.len(),
+                        ),
+                        serving_permits,
+                    )
                     .await
                 else {
                     return;
                 };
-                // The exact descriptor length has been admitted before the
-                // generation opens or allocates its encoded payload Vec.
+                // Admit the canonical payload and compression scratch together
+                // before allocation. The codec must never wait for a second
+                // shared-budget reservation while holding the first one.
                 let loaded = tokio::task::spawn_blocking(move || {
                     let _encode_permit = permit;
-                    export.read_encoded_segment(descriptor.segment_id)
+                    descriptors
+                        .iter()
+                        .map(|part| {
+                            export.read_encoded_segment(part.segment_id).map(|data| {
+                                crate::protocol::StateSegmentPayload {
+                                    segment_id: part.segment_id,
+                                    data,
+                                }
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()
                 })
                 .await;
                 let response = match loaded {
-                    Ok(Ok(data)) => GetStateSegmentResponse {
-                        segment_id: descriptor.segment_id,
-                        expected_tip_height: requested_tip_height,
-                        expected_tip_hash: requested_tip_hash,
-                        manifest_digest: requested_manifest_digest,
-                        status: DataResponseStatus::Ready,
-                        eff_log: effective_log,
-                        data: Some(data),
-                        inbound_memory_permit: None,
-                        outbound_memory_permit: Some(outbound_memory_permit),
-                    },
+                    Ok(Ok(parts)) => {
+                        let mut parts = parts.into_iter();
+                        let first = parts.next().expect("at least one descriptor was selected");
+                        GetStateSegmentResponse {
+                            segment_id: descriptor.segment_id,
+                            additional_segments: parts.collect(),
+                            expected_tip_height: requested_tip_height,
+                            expected_tip_hash: requested_tip_hash,
+                            manifest_digest: requested_manifest_digest,
+                            status: DataResponseStatus::Ready,
+                            eff_log: effective_log,
+                            data: Some(first.data),
+                            transport: Default::default(),
+                            inbound_memory_permit: None,
+                            outbound_memory_permit: Some(outbound_memory_permit),
+                        }
+                    }
                     Ok(Err(error)) => {
                         tracing::warn!(segment = descriptor.segment_id, err = %error, "disk snapshot segment read failed");
                         GetStateSegmentResponse {
                             segment_id: descriptor.segment_id,
+                            additional_segments: Vec::new(),
                             expected_tip_height: requested_tip_height,
                             expected_tip_hash: requested_tip_hash,
                             manifest_digest: requested_manifest_digest,
                             status: DataResponseStatus::Ready,
                             eff_log: 0,
                             data: None,
+                            transport: Default::default(),
                             inbound_memory_permit: None,
                             // The permit is harmless for an empty response and
                             // is retained until the codec reports completion.
@@ -8585,12 +8679,14 @@ async fn handle_swarm_event(
                         tracing::warn!(segment = descriptor.segment_id, err = %error, "snapshot segment worker failed");
                         GetStateSegmentResponse {
                             segment_id: descriptor.segment_id,
+                            additional_segments: Vec::new(),
                             expected_tip_height: requested_tip_height,
                             expected_tip_hash: requested_tip_hash,
                             manifest_digest: requested_manifest_digest,
                             status: DataResponseStatus::Ready,
                             eff_log: 0,
                             data: None,
+                            transport: Default::default(),
                             inbound_memory_permit: None,
                             outbound_memory_permit: Some(outbound_memory_permit),
                         }
@@ -8647,17 +8743,35 @@ async fn handle_swarm_event(
                 return;
             }
             if let DataResponseStatus::Busy { retry_after_ms } = response.status {
-                let _ = required_event_tx
-                    .send(NetworkEvent::StateSegmentRequestBusy {
-                        from: peer,
-                        segment_id: pending.segment_id,
-                        expected_tip_height: pending.expected_tip_height,
-                        expected_tip_hash: pending.expected_tip_hash,
-                        manifest_digest: pending.manifest_digest,
-                        retry_after_ms,
-                    })
-                    .await;
+                for segment_id in pending.segment_ids() {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::StateSegmentRequestBusy {
+                            from: peer,
+                            segment_id,
+                            expected_tip_height: pending.expected_tip_height,
+                            expected_tip_hash: pending.expected_tip_hash,
+                            manifest_digest: pending.manifest_digest,
+                            retry_after_ms,
+                        })
+                        .await;
+                }
                 return;
+            }
+            if response.transport.version == 5 {
+                // A connection can fall back to v5 after reconnecting. Release
+                // every unsent sibling without penalizing an honest old peer.
+                for segment_id in pending.segment_ids().skip(1) {
+                    let _ = required_event_tx
+                        .send(NetworkEvent::StateSegmentRequestFailed {
+                            from: peer,
+                            segment_id,
+                            expected_tip_height: pending.expected_tip_height,
+                            expected_tip_hash: pending.expected_tip_hash,
+                            manifest_digest: pending.manifest_digest,
+                            kind: RequestFailureKind::LocalCapacity,
+                        })
+                        .await;
+                }
             }
             if let Some(ref data) = response.data {
                 let Some(maximum_len) = max_encoded_segment_len_for_eff_log(response.eff_log)
@@ -11437,6 +11551,8 @@ mod tests {
         let old = PendingStateSegmentRequest {
             peer,
             segment_id: 7,
+            additional_segments: [0; crate::protocol::MAX_STATE_SEGMENT_BATCH - 1],
+            additional_count: 0,
             expected_tip_height: 144,
             expected_tip_hash: [0xA5; 32],
             manifest_digest: [0x11; 32],
@@ -11445,12 +11561,14 @@ mod tests {
         };
         let response = GetStateSegmentResponse {
             segment_id: 7,
+            additional_segments: Vec::new(),
             expected_tip_height: 144,
             expected_tip_hash: [0xA5; 32],
             manifest_digest: [0x11; 32],
             status: crate::object_protocol::DataResponseStatus::Ready,
             eff_log: 0,
             data: None,
+            transport: Default::default(),
             inbound_memory_permit: None,
             outbound_memory_permit: None,
         };
@@ -11473,6 +11591,7 @@ mod tests {
 
         let request = GetStateSegmentRequest {
             segment_id: 9,
+            additional_segments: Vec::new(),
             expected_tip_height: 200,
             expected_tip_hash: [0xCC; 32],
             manifest_digest: [0x33; 32],

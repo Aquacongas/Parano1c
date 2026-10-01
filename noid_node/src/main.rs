@@ -3753,14 +3753,10 @@ enum SnapshotSegmentFailureScope {
 /// Semantic errors are classified as candidate failures only after the State
 /// segment verifier has matched the exact advertised subtree root.
 fn snapshot_segment_failure_scope(error: &SnapshotStagingError) -> SnapshotSegmentFailureScope {
+    if error.is_payload_authentication_error() {
+        return SnapshotSegmentFailureScope::Source;
+    }
     match error {
-        SnapshotStagingError::ResponseEffectiveLogMismatch { .. }
-        | SnapshotStagingError::PayloadLength { .. }
-        | SnapshotStagingError::SegmentDecode { .. }
-        | SnapshotStagingError::EncodedEffectiveLogMismatch { .. }
-        | SnapshotStagingError::ExactSegmentRootMismatch { .. } => {
-            SnapshotSegmentFailureScope::Source
-        }
         SnapshotStagingError::CreationIdExceedsBound { .. }
         | SnapshotStagingError::CoinbaseCreationHeightExceedsBoundary { .. }
         | SnapshotStagingError::EmptyAdvertisedSegment { .. } => {
@@ -3768,6 +3764,38 @@ fn snapshot_segment_failure_scope(error: &SnapshotStagingError) -> SnapshotSegme
         }
         _ => SnapshotSegmentFailureScope::Fatal,
     }
+}
+
+struct LocalSnapshotReuse {
+    staging: SnapshotStagingSession,
+    segment_ids: Vec<u16>,
+    bytes: u64,
+}
+
+/// Runs in the single State blocking lane. Only one encoded segment is live
+/// at a time, and compact summaries are never accepted as payload authority.
+fn reuse_snapshot_segments_from_store(
+    mut staging: SnapshotStagingSession,
+    store: &MdbxStore,
+    still_current: impl Fn() -> bool,
+) -> Result<LocalSnapshotReuse, SnapshotSessionPrepareError> {
+    let (segment_ids, bytes) =
+        staging
+            .reuse_local_segments(store, still_current)
+            .map_err(|error| match error {
+                noid_chain::storage::StoreError::SnapshotStaging(ref staging_error)
+                    if snapshot_segment_failure_scope(staging_error)
+                        == SnapshotSegmentFailureScope::Candidate =>
+                {
+                    SnapshotSessionPrepareError::CandidateRejected(error.to_string())
+                }
+                _ => SnapshotSessionPrepareError::Fatal(error.to_string()),
+            })?;
+    Ok(LocalSnapshotReuse {
+        staging,
+        segment_ids,
+        bytes,
+    })
 }
 
 fn highest_snapshot_header_boundary(
@@ -8209,6 +8237,10 @@ async fn handle_p2p_events(
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SnapshotStagingOperationKey {
+        Reuse {
+            generation: u64,
+            snapshot: noid_node::networking::SnapshotId,
+        },
         Accept {
             generation: u64,
             snapshot: noid_node::networking::SnapshotId,
@@ -8221,9 +8253,13 @@ async fn handle_p2p_events(
         },
     }
     enum SnapshotStagingCompletion {
+        Reused {
+            key: SnapshotStagingOperationKey,
+            work_elapsed: std::time::Duration,
+            result: Result<LocalSnapshotReuse, SnapshotSessionPrepareError>,
+        },
         Accepted {
             key: SnapshotStagingOperationKey,
-            payload_bytes: u64,
             work_elapsed: std::time::Duration,
             result: SnapshotSegmentStageResult,
         },
@@ -8235,10 +8271,10 @@ async fn handle_p2p_events(
         },
     }
     enum SnapshotSegmentStageResult {
-        Accepted(SnapshotStagingSession),
-        SourceRejected {
+        Staged {
             staging: SnapshotStagingSession,
-            error: String,
+            accepted: Vec<(u16, u64)>,
+            rejected: Vec<(u16, String)>,
         },
         CandidateRejected(String),
         Fatal(String),
@@ -8764,13 +8800,20 @@ async fn handle_p2p_events(
 
     macro_rules! dispatch_snapshot_segments_from_available_source {
         () => {{
-            if let Some(sync) = active_snapshot_sync.as_mut() {
-                dispatch_exact_snapshot_segments(
-                    sync,
-                    &p2p_cmd,
-                    snapshot_staging_inflight.is_some(),
-                    queued_segment_response.is_some(),
-                );
+            // Local reuse imports Wanted objects before any network lease.
+            // Ordinary network staging still overlaps the next transfer.
+            if !matches!(
+                snapshot_staging_inflight,
+                Some(SnapshotStagingOperationKey::Reuse { .. })
+            ) {
+                if let Some(sync) = active_snapshot_sync.as_mut() {
+                    dispatch_exact_snapshot_segments(
+                        sync,
+                        &p2p_cmd,
+                        snapshot_staging_inflight.is_some(),
+                        queued_segment_response.is_some(),
+                    );
+                }
             }
         }};
     }
@@ -8839,36 +8882,6 @@ async fn handle_p2p_events(
                 correlated,
                 reason = $reason,
                 "snapshot object source failed; preserving generation and verified segments"
-            );
-            request_snapshot_generation_providers!(failed_peer);
-            dispatch_snapshot_segments_from_available_source!();
-        }};
-    }
-
-    macro_rules! reject_snapshot_segment_source {
-        ($failed_peer:expr, $segment_id:expr, $reason:expr) => {{
-            let failed_peer = $failed_peer;
-            let segment_id = $segment_id;
-            let correlated = if let Some(sync) = active_snapshot_sync.as_mut() {
-                if let Some(segment) = sync.segment(segment_id) {
-                    sync.reject_provider(failed_peer, segment).is_ok()
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if correlated {
-                if let Some(pending) = pending_manifest.as_mut() {
-                    pending.providers.remove(&failed_peer);
-                }
-            }
-            tracing::warn!(
-                peer = %failed_peer,
-                segment = segment_id,
-                correlated,
-                reason = $reason,
-                "snapshot object source rejected; preserving generation and verified segments"
             );
             request_snapshot_generation_providers!(failed_peer);
             dispatch_snapshot_segments_from_available_source!();
@@ -9473,39 +9486,36 @@ async fn handle_p2p_events(
             let completion = snapshot_staging_completion_tx.clone();
             let response_effective_log = response.eff_log;
             let segment_id = response.segment_id;
-            let payload_bytes = response
-                .data
-                .as_ref()
-                .map_or(0u64, |data| data.len() as u64);
+            let payload_bytes = response.payloads().map(|(_, data)| data.len() as u64).sum();
+            sync_phase_telemetry.record_state_download(response.transport, payload_bytes, response.payloads().count() as u64);
             tokio::task::spawn_blocking(move || {
                 let started = Instant::now();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    match staging.accept_segment_recoverable(
+                    let mut accepted = Vec::new();
+                    let mut rejected = Vec::new();
+                    for (segment_id, data) in response.payloads() {
+                        match staging.accept_segment_recoverable(
                             segment_id,
                             response_effective_log,
-                            response
-                                .data
-                                .as_deref()
-                                .expect("present segment payload moved intact"),
+                            data,
                         ) {
-                            Ok(()) => SnapshotSegmentStageResult::Accepted(staging),
+                            Ok(()) => accepted.push((segment_id, data.len() as u64)),
                             Err(error)
                                 if snapshot_segment_failure_scope(&error)
                                     == SnapshotSegmentFailureScope::Source =>
                             {
-                                SnapshotSegmentStageResult::SourceRejected {
-                                    staging,
-                                    error: error.to_string(),
-                                }
+                                rejected.push((segment_id, error.to_string()));
                             }
                             Err(error)
                                 if snapshot_segment_failure_scope(&error)
                                     == SnapshotSegmentFailureScope::Candidate =>
                             {
-                                SnapshotSegmentStageResult::CandidateRejected(error.to_string())
+                                return SnapshotSegmentStageResult::CandidateRejected(error.to_string());
                             }
-                            Err(error) => SnapshotSegmentStageResult::Fatal(error.to_string()),
+                            Err(error) => return SnapshotSegmentStageResult::Fatal(error.to_string()),
                         }
+                    }
+                    SnapshotSegmentStageResult::Staged { staging, accepted, rejected }
                 }))
                 .unwrap_or_else(|_| {
                     SnapshotSegmentStageResult::Fatal(
@@ -9516,7 +9526,6 @@ async fn handle_p2p_events(
                 // authentication and atomic disk publication by the closure.
                 let _ = completion.blocking_send(SnapshotStagingCompletion::Accepted {
                     key,
-                    payload_bytes,
                     work_elapsed: started.elapsed(),
                     result,
                 });
@@ -9526,6 +9535,53 @@ async fn handle_p2p_events(
                 segment = segment_id,
                 "snapshot segment queued for bounded authentication/staging"
             );
+        }};
+    }
+
+    macro_rules! finalize_snapshot_staging_if_ready {
+        () => {{
+            if snapshot_staging_inflight.is_none()
+                && queued_segment_response.is_none()
+                && active_snapshot_sync
+                    .as_ref()
+                    .is_some_and(|sync| sync.all_segments_verified())
+            {
+                let staging = snapshot_staging
+                    .take()
+                    .expect("verified snapshot session is available for finalization");
+                let segment_count = staging.descriptors().len();
+                let snapshot = pending_manifest
+                    .as_ref()
+                    .expect("snapshot manifest exists during finalization")
+                    .offer
+                    .snapshot_id();
+                let key = SnapshotStagingOperationKey::Finalize {
+                    generation: snapshot_sync_generation,
+                    snapshot,
+                };
+                snapshot_staging_inflight = Some(key);
+                let completion = snapshot_staging_completion_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let started = Instant::now();
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                        move || match staging.finalize() {
+                            Ok(finalized) => SnapshotFinalizationOutcome::Finalized(finalized),
+                            Err(error) => classify_snapshot_finalization_error(error),
+                        },
+                    ))
+                    .unwrap_or_else(|_| {
+                        SnapshotFinalizationOutcome::Fatal(
+                            "snapshot finalization worker panicked".to_owned(),
+                        )
+                    });
+                    let _ = completion.blocking_send(SnapshotStagingCompletion::Finalized {
+                        key,
+                        segment_count,
+                        work_elapsed: started.elapsed(),
+                        result,
+                    });
+                });
+            }
         }};
     }
 
@@ -11963,7 +12019,7 @@ async fn handle_p2p_events(
                     drop(response);
                     continue;
                 }
-                let Some(data_len) = response.data.as_ref().map(Vec::len) else {
+                let Some(_) = response.data.as_ref() else {
                     // A served exact manifest promises a complete immutable
                     // generation. Missing any advertised segment makes this
                     // peer unsuitable for the whole plan, even if it is an
@@ -11976,24 +12032,32 @@ async fn handle_p2p_events(
                     dispatch_snapshot_segments_from_available_source!();
                     continue;
                 };
+                let parts = response.payloads().map(|(id, data)| sync.segment(id).map(|part| (part, data.len())))
+                    .collect::<Option<Vec<_>>>();
+                let Some(parts) = parts else {
+                    let _ = sync.reject_provider(from, segment);
+                    drop(response);
+                    request_snapshot_generation_providers!(from);
+                    dispatch_snapshot_segments_from_available_source!();
+                    continue;
+                };
+                sync.note_transport(from, response.transport.version);
                 if snapshot_staging_inflight.is_some() && queued_segment_response.is_some() {
                     // Both bounded local staging slots are occupied. The
                     // response has not yet been admitted into ObjectFetcher,
                     // so return its exact request to Wanted without scoring
                     // the peer or manufacturing an orphan Received state.
-                    let request =
-                        noid_node::networking::snapshot_sync::SnapshotSegmentRequest {
-                            peer: from,
-                            segment,
-                        };
-                    if let Err(error) = sync.defer_request(request) {
-                        tracing::warn!(peer = %from, segment = response.segment_id, %error, "could not defer State response behind local staging capacity");
+                    for (segment, _) in &parts {
+                        let request = noid_node::networking::snapshot_sync::SnapshotSegmentRequest { peer: from, segment: *segment };
+                        if let Err(error) = sync.defer_request(request) {
+                            tracing::warn!(peer = %from, segment = segment.segment_id, %error, "could not defer State response behind local staging capacity");
+                        }
                     }
                     drop(response);
                     dispatch_snapshot_segments_from_available_source!();
                     continue;
                 }
-                if let Err(error) = sync.accept_response(from, segment, data_len) {
+                if let Err(error) = sync.accept_batch(from, &parts) {
                     tracing::warn!(peer = %from, segment = response.segment_id, %error, "snapshot response failed exact correlation");
                     if matches!(
                         error,
@@ -13497,16 +13561,19 @@ async fn handle_p2p_events(
                 continue;
             };
             let key = match &completed {
-                SnapshotStagingCompletion::Accepted { key, .. }
+                SnapshotStagingCompletion::Reused { key, .. }
+                | SnapshotStagingCompletion::Accepted { key, .. }
                 | SnapshotStagingCompletion::Finalized { key, .. } => *key,
             };
             if snapshot_staging_inflight != Some(key) {
                 tracing::debug!(?key, "discarding superseded snapshot staging completion");
                 match completed {
+                    SnapshotStagingCompletion::Reused {
+                        result: Ok(reused), ..
+                    } => cleanup_snapshot_staging_session_offthread(reused.staging),
                     SnapshotStagingCompletion::Accepted {
                         result:
-                            SnapshotSegmentStageResult::Accepted(staging)
-                            | SnapshotSegmentStageResult::SourceRejected { staging, .. },
+                            SnapshotSegmentStageResult::Staged { staging, .. },
                         ..
                     } => cleanup_snapshot_staging_session_offthread(staging),
                     SnapshotStagingCompletion::Finalized {
@@ -13520,9 +13587,59 @@ async fn handle_p2p_events(
             snapshot_staging_inflight = None;
 
             match completed {
+                SnapshotStagingCompletion::Reused { key, work_elapsed, result } => {
+                    let SnapshotStagingOperationKey::Reuse { generation, snapshot } = key else {
+                        unreachable!("reuse completion always has a reuse key");
+                    };
+                    if generation != snapshot_sync_generation
+                        || active_snapshot_sync.as_ref()
+                            .is_none_or(|sync| sync.plan().snapshot_id() != Some(snapshot))
+                    {
+                        if let Ok(reused) = result {
+                            cleanup_snapshot_staging_session_offthread(reused.staging);
+                        }
+                        continue;
+                    }
+                    let reused = match result {
+                        Ok(reused) => reused,
+                        Err(SnapshotSessionPrepareError::CandidateRejected(error)) => {
+                            let failed_peer = pending_manifest.as_ref()
+                                .expect("reuse has its selected manifest").preferred_peer;
+                            tracing::warn!(%error, "root-bound local segment violates snapshot boundary semantics");
+                            retire_snapshot_plan!();
+                            request_bounded_manifest_failover!(failed_peer, false);
+                            continue;
+                        }
+                        Err(SnapshotSessionPrepareError::Fatal(error)) => {
+                            return Err(anyhow::anyhow!("local snapshot reuse failed: {error}"));
+                        }
+                    };
+                    let sync = active_snapshot_sync.as_mut().expect("reuse has its exact plan");
+                    for segment_id in &reused.segment_ids {
+                        let segment = sync.segment(*segment_id)
+                            .expect("reuse descriptor belongs to the immutable plan");
+                        if let Err(error) = sync.mark_local_verified(segment) {
+                            cleanup_snapshot_staging_session_offthread(reused.staging);
+                            return Err(anyhow::anyhow!("locally staged segment lost exact authority: {error}"));
+                        }
+                    }
+                    tracing::info!(
+                        boundary = snapshot.boundary.height,
+                        reused_segments = reused.segment_ids.len(),
+                        reused_bytes = reused.bytes,
+                        remaining_segments = sync.counts().wanted,
+                        elapsed_ms = work_elapsed.as_millis() as u64,
+                        "authenticated local snapshot segments reused before network transfer"
+                    );
+                    sync_phase_telemetry.record_state_reuse(reused.segment_ids.len() as u64, reused.bytes, work_elapsed);
+                    snapshot_staging = Some(reused.staging);
+                    snapshot_plan_last_progress = Some(Instant::now());
+                    snapshot_provider_discovery_rounds = 0;
+                    dispatch_snapshot_segments_from_available_source!();
+                    finalize_snapshot_staging_if_ready!();
+                }
                 SnapshotStagingCompletion::Accepted {
                     key,
-                    payload_bytes,
                     work_elapsed,
                     result,
                 } => {
@@ -13537,8 +13654,7 @@ async fn handle_p2p_events(
                     };
                     if generation != snapshot_sync_generation {
                         match result {
-                            SnapshotSegmentStageResult::Accepted(staging)
-                            | SnapshotSegmentStageResult::SourceRejected { staging, .. } => {
+                            SnapshotSegmentStageResult::Staged { staging, .. } => {
                                 cleanup_snapshot_staging_session_offthread(staging);
                             }
                             SnapshotSegmentStageResult::CandidateRejected(_)
@@ -13556,8 +13672,7 @@ async fn handle_p2p_events(
                         .is_none_or(|sync| sync.plan().snapshot_id() != Some(snapshot))
                     {
                         match result {
-                            SnapshotSegmentStageResult::Accepted(staging)
-                            | SnapshotSegmentStageResult::SourceRejected { staging, .. } => {
+                            SnapshotSegmentStageResult::Staged { staging, .. } => {
                                 cleanup_snapshot_staging_session_offthread(staging);
                             }
                             SnapshotSegmentStageResult::CandidateRejected(_)
@@ -13570,32 +13685,8 @@ async fn handle_p2p_events(
                         );
                         continue;
                     }
-                    let staging = match result {
-                        SnapshotSegmentStageResult::Accepted(staging) => staging,
-                        SnapshotSegmentStageResult::SourceRejected { staging, error } => {
-                            tracing::warn!(
-                                from = %from,
-                                segment = segment_id,
-                                err = %error,
-                                "snapshot segment authentication/staging failed; retaining verified objects"
-                            );
-                            snapshot_staging = Some(staging);
-                            reject_snapshot_segment_source!(
-                                from,
-                                segment_id,
-                                "segment authentication failed"
-                            );
-                            // One exact response may already be buffered behind
-                            // this disk operation. It has its own descriptor and
-                            // root, so authenticate it normally instead of
-                            // throwing away useful bytes with the failed object.
-                            if let Some((queued_from, response)) =
-                                queued_segment_response.take()
-                            {
-                                stage_snapshot_segment_response!(queued_from, response);
-                            }
-                            continue;
-                        }
+                    let (staging, accepted, rejected) = match result {
+                        SnapshotSegmentStageResult::Staged { staging, accepted, rejected } => (staging, accepted, rejected),
                         SnapshotSegmentStageResult::CandidateRejected(error) => {
                             let failed_peer = pending_manifest
                                 .as_ref()
@@ -13623,37 +13714,29 @@ async fn handle_p2p_events(
                             ));
                         }
                     };
-                    sync_phase_telemetry.record_state_segment(payload_bytes, work_elapsed);
+                    sync_phase_telemetry.record_state_work(work_elapsed);
                     if pending_manifest.is_none() {
-                        tracing::warn!(
-                            from = %from,
-                            segment = segment_id,
-                            "snapshot staging completion lost its selected manifest"
-                        );
                         cleanup_snapshot_staging_session_offthread(staging);
-                        return Err(anyhow::anyhow!(
-                            "snapshot staging completion lost its immutable manifest"
-                        ));
+                        return Err(anyhow::anyhow!("snapshot staging completion lost its immutable manifest"));
                     }
-                    let Some(segment) = active_snapshot_sync
-                        .as_ref()
-                        .and_then(|sync| sync.segment(segment_id))
-                    else {
-                        cleanup_snapshot_staging_session_offthread(staging);
-                        return Err(anyhow::anyhow!(
-                            "snapshot staging completion lost exact segment {segment_id}"
-                        ));
-                    };
-                    if let Err(error) = active_snapshot_sync
-                        .as_mut()
-                        .expect("exact snapshot plan exists")
-                        .mark_verified(segment)
-                    {
-                        tracing::error!(from = %from, segment = segment_id, %error, "staged snapshot segment lost exact-object authority");
-                        cleanup_snapshot_staging_session_offthread(staging);
-                        return Err(anyhow::anyhow!(
-                            "staged snapshot segment {segment_id} lost exact-object authority: {error}"
-                        ));
+                    for (id, bytes) in &accepted {
+                        let sync = active_snapshot_sync.as_mut().expect("exact snapshot plan exists");
+                        let segment = sync.segment(*id).expect("authenticated batch member belongs to the plan");
+                        if let Err(error) = sync.mark_verified(segment) {
+                            cleanup_snapshot_staging_session_offthread(staging);
+                            return Err(anyhow::anyhow!("staged snapshot segment {id} lost exact-object authority: {error}"));
+                        }
+                        sync_phase_telemetry.record_state_segment(*bytes, std::time::Duration::ZERO);
+                    }
+                    if !rejected.is_empty() {
+                        let sync = active_snapshot_sync.as_mut().expect("exact snapshot plan exists");
+                        let segments = rejected.iter().map(|(id, _)| sync.segment(*id).expect("correlated rejected member")).collect::<Vec<_>>();
+                        sync.reject_provider_batch(from, &segments)?;
+                        if let Some(pending) = pending_manifest.as_mut() { pending.providers.remove(&from); }
+                        for (id, error) in &rejected {
+                            tracing::warn!(peer = %from, segment = id, %error, "snapshot batch member rejected; independently verified objects retained");
+                        }
+                        request_snapshot_generation_providers!(from);
                     }
                     snapshot_staging = Some(staging);
                     snapshot_plan_last_progress = Some(Instant::now());
@@ -13678,58 +13761,7 @@ async fn handle_p2p_events(
                         "snapshot segment authenticated and sealed to disk"
                     );
 
-                    // Once every response is durably staged, independently
-                    // reconstruct the exact root in the same one-operation
-                    // blocking lane.  `pending_manifest` continues to own the
-                    // authenticated HistoryStep boundary and inbound permit during this pass.
-                    if snapshot_staging_inflight.is_none()
-                        && queued_segment_response.is_none()
-                        && active_snapshot_sync
-                            .as_ref()
-                            .is_some_and(|sync| sync.all_segments_verified())
-                    {
-                        let staging = snapshot_staging
-                            .take()
-                            .expect("accepted snapshot session is available for finalization");
-                        let segment_count = staging.descriptors().len();
-                        let snapshot = pending_manifest
-                            .as_ref()
-                            .expect("snapshot manifest exists during finalization")
-                            .offer
-                            .snapshot_id();
-                        let key = SnapshotStagingOperationKey::Finalize {
-                            generation: snapshot_sync_generation,
-                            snapshot,
-                        };
-                        snapshot_staging_inflight = Some(key);
-                        let completion = snapshot_staging_completion_tx.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let started = Instant::now();
-                            let result = std::panic::catch_unwind(
-                                std::panic::AssertUnwindSafe(move || {
-                                    match staging.finalize() {
-                                        Ok(finalized) => {
-                                            SnapshotFinalizationOutcome::Finalized(finalized)
-                                        }
-                                        Err(error) => classify_snapshot_finalization_error(error),
-                                    }
-                                }),
-                            )
-                            .unwrap_or_else(|_| {
-                                SnapshotFinalizationOutcome::Fatal(
-                                    "snapshot finalization worker panicked".to_owned(),
-                                )
-                            });
-                            let _ = completion.blocking_send(
-                                SnapshotStagingCompletion::Finalized {
-                                    key,
-                                    segment_count,
-                                    work_elapsed: started.elapsed(),
-                                    result,
-                                },
-                            );
-                        });
-                    }
+                    finalize_snapshot_staging_if_ready!();
                 }
                 SnapshotStagingCompletion::Finalized {
                     key,
@@ -13835,6 +13867,7 @@ async fn handle_p2p_events(
                     sync_phase_telemetry.record_state_work(applied.state_install_elapsed);
                     log_sync_phase_measurement(sync_phase_telemetry.finish_headers());
                     log_sync_phase_measurement(sync_phase_telemetry.finish_state());
+                    sync_phase_telemetry.log_state_transfer();
                     log_sync_phase_measurement(sync_phase_telemetry.complete_staged_tail(
                         applied.tail_blocks,
                         applied.tail_bytes,
@@ -13969,6 +14002,7 @@ async fn handle_p2p_events(
                     sync_phase_telemetry.record_state_work(applied.state_install_elapsed);
                     log_sync_phase_measurement(sync_phase_telemetry.finish_headers());
                     log_sync_phase_measurement(sync_phase_telemetry.finish_state());
+                    sync_phase_telemetry.log_state_transfer();
                     log_sync_phase_measurement(sync_phase_telemetry.complete_staged_tail(
                         applied.tail_blocks,
                         applied.tail_bytes,
@@ -14281,44 +14315,31 @@ async fn handle_p2p_events(
                 .as_mut()
                 .expect("selected snapshot manifest is installed")
                 .history_step = Some(verified_history_step);
-            snapshot_staging = Some(staging);
-            dispatch_snapshot_segments_from_available_source!();
-
-            if active_snapshot_sync
-                .as_ref()
-                .is_some_and(|sync| sync.all_segments_verified())
-            {
-                let staging = snapshot_staging
-                    .take()
-                    .expect("snapshot staging exists before empty finalization");
-                let segment_count = staging.descriptors().len();
-                let key = SnapshotStagingOperationKey::Finalize {
-                    generation: snapshot_sync_generation,
-                    snapshot: completed.key.snapshot,
-                };
-                snapshot_staging_inflight = Some(key);
-                let completion = snapshot_staging_completion_tx.clone();
-                tokio::task::spawn_blocking(move || {
-                    let started = Instant::now();
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                        move || match staging.finalize() {
-                            Ok(finalized) => SnapshotFinalizationOutcome::Finalized(finalized),
-                            Err(error) => classify_snapshot_finalization_error(error),
-                        },
-                    ))
-                    .unwrap_or_else(|_| {
-                        SnapshotFinalizationOutcome::Fatal(
-                            "snapshot finalization worker panicked".to_owned(),
-                        )
-                    });
-                    let _ = completion.blocking_send(SnapshotStagingCompletion::Finalized {
-                        key,
-                        segment_count,
-                        work_elapsed: started.elapsed(),
-                        result,
-                    });
+            sync_phase_telemetry.begin_state_transfer();
+            let key = SnapshotStagingOperationKey::Reuse {
+                generation: snapshot_sync_generation,
+                snapshot: completed.key.snapshot,
+            };
+            snapshot_staging_inflight = Some(key);
+            let completion = snapshot_staging_completion_tx.clone();
+            let store = snapshot_header_store.clone();
+            let generation_guard = Arc::clone(&snapshot_sync_generation_guard);
+            let generation = snapshot_sync_generation;
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    reuse_snapshot_segments_from_store(staging, &store, || {
+                        generation_guard.load(std::sync::atomic::Ordering::Acquire) == generation
+                    })
+                })).unwrap_or_else(|_| Err(SnapshotSessionPrepareError::Fatal(
+                    "local snapshot reuse worker panicked".to_owned(),
+                )));
+                let _ = completion.blocking_send(SnapshotStagingCompletion::Reused {
+                    key,
+                    work_elapsed: started.elapsed(),
+                    result,
                 });
-            }
+            });
         }
 
         completed = boundary_proof_maintenance_rx.recv() => {
@@ -15523,17 +15544,25 @@ fn dispatch_exact_snapshot_segments(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    for request in sync.schedule(now_ms, 1) {
-        let command = noid_p2p::NetworkCommand::RequestStateSegment {
-            peer: request.peer,
-            segment_id: request.segment.segment_id,
-            expected_tip_height: request.segment.snapshot.boundary.height,
-            expected_tip_hash: request.segment.snapshot.boundary.hash,
-            manifest_digest: request.segment.snapshot.manifest_digest,
-        };
-        if p2p_cmd.try_send(command).is_err() {
+    let requests = sync.schedule_batch(now_ms);
+    let Some(first) = requests.first() else {
+        return;
+    };
+    let command = noid_p2p::NetworkCommand::RequestStateSegment {
+        peer: first.peer,
+        segment_id: first.segment.segment_id,
+        additional_segments: requests
+            .iter()
+            .skip(1)
+            .map(|request| request.segment.segment_id)
+            .collect(),
+        expected_tip_height: first.segment.snapshot.boundary.height,
+        expected_tip_hash: first.segment.snapshot.boundary.hash,
+        manifest_digest: first.segment.snapshot.manifest_digest,
+    };
+    if p2p_cmd.try_send(command).is_err() {
+        for request in requests {
             let _ = sync.defer_request(request);
-            break;
         }
     }
 }

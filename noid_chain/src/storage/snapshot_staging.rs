@@ -234,6 +234,18 @@ pub enum SnapshotStagingError {
 }
 
 impl SnapshotStagingError {
+    /// These errors reject payload bytes before boundary semantics acquire
+    /// authority. Network sources and local reuse hints can both be retried.
+    pub fn is_payload_authentication_error(&self) -> bool {
+        matches!(
+            self,
+            Self::ResponseEffectiveLogMismatch { .. }
+                | Self::PayloadLength { .. }
+                | Self::SegmentDecode { .. }
+                | Self::EncodedEffectiveLogMismatch { .. }
+                | Self::ExactSegmentRootMismatch { .. }
+        )
+    }
     fn io(operation: &'static str, source: io::Error) -> Self {
         Self::Io { operation, source }
     }
@@ -411,6 +423,41 @@ impl SnapshotStagingSession {
 
     pub fn received_count(&self) -> usize {
         self.received_count
+    }
+
+    /// Authenticate and seal root-matching local segments before transport
+    /// dispatch. At most one encoded payload is resident. A corrupt local
+    /// hint falls back to the network without invalidating verified progress;
+    /// boundary semantic failures and disk failures propagate to the caller.
+    pub fn reuse_local_segments(
+        &mut self,
+        store: &super::MdbxStore,
+        still_current: impl Fn() -> bool,
+    ) -> Result<(Vec<u16>, u64), super::StoreError> {
+        let effective_log = self.metadata.effective_log_segment;
+        let mut segment_ids = Vec::new();
+        let mut bytes = 0u64;
+        for index in 0..self.descriptors.len() {
+            if !still_current() {
+                break;
+            }
+            let descriptor = self.descriptors[index];
+            let Some(encoded) = store.matching_encoded_segment(&descriptor, effective_log)? else {
+                continue;
+            };
+            match self.accept_segment_recoverable(descriptor.segment_id, effective_log, &encoded) {
+                Ok(()) => {
+                    segment_ids.push(descriptor.segment_id);
+                    bytes = bytes.saturating_add(encoded.len() as u64);
+                }
+                Err(error) if error.is_payload_authentication_error() => {
+                    tracing::warn!(segment = descriptor.segment_id, %error,
+                        "local snapshot reuse failed authentication; fetching exact segment from network");
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok((segment_ids, bytes))
     }
 
     #[cfg(test)]

@@ -2014,6 +2014,42 @@ impl MdbxStore {
         Ok(raw.and_then(|b| decode_segment(&b)))
     }
 
+    /// Read a possible local snapshot segment without materializing unrelated
+    /// payloads. The compact summary and payload length are checked in the same
+    /// read transaction before allocation. A matching summary is only a hint:
+    /// the caller must authenticate the returned SGS1 bytes in snapshot staging.
+    pub fn matching_encoded_segment(
+        &self,
+        descriptor: &crate::storage::SnapshotSegmentDescriptor,
+        effective_log: u8,
+    ) -> Result<Option<Vec<u8>>, StoreError> {
+        let Some(expected_count) =
+            encoded_segment_live_count_from_len(effective_log, descriptor.encoded_len as usize)
+                .filter(|count| *count > 0)
+        else {
+            return Ok(None);
+        };
+        let txn = self.db.begin_ro_txn()?;
+        let summaries = txn.open_table(Some(T_SEGMENT_SUMMARIES))?;
+        let key = descriptor.segment_id.to_le_bytes();
+        if txn.get::<ObjectLength>(&summaries, &key)? != Some(ObjectLength(36)) {
+            return Ok(None);
+        }
+        let summary: Option<Vec<u8>> = txn.get(&summaries, &key)?;
+        if summary.as_deref().and_then(decode_segment_summary)
+            != Some((expected_count, descriptor.segment_root))
+        {
+            return Ok(None);
+        }
+        let segments = txn.open_table(Some(T_SEGMENTS))?;
+        if txn.get::<ObjectLength>(&segments, &key)?
+            != Some(ObjectLength(descriptor.encoded_len as usize))
+        {
+            return Ok(None);
+        }
+        txn.get(&segments, &key).map_err(Into::into)
+    }
+
     /// Sum the exact canonical bytes stored in the current-state segment
     /// table without materializing any payload value.
     ///
@@ -4449,6 +4485,312 @@ mod tests {
             Some(state.circulating_supply_micronoid)
         );
         (state, header, hash)
+    }
+
+    struct ReuseTestResult {
+        staging: crate::storage::snapshot_staging::SnapshotStagingSession,
+        segment_ids: Vec<u16>,
+        bytes: u64,
+    }
+
+    fn reuse_snapshot_segments_from_store(
+        mut staging: crate::storage::snapshot_staging::SnapshotStagingSession,
+        store: &MdbxStore,
+        still_current: impl Fn() -> bool,
+    ) -> Result<ReuseTestResult, StoreError> {
+        let (segment_ids, bytes) = staging.reuse_local_segments(store, still_current)?;
+        Ok(ReuseTestResult {
+            staging,
+            segment_ids,
+            bytes,
+        })
+    }
+
+    fn local_reuse_fixture(
+        directory: &std::path::Path,
+        entries: &[(u32, crate::fri_state::SlotValue)],
+        override_root: Option<(u16, [u8; 32])>,
+    ) -> (super::MdbxStore, crate::state::ChainState) {
+        use crate::consensus::da_prune::BlockUndoLog;
+        use crate::storage::meta::{ConsensusMeta, FinalizedCheckpoint};
+        let store = super::MdbxStore::open(directory).unwrap();
+        let state = crate::state::ChainState::from_sparse_utxos(19, entries, 10).unwrap();
+        let mut header = crate::consensus::genesis::genesis_header();
+        header.height = 0;
+        header.log_slots = 19;
+        header.active_slot_count = entries.len() as u64;
+        header.alloc_counter = 10;
+        header.state_root = state.cached_state_root();
+        let hash = crate::block_header::block_id(&header);
+        let meta = ConsensusMeta {
+            tip_height: 0,
+            tip_hash: hash,
+            cumulative_chainwork: crate::block_work(&header.difficulty_target),
+            finalized: FinalizedCheckpoint {
+                height: 0,
+                hash: [0; 32],
+            },
+        };
+        let ids: std::collections::BTreeSet<u16> = entries
+            .iter()
+            .map(|(slot, _)| (slot >> 16) as u16)
+            .collect();
+        let columns: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                (
+                    *id,
+                    16,
+                    Some(state.state.try_get_segment_columns(*id).unwrap()),
+                )
+            })
+            .collect();
+        let summaries: Vec<_> = ids
+            .iter()
+            .map(|id| {
+                let root = override_root
+                    .filter(|(override_id, _)| override_id == id)
+                    .map_or_else(
+                        || state.cached_exact_segment_root(*id).unwrap(),
+                        |(_, root)| root,
+                    );
+                (
+                    *id,
+                    entries
+                        .iter()
+                        .filter(|(slot, _)| (slot >> 16) as u16 == *id)
+                        .count() as u32,
+                    root,
+                )
+            })
+            .collect();
+        store
+            .commit_block(
+                &header,
+                &hash,
+                &BlockUndoLog::empty(0, 19),
+                &columns,
+                &summaries,
+                &[],
+                &[],
+                None,
+                state.circulating_supply_micronoid,
+                &meta,
+                true,
+            )
+            .unwrap();
+        (store, state)
+    }
+
+    fn local_reuse_staging(
+        directory: &std::path::Path,
+        entries: &[(u32, crate::fri_state::SlotValue)],
+    ) -> (
+        crate::storage::snapshot_staging::SnapshotStagingSession,
+        crate::state::ChainState,
+    ) {
+        let state = crate::state::ChainState::from_sparse_utxos(19, entries, 10).unwrap();
+        let mut header = crate::consensus::genesis::genesis_header();
+        header.height = 42;
+        header.log_slots = 19;
+        header.active_slot_count = entries.len() as u64;
+        header.alloc_counter = 10;
+        header.state_root = state.cached_state_root();
+        let metadata = crate::storage::snapshot_staging::AuthenticatedSnapshotMetadata::from_authenticated_header(
+            header,
+            crate::block_header::block_id(&header),
+            16,
+        )
+        .unwrap();
+        let ids: std::collections::BTreeSet<u16> = entries
+            .iter()
+            .map(|(slot, _)| (slot >> 16) as u16)
+            .collect();
+        let descriptors = ids
+            .iter()
+            .map(|id| {
+                let columns = state.state.try_get_segment_columns(*id).unwrap();
+                crate::storage::SnapshotSegmentDescriptor {
+                    segment_id: *id,
+                    segment_root: state.cached_exact_segment_root(*id).unwrap(),
+                    encoded_len: crate::storage::serial::encode_segment(&columns, 16).len() as u32,
+                }
+            })
+            .collect();
+        (
+            crate::storage::snapshot_staging::SnapshotStagingSession::new(
+                directory,
+                metadata,
+                descriptors,
+            )
+            .unwrap(),
+            state,
+        )
+    }
+
+    fn reuse_slot(amount: u64) -> crate::fri_state::SlotValue {
+        crate::fri_state::SlotValue::with_owner_fields(
+            amount,
+            1,
+            [
+                noid_core::Block128::from(11u128),
+                noid_core::Block128::from(12u128),
+            ],
+        )
+    }
+
+    #[test]
+    fn snapshot_local_reuse_skips_changed_and_missing_segments_and_finishes_exact_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let local = [
+            (1 << 16, reuse_slot(11)),
+            (3 << 16, reuse_slot(12)),
+            (6 << 16, reuse_slot(13)),
+        ];
+        let target = [
+            (1 << 16, reuse_slot(11)),
+            (3 << 16, reuse_slot(19)),
+            (4 << 16, reuse_slot(21)),
+        ];
+        let (store, _) = local_reuse_fixture(&directory.path().join("db"), &local, None);
+        let (staging, target_state) =
+            local_reuse_staging(&directory.path().join("staging"), &target);
+        let mut reused = reuse_snapshot_segments_from_store(staging, &store, || true)
+            .unwrap_or_else(|_| panic!("local reuse failed"));
+        assert_eq!(reused.segment_ids, vec![1]);
+        assert_eq!(reused.bytes, 59);
+        assert_eq!(reused.staging.received_count(), 1);
+        for id in [3, 4] {
+            let columns = target_state.state.try_get_segment_columns(id).unwrap();
+            let encoded = crate::storage::serial::encode_segment(&columns, 16);
+            reused
+                .staging
+                .accept_segment_recoverable(id, 16, &encoded)
+                .unwrap();
+        }
+        let finalized = reused.staging.finalize().unwrap();
+        assert_eq!(
+            finalized.metadata().header().state_root,
+            target_state.cached_state_root()
+        );
+    }
+
+    #[test]
+    fn snapshot_local_reuse_does_not_trust_a_corrupt_root_matching_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = [(1 << 16, reuse_slot(11))];
+        let (staging, state) = local_reuse_staging(&directory.path().join("staging"), &target);
+        let root = state.cached_exact_segment_root(1).unwrap();
+        let (store, _) = local_reuse_fixture(
+            &directory.path().join("db"),
+            &[(1 << 16, reuse_slot(99))],
+            Some((1, root)),
+        );
+        let reused = reuse_snapshot_segments_from_store(staging, &store, || true)
+            .unwrap_or_else(|_| panic!("bad local bytes must fall back to network"));
+        assert!(reused.segment_ids.is_empty());
+        assert_eq!(reused.staging.received_count(), 0);
+    }
+
+    #[test]
+    fn snapshot_local_reuse_stops_when_its_generation_is_retired() {
+        let directory = tempfile::tempdir().unwrap();
+        let entries = [(1 << 16, reuse_slot(11))];
+        let (store, _) = local_reuse_fixture(&directory.path().join("db"), &entries, None);
+        let (staging, _) = local_reuse_staging(&directory.path().join("staging"), &entries);
+        let reused = reuse_snapshot_segments_from_store(staging, &store, || false)
+            .unwrap_or_else(|_| panic!("retirement is not a local failure"));
+        assert!(reused.segment_ids.is_empty());
+        assert_eq!(reused.staging.received_count(), 0);
+    }
+
+    #[test]
+    fn local_snapshot_lookup_bounds_allocation_and_only_returns_root_matching_hints() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MdbxStore::open(directory.path()).unwrap();
+        let (state, _, _) = commit_stateful_test_genesis(&store);
+        let descriptor = crate::storage::SnapshotSegmentDescriptor {
+            segment_id: 0,
+            segment_root: state.cached_exact_segment_root(0).unwrap(),
+            encoded_len: 59,
+        };
+        let encoded = store
+            .matching_encoded_segment(&descriptor, 8)
+            .unwrap()
+            .unwrap();
+        assert_eq!(encoded.len(), 59);
+        for mismatch in [
+            crate::storage::SnapshotSegmentDescriptor {
+                segment_id: 1,
+                ..descriptor
+            },
+            crate::storage::SnapshotSegmentDescriptor {
+                segment_root: [0xA5; 32],
+                ..descriptor
+            },
+            crate::storage::SnapshotSegmentDescriptor {
+                encoded_len: 109,
+                ..descriptor
+            },
+            crate::storage::SnapshotSegmentDescriptor {
+                encoded_len: u32::MAX,
+                ..descriptor
+            },
+        ] {
+            assert!(store
+                .matching_encoded_segment(&mismatch, 8)
+                .unwrap()
+                .is_none());
+        }
+        // The index is an accelerator, not authentication. Matching-length
+        // bytes can be corrupt and must still pass the caller's staging check.
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_SEGMENTS)).unwrap();
+        txn.put(
+            &table,
+            0u16.to_le_bytes(),
+            vec![0xA5; 59],
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(
+            store
+                .matching_encoded_segment(&descriptor, 8)
+                .unwrap()
+                .unwrap(),
+            vec![0xA5; 59]
+        );
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_SEGMENTS)).unwrap();
+        txn.put(
+            &table,
+            0u16.to_le_bytes(),
+            vec![0; 1024 * 1024],
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert!(store
+            .matching_encoded_segment(&descriptor, 8)
+            .unwrap()
+            .is_none());
+
+        let txn = store.db.begin_rw_txn().unwrap();
+        let table = txn.open_table(Some(T_SEGMENT_SUMMARIES)).unwrap();
+        txn.put(
+            &table,
+            0u16.to_le_bytes(),
+            vec![0; 1024 * 1024],
+            WriteFlags::empty(),
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert!(store
+            .matching_encoded_segment(&descriptor, 8)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

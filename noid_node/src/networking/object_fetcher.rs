@@ -223,6 +223,40 @@ impl ObjectFetcher {
     /// Add at most one hedge after the primary stopped making progress.
     /// The hedge must advertise the exact same object and come from a distinct
     /// failure domain.
+    pub(super) fn start_primary_for_peer(
+        &mut self,
+        claim: ObjectClaimId,
+        peer: PeerId,
+        now_ms: u64,
+    ) -> Result<FetchAssignment, FetchError> {
+        let job = self.jobs.get_mut(&claim).ok_or(FetchError::UnknownClaim)?;
+        if job.state != FetchState::Wanted {
+            return Err(FetchError::InvalidState);
+        }
+        let source = job
+            .sources
+            .get(&peer)
+            .copied()
+            .filter(|source| {
+                source.retry_after_ms <= now_ms
+                    && job
+                        .selected_object
+                        .is_none_or(|object| source.object == object)
+            })
+            .ok_or(FetchError::NoSource)?;
+        job.selected_object = Some(source.object);
+        job.state = FetchState::InFlight {
+            primary: peer,
+            hedge: None,
+        };
+        job.last_progress_ms = Some(now_ms);
+        Ok(FetchAssignment {
+            peer,
+            object: source.object,
+            resumed_bytes: job.partial_bytes,
+        })
+    }
+
     pub fn start_hedge(
         &mut self,
         claim: ObjectClaimId,
@@ -359,16 +393,8 @@ impl ObjectFetcher {
         peer: PeerId,
         object: ObjectId,
     ) -> Result<(), FetchError> {
+        self.validate_receive(claim, peer, object)?;
         let job = self.jobs.get_mut(&claim).ok_or(FetchError::UnknownClaim)?;
-        let active = job.active_source(peer);
-        let late = job.late_responses.get(&peer).copied() == Some(object)
-            && matches!(job.state, FetchState::Wanted | FetchState::InFlight { .. });
-        if !active && !late {
-            return Err(FetchError::InactiveSource);
-        }
-        if object.claim() != claim || job.selected_object != Some(object) {
-            return Err(FetchError::ObjectMismatch);
-        }
         job.partial_bytes = object.encoded_len().unwrap_or(job.partial_bytes);
         if let Some(source) = job.sources.get_mut(&peer) {
             source.failures = 0;
@@ -383,6 +409,25 @@ impl ObjectFetcher {
         Ok(())
     }
 
+    pub(super) fn validate_receive(
+        &self,
+        claim: ObjectClaimId,
+        peer: PeerId,
+        object: ObjectId,
+    ) -> Result<(), FetchError> {
+        let job = self.jobs.get(&claim).ok_or(FetchError::UnknownClaim)?;
+        let active = job.active_source(peer);
+        let late = job.late_responses.get(&peer).copied() == Some(object)
+            && matches!(job.state, FetchState::Wanted | FetchState::InFlight { .. });
+        if !active && !late {
+            return Err(FetchError::InactiveSource);
+        }
+        if object.claim() != claim || job.selected_object != Some(object) {
+            return Err(FetchError::ObjectMismatch);
+        }
+        Ok(())
+    }
+
     pub fn mark_verified(
         &mut self,
         claim: ObjectClaimId,
@@ -393,6 +438,28 @@ impl ObjectFetcher {
         {
             return Err(FetchError::InvalidState);
         }
+        job.late_responses.clear();
+        job.state = FetchState::Verified { object };
+        Ok(())
+    }
+
+    /// Import an independently authenticated local object before any network
+    /// lease is issued. No provider is credited and no received response is
+    /// fabricated. In-flight/received jobs must use the ordinary receive path.
+    pub(super) fn import_verified(
+        &mut self,
+        claim: ObjectClaimId,
+        object: ObjectId,
+    ) -> Result<(), FetchError> {
+        if object.claim() != claim {
+            return Err(FetchError::ClaimMismatch);
+        }
+        let job = self.jobs.get_mut(&claim).ok_or(FetchError::UnknownClaim)?;
+        if job.state != FetchState::Wanted {
+            return Err(FetchError::InvalidState);
+        }
+        job.selected_object = Some(object);
+        job.partial_bytes = object.encoded_len().unwrap_or(0);
         job.late_responses.clear();
         job.state = FetchState::Verified { object };
         Ok(())

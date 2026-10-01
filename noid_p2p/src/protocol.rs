@@ -674,6 +674,9 @@ pub fn decode_snapshot_manifest_page(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentRequest {
     pub segment_id: u16,
+    /// Protocol 6 can carry a bounded ascending set of small segments.
+    /// Protocol 5 sends only the first segment, preserving its original bytes.
+    pub additional_segments: Vec<u16>,
     /// Expected snapshot height from the manifest (for staleness guard).
     pub expected_tip_height: u64,
     /// Expected snapshot hash from the manifest. Height alone is not enough across
@@ -690,6 +693,7 @@ pub struct GetStateSegmentRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetStateSegmentResponse {
     pub segment_id: u16,
+    pub additional_segments: Vec<StateSegmentPayload>,
     /// Exact snapshot height echoed from the request.
     pub expected_tip_height: u64,
     /// Exact snapshot hash echoed from the request. Together with the segment
@@ -702,12 +706,44 @@ pub struct GetStateSegmentResponse {
     /// Column data encoded by `noid_chain::storage::serial::encode_segment`.
     /// `None` if the peer cannot serve this segment.
     pub data: Option<Vec<u8>>,
+    /// Local transport measurements; never part of canonical state or CBOR.
+    #[serde(skip)]
+    pub transport: StateSegmentTransport,
     /// Inbound payload admission retained until the node consumes the segment.
     #[serde(skip)]
     pub(crate) inbound_memory_permit: Option<std::sync::Arc<tokio::sync::OwnedSemaphorePermit>>,
     /// Process-wide outbound byte admission retained through the codec write.
     #[serde(skip)]
     pub(crate) outbound_memory_permit: Option<crate::outbound_budget::OutboundMemoryPermit>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StateSegmentTransport {
+    pub version: u8,
+    pub payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateSegmentPayload {
+    pub segment_id: u16,
+    pub data: Vec<u8>,
+}
+
+pub const MAX_STATE_SEGMENT_BATCH: usize = 64;
+pub const MAX_STATE_SEGMENT_BATCH_BYTES: usize = 64 * 1024;
+
+impl GetStateSegmentResponse {
+    pub fn payloads(&self) -> impl Iterator<Item = (u16, &[u8])> {
+        self.data
+            .as_deref()
+            .map(|data| (self.segment_id, data))
+            .into_iter()
+            .chain(
+                self.additional_segments
+                    .iter()
+                    .map(|part| (part.segment_id, part.data.as_slice())),
+            )
+    }
 }
 
 // ---------------------------------------------------------------------------

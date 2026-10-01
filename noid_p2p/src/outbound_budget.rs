@@ -25,6 +25,12 @@ pub(crate) struct OutboundPermitBundle {
     _serving: Vec<OwnedSemaphorePermit>,
 }
 
+impl OutboundPermitBundle {
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self._memory.num_permits()
+    }
+}
+
 pub(crate) type OutboundMemoryPermit = Arc<OutboundPermitBundle>;
 
 #[derive(Debug, Clone)]
