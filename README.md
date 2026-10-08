@@ -1,216 +1,314 @@
-# Parano1d ①
+# Parano1c Android
 
-> **V2 activation: mainnet block 210537.** This README describes the v2 rules.
-> Before that height the network uses v1.1. Activation follows height; the
-> planning estimate is October 10, 2026, 11:59 PM PDT (October 11, 06:59 UTC).
-> Previous profiles and measurements are in the [archive](docs/archive/index.md).
+Parano1c is an Android wallet and mobile node implementation built on top of the Parano1d source code.
 
-**Proof-native Layer 1 ordered by proof of work. From live value to live rights.**
+The current Parano1c Android release is built against:
 
-[Website](https://parano1d.org) ·
-[Documentation](https://docs.parano1d.org) ·
-[Research](https://lab.parano1d.org) ·
-[Releases](https://git.parano1d.org/ignotusnemo/parano1d/releases)
+Parano1d v2.0.3
 
-**Source:** [Forgejo](https://git.parano1d.org/ignotusnemo/parano1d) (canonical) ·
-[GitHub](https://github.com/proof-native/parano1d) ·
-[GitLab](https://gitlab.com/ignotusnemo/parano1d)
+## Android-specific source adaptations
 
-Parano1d makes the current State independently verifiable without replaying
-historical transactions. The wallet proves authorization with its private
-witness. The miner proves public execution and the exact State transition.
-Peers verify the resulting recursive proof and materialize the proven writes.
+Parano1c is based on the Parano1d source code, but some upstream files have been adapted specifically for Android/mobile operation.
 
-Every accepted block carries a `HistoryStep` that proves its transition and
-verifies the preceding terminal. A joining node authenticates Live State and
-a bounded recent suffix. Old transaction bodies can be pruned; their validity
-remains in the recursive proof. Permanent headers still support cumulative-work
-comparison, and State transfer still scales with the live data.
+These changes are limited to platform-specific compatibility and runtime handling required by Android. They do not represent an attempt to change the underlying Parano1d consensus rules or network protocol.
 
-## From live value to live rights
+Where applicable, the modified files can be compared directly with the original Parano1d sources to review the Android-specific differences.
 
-V2 extends that model to **proof-native contracts**. A live output can commit
-to a program, authorities, recipients, height conditions and persistent
-counters. Spending it proves not only ownership of value but the right to take
-a particular action: collect a payment, spend a budget, claim a due installment
-or recover a remaining balance.
+Upstream project:
+https://github.com/ignotusnemo/parano1d
 
-The authorized transition produces a new committed state or closes the right.
-Its validity becomes part of the same block proof. Nodes do not need a growing
-contract execution history to validate the present. Applications retain the
-public terms and portable receipts they need to use and explain that present.
+This repository:
+https://github.com/Aquacongas/Parano1c
 
-The shared integer core has 16 instructions, two persistent u64 counters, two
-scratch registers, checked arithmetic, conditions and block-height access.
-Users can create programs within this ABI without a new circuit or matrix per
-application. It is a bounded core: scheduled actions require an authorized
-call, and there are no loops or cross-contract calls.
+## Current Status
 
-The GUI, CLI and RPC expose six templates plus custom programs:
+Parano1c Android is under active development.
 
-- refundable payments;
-- timelocked vaults;
-- delegated allowance wallets;
-- budgets per height period;
-- recurring payments;
-- gradual release in fixed tranches.
+The current Android version is based on the Parano1d v2.0.3 source tree and adds the Android application, mobile node integration, mobile wallet functionality and native Rust/Android interface.
 
-This opens application space around prepaid services, delegated spending,
-conditional access and staged payments while keeping consensus storage tied
-to live rights. Each deposit is an independent instance. The
-[concept](docs/concepts/proof-native-contracts.md),
-[contract guide](docs/contracts/index.md), [API](docs/contracts/api.md) and
-[GUI walkthrough](docs/contracts/gui.md) explain the mechanics and limits.
+This is still an experimental mobile implementation.
 
-## How a block is made
+Things may break and future versions may require changes to synchronization, storage or mobile-specific components.
 
-1. The wallet builds an atomic intent and proves knowledge of the required
-   spending secret, bound to the complete logical transaction.
-2. The mempool checks authorization, current spendability, limits and fees.
-3. The miner proves the selected payments and contract calls, exact slot writes
-   and recursive continuity with the parent.
-4. Only then does an internal or external worker search the immutable
-   Poseidon2b header's 128-bit nonce.
-5. Peers verify the proof, PoW and chain rules, then apply the proven writes.
+Always keep your wallet keys backed up.
 
-**Hashpower alone cannot originate a block.** A producer needs current State
-and a completed proof. An external worker receives a single-use nonce template;
-transaction selection and proving remain in the node.
 
-## V2 network profile
+## Android Features
 
-| Parameter | Value |
-| --- | --- |
-| Mainnet genesis | 2026-08-21 16:00:00 UTC |
-| Genesis block ID | `860e70453390bf815718e933aa4927167a13d098b0151391eefd722ee1add610` |
-| Target block interval | 30 seconds |
-| ASERT | 6-block reference epoch, 180-second half-life |
-| Default Small | m23: 63 pages, 504 live inputs, 63 contract calls |
-| Optional Large | m24: 206 pages, 504 live inputs, 63 contract calls |
-| Hard finality / maximum reorg | 18 / 17 blocks |
-| Local body retention | 42 blocks |
-| State domain | 2^24 to 2^32 slots |
-| Serialized terminal cap | 1,100,000 bytes |
+The current Android wallet provides:
 
-Page, input and call limits apply together. Small fits 63 one-page payments or
-63 calls; Large fits 206 one-page payments or 63 calls plus 143 payments,
-within the input budget. A multi-page spend remains one logical transaction.
-The primary coinbase is separate; an additional mandatory system page consumes
-one effective page.
+- Wallet balance
+- Active wallet address
+- Send
+- Send All
+- Receive
+- Network status
+- Current block height
+- Synchronization status
+- Peer count
+- Recent transactions
+- Local mobile node integration
+- Native Rust backend through noid_mobile_ffi
 
-Large production is a server option, `--v2-large-blocks`, with no GUI switch.
-It permits fee-based class selection and does not force Large blocks. Every
-node verifies both classes. Ordinary one-page capacity ceilings at the target
-interval are 2.1 and about 6.87 transactions/s; these are capacity calculations,
-not measured sustained network throughput. See [parameters](docs/protocol/parameters.md)
-and [measured proving and verification costs](docs/reference/performance.md).
 
-## State and issuance
+## Source Layout
 
-State is an exact sparse vector of indexed outputs. Spending clears a slot;
-new outputs reuse empty positions with fresh `creation_id` values. Empty
-2^16-slot segments need no materialized payload. Sustained finalized occupancy
-can expand the domain without moving existing outputs.
+Parano1c uses the complete Parano1d Rust workspace.
 
-Issuance follows an exact height schedule from H210537:
-**16 → 11.30 → 8 → 5.65 → 4 → 2.83 → 2 → 1.41 → 1 NOID**,
-one step every 1,051,200 blocks. The permanent 1 NOID tail means there is no
-fixed maximum supply. State expansion does not change the reward.
+The main Android-specific components are:
 
-Occupancy still increases the fee for net-new live slots. That growth component
-is burned; consolidation frees slots and avoids growth fees. The
-[network economics](docs/protocol/economics.md) explains the schedule, its
-rationale and the distinction between gross subsidy and actual supply.
+    android/
+    noid_mobile_node/
+    noid_mobile_ffi/
 
-## One proof stack
+These components depend on the rest of the Parano1d workspace and are not intended to be compiled completely independently.
 
-Committed traces use GF(2^128); C1 Fiat–Shamir challenges and recursive claims
-use GF(2^256) with a trace-one support of size 2^255. Poseidon2b underlies
-addresses, transactions, trees, transcripts and PoW. FROST-GKR batches its
-permutations and Merkle paths; sumcheck, zerocheck, lincheck and FRI-Binius
-close the relation without a trusted setup.
+Important dependencies include:
 
-Ordinary ownership uses a freshly randomized proof of a 256-bit secret's
-preimage, with no public-key transaction signature. Contract calls prove the
-active policy authority. The libp2p Ed25519 identity identifies a peer only.
-Public addresses, values and relayed transactions are not concealed, and third
-parties can archive them. Pruning is not an anonymity guarantee.
+    noid_wallet/
+    noid_networking/
+    noid_p2p/
+    noid_chain/
+    noid_core/
+    noid_recursive/
+    noid_sync_apply/
+    noid_history_runtime/
 
-The final v2 bank and matrix-retirement construction have
-[source-linked soundness accounting](noid_soundness/docs/v2-retirement.md),
-including legacy ancestry. Under the stated all-root composition, ideal
-compiler, honest public preprocessing, fixed-Poseidon2b and resource-price
-premises, the Category 1 assessment gives a dominant gate-depth floor with
-log2 value **173.3897612554174** and an ideal success bound of about
-**0.04937388373372754** at the Category 1 reference envelope. The premises and exact resource bounds are detailed in the
-[security model](docs/protocol/security-model.md) and
-[exact final-bank records](research/v2_feasibility/results/2026-09-25-common-input-budget/REPORT.md#accounting-for-the-final-banks).
+and other Parano1d crates.
 
-The fork binds the new proof to the selected last old block. The transition
-release includes the historical verification material. A later
-`--retired-history` build can omit old matrix bytes using independently
-verified ancestry certificates; it does not introduce a trusted checkpoint.
 
-## Run a node or wallet
+## Requirements
 
-Official releases contain a Core archive and a native GUI wallet with its own
-supervised node. The GUI supports Linux, Windows and macOS. See
-[installation](docs/getting-started/wallet.md) and [Core](docs/getting-started/core.md).
+The following tools are required to build the Android version:
+
+- Rust
+- Cargo
+- Android SDK
+- Android NDK
+- Java 17
+- cargo-ndk
+- Android ARM64 Rust target
+
+Install cargo-ndk:
+
+    cargo install cargo-ndk
+
+Install the Android ARM64 Rust target:
+
+    rustup target add aarch64-linux-android
+
+The Rust version used by the project is defined in:
+
+    rust-toolchain.toml
+
+
+## HistoryStep v1 and v2 packs
+
+The Android release embeds authenticated proof material for both the legacy
+HistoryStep ancestry and the frozen v2 bank. The pack directories are external
+build inputs; do not commit generated matrices, retirement keys or local paths.
+
+Obtain the release-matched legacy pack, the frozen v2 pack, its reviewed bank
+pin and both independently verified retirement-key pins from the official
+Parano1d release/build documentation. Do not substitute an H10 test pack for
+the mainnet v2 bank. The legacy pack must contain the `v1/` runtime metadata
+and matrices; the v2 pack must contain the authenticated v2 runtime metadata,
+Small/Large matrices and `retirement-keys/class-0.key` and `class-1.key`.
+
+Set the following environment variables to paths and verified **64-character
+lowercase hexadecimal SHA-256 digests** appropriate to the release being built:
 
 ```sh
-parano1d --check-hardware
-parano1d
+export NOID_HISTORY_STEP_PACK_DIR="PATH_TO_LEGACY_HISTORY_STEP_PACK"
+export NOID_HISTORY_STEP_RUNTIME_METADATA_RELEASE_DIGEST="REVIEWED_LEGACY_METADATA_SHA256"
+export NOID_V2_PACK_DIR="PATH_TO_FROZEN_V2_PACK"
+export NOID_V2_RELEASE_BANK="REVIEWED_V2_BANK_SHA256"
+export NOID_RETIREMENT_KEYS_DIR="${NOID_V2_PACK_DIR}/retirement-keys"
+export NOID_RETIREMENT_KEY_0_PIN="REVIEWED_CLASS_0_KEY_SHA256"
+export NOID_RETIREMENT_KEY_1_PIN="REVIEWED_CLASS_1_KEY_SHA256"
 ```
 
-For mining:
+The placeholders above are **not usable digests**. Verify the actual pins and
+pack layout against the upstream release manifest before building. A release
+build must fail if an artifact or digest does not match; do not bypass these
+checks. For provenance and reproduction see the upstream
+[build guide](https://github.com/ignotusnemo/parano1d/blob/v2/docs/developers/build.md).
 
-```sh
-parano1d --miner
-parano1d --miner --v2-large-blocks
-```
+## Build the Rust Components
 
-External nonce search keeps proving in the node:
+From the repository root:
 
-```sh
-parano1d --extminer --mining-key-file ~/.parano1d/mining.key
-parano1d-miner --key-file ~/.parano1d/mining.key
-```
+    cargo fmt
 
-Use only the mining command appropriate to the host. Default ports are P2P
-9600 and local JSON-RPC 127.0.0.1:9601. The built-in wallet key is not
-password-encrypted; protect it and back up contract terms and receipts too.
+    cargo check \
+      -p noid_wallet \
+      -p noid_mobile_node \
+      -p noid_mobile_ffi \
+      -j16
 
-```sh
-parano1d-cli status
-parano1d-cli balance
-parano1d-cli contract protocol
-parano1d-cli contract --help
-```
+The build should complete successfully before building the Android native library.
 
-Addresses use bech32m `o1…`; 1 NOID = 1,000,000 μNOID. F7 opens Contracts in
-the GUI, and F8 opens Settings. See [RPC](docs/reference/rpc.md) for owner,
-mining and operator access scopes.
 
-## Build and verify
+## Build the Android ARM64 Native Library
 
-The workspace pins Rust 1.96.0. Native builds need a C/C++ toolchain, CMake,
-libclang and platform packaging tools. Production x86-64 requires SSE4.1 and
-PCLMULQDQ; ARM64 requires NEON and PMULL. Portable binaries select the available
-PCLMUL, AVX2+VPCLMUL, AVX-512+VPCLMUL or NEON+PMULL backend at runtime.
+From the repository root:
 
-A production build requires the authenticated v2 bank, reviewed pins and
-legacy ancestry material. The [build guide](docs/developers/build.md) provides
-the complete generation, authentication and packaging procedure. Contract
-programs use this shared bank and do not generate new matrices.
+    cargo ndk --target arm64-v8a --platform 26 \
+      --output-dir android/app/src/main/jniLibs \
+      build --release -p noid_mobile_ffi
 
-```sh
-./scripts/build_release.sh \
-  --pack PATH_TO_LEGACY_PACK \
-  --v2-pack PATH_TO_FROZEN_V2_PACK \
-  --v2-pins PATH_TO_REVIEWED_PIN_FILE \
-  --retirement-keys PATH_TO_AUTHENTICATED_KEYS
-```
+This generates the native Rust library used by the Android application.
 
-Designed and developed by **Ignotus Nemo**. [Apache License 2.0](LICENSE).
-Report security issues through the [security policy](.github/SECURITY.md).
-Contact: [dev@parano1d.org](mailto:dev@parano1d.org).
+
+## Build the Debug APK
+
+    cd android
+
+    ./gradlew assembleDebug
+
+The debug APK will be created under:
+
+    android/app/build/outputs/apk/debug/
+
+
+## Build a Signed Release APK
+
+The Android project supports a release signing configuration.
+
+A private signing keystore is intentionally NOT included in this repository.
+
+Never commit your signing keystore or passwords.
+
+The expected keystore location for the current configuration is:
+
+    android/parano1c-release.jks
+
+Configure the release signing key, alias and passwords locally in the
+Android Gradle signing configuration. Never hard-code them in the repository.
+The chosen keystore **must** match the certificate of the APK being updated.
+The signed release build can be produced with:
+
+    cd android
+
+    ./gradlew :app:assembleRelease
+
+If Gradle requires a keystore, provide it through the local signing
+configuration, not through files committed to Git.
+
+The signed APK is generated under:
+
+    android/app/build/outputs/apk/release/
+
+The release artifact may be renamed to `Parano1c.apk` for publication.
+
+
+## Verify the APK
+
+Generate the APK SHA256 checksum:
+
+    sha256sum Parano1c.apk
+
+Create a checksum file:
+
+    sha256sum Parano1c.apk > SHA256SUMS.txt
+
+Verify the signing certificate embedded in the APK:
+
+    apksigner verify --verbose --print-certs Parano1c.apk
+
+Official releases should publish both:
+
+- APK SHA-256 and SHA-512 checksums
+- Signing certificate SHA-256 fingerprint
+
+
+## Official Signing Certificate
+
+The current Parano1c Android signing certificate SHA256 fingerprint is:
+
+    AD:B0:D8:65:E5:4E:CB:46:8F:10:A6:CC:91:D4:60:E7:C0:E9:D3:A6:AA:83:2D:0F:4B:4B:0E:EC:6C:1E:2F:53
+
+Users should verify that downloaded Android releases are signed with the expected certificate.
+
+
+## MDBX Android Storage Limitation
+
+Parano1c Android currently uses MDBX for persistent local storage.
+
+The original database geometry allowed approximately 1 TB.
+
+For the Android implementation the maximum MDBX database size has been reduced to:
+
+    64 GB
+
+This does not mean that the application immediately allocates or consumes 64 GB.
+
+The MDBX database grows gradually as data is stored.
+
+The 64 GB limit applies only to the maximum size of the local MDBX database.
+
+It does not directly limit:
+
+- wallet balance
+- number of addresses
+- blockchain height
+- number of transactions on the network
+- cryptographic security
+
+The wallet can operate normally while its local MDBX database remains below the configured maximum.
+
+If the database eventually reaches the 64 GB limit, additional database writes may fail.
+
+
+## Future Android Storage Work
+
+The current MDBX configuration is not intended to be the final mobile storage architecture.
+
+Future development may reduce the amount of persistent full-node data required by the mobile wallet, separate unnecessary full-node storage dependencies from Android, or introduce a storage architecture better suited to mobile devices.
+
+The configured MDBX limit may also be increased in the future if Android hardware and platform constraints make significantly larger local databases practical.
+
+
+## Releases
+
+Signed Android releases are published here:
+
+https://github.com/Aquacongas/Parano1c/releases
+
+
+## Security
+
+Never commit or publish:
+
+- Android signing keystores
+- private keys
+- wallet master keys
+- seed phrases
+- passwords
+- API tokens
+- environment files containing secrets
+
+Before using experimental releases with funds, make sure your wallet keys are safely backed up.
+
+
+## Upstream
+
+Parano1c Android uses the Parano1d source code.
+
+Upstream repository:
+
+https://github.com/ignotusnemo/parano1d
+
+The current Android version is built against Parano1d v2.0.3.
+
+
+## License
+
+Parano1c retains the licensing and notices applicable to the upstream Parano1d source code.
+
+See:
+
+    LICENSE
+    NOTICE
+
+for details.
