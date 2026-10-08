@@ -93,15 +93,26 @@ const T_OWNER_INDEX: &str = "owner_idx";
 const T_RETENTION_META: &str = "retention_meta";
 const N_TABLES: u64 = 17;
 
-/// Maximum reclaimed-page list searched for one contiguous overflow value.
+/// Minimum reclaimed-page search before the GC time budget may stop a scan.
 ///
 /// HistoryStep terminals are close to one MiB and rotate through two bounded
 /// tables.  The libmdbx dynamic default is only about 2,044 pages on a small
 /// database; once free space becomes fragmented, that search can miss every
 /// suitable run and extend the file despite gigabytes already being free.
-/// 65,536 page numbers cover 256 MiB at the production 4 KiB page size while
-/// keeping the temporary allocator list bounded and small.
+/// 65,536 page numbers cover 256 MiB at the production 4 KiB page size. An
+/// explicit floor also avoids the small dynamic default on existing databases.
 const MDBX_RECLAIM_PAGE_SEARCH_LIMIT: u64 = 65_536;
+
+/// Allow a fragmented database to search beyond the initial page list before
+/// extending the file. A full SGS1 segment needs 801 contiguous 4 KiB pages;
+/// newer GC records can contain only 800-page runs while older records still
+/// contain much larger reusable extents.
+///
+/// MDBX uses 16.16 seconds and accumulates GC search time per write transaction.
+/// The 50 ms budget is checked after reaching the page floor. It is not a
+/// transaction timeout or a delay added to every write. Keep the explicit floor:
+/// the pinned MDBX version's automatic limit does not scale smoothly with file size.
+const MDBX_RECLAIM_TIME_BUDGET: u64 = (50 * (1 << 16) + 999) / 1_000;
 
 // Single-entry table keys
 const KEY_TIP: &[u8] = &[0u8];
@@ -1532,6 +1543,19 @@ impl MdbxStore {
                 ..Default::default()
             },
         )?;
+        // SAFETY: `db` owns this live environment and has not been shared or
+        // started a transaction. The option changes only the local allocator.
+        // libmdbx 0.6 does not expose this setting through DatabaseOptions.
+        let result = unsafe {
+            mdbx_sys::mdbx_env_set_option(
+                db.ptr().0,
+                mdbx_sys::MDBX_opt_gc_time_limit,
+                MDBX_RECLAIM_TIME_BUDGET,
+            )
+        };
+        if result != mdbx_sys::MDBX_SUCCESS as i32 {
+            return Err(libmdbx::Error::from_err_code(result).into());
+        }
         // Ensure all named tables exist — idempotent on re-open.
         let txn = db.begin_rw_txn()?;
         for name in [
@@ -5785,6 +5809,130 @@ mod tests {
                 crate::hash_block_header(&store.get_header(boundary - 1).unwrap().unwrap()),
             )
             .unwrap());
+    }
+
+    #[test]
+    fn full_segment_reuses_old_extent_beyond_fragmented_gc_window() {
+        const FRAGMENTS: u64 = 192;
+        const FRAGMENT_BYTES: usize = 800 * 4096 - 32;
+        const FULL_SEGMENT_BYTES: usize = 3_276_809;
+
+        let directory = tempfile::tempdir().unwrap();
+        // Reproduce the captured seed's 4 KiB database pages even on hosts
+        // whose operating-system pages are larger.
+        drop(
+            Database::<NoWriteMap>::open_with_options(
+                directory.path(),
+                DatabaseOptions {
+                    page_size: Some(libmdbx::PageSize::Set(4096)),
+                    mode: Mode::ReadWrite(libmdbx::ReadWriteOptions {
+                        min_size: Some(4 * 1024 * 1024),
+                        growth_step: Some(64 * 1024 * 1024),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let store = MdbxStore::open(directory.path()).unwrap();
+        assert_eq!(store.db.stat().unwrap().page_size(), 4096);
+
+        // Put an older contiguous extent behind more than one initial search
+        // window of newer 800-page holes. A full SGS1 segment needs 801 pages.
+        // Pin the old view only while constructing that layout, so the writer
+        // cannot consume the older extent before the fragmented holes exist.
+        {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+            txn.put(
+                &table,
+                u64_key(0),
+                vec![0xA5; 72 * 1024 * 1024],
+                WriteFlags::empty(),
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        let pinned = store.db.begin_ro_txn().unwrap();
+        {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+            txn.del(&table, u64_key(0), None).unwrap();
+            txn.commit().unwrap();
+        }
+        let payload = vec![0x5A; FULL_SEGMENT_BYTES];
+        for first in (0..FRAGMENTS).step_by(8) {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS)).unwrap();
+            for id in first..first + 8 {
+                txn.put(
+                    &table,
+                    u64_key(id * 2),
+                    &payload[..FRAGMENT_BYTES],
+                    WriteFlags::empty(),
+                )
+                .unwrap();
+                // A live single-page value separates adjacent retired runs.
+                txn.put(
+                    &table,
+                    u64_key(id * 2 + 1),
+                    &payload[..3072],
+                    WriteFlags::empty(),
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        for id in 0..256u64 {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_HEADERS)).unwrap();
+            txn.put(&table, u64_key(0), [id as u8; 400], WriteFlags::empty())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_HISTORY_STEP_PROOF_OBJECTS)).unwrap();
+            for id in 0..FRAGMENTS {
+                txn.del(&table, u64_key(id * 2), None).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        drop(pinned);
+        assert!(store.db.freelist().unwrap() as u64 > MDBX_RECLAIM_PAGE_SEARCH_LIMIT);
+        let last_page_before = store.db.info().unwrap().last_pgno();
+
+        for id in 0..8u64 {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let table = txn.open_table(Some(T_HEADERS)).unwrap();
+            txn.put(&table, u64_key(id), &payload[..400], WriteFlags::empty())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        {
+            let txn = store.db.begin_rw_txn().unwrap();
+            let segments = txn.open_table(Some(T_SEGMENTS)).unwrap();
+            let terminals = txn.open_table(Some(T_HISTORY_STEP_TERMINALS)).unwrap();
+            let proofs = txn.open_table(Some(T_RECENT_BLOCKS)).unwrap();
+            txn.put(&segments, 0u16.to_le_bytes(), &payload, WriteFlags::empty())
+                .unwrap();
+            for table in [&terminals, &proofs] {
+                txn.put(table, u64_key(1), &payload[..874_151], WriteFlags::empty())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        assert!(
+            store.db.info().unwrap().last_pgno() <= last_page_before,
+            "overflow allocation extended a database with an older reusable extent"
+        );
+        let txn = store.db.begin_ro_txn().unwrap();
+        let table = txn.open_table(Some(T_SEGMENTS)).unwrap();
+        assert_eq!(
+            txn.get::<Vec<u8>>(&table, &0u16.to_le_bytes()).unwrap(),
+            Some(payload)
+        );
     }
 
     #[test]

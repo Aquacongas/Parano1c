@@ -18,6 +18,8 @@ noid_fri = { path = "../noid_fri" }
 noid_fri_binius = { path = "../noid_fri_binius" }
 rayon = "1.10"
 libmdbx = "0.6"
+# The safe wrapper does not expose MDBX's bounded GC search option.
+mdbx-sys = "13.11"
 bincode = "1"
 serde = { version = "1", features = ["derive"] }
 

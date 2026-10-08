@@ -3956,6 +3956,7 @@ version = "2.0.2"
 dependencies = [
  "bincode",
  "libmdbx",
+ "mdbx-sys",
  "noid_core",
  "noid_fri",
  "noid_fri_binius",
