@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">Создать ПИН</string>
+    <string name="p1_pin_confirm_pin">Подтвердить ПИН</string>
+    <string name="p1_pin_unlock_wallet">Разблокировать кошелёк</string>
+    <string name="p1_pin_six_digit_pin">Введите шестизначный ПИН</string>
+    <string name="p1_pin_pin_code">ПИН-код</string>
+    <string name="p1_pin_pins_do_not_match">ПИН-коды не совпадают</string>
+    <string name="p1_pin_too_many_attempts">Слишком много попыток. Повторите через минуту.</string>
+    <string name="p1_pin_incorrect_pin">Неверный ПИН</string>
+    <string name="p1_pin_pin_storage_error">Ошибка хранения ПИН. Доступ закрыт.</string>
+    <string name="p1_pin_continue">Далее</string>
+    <string name="p1_pin_confirm">Подтвердить</string>
+    <string name="p1_pin_start_over">Начать заново</string>
+</resources>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">PIN instellen</string>
+    <string name="p1_pin_confirm_pin">PIN bevestigen</string>
+    <string name="p1_pin_unlock_wallet">Wallet ontgrendelen</string>
+    <string name="p1_pin_six_digit_pin">Voer een pincode van zes cijfers in</string>
+    <string name="p1_pin_pin_code">Pincode</string>
+    <string name="p1_pin_pins_do_not_match">Pincodes komen niet overeen</string>
+    <string name="p1_pin_too_many_attempts">Te veel pogingen. Probeer over een minuut opnieuw.</string>
+    <string name="p1_pin_incorrect_pin">Onjuiste pincode</string>
+    <string name="p1_pin_pin_storage_error">Fout bij opslaan pincode. Toegang geblokkeerd.</string>
+    <string name="p1_pin_continue">Doorgaan</string>
+    <string name="p1_pin_confirm">Bevestigen</string>
+    <string name="p1_pin_start_over">Opnieuw beginnen</string>
+</resources>

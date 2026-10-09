@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">पिन बनाएं</string>
+    <string name="p1_pin_confirm_pin">पिन की पुष्टि करें</string>
+    <string name="p1_pin_unlock_wallet">वॉलेट अनलॉक करें</string>
+    <string name="p1_pin_six_digit_pin">छह अंकों का पिन दर्ज करें</string>
+    <string name="p1_pin_pin_code">पिन कोड</string>
+    <string name="p1_pin_pins_do_not_match">पिन मेल नहीं खाते</string>
+    <string name="p1_pin_too_many_attempts">बहुत अधिक प्रयास। एक मिनट बाद पुनः प्रयास करें।</string>
+    <string name="p1_pin_incorrect_pin">गलत पिन</string>
+    <string name="p1_pin_pin_storage_error">पिन संग्रहण त्रुटि। पहुंच अवरुद्ध।</string>
+    <string name="p1_pin_continue">आगे बढ़ें</string>
+    <string name="p1_pin_confirm">पुष्टि करें</string>
+    <string name="p1_pin_start_over">फिर से शुरू करें</string>
+</resources>

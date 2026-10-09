@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">PIN oluştur</string>
+    <string name="p1_pin_confirm_pin">PIN onayla</string>
+    <string name="p1_pin_unlock_wallet">Cüzdan kilidini aç</string>
+    <string name="p1_pin_six_digit_pin">Altı haneli PIN girin</string>
+    <string name="p1_pin_pin_code">PIN kodu</string>
+    <string name="p1_pin_pins_do_not_match">PIN kodları eşleşmiyor</string>
+    <string name="p1_pin_too_many_attempts">Çok fazla deneme. Bir dakika sonra tekrar deneyin.</string>
+    <string name="p1_pin_incorrect_pin">Yanlış PIN</string>
+    <string name="p1_pin_pin_storage_error">PIN depolama hatası. Erişim engellendi.</string>
+    <string name="p1_pin_continue">Devam</string>
+    <string name="p1_pin_confirm">Onayla</string>
+    <string name="p1_pin_start_over">Baştan başla</string>
+</resources>

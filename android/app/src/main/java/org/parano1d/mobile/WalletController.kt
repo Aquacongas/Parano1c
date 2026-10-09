@@ -321,6 +321,12 @@ class WalletController(
         }
     }
 
+    fun verifyReceiptHex(receipt: String): JSONObject =
+        JSONObject(NativeNode.verifyReceiptHex(receipt))
+
+    fun receipt(txid: String): JSONObject =
+        JSONObject(NativeNode.receipt(txid))
+
     fun recentTransactions(
         limit: Int = 5
     ): List<RecentTransaction> {

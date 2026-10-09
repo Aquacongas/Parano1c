@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.Parano1d" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">monospace</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:statusBarColor">#0B0E16</item>
+        <item name="android:navigationBarColor">#0B0E16</item>
+        <item name="android:windowBackground">#0B0E16</item>
+    </style>
+
+    <style name="Theme.Parano1d.Starting" parent="Theme.Parano1d">
+        <item name="android:windowBackground">@drawable/launch_background</item>
+    </style>
+
+</resources>

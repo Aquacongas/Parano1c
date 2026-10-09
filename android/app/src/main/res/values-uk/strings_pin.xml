@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">Створити PIN</string>
+    <string name="p1_pin_confirm_pin">Підтвердити PIN</string>
+    <string name="p1_pin_unlock_wallet">Розблокувати гаманець</string>
+    <string name="p1_pin_six_digit_pin">Введіть шестизначний PIN</string>
+    <string name="p1_pin_pin_code">PIN-код</string>
+    <string name="p1_pin_pins_do_not_match">PIN-коди не збігаються</string>
+    <string name="p1_pin_too_many_attempts">Забагато спроб. Спробуйте за хвилину.</string>
+    <string name="p1_pin_incorrect_pin">Неправильний PIN</string>
+    <string name="p1_pin_pin_storage_error">Помилка збереження PIN. Доступ заблоковано.</string>
+    <string name="p1_pin_continue">Далі</string>
+    <string name="p1_pin_confirm">Підтвердити</string>
+    <string name="p1_pin_start_over">Почати знову</string>
+</resources>

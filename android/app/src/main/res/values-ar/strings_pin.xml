@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">إنشاء رمز PIN</string>
+    <string name="p1_pin_confirm_pin">تأكيد رمز PIN</string>
+    <string name="p1_pin_unlock_wallet">فتح المحفظة</string>
+    <string name="p1_pin_six_digit_pin">أدخل رمز PIN من ستة أرقام</string>
+    <string name="p1_pin_pin_code">رمز PIN</string>
+    <string name="p1_pin_pins_do_not_match">الرمزان غير متطابقين</string>
+    <string name="p1_pin_too_many_attempts">محاولات كثيرة جدًا. حاول بعد دقيقة.</string>
+    <string name="p1_pin_incorrect_pin">رمز PIN غير صحيح</string>
+    <string name="p1_pin_pin_storage_error">خطأ في تخزين PIN. تم حظر الوصول.</string>
+    <string name="p1_pin_continue">متابعة</string>
+    <string name="p1_pin_confirm">تأكيد</string>
+    <string name="p1_pin_start_over">البدء من جديد</string>
+</resources>

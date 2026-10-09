@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">Criar PIN</string>
+    <string name="p1_pin_confirm_pin">Confirmar PIN</string>
+    <string name="p1_pin_unlock_wallet">Desbloquear carteira</string>
+    <string name="p1_pin_six_digit_pin">Insira um PIN de seis dígitos</string>
+    <string name="p1_pin_pin_code">Código PIN</string>
+    <string name="p1_pin_pins_do_not_match">Os PINs não coincidem</string>
+    <string name="p1_pin_too_many_attempts">Muitas tentativas. Tente novamente num minuto.</string>
+    <string name="p1_pin_incorrect_pin">PIN incorreto</string>
+    <string name="p1_pin_pin_storage_error">Erro de armazenamento do PIN. Acesso bloqueado.</string>
+    <string name="p1_pin_continue">Continuar</string>
+    <string name="p1_pin_confirm">Confirmar</string>
+    <string name="p1_pin_start_over">Recomeçar</string>
+</resources>

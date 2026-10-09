@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">Créer un code PIN</string>
+    <string name="p1_pin_confirm_pin">Confirmer le PIN</string>
+    <string name="p1_pin_unlock_wallet">Déverrouiller le portefeuille</string>
+    <string name="p1_pin_six_digit_pin">Saisissez un PIN à six chiffres</string>
+    <string name="p1_pin_pin_code">Code PIN</string>
+    <string name="p1_pin_pins_do_not_match">Les codes PIN ne correspondent pas</string>
+    <string name="p1_pin_too_many_attempts">Trop de tentatives. Réessayez dans une minute.</string>
+    <string name="p1_pin_incorrect_pin">PIN incorrect</string>
+    <string name="p1_pin_pin_storage_error">Erreur de stockage du PIN. Accès bloqué.</string>
+    <string name="p1_pin_continue">Continuer</string>
+    <string name="p1_pin_confirm">Confirmer</string>
+    <string name="p1_pin_start_over">Recommencer</string>
+</resources>

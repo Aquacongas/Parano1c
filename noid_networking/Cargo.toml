@@ -1,0 +1,26 @@
+[package]
+name = "noid_networking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noid_chain = { path = "../noid_chain" }
+noid_p2p   = { path = "../noid_p2p" }
+
+anyhow      = "1"
+async-trait = "0.1"
+futures     = "0.3"
+hex         = "0.4"
+rand        = "0.8"
+serde       = { workspace = true }
+thiserror   = "2"
+tokio       = { workspace = true }
+tracing     = "0.1"
+libp2p = { version = "0.55", features = ["tokio", "tcp", "noise", "yamux", "gossipsub", "request-response", "identify", "ping", "macros"] }
+blake3 = "1"
+
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

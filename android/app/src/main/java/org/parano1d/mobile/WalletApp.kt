@@ -104,6 +104,7 @@ private enum class AppScreen {
     Setup,
     Wallet,
     Addresses,
+    Transactions,
     Settings
 }
 
@@ -177,10 +178,10 @@ fun WalletApp(
     }
 
     var recentTransactions by remember {
-        mutableStateOf(
-            emptyList<RecentTransaction>()
-        )
+        mutableStateOf(emptyList<RecentTransaction>())
     }
+    var transactionLimit by remember { mutableStateOf(100) }
+    var transactionLoading by remember { mutableStateOf(false) }
 
     var startupError by remember {
         mutableStateOf<String?>(null)
@@ -217,7 +218,7 @@ fun WalletApp(
         if (!result.ok) {
             startupError =
                 result.error
-                    ?: "Node start failed"
+                    ?: WalletLanguage.uiString("Node start failed")
         }
 
         node =
@@ -284,10 +285,11 @@ fun WalletApp(
                 AppScreen.Setup
     }
 
-    LaunchedEffect(screen) {
+    LaunchedEffect(screen, transactionLimit) {
         if (
             screen == AppScreen.Wallet ||
-            screen == AppScreen.Settings
+            screen == AppScreen.Settings ||
+            screen == AppScreen.Transactions
         ) {
             while (true) {
                 node =
@@ -311,13 +313,16 @@ fun WalletApp(
                         controller.walletOverview()
                     }
 
-                recentTransactions =
-                    withContext(
-                        Dispatchers.IO
-                    ) {
-                        controller
-                            .recentTransactions(5)
+                if (screen == AppScreen.Transactions) {
+                    transactionLoading = true
+                    try {
+                        recentTransactions = withContext(Dispatchers.IO) {
+                            controller.recentTransactions(transactionLimit)
+                        }
+                    } finally {
+                        transactionLoading = false
                     }
+                }
 
                 delay(1500)
             }
@@ -403,8 +408,6 @@ fun WalletApp(
                 controller = controller,
                 node = node,
                 overview = overview,
-                recentTransactions =
-                    recentTransactions,
                 startupError = startupError,
                 initialSendDestination =
                     pendingSendDestination,
@@ -421,7 +424,22 @@ fun WalletApp(
                 onSettings = {
                     screen =
                         AppScreen.Settings
+                },
+                onTransactions = {
+                    transactionLimit = 100
+                    screen = AppScreen.Transactions
                 }
+            )
+
+        AppScreen.Transactions ->
+            TransactionsScreen(
+                context = context,
+                controller = controller,
+                transactions = recentTransactions,
+                loading = transactionLoading,
+                limit = transactionLimit,
+                onLoadMore = { transactionLimit = (transactionLimit + 100).coerceAtMost(5000) },
+                onBack = { screen = AppScreen.Wallet }
             )
 
         AppScreen.Addresses ->
@@ -567,7 +585,7 @@ private fun LoadingScreen() {
             )
 
             Text(
-                "PARANO1D / MAINNET / MOBILE",
+                WalletLanguage.uiString("PARANO1D / MAINNET / MOBILE"),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 9.sp,
@@ -593,7 +611,7 @@ private fun LoadingScreen() {
             )
 
             Text(
-                "FULL MOBILE WALLET",
+                WalletLanguage.uiString("FULL MOBILE WALLET"),
                 color = Cyan,
                 fontFamily = Mono,
                 fontSize = 12.sp,
@@ -639,7 +657,7 @@ private fun LoadingScreen() {
             )
 
             Text(
-                "INITIALIZING WALLET + FULL NODE",
+                WalletLanguage.uiString("INITIALIZING WALLET + FULL NODE"),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 9.sp,
@@ -660,7 +678,7 @@ private fun LoadingScreen() {
                 Alignment.CenterHorizontally
         ) {
             Text(
-                "FULL NODE WALLET  •  MAINNET",
+                WalletLanguage.uiString("FULL NODE WALLET  •  MAINNET"),
                 color = Magenta,
                 fontFamily = Mono,
                 fontSize = 9.sp,
@@ -672,7 +690,7 @@ private fun LoadingScreen() {
             )
 
             Text(
-                "Made by Aquacongas",
+                WalletLanguage.uiString("Made by Aquacongas"),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 10.sp
@@ -752,7 +770,7 @@ private fun SetupScreen(
         )
 
         Text(
-            "FULL MOBILE WALLET",
+            WalletLanguage.uiString("FULL MOBILE WALLET"),
             color = Cyan,
             fontFamily = Mono,
             fontSize = 12.sp,
@@ -765,7 +783,7 @@ private fun SetupScreen(
 
         TerminalCard {
             Text(
-                "WALLET SETUP",
+                WalletLanguage.uiString("WALLET SETUP"),
                 color = Green,
                 fontFamily = Mono,
                 fontWeight =
@@ -778,7 +796,7 @@ private fun SetupScreen(
             )
 
             Text(
-                "No configured wallet found.",
+                WalletLanguage.uiString("No configured wallet found."),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 12.sp
@@ -790,7 +808,7 @@ private fun SetupScreen(
 
             ActionButton(
                 text =
-                    "CREATE NEW WALLET",
+                    WalletLanguage.uiString("CREATE NEW WALLET"),
                 enabled =
                     !busy,
                 onClick =
@@ -803,7 +821,7 @@ private fun SetupScreen(
 
             ActionButton(
                 text =
-                    "IMPORT WALLET",
+                    WalletLanguage.uiString("IMPORT WALLET"),
                 enabled =
                     !busy,
                 onClick = {
@@ -817,7 +835,7 @@ private fun SetupScreen(
                 )
 
                 Text(
-                    "WORKING...",
+                    WalletLanguage.uiString("WORKING..."),
                     color = Yellow,
                     fontFamily = Mono,
                     fontSize = 11.sp
@@ -847,7 +865,7 @@ private fun SetupScreen(
 
             title = {
                 Text(
-                    "IMPORT WALLET",
+                    WalletLanguage.uiString("IMPORT WALLET"),
                     color = Green,
                     fontFamily = Mono
                 )
@@ -856,7 +874,7 @@ private fun SetupScreen(
             text = {
                 Column {
                     Text(
-                        "Enter the 64-character hexadecimal master key.",
+                        WalletLanguage.uiString("Enter the 64-character hexadecimal master key."),
                         color = Muted,
                         fontFamily = Mono,
                         fontSize = 12.sp
@@ -881,7 +899,7 @@ private fun SetupScreen(
 
                         label = {
                             Text(
-                                "MASTER KEY"
+                                WalletLanguage.uiString("MASTER KEY")
                             )
                         },
 
@@ -912,7 +930,7 @@ private fun SetupScreen(
                     }
                 ) {
                     Text(
-                        "IMPORT",
+                        WalletLanguage.uiString("IMPORT"),
                         color = Green
                     )
                 }
@@ -926,7 +944,7 @@ private fun SetupScreen(
                     }
                 ) {
                     Text(
-                        "CANCEL",
+                        WalletLanguage.uiString("CANCEL"),
                         color = Muted
                     )
                 }
@@ -941,12 +959,12 @@ private fun WalletHome(
     controller: WalletController,
     node: NodeStatus,
     overview: WalletOverview,
-    recentTransactions: List<RecentTransaction>,
     startupError: String?,
     initialSendDestination: String?,
     onSendDestinationConsumed: () -> Unit,
     onAddresses: () -> Unit,
-    onSettings: () -> Unit
+    onSettings: () -> Unit,
+    onTransactions: () -> Unit
 ) {
     var sendDialog by remember {
         mutableStateOf(false)
@@ -1054,7 +1072,7 @@ private fun WalletHome(
                         )
             ) {
                 Text(
-                    "AVAILABLE BALANCE",
+                    WalletLanguage.uiString("AVAILABLE BALANCE"),
                     color = Cyan,
                     fontFamily = Mono,
                     fontSize = 10.sp,
@@ -1096,6 +1114,15 @@ private fun WalletHome(
                     )
                 }
 
+                Spacer(Modifier.height(5.dp))
+
+                Text(
+                    WalletLanguage.uiString("FROM ALL ADDRESSES"),
+                    color = Muted,
+                    fontFamily = Mono,
+                    fontSize = 10.sp
+                )
+
                 Spacer(
                     Modifier.height(24.dp)
                 )
@@ -1130,7 +1157,7 @@ private fun WalletHome(
                                 Modifier.weight(1f)
                         ) {
                             Text(
-                                "ACTIVE ADDRESS",
+                                WalletLanguage.uiString("ACTIVE ADDRESS"),
                                 color = Magenta,
                                 fontFamily = Mono,
                                 fontSize = 9.sp,
@@ -1152,7 +1179,7 @@ private fun WalletHome(
                         }
 
                         CompactOutlineButton(
-                            text = "CHANGE",
+                            text = WalletLanguage.uiString("CHANGE"),
                             accent = Green,
                             onClick =
                                 onAddresses
@@ -1190,7 +1217,7 @@ private fun WalletHome(
                     ) {
                         Column {
                             Text(
-                                "ACTIVE BALANCE",
+                                WalletLanguage.uiString("ACTIVE BALANCE"),
                                 color = Muted,
                                 fontFamily = Mono,
                                 fontSize = 9.sp
@@ -1244,7 +1271,7 @@ private fun WalletHome(
                             Modifier.weight(1f)
                     ) {
                         ActionButton(
-                            text = "SEND",
+                            text = WalletLanguage.uiString("SEND"),
                             enabled =
                                 active != null,
                             onClick = {
@@ -1258,7 +1285,7 @@ private fun WalletHome(
                             Modifier.weight(1f)
                     ) {
                         AccentButton(
-                            text = "RECEIVE",
+                            text = WalletLanguage.uiString("RECEIVE"),
                             accent = Cyan,
                             enabled =
                                 active != null,
@@ -1274,23 +1301,23 @@ private fun WalletHome(
                 )
 
                 OutlineActionButton(
-                    text = "SETTINGS",
+                    text = WalletLanguage.uiString("SETTINGS"),
                     accent = Cyan,
                     onClick =
                         onSettings
                 )
+
+                Spacer(
+                    Modifier.height(10.dp)
+                )
+
+                OutlineActionButton(
+                    text = WalletLanguage.uiString("TRANSACTIONS"),
+                    accent = Cyan,
+                    onClick = onTransactions
+                )
             }
         }
-
-        Spacer(
-            Modifier.height(12.dp)
-        )
-
-        RecentTransactionsCard(
-            context = context,
-            transactions =
-                recentTransactions
-        )
 
         if (
             !startupError.isNullOrBlank() &&
@@ -1381,7 +1408,7 @@ private fun AddressesScreen(
                     onBack
             ) {
                 Text(
-                    "BACK",
+                    WalletLanguage.uiString("BACK"),
                     color = Cyan,
                     fontSize = 12.sp
                 )
@@ -1392,7 +1419,7 @@ private fun AddressesScreen(
             )
 
             Text(
-                "ADDRESSES",
+                WalletLanguage.uiString("ADDRESSES"),
                 color = TextMain,
                 fontSize = 20.sp,
                 fontWeight =
@@ -1404,8 +1431,7 @@ private fun AddressesScreen(
             Modifier.height(22.dp)
         )
 
-        Text(
-            "${overview.addressCount} GENERATED",
+        Text(WalletLanguage.uiString("GENERATED").let { "${overview.addressCount} $it" },
             color = Muted,
             fontSize = 11.sp
         )
@@ -1473,7 +1499,7 @@ private fun AddressesScreen(
                     if (item.active) {
 
                         Text(
-                            "ACTIVE",
+                            WalletLanguage.uiString("ACTIVE"),
                             color = Green,
                             fontSize = 11.sp,
                             fontWeight =
@@ -1490,7 +1516,7 @@ private fun AddressesScreen(
                             }
                         ) {
                             Text(
-                                "SELECT",
+                                WalletLanguage.uiString("SELECT"),
                                 color = Cyan,
                                 fontSize = 11.sp,
                                 fontWeight =
@@ -1540,7 +1566,7 @@ private fun AddressesScreen(
 
         ActionButton(
             text =
-                "NEW ADDRESS",
+                WalletLanguage.uiString("NEW ADDRESS"),
 
             enabled =
                 overview.error == null,
@@ -1592,7 +1618,7 @@ private fun NodeCard(
                 Alignment.CenterVertically
         ) {
             Text(
-                "STATUS",
+                WalletLanguage.uiString("STATUS"),
                 color = Cyan,
                 fontFamily = Mono,
                 fontSize = 9.sp,
@@ -1605,9 +1631,9 @@ private fun NodeCard(
 
             Text(
                 if (node.running)
-                    "ONLINE"
+                    WalletLanguage.uiString("ONLINE")
                 else
-                    "OFFLINE",
+                    WalletLanguage.uiString("OFFLINE"),
                 color =
                     if (node.running)
                         Green
@@ -1659,7 +1685,7 @@ private fun NodeCard(
             MetricCell(
                 modifier =
                     Modifier.weight(1f),
-                label = "HEIGHT",
+                label = WalletLanguage.uiString("HEIGHT"),
                 value =
                     node.tipHeight
                         .toString(),
@@ -1670,10 +1696,10 @@ private fun NodeCard(
             MetricCell(
                 modifier =
                     Modifier.weight(1f),
-                label = "SYNC",
+                label = WalletLanguage.uiString("SYNC"),
                 value =
                     if (!node.running)
-                        "OFFLINE"
+                        WalletLanguage.uiString("OFFLINE")
                     else
                         node.syncState,
                 accent =
@@ -1689,7 +1715,7 @@ private fun NodeCard(
             MetricCell(
                 modifier =
                     Modifier.weight(1f),
-                label = "PEERS",
+                label = WalletLanguage.uiString("PEERS"),
                 value =
                     node.peers
                         .toString(),
@@ -1708,10 +1734,174 @@ private fun NodeCard(
 }
 
 @Composable
+private fun TransactionsScreen(
+    context: Context,
+    controller: WalletController,
+    transactions: List<RecentTransaction>,
+    loading: Boolean,
+    limit: Int,
+    onLoadMore: () -> Unit,
+    onBack: () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxSize().background(Bg).safeDrawingPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp, vertical = 14.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            CompactOutlineButton(
+                text = WalletLanguage.uiString("< BACK"),
+                accent = Cyan,
+                onClick = onBack
+            )
+            Spacer(Modifier.weight(1f))
+            Logo(size = 20)
+        }
+        Spacer(Modifier.height(20.dp))
+        Text(
+            WalletLanguage.uiString("TRANSACTIONS"),
+            color = TextMain,
+            fontSize = 22.sp,
+            fontWeight = FontWeight.Bold
+        )
+        var importedReceipt by remember { mutableStateOf("") }
+        var verificationMessage by remember { mutableStateOf<String?>(null) }
+        var verifyingReceipt by remember { mutableStateOf(false) }
+        OutlinedTextField(
+            value = importedReceipt,
+            onValueChange = {
+                importedReceipt = it.take(262170)
+                verificationMessage = null
+            },
+            label = { Text(WalletLanguage.uiString("PASTE RECEIPT")) },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 2,
+            maxLines = 4,
+            textStyle = androidx.compose.ui.text.TextStyle(color = TextMain),
+            colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
+                focusedTextColor = TextMain,
+                unfocusedTextColor = TextMain,
+                cursorColor = Green,
+                focusedLabelColor = Green,
+                unfocusedLabelColor = TextMain,
+                focusedBorderColor = Green,
+                unfocusedBorderColor = TextMain
+            )
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlineActionButton(
+            text = WalletLanguage.uiString("VERIFY RECEIPT"),
+            accent = Cyan,
+            onClick = {
+                if (!verifyingReceipt && importedReceipt.isNotBlank()) {
+                    verifyingReceipt = true
+                    MainScope().launch {
+                        try {
+                            val result = withContext(Dispatchers.IO) {
+                                controller.verifyReceiptHex(importedReceipt)
+                            }
+                            verificationMessage = when {
+                                !result.optBoolean("ok") -> result.optString("error", WalletLanguage.uiString("INVALID RECEIPT"))
+                                result.optBoolean("canonical_verified") ->
+                                    WalletLanguage.uiString("CANONICAL RECEIPT VERIFIED") + "\nTXID: " + result.optString("txid")
+                                else -> WalletLanguage.uiString("MERKLE VERIFIED ONLY") + "\n" +
+                                    WalletLanguage.uiString("CANONICAL HEADER UNAVAILABLE") + "\nTXID: " + result.optString("txid")
+                            }
+                        } catch (e: Exception) {
+                            verificationMessage = e.message ?: WalletLanguage.uiString("INVALID RECEIPT")
+                        } finally { verifyingReceipt = false }
+                    }
+                }
+            }
+        )
+        if (verificationMessage != null) {
+            val message = verificationMessage.orEmpty()
+            val canonical = message.startsWith(
+                WalletLanguage.uiString("CANONICAL RECEIPT VERIFIED")
+            )
+            val merkleOnly = message.startsWith(
+                WalletLanguage.uiString("MERKLE VERIFIED ONLY")
+            )
+            val statusColor = when {
+                canonical -> Green
+                merkleOnly -> Cyan
+                else -> androidx.compose.ui.graphics.Color(0xFFFF7070)
+            }
+
+            androidx.compose.material3.Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = Surface,
+                border = androidx.compose.foundation.BorderStroke(
+                    1.dp,
+                    statusColor.copy(alpha = 0.65f)
+                )
+            ) {
+                Text(
+                    text = message,
+                    color = statusColor,
+                    fontFamily = Mono,
+                    modifier = Modifier.padding(16.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+        if (loading && transactions.isEmpty()) {
+            CircularProgressIndicator(color = Cyan)
+        }
+        RecentTransactionsCard(
+            context = context,
+            controller = controller,
+            transactions = transactions
+        )
+        Spacer(Modifier.height(12.dp))
+        if (transactions.size >= limit && limit < 5000) {
+            OutlineActionButton(
+                text = WalletLanguage.uiString("LOAD MORE"),
+                accent = Cyan,
+                onClick = onLoadMore
+            )
+        }
+        if (loading) {
+            Spacer(Modifier.height(8.dp))
+            CircularProgressIndicator(color = Cyan)
+        }
+    }
+}
+
+@Composable
 private fun RecentTransactionsCard(
     context: Context,
+    controller: WalletController,
     transactions: List<RecentTransaction>
 ) {
+    var receiptStatus by remember { mutableStateOf<String?>(null) }
+    var receiptPayload by remember { mutableStateOf<String?>(null) }
+    var receiptBusy by remember { mutableStateOf(false) }
+    if (receiptStatus != null) {
+        AlertDialog(
+            onDismissRequest = { receiptStatus = null },
+            title = { Text(WalletLanguage.uiString("PAYMENT RECEIPT")) },
+            text = { Text(receiptStatus ?: "") },
+            confirmButton = {
+                TextButton(
+                    enabled = receiptPayload != null,
+                    onClick = {
+                        val share = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, receiptPayload)
+                        }
+                        context.startActivity(Intent.createChooser(share, null))
+                    }
+                ) { Text(WalletLanguage.uiString("SHARE RECEIPT")) }
+            },
+            dismissButton = {
+                TextButton(onClick = { receiptStatus = null }) {
+                    Text(WalletLanguage.uiString("CLOSE"))
+                }
+            }
+        )
+    }
     Column(
         modifier =
             Modifier
@@ -1738,7 +1928,7 @@ private fun RecentTransactionsCard(
                 Alignment.CenterVertically
         ) {
             Text(
-                "RECENT TRANSACTIONS",
+                WalletLanguage.uiString("TRANSACTIONS"),
                 color = Cyan,
                 fontFamily = Mono,
                 fontSize = 10.sp,
@@ -1752,10 +1942,10 @@ private fun RecentTransactionsCard(
             )
 
             Text(
-                "LAST 5",
+                transactions.size.toString(),
                 color = Muted,
                 fontFamily = Mono,
-                fontSize = 8.sp
+                fontSize = 9.sp
             )
         }
 
@@ -1765,14 +1955,13 @@ private fun RecentTransactionsCard(
 
         if (transactions.isEmpty()) {
             Text(
-                "NO TRANSACTIONS YET",
+                WalletLanguage.uiString("NO TRANSACTIONS YET"),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 10.sp
             )
         } else {
-            val shown =
-                transactions.take(5)
+            val shown = transactions
 
             shown.forEachIndexed {
                 index,
@@ -1842,7 +2031,7 @@ private fun RecentTransactionsCard(
                                 )
 
                                 Text(
-                                    "PENDING",
+                                    WalletLanguage.uiString("PENDING"),
                                     color = Yellow,
                                     fontFamily = Mono,
                                     fontSize = 8.sp
@@ -1886,6 +2075,46 @@ private fun RecentTransactionsCard(
                         fontWeight =
                             FontWeight.Bold
                     )
+                }
+
+                if (tx.direction == "SENT" && !tx.pending && !tx.coinbase) {
+                    TextButton(
+                        enabled = !receiptBusy,
+                        onClick = {
+                            receiptBusy = true
+                            receiptPayload = null
+                            MainScope().launch {
+                                try {
+                                    val result = withContext(Dispatchers.IO) {
+                                        controller.receipt(tx.txid)
+                                    }
+                                    if (!result.optBoolean("ok", false)) {
+                                        receiptStatus = result.optString("error", "Receipt read failed")
+                                    } else if (!result.optBoolean("available", false)) {
+                                        receiptStatus = WalletLanguage.uiString("RECEIPT NOT AVAILABLE")
+                                    } else if (!result.optBoolean("merkle_valid", false)) {
+                                        receiptStatus = WalletLanguage.uiString("INVALID RECEIPT")
+                                    } else {
+                                        val hex = result.getString("receipt_hex")
+                                        receiptPayload = "PARANO1D-RECEIPT-V2-HEX:" + hex
+                                        val verified = withContext(Dispatchers.IO) {
+                                            controller.verifyReceiptHex(receiptPayload ?: "")
+                                        }
+                                        receiptStatus = when {
+                                            verified.optBoolean("canonical_verified") -> WalletLanguage.uiString("CANONICAL RECEIPT VERIFIED")
+                                            verified.optBoolean("ok") -> WalletLanguage.uiString("MERKLE VERIFIED ONLY") +
+                                                "\n" + WalletLanguage.uiString("CANONICAL HEADER UNAVAILABLE")
+                                            else -> verified.optString("error", WalletLanguage.uiString("INVALID RECEIPT"))
+                                        } + "\nTXID: " + tx.txid
+                                    }
+                                } catch (e: Exception) {
+                                    receiptStatus = e.message ?: "Receipt error"
+                                } finally {
+                                    receiptBusy = false
+                                }
+                            }
+                        }
+                    ) { Text(WalletLanguage.uiString("PAYMENT RECEIPT"), color = Cyan) }
                 }
 
                 if (index < shown.lastIndex) {
@@ -1942,7 +2171,7 @@ private fun SendDialog(
         title = {
             Column {
                 AccentLabel(
-                    text = "SEND",
+                    text = WalletLanguage.uiString("SEND"),
                     accent = Green
                 )
 
@@ -1951,7 +2180,7 @@ private fun SendDialog(
                 )
 
                 Text(
-                    "SEND NOID",
+                    WalletLanguage.uiString("SEND NOID"),
                     color = TextMain,
                     fontFamily = Mono,
                     fontWeight =
@@ -1960,7 +2189,7 @@ private fun SendDialog(
                 )
 
                 Text(
-                    "Active address only",
+                    WalletLanguage.uiString("Active address only"),
                     color = Muted,
                     fontFamily = Mono,
                     fontSize = 10.sp
@@ -1978,7 +2207,7 @@ private fun SendDialog(
                         Modifier.fillMaxWidth(),
                     label = {
                         Text(
-                            "DESTINATION"
+                            WalletLanguage.uiString("DESTINATION")
                         )
                     },
                     placeholder = {
@@ -2013,7 +2242,7 @@ private fun SendDialog(
                         Modifier.fillMaxWidth(),
                     label = {
                         Text(
-                            "AMOUNT"
+                            WalletLanguage.uiString("AMOUNT")
                         )
                     },
                     suffix = {
@@ -2055,7 +2284,7 @@ private fun SendDialog(
                         Modifier.fillMaxWidth(),
                     label = {
                         Text(
-                            "FEE / 0 = AUTO"
+                            WalletLanguage.uiString("FEE / 0 = AUTO")
                         )
                     },
                     suffix = {
@@ -2082,9 +2311,9 @@ private fun SendDialog(
                 OutlineActionButton(
                     text =
                         if (working)
-                            "WORKING..."
+                            WalletLanguage.uiString("WORKING...")
                         else
-                            "SEND ALL",
+                            WalletLanguage.uiString("SEND ALL"),
                     accent = Magenta,
                     enabled =
                         !working &&
@@ -2110,7 +2339,7 @@ private fun SendDialog(
                                         "TX ${response.txid}"
                                     else
                                         response.error
-                                            ?: "SEND ALL failed"
+                                            ?: WalletLanguage.uiString("SEND ALL failed")
 
                                 working = false
                             }
@@ -2122,7 +2351,7 @@ private fun SendDialog(
                 )
 
                 Text(
-                    "FULL ACTIVE-ADDRESS BALANCE • AUTO FEE • NO CHANGE",
+                    WalletLanguage.uiString("FULL ACTIVE-ADDRESS BALANCE • AUTO FEE • NO CHANGE"),
                     color = Muted,
                     fontFamily = Mono,
                     fontSize = 8.sp
@@ -2222,7 +2451,7 @@ private fun SendDialog(
                             )
 
                             Text(
-                                "OPEN IN NOID EXPLORER  ↗",
+                                WalletLanguage.uiString("OPEN IN NOID EXPLORER  ↗"),
                                 color = Cyan,
                                 fontFamily = Mono,
                                 fontSize = 9.sp,
@@ -2263,7 +2492,7 @@ private fun SendDialog(
                                     "TX ${response.txid}"
                                 else
                                     response.error
-                                        ?: "Send failed"
+                                        ?: WalletLanguage.uiString("Send failed")
 
                             working = false
                         }
@@ -2271,9 +2500,9 @@ private fun SendDialog(
             ) {
                 Text(
                     if (working)
-                        "SENDING..."
+                        WalletLanguage.uiString("SENDING...")
                     else
-                        "SEND",
+                        WalletLanguage.uiString("SEND"),
                     color = Green,
                     fontFamily = Mono,
                     fontWeight =
@@ -2289,7 +2518,7 @@ private fun SendDialog(
                     onDismiss
             ) {
                 Text(
-                    "CLOSE",
+                    WalletLanguage.uiString("CLOSE"),
                     color = Muted,
                     fontFamily = Mono
                 )
@@ -2312,7 +2541,7 @@ private fun ReceiveDialog(
         title = {
             Column {
                 AccentLabel(
-                    text = "RECEIVE",
+                    text = WalletLanguage.uiString("RECEIVE"),
                     accent = Cyan
                 )
 
@@ -2321,7 +2550,7 @@ private fun ReceiveDialog(
                 )
 
                 Text(
-                    "RECEIVE NOID",
+                    WalletLanguage.uiString("RECEIVE NOID"),
                     color = TextMain,
                     fontFamily = Mono,
                     fontWeight =
@@ -2333,7 +2562,7 @@ private fun ReceiveDialog(
         text = {
             Column {
                 Text(
-                    "ACTIVE ADDRESS",
+                    WalletLanguage.uiString("ACTIVE ADDRESS"),
                     color = Muted,
                     fontFamily = Mono,
                     fontSize = 9.sp,
@@ -2376,7 +2605,7 @@ private fun ReceiveDialog(
                 )
 
                 Text(
-                    "Share this address to receive NOID.",
+                    WalletLanguage.uiString("Share this address to receive NOID."),
                     color = Muted,
                     fontFamily = Mono,
                     fontSize = 10.sp
@@ -2394,7 +2623,7 @@ private fun ReceiveDialog(
                 }
             ) {
                 Text(
-                    "COPY ADDRESS",
+                    WalletLanguage.uiString("COPY ADDRESS"),
                     color = Cyan,
                     fontFamily = Mono,
                     fontWeight =
@@ -2408,7 +2637,7 @@ private fun ReceiveDialog(
                     onDismiss
             ) {
                 Text(
-                    "CLOSE",
+                    WalletLanguage.uiString("CLOSE"),
                     color = Muted,
                     fontFamily = Mono
                 )
@@ -2468,7 +2697,7 @@ private fun SettingsScreen(
                 Alignment.CenterVertically
         ) {
             CompactOutlineButton(
-                text = "< BACK",
+                text = WalletLanguage.uiString("< BACK"),
                 accent = Cyan,
                 onClick =
                     onBack
@@ -2488,7 +2717,7 @@ private fun SettingsScreen(
         )
 
         Text(
-            "SETTINGS",
+            WalletLanguage.uiString("SETTINGS"),
             color = TextMain,
             fontFamily = Mono,
             fontWeight =
@@ -2497,12 +2726,14 @@ private fun SettingsScreen(
         )
 
         Text(
-            "WALLET / NODE / SECURITY",
+            WalletLanguage.uiString("WALLET / NODE / SECURITY"),
             color = Muted,
             fontFamily = Mono,
             fontSize = 9.sp,
             letterSpacing = 1.sp
         )
+
+        WalletLanguageSetting()
 
         Spacer(
             Modifier.height(18.dp)
@@ -2512,7 +2743,7 @@ private fun SettingsScreen(
             accent = Green
         ) {
             AccentLabel(
-                text = "WALLET",
+                text = WalletLanguage.uiString("WALLET"),
                 accent = Green
             )
 
@@ -2521,7 +2752,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                "MASTER KEY BACKUP",
+                WalletLanguage.uiString("MASTER KEY BACKUP"),
                 color = TextMain,
                 fontFamily = Mono,
                 fontWeight =
@@ -2534,7 +2765,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                "One master key derives every address in this wallet.",
+                WalletLanguage.uiString("One master key derives every address in this wallet."),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 10.sp
@@ -2546,7 +2777,7 @@ private fun SettingsScreen(
 
             ActionButton(
                 text =
-                    "EXPORT MASTER KEY",
+                    WalletLanguage.uiString("EXPORT MASTER KEY"),
                 onClick = {
                     exportError = null
 
@@ -2585,7 +2816,7 @@ private fun SettingsScreen(
             accent = Magenta
         ) {
             AccentLabel(
-                text = "SUPPORT",
+                text = WalletLanguage.uiString("SUPPORT"),
                 accent = Magenta
             )
 
@@ -2594,7 +2825,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                "SUPPORT PARANO1D",
+                WalletLanguage.uiString("SUPPORT PARANO1D"),
                 color = TextMain,
                 fontFamily = Mono,
                 fontWeight =
@@ -2607,7 +2838,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                "Donate NOID directly from the active address.",
+                WalletLanguage.uiString("Donate NOID directly from the active address."),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 10.sp
@@ -2630,7 +2861,7 @@ private fun SettingsScreen(
             )
 
             AccentButton(
-                text = "DONATE",
+                text = WalletLanguage.uiString("DONATE"),
                 accent = Magenta,
                 onClick =
                     onDonate
@@ -2645,7 +2876,7 @@ private fun SettingsScreen(
             accent = Cyan
         ) {
             AccentLabel(
-                text = "NODE",
+                text = WalletLanguage.uiString("NODE"),
                 accent = Cyan
             )
 
@@ -2654,29 +2885,29 @@ private fun SettingsScreen(
             )
 
             InfoLine(
-                "STATUS",
+                WalletLanguage.uiString("STATUS"),
                 if (node.running)
-                    "ONLINE"
+                    WalletLanguage.uiString("ONLINE")
                 else
-                    "OFFLINE"
+                    WalletLanguage.uiString("OFFLINE")
             )
 
             InfoLine(
-                "HEIGHT",
+                WalletLanguage.uiString("HEIGHT"),
                 node.tipHeight
                     .toString()
             )
 
             InfoLine(
-                "SYNC",
+                WalletLanguage.uiString("SYNC"),
                 if (node.running)
                     node.syncState
                 else
-                    "OFFLINE"
+                    WalletLanguage.uiString("OFFLINE")
             )
 
             InfoLine(
-                "PEERS",
+                WalletLanguage.uiString("PEERS"),
                 node.peers
                     .toString()
             )
@@ -2690,7 +2921,7 @@ private fun SettingsScreen(
             accent = Danger
         ) {
             AccentLabel(
-                text = "DANGER",
+                text = WalletLanguage.uiString("DANGER"),
                 accent = Danger
             )
 
@@ -2699,7 +2930,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                "DELETE WALLET",
+                WalletLanguage.uiString("DELETE WALLET"),
                 color = TextMain,
                 fontFamily = Mono,
                 fontWeight =
@@ -2712,7 +2943,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                "Permanently removes the local master key and wallet metadata. The chain database is retained.",
+                WalletLanguage.uiString("Permanently removes the local master key and wallet metadata. The chain database is retained."),
                 color = Muted,
                 fontFamily = Mono,
                 fontSize = 10.sp
@@ -2724,7 +2955,7 @@ private fun SettingsScreen(
 
             DangerButton(
                 text =
-                    "DELETE WALLET",
+                    WalletLanguage.uiString("DELETE WALLET"),
                 onClick = {
                     deleteDialog = true
                 }
@@ -2756,7 +2987,7 @@ private fun SettingsScreen(
             title = {
                 Column {
                     AccentLabel(
-                        text = "SECURITY",
+                        text = WalletLanguage.uiString("SECURITY"),
                         accent = Yellow
                     )
 
@@ -2765,7 +2996,7 @@ private fun SettingsScreen(
                     )
 
                     Text(
-                        "MASTER KEY",
+                        WalletLanguage.uiString("MASTER KEY"),
                         color = TextMain,
                         fontFamily = Mono,
                         fontWeight =
@@ -2776,7 +3007,7 @@ private fun SettingsScreen(
             text = {
                 Column {
                     Text(
-                        "Anyone with this key controls the wallet.",
+                        WalletLanguage.uiString("Anyone with this key controls the wallet."),
                         color = Danger,
                         fontFamily = Mono,
                         fontSize = 10.sp
@@ -2825,7 +3056,7 @@ private fun SettingsScreen(
                     }
                 ) {
                     Text(
-                        "COPY",
+                        WalletLanguage.uiString("COPY"),
                         color = Yellow,
                         fontFamily = Mono,
                         fontWeight =
@@ -2840,7 +3071,7 @@ private fun SettingsScreen(
                     }
                 ) {
                     Text(
-                        "CLOSE",
+                        WalletLanguage.uiString("CLOSE"),
                         color = Muted,
                         fontFamily = Mono
                     )
@@ -2860,7 +3091,7 @@ private fun SettingsScreen(
             title = {
                 Column {
                     AccentLabel(
-                        text = "DANGER",
+                        text = WalletLanguage.uiString("DANGER"),
                         accent = Danger
                     )
 
@@ -2869,7 +3100,7 @@ private fun SettingsScreen(
                     )
 
                     Text(
-                        "DELETE WALLET",
+                        WalletLanguage.uiString("DELETE WALLET"),
                         color = Danger,
                         fontFamily = Mono,
                         fontWeight =
@@ -2880,7 +3111,7 @@ private fun SettingsScreen(
             text = {
                 Column {
                     Text(
-                        "This permanently removes the local master key.",
+                        WalletLanguage.uiString("This permanently removes the local master key."),
                         color = Danger,
                         fontFamily = Mono,
                         fontSize = 11.sp
@@ -2891,7 +3122,7 @@ private fun SettingsScreen(
                     )
 
                     Text(
-                        "Type DELETE to confirm.",
+                        WalletLanguage.uiString("Type DELETE to confirm."),
                         color = Muted,
                         fontFamily = Mono,
                         fontSize = 10.sp
@@ -2911,7 +3142,7 @@ private fun SettingsScreen(
                             Modifier.fillMaxWidth(),
                         label = {
                             Text(
-                                "CONFIRM"
+                                WalletLanguage.uiString("CONFIRM")
                             )
                         },
                         singleLine = true,
@@ -2936,12 +3167,12 @@ private fun SettingsScreen(
                         } else {
                             deleteError =
                                 result.error
-                                    ?: "Delete failed"
+                                    ?: WalletLanguage.uiString("Delete failed")
                         }
                     }
                 ) {
                     Text(
-                        "DELETE",
+                        WalletLanguage.uiString("DELETE"),
                         color = Danger,
                         fontFamily = Mono,
                         fontWeight =
@@ -2957,7 +3188,7 @@ private fun SettingsScreen(
                     }
                 ) {
                     Text(
-                        "CANCEL",
+                        WalletLanguage.uiString("CANCEL"),
                         color = Muted,
                         fontFamily = Mono
                     )

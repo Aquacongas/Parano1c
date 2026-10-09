@@ -1,0 +1,16 @@
+[package]
+name = "noid_history_runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+noid_poseidon2b = { path = "../noid_poseidon2b" }
+noid_recursive  = { path = "../noid_recursive" }
+noid-ivc-core   = { path = "../noid_ivc_core" }
+
+thiserror = { workspace = true }
+zstd = { version = "0.13", features = ["zstdmt"] }
+
+[dev-dependencies]
+tempfile = "3"

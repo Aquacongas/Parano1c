@@ -3731,14 +3731,26 @@ async fn run_swarm(
     let protocol_id = topics.protocol_id.clone();
     let network_profile = NetworkProfile::for_proof_bank(history_proof_bank_id);
     let public_relay_enabled = !public_addresses.is_empty();
-    let mut swarm = SwarmBuilder::with_existing_identity(identity)
+    let builder = SwarmBuilder::with_existing_identity(identity)
         .with_tokio()
         .with_tcp(
             tcp::Config::default().nodelay(true),
             noise::Config::new,
             yamux::Config::default,
-        )?
-        .with_dns()?
+        )?;
+
+    // Android has no conventional /etc/resolv.conf.
+    // Keep the native system resolver on desktop.
+    #[cfg(target_os = "android")]
+    let builder = builder.with_dns_config(
+        libp2p::dns::ResolverConfig::cloudflare(),
+        libp2p::dns::ResolverOpts::default(),
+    );
+
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.with_dns()?;
+
+    let mut swarm = builder
         // Relay client transport: enables dialling and listening through relay
         // nodes.  The relay::client::Behaviour is wired here by the builder
         // and passed into NodeBehaviour::new() via the closure below.

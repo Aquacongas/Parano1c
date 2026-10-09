@@ -20,8 +20,9 @@ class MainActivity :
             requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 7001)
         }
 
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
         setContent {
-            WalletApp()
+            WalletLanguageGate { WalletPinGate { WalletApp() } }
         }
     }
 }

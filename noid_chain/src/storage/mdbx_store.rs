@@ -1525,7 +1525,7 @@ impl MdbxStore {
         let rw = ReadWriteOptions {
             sync_mode: SyncMode::Durable,
             min_size: Some(4 * 1024 * 1024),                // 4 MiB
-            max_size: Some(1024isize * 1024 * 1024 * 1024), // 1 TiB virtual ceiling
+            max_size: Some(if cfg!(target_os = "android") { 64isize * 1024 * 1024 * 1024 } else { 1024isize * 1024 * 1024 * 1024 }), // 1 TiB virtual ceiling
             growth_step: Some(64 * 1024 * 1024),            // 64 MiB steps
             ..Default::default()
         };

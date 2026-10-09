@@ -977,10 +977,30 @@ fn atomic_publish_segment(
 
         // `hard_link` publishes a fully synced inode atomically and, unlike
         // `rename`, cannot replace an existing final name.
-        fs::hard_link(&temporary, &final_path)
-            .map_err(|error| SnapshotStagingError::io("publish staged segment", error))?;
-        fs::remove_file(&temporary)
-            .map_err(|error| SnapshotStagingError::io("remove temporary segment link", error))?;
+        // Android: publish a synced segment by renaming inside the same
+        // private staging directory. Some Android filesystems deny hard links.
+        #[cfg(target_os = "android")]
+        {
+            if final_path.try_exists()
+                .map_err(|error| SnapshotStagingError::io("check staged segment destination", error))?
+            {
+                return Err(SnapshotStagingError::io(
+                    "publish staged segment",
+                    io::Error::new(io::ErrorKind::AlreadyExists, "staged segment already exists"),
+                ));
+            }
+            fs::rename(&temporary, &final_path)
+                .map_err(|error| SnapshotStagingError::io("publish staged segment", error))?;
+        }
+
+        // Desktop: retain atomic no-replace hard-link publication.
+        #[cfg(not(target_os = "android"))]
+        {
+            fs::hard_link(&temporary, &final_path)
+                .map_err(|error| SnapshotStagingError::io("publish staged segment", error))?;
+            fs::remove_file(&temporary)
+                .map_err(|error| SnapshotStagingError::io("remove temporary segment link", error))?;
+        }
         sync_directory(directory)?;
         Ok(())
     })();

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">設定 PIN</string>
+    <string name="p1_pin_confirm_pin">確認 PIN</string>
+    <string name="p1_pin_unlock_wallet">解鎖錢包</string>
+    <string name="p1_pin_six_digit_pin">輸入六位數字 PIN</string>
+    <string name="p1_pin_pin_code">PIN 碼</string>
+    <string name="p1_pin_pins_do_not_match">PIN 不一致</string>
+    <string name="p1_pin_too_many_attempts">嘗試次數過多，請一分鐘後重試。</string>
+    <string name="p1_pin_incorrect_pin">PIN 錯誤</string>
+    <string name="p1_pin_pin_storage_error">PIN 儲存錯誤，已阻止存取。</string>
+    <string name="p1_pin_continue">繼續</string>
+    <string name="p1_pin_confirm">確認</string>
+    <string name="p1_pin_start_over">重新開始</string>
+</resources>

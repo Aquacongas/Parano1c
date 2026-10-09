@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">PIN 설정</string>
+    <string name="p1_pin_confirm_pin">PIN 확인</string>
+    <string name="p1_pin_unlock_wallet">지갑 잠금 해제</string>
+    <string name="p1_pin_six_digit_pin">6자리 PIN 입력</string>
+    <string name="p1_pin_pin_code">PIN 코드</string>
+    <string name="p1_pin_pins_do_not_match">PIN이 일치하지 않습니다</string>
+    <string name="p1_pin_too_many_attempts">시도 횟수가 너무 많습니다. 1분 뒤 다시 시도하세요.</string>
+    <string name="p1_pin_incorrect_pin">PIN이 올바르지 않습니다</string>
+    <string name="p1_pin_pin_storage_error">PIN 저장 오류. 접근이 차단되었습니다.</string>
+    <string name="p1_pin_continue">계속</string>
+    <string name="p1_pin_confirm">확인</string>
+    <string name="p1_pin_start_over">다시 시작</string>
+</resources>

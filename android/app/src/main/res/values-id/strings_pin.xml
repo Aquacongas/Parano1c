@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">Buat PIN</string>
+    <string name="p1_pin_confirm_pin">Konfirmasi PIN</string>
+    <string name="p1_pin_unlock_wallet">Buka kunci dompet</string>
+    <string name="p1_pin_six_digit_pin">Masukkan PIN enam digit</string>
+    <string name="p1_pin_pin_code">Kode PIN</string>
+    <string name="p1_pin_pins_do_not_match">PIN tidak cocok</string>
+    <string name="p1_pin_too_many_attempts">Terlalu banyak percobaan. Coba lagi dalam satu menit.</string>
+    <string name="p1_pin_incorrect_pin">PIN salah</string>
+    <string name="p1_pin_pin_storage_error">Kesalahan penyimpanan PIN. Akses diblokir.</string>
+    <string name="p1_pin_continue">Lanjutkan</string>
+    <string name="p1_pin_confirm">Konfirmasi</string>
+    <string name="p1_pin_start_over">Mulai ulang</string>
+</resources>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">PINを設定</string>
+    <string name="p1_pin_confirm_pin">PINを確認</string>
+    <string name="p1_pin_unlock_wallet">ウォレットのロック解除</string>
+    <string name="p1_pin_six_digit_pin">6桁のPINを入力</string>
+    <string name="p1_pin_pin_code">PINコード</string>
+    <string name="p1_pin_pins_do_not_match">PINが一致しません</string>
+    <string name="p1_pin_too_many_attempts">試行回数が多すぎます。1分後に再試行してください。</string>
+    <string name="p1_pin_incorrect_pin">PINが違います</string>
+    <string name="p1_pin_pin_storage_error">PIN保存エラー。アクセスを拒否しました。</string>
+    <string name="p1_pin_continue">続行</string>
+    <string name="p1_pin_confirm">確認</string>
+    <string name="p1_pin_start_over">やり直す</string>
+</resources>

@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "noid_mobile_ffi",
+    "noid_mobile_node",
     "bench_prover",
     "noid_core",
     "noid_fri",
@@ -56,3 +58,6 @@ codegen-units = 1
 [profile.bench]
 lto = "thin"
 codegen-units = 1
+
+[patch.crates-io]
+libmdbx = { path = "vendor/libmdbx-android" }

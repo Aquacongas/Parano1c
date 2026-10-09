@@ -45,6 +45,10 @@ object NativeNode {
         destination: String
     ): String
 
+    external fun receipt(txid: String): String
+
+    external fun verifyReceiptHex(receipt: String): String
+
     external fun recentTransactions(
         limit: Int
     ): String

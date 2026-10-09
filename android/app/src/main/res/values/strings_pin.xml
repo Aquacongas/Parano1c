@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_pin_create_pin">Create PIN</string>
+    <string name="p1_pin_confirm_pin">Confirm PIN</string>
+    <string name="p1_pin_unlock_wallet">Unlock wallet</string>
+    <string name="p1_pin_six_digit_pin">Enter a six-digit PIN</string>
+    <string name="p1_pin_pin_code">PIN code</string>
+    <string name="p1_pin_pins_do_not_match">PINs do not match</string>
+    <string name="p1_pin_too_many_attempts">Too many attempts. Try again in one minute.</string>
+    <string name="p1_pin_incorrect_pin">Incorrect PIN</string>
+    <string name="p1_pin_pin_storage_error">PIN storage unavailable. Access blocked.</string>
+    <string name="p1_pin_continue">Continue</string>
+    <string name="p1_pin_confirm">Confirm</string>
+    <string name="p1_pin_start_over">Start over</string>
+</resources>

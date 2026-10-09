@@ -47,7 +47,7 @@ class NodeSyncService : Service() {
         manager.createNotificationChannel(NotificationChannel(RUN_CHANNEL, "Parano1c node", NotificationManager.IMPORTANCE_LOW))
         manager.createNotificationChannel(NotificationChannel(INCOMING_CHANNEL, "Parano1c incoming transactions", NotificationManager.IMPORTANCE_DEFAULT))
         // Android requires promotion to foreground promptly, before Rust initialization.
-        val note = statusNotification("Uruchamianie noda…")
+        val note = statusNotification(WalletLanguage.string(this, R.string.p1_node_starting))
         if (Build.VERSION.SDK_INT >= 29) {
             startForeground(RUN_ID, note, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
@@ -69,7 +69,7 @@ class NodeSyncService : Service() {
                         val status = controller.status()
                         getSystemService(NotificationManager::class.java).notify(
                             RUN_ID,
-                            statusNotification("Blok ${status.tipHeight} · peerów ${status.peers}")
+                            statusNotification(WalletLanguage.format(this@NodeSyncService, R.string.p1_node_status, status.tipHeight, status.peers))
                         )
                         if (status.running) checkIncoming()
                         delay(15_000L)
@@ -91,7 +91,7 @@ class NodeSyncService : Service() {
         )
         return NotificationCompat.Builder(this, RUN_CHANNEL)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("Parano1c — węzeł aktywny")
+            .setContentTitle(WalletLanguage.string(this, R.string.p1_node_active))
             .setContentText(message)
             .setContentIntent(open)
             .setOngoing(true)
@@ -128,8 +128,8 @@ class NodeSyncService : Service() {
             )
             val notification = NotificationCompat.Builder(this, INCOMING_CHANNEL)
                 .setSmallIcon(R.mipmap.ic_launcher)
-                .setContentTitle("Parano1c — nowa wpłata")
-                .setContentText("+${WalletController.formatNoid(tx.amountMicronoid)} NOID · potwierdzona")
+                .setContentTitle(WalletLanguage.string(this, R.string.p1_incoming_payment))
+                .setContentText(WalletLanguage.format(this, R.string.p1_payment_confirmed, "+${WalletController.formatNoid(tx.amountMicronoid)}"))
                 .setContentIntent(open)
                 .setAutoCancel(true)
                 .build()
