@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0b0e16">
+<meta name="description" content="Parano1c is an independent, open-source Android wallet for Parano1d V2. Run a full node on your phone, manage NOID and verify payment receipts.">
+<title>Parano1c — Your keys. Your node. Your phone.</title>
+<style>
+:root{color-scheme:dark;--bg:#0b0e16;--panel:#151a26;--line:#2a3244;--text:#f0f0f4;--muted:#a9b1c3;--green:#39e67a;--cyan:#55d8f5}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:90px}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.65 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+a{color:inherit}
+.wrap{width:min(1120px,calc(100% - 40px));margin:auto}
+.skip{position:absolute;left:20px;top:-100px;background:var(--green);color:var(--bg);padding:12px;z-index:10}
+.skip:focus{top:10px}
+header{border-bottom:1px solid var(--line)}
+nav{display:flex;align-items:center;justify-content:space-between;gap:24px;padding:22px 0}
+.brand{text-decoration:none;font-size:24px;font-weight:850;letter-spacing:-1px}
+.brand span{color:var(--green)}
+.links{display:flex;gap:24px;flex-wrap:wrap;font-size:14px}
+.links a{text-decoration:none;color:var(--muted)}
+.links a:hover{color:var(--green)}
+.hero{display:grid;grid-template-columns:1.25fr 1fr;gap:70px;align-items:center;padding:100px 0 80px}
+.eyebrow{color:var(--green);font-size:12px;font-weight:750;letter-spacing:2px;text-transform:uppercase}
+h1{font-size:clamp(48px,6.5vw,82px);line-height:1.04;letter-spacing:-4px;margin:22px 0 28px}
+h1 span{color:var(--green)}
+h2{font-size:clamp(30px,4vw,46px);line-height:1.15;letter-spacing:-1.6px;margin:14px 0 24px}
+h3{font-size:20px;line-height:1.3;margin:16px 0 10px}
+p{margin:0 0 20px;color:var(--muted)}
+.intro{font-size:19px;max-width:540px}
+.actions{display:flex;flex-wrap:wrap;gap:12px;margin:30px 0 18px}
+.button{display:inline-flex;align-items:center;justify-content:center;min-height:48px;padding:12px 22px;border:1px solid var(--line);border-radius:8px;text-decoration:none;font-weight:700}
+.primary{background:var(--green);border-color:var(--green);color:#0b2114}
+.button:hover{border-color:var(--green)}
+.small{font-size:13px}
+.visual{position:relative;min-height:420px;display:grid;place-items:center;background:radial-gradient(ellipse,#39e67a16,transparent 68%)}
+.orbit{width:340px;height:340px;border:1px solid #39e67a35;border-radius:50%;position:absolute}
+.orbit:before{content:"";position:absolute;inset:35px;border:1px dashed #55d8f540;border-radius:50%}
+.phone{position:relative;width:238px;background:#0f1320;border:7px solid #333a4b;border-radius:36px;padding:30px 18px 22px;box-shadow:0 30px 90px #0008;transform:rotate(-6deg)}
+.speaker{position:absolute;top:10px;left:calc(50% - 25px);width:50px;height:5px;border-radius:10px;background:#333a4b}
+.phone-name{font-size:18px;font-weight:800}
+.phone-name span{color:var(--green)}
+.phone-label{color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-top:25px}
+.phone-main{font-size:27px;font-weight:800;margin:8px 0 20px;line-height:1.2}
+.phone-row{padding:13px 0;border-top:1px solid var(--line);font-size:12px;display:flex;justify-content:space-between;gap:10px}
+.phone-row b{color:var(--green)}
+.phone-bottom{background:var(--green);color:#0b2114;border-radius:8px;text-align:center;font-size:12px;font-weight:800;padding:12px;margin-top:20px}
+.visual-caption{position:absolute;bottom:0;font-size:11px;color:var(--muted)}
+.strip{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+.strip div{padding:24px 20px}
+.strip div+div{border-left:1px solid var(--line)}
+.strip strong{display:block;font-size:22px}
+.strip span{color:var(--muted);font-size:13px}
+section{padding:80px 0;border-bottom:1px solid var(--line)}
+.section-intro{max-width:650px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:35px}
+.card{background:var(--panel);padding:28px;border:1px solid var(--line);border-radius:12px}
+.number{font:13px ui-monospace,monospace;color:var(--green)}
+.card p{font-size:15px;margin-bottom:0}
+.split{display:grid;grid-template-columns:1fr 1fr;gap:60px}
+.steps{margin:0;padding-left:24px;color:var(--muted)}
+.steps li{padding:0 0 18px 8px}
+.steps strong{color:var(--text)}
+.notice{padding:22px 26px;border-left:3px solid var(--green);background:var(--panel);margin-top:28px}
+.notice p{margin:0;font-size:14px}
+details{border-bottom:1px solid var(--line);padding:20px 0}
+summary{cursor:pointer;font-weight:650;padding-right:10px}
+details p{margin:16px 0 0;max-width:800px}
+.download{background:linear-gradient(135deg,#12241c,var(--bg))}
+footer{padding:30px 0}
+.footer-row{display:flex;justify-content:space-between;gap:25px;flex-wrap:wrap;font-size:13px;color:var(--muted)}
+:focus-visible{outline:3px solid var(--cyan);outline-offset:5px}
+@media(max-width:760px){
+nav{align-items:flex-start}.links{gap:10px 16px;justify-content:flex-end;max-width:240px}
+.hero{grid-template-columns:1fr;gap:25px;padding:60px 0 40px}
+h1{letter-spacing:-2.5px}.visual{min-height:370px}.orbit{width:300px;height:300px}
+.grid,.split{grid-template-columns:1fr}.split{gap:30px}
+.strip div{padding:20px 10px}.strip strong{font-size:18px}.strip span{font-size:12px}
+section{padding:55px 0}
+}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header>
+<nav class="wrap" aria-label="Main navigation">
+<a class="brand" href="#main">Parano<span>1c</span></a>
+<div class="links">
+<a href="#features">Features</a>
+<a href="#guide">Getting started</a>
+<a href="#faq">FAQ</a>
+<a href="#download">Download</a>
+</div>
+</nav>
+</header>
+<main id="main">
+<div class="wrap hero">
+<div>
+<div class="eyebrow">Independent Android wallet · Parano1d V2</div>
+<h1>Your keys.<br>Your node.<br><span>Your phone.</span></h1>
+<p class="intro">Manage NOID with an open-source wallet that runs a full node directly on your Android phone.</p>
+<p>Your phone connects to the peer-to-peer network and verifies blockchain state locally. You keep control of your master key.</p>
+<div class="actions">
+<a class="button primary" href="https://github.com/Aquacongas/Parano1c/releases/tag/v2.0.0">Download v2.0.0 ↗</a>
+<a class="button" href="https://github.com/Aquacongas/Parano1c/tree/v2">Explore the code ↗</a>
+</div>
+<p class="small">Android 8.0+ · ARM64 · Independent community project</p>
+</div>
+<div class="visual" role="img" aria-label="Illustration of a phone running a local NOID wallet and node">
+<div class="orbit"></div>
+<div class="phone">
+<div class="speaker"></div>
+<div class="phone-name">Parano<span>1c</span></div>
+<div class="phone-label">On your device</div>
+<div class="phone-main">Wallet.<br>Full node.<br>One app.</div>
+<div class="phone-row"><span>Master key</span><b>Local</b></div>
+<div class="phone-row"><span>Network</span><b>Peer-to-peer</b></div>
+<div class="phone-row"><span>Verification</span><b>On-device</b></div>
+<div class="phone-bottom">Your NOID. Your control.</div>
+</div>
+<span class="visual-caption">Concept illustration · not an app screenshot</span>
+</div>
+</div>
+<div class="wrap strip">
+<div><strong>Full node</strong><span>Runs directly on Android</span></div>
+<div><strong>18 languages</strong><span>Choose your interface</span></div>
+<div><strong>Open source</strong><span>Inspect the implementation</span></div>
+</div>
+
+<section id="features">
+<div class="wrap">
+<div class="section-intro">
+<div class="eyebrow">Built for everyday NOID</div>
+<h2>A wallet with verification built in.</h2>
+<p>Send and receive payments, manage your addresses and verify supported payment receipts from one application.</p>
+</div>
+<div class="grid">
+<article class="card"><span class="number">01 / OWNERSHIP</span><h3>Keys on your phone</h3><p>Your master key stays on your device. Back it up securely: there is no hosted account recovery.</p></article>
+<article class="card"><span class="number">02 / NETWORK</span><h3>A node in your pocket</h3><p>Run the Parano1d node locally and connect to network peers. Synchronization needs a working connection and time to catch up.</p></article>
+<article class="card"><span class="number">03 / ACCESS</span><h3>Six-digit PIN</h3><p>An app access lock with failed-attempt protection and automatic locking when returning to the app. The PIN is separate from master-key encryption.</p></article>
+<article class="card"><span class="number">04 / PAYMENTS</span><h3>Send, receive, track</h3><p>Use multiple derived addresses and a dedicated transactions screen. Available Balance covers all wallet addresses; Active Balance covers the selected address.</p></article>
+<article class="card"><span class="number">05 / RECEIPTS</span><h3>Check the proof</h3><p>Export supported confirmed payment receipts, share them and import receipts from other users. Verify Merkle proofs against your local canonical blockchain.</p></article>
+<article class="card"><span class="number">06 / LANGUAGE</span><h3>Make it familiar</h3><p>Choose from 18 interface languages during setup or change your language later in Settings.</p></article>
+</div>
+</div>
+</section>
+
+<section id="guide">
+<div class="wrap split">
+<div>
+<div class="eyebrow">Getting started</div>
+<h2>Set up. Back up.<br>Let it sync.</h2>
+<p>Parano1c is a full node. Your phone downloads and maintains local network state, so allow time and free storage for synchronization.</p>
+<div class="notice"><p><strong style="color:#ff5a68">Keep your master key private.</strong> Store a secure backup before updating, restoring or resetting your wallet. Never send it with a bug report.</p></div>
+</div>
+<ol class="steps">
+<li><strong>Download the signed APK.</strong><br>Use the GitHub release and verify it using the published checksums.</li>
+<li><strong>Create or restore your wallet.</strong><br>Choose a language, configure your PIN and securely back up your master key.</li>
+<li><strong>Connect and synchronize.</strong><br>Use a stable connection. Check peer connectivity and synchronization progress before relying on the displayed balance.</li>
+<li><strong>Receive NOID.</strong><br>Copy your receiving address and check it carefully before sending a small test payment.</li>
+<li><strong>Send NOID.</strong><br>Open Send, enter the recipient's address and amount, then carefully check the address, amount and fee before confirming.</li>
+</ol>
+</div>
+</section>
+
+<section id="faq">
+<div class="wrap">
+<div class="eyebrow">Know your wallet</div>
+<h2>A few things worth understanding.</h2>
+<details><summary>Is Parano1c an official Parano1d wallet?</summary><p>No. Parano1c is an independent, third-party, open-source project maintained by Aquacongas. It is developed separately from the official Parano1d team.</p></details>
+<details><summary>Does the wallet depend on a developer-hosted wallet server?</summary><p>No. The wallet runs its own node on your phone and connects to the peer-to-peer network. Network access and reachable peers are still required for synchronization and broadcasting transactions.</p></details>
+<details><summary>Can I paste a transaction ID into Receipt Import?</summary><p>Receipt Import accepts a payment receipt, not a bare transaction ID. A receipt contains proof material for verification. An exchange withdrawal may not include a compatible receipt, and importing a receipt does not credit your wallet balance.</p></details>
+<details><summary>Why can transaction history be incomplete after restoring?</summary><p>Historical transaction reconstruction after restoration is a known limitation. Transaction history and the balance derived from current blockchain state are different things. Missing history alone does not establish whether a payment was received.</p></details>
+<details><summary>What should I check if synchronization stops?</summary><p>Check your connection, peer connectivity and current synchronization progress. Keep the application open while troubleshooting. Some Android devices restrict background activity; on Xiaomi devices, check the app's battery restrictions and background autostart settings. Setting names vary by device.</p></details>
+<details><summary>Are notifications required to receive NOID?</summary><p>Notification permission controls visible alerts. Denying that permission does not itself prevent a blockchain payment from being sent to your address. The local node still needs to synchronize before the app can show the current wallet state.</p></details>
+<details><summary>How do I report a problem?</summary><p><a href="https://github.com/Aquacongas/Parano1c/issues">Open a GitHub issue</a> with your app version, phone model, Android version, steps to reproduce and current synchronization information. Include a transaction ID or relevant screenshots when useful. Never include your master key, PIN or signing keys.</p></details>
+</div>
+</section>
+
+<section class="download" id="download">
+<div class="wrap split">
+<div>
+<div class="eyebrow">Parano1c Android v2.0.0</div>
+<h2>Put your node<br>in your pocket.</h2>
+<p>For Android 8.0 or newer on ARM64 devices.<br>Android wallet v2.0.0 · Parano1d core v2.0.3.</p>
+<div class="actions">
+<a class="button primary" href="https://github.com/Aquacongas/Parano1c/releases/tag/v2.0.0">Get the APK ↗</a>
+<a class="button" href="https://github.com/Aquacongas/Parano1c">GitHub repository ↗</a>
+</div>
+<p class="small">Signed APK and SHA-256 / SHA-512 checksums available in the release.</p>
+</div>
+<div class="card">
+<span class="number">BEFORE YOU INSTALL</span>
+<h3>Active development. Real responsibility.</h3>
+<p>Parano1c is experimental software. Bugs, crashes, synchronization issues and unexpected behavior are possible. Back up your master key and start with a small test payment.</p>
+<p style="margin-top:18px">The six-digit PIN protects access to the app interface. It does not replace a secure master-key backup or wallet encryption.</p>
+</div>
+</div>
+</section>
+</main>
+<footer>
+<div class="wrap footer-row">
+<span>Parano1c · Independent development by Aquacongas</span>
+<a href="https://github.com/Aquacongas/Parano1c/issues">Report an issue ↗</a>
+</div>
+</footer>
+</body>
+</html>
