@@ -47,7 +47,7 @@ p{margin:0 0 20px;color:var(--muted)}
 .phone-row{padding:13px 0;border-top:1px solid var(--line);font-size:12px;display:flex;justify-content:space-between;gap:10px}
 .phone-row b{color:var(--green)}
 .phone-bottom{background:var(--green);color:#0b2114;border-radius:8px;text-align:center;font-size:12px;font-weight:800;padding:12px;margin-top:20px}
-.visual-caption{position:absolute;bottom:0;font-size:11px;color:var(--muted)}
+.visual-caption{position:static;display:block;margin-top:12px;font-size:11px;color:var(--muted)}
 .strip{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
 .strip div{padding:24px 20px}
 .strip div+div{border-left:1px solid var(--line)}
@@ -110,19 +110,12 @@ section{padding:55px 0}
 </div>
 <p class="small">Android 8.0+ · ARM64 · Independent community project</p>
 </div>
-<div class="visual" role="img" aria-label="Illustration of a phone running a local NOID wallet and node">
-<div class="orbit"></div>
-<div class="phone">
-<div class="speaker"></div>
-<div class="phone-name">Parano<span>1c</span></div>
-<div class="phone-label">On your device</div>
-<div class="phone-main">Wallet.<br>Full node.<br>One app.</div>
-<div class="phone-row"><span>Master key</span><b>Local</b></div>
-<div class="phone-row"><span>Network</span><b>Peer-to-peer</b></div>
-<div class="phone-row"><span>Verification</span><b>On-device</b></div>
-<div class="phone-bottom">Your NOID. Your control.</div>
-</div>
-<span class="visual-caption">Concept illustration · not an app screenshot</span>
+<div class="visual">
+<img src="./wallet-preview.png"
+     alt="Parano1c wallet preview with a sample balance of 600 NOID"
+     style="display:block;width:min(100%,320px);height:auto"
+     fetchpriority="high">
+<span class="visual-caption">Wallet preview · sample balance</span>
 </div>
 </div>
 <div class="wrap strip">
