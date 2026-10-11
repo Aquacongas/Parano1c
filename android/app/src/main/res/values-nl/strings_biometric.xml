@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">VERGRENDELING</string>
+    <string name="p1_ui_biometric_unlock">BIOMETRISCH ONTGRENDELEN</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Ontgrendel met biometrie. Uw zescijferige pincode blijft beschikbaar.</string>
+    <string name="p1_ui_enable_biometrics">BIOMETRIE INSCHAKELEN</string>
+    <string name="p1_ui_disable_biometrics">BIOMETRIE UITSCHAKELEN</string>
+    <string name="p1_ui_unlock_with_biometrics">Ontgrendelen met biometrie</string>
+    <string name="p1_ui_enable_biometric_unlock">Biometrisch ontgrendelen inschakelen</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Verifieer met uw vingerafdruk of ondersteunde biometrie</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Biometrie niet beschikbaar. Gebruik uw pincode of registreer een vingerafdruk in de Android-instellingen.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Biometrische verificatie niet beschikbaar. Gebruik uw pincode en schakel biometrie opnieuw in bij Instellingen.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Biometrie kon niet worden uitgeschakeld.</string>
+    <string name="p1_ui_use_pin">Pincode gebruiken</string>
+</resources>

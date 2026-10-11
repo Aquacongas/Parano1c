@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">SPERRE</string>
+    <string name="p1_ui_biometric_unlock">BIOMETRISCHES ENTSPERREN</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Mit Biometrie entsperren. Ihre sechsstellige PIN bleibt verfügbar.</string>
+    <string name="p1_ui_enable_biometrics">BIOMETRIE AKTIVIEREN</string>
+    <string name="p1_ui_disable_biometrics">BIOMETRIE DEAKTIVIEREN</string>
+    <string name="p1_ui_unlock_with_biometrics">Mit Biometrie entsperren</string>
+    <string name="p1_ui_enable_biometric_unlock">Biometrisches Entsperren aktivieren</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Mit Fingerabdruck oder unterstützter Biometrie authentifizieren</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Biometrie nicht verfügbar. PIN verwenden oder einen Fingerabdruck in den Android-Einstellungen registrieren.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Biometrische Prüfung nicht verfügbar. PIN verwenden und Biometrie in den Einstellungen erneut aktivieren.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Biometrie konnte nicht deaktiviert werden.</string>
+    <string name="p1_ui_use_pin">PIN verwenden</string>
+</resources>

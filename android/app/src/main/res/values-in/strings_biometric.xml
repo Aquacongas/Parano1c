@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">KUNCI</string>
+    <string name="p1_ui_biometric_unlock">BUKA KUNCI BIOMETRIK</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Buka kunci dengan biometrik. PIN enam digit Anda tetap tersedia.</string>
+    <string name="p1_ui_enable_biometrics">AKTIFKAN BIOMETRIK</string>
+    <string name="p1_ui_disable_biometrics">NONAKTIFKAN BIOMETRIK</string>
+    <string name="p1_ui_unlock_with_biometrics">Buka kunci dengan biometrik</string>
+    <string name="p1_ui_enable_biometric_unlock">Aktifkan buka kunci biometrik</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Autentikasi dengan sidik jari atau biometrik yang didukung</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Biometrik tidak tersedia. Gunakan PIN atau daftarkan sidik jari di Setelan Android.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Verifikasi biometrik tidak tersedia. Gunakan PIN dan aktifkan kembali biometrik di Setelan.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Tidak dapat menonaktifkan biometrik.</string>
+    <string name="p1_ui_use_pin">Gunakan PIN</string>
+    <string name="p1_ui_cancel">Batal</string>
+</resources>

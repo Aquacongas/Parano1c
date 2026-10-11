@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">鎖定</string>
+    <string name="p1_ui_biometric_unlock">生物辨識解鎖</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">使用生物辨識解鎖。您仍可使用六位 PIN 碼。</string>
+    <string name="p1_ui_enable_biometrics">啟用生物辨識</string>
+    <string name="p1_ui_disable_biometrics">停用生物辨識</string>
+    <string name="p1_ui_unlock_with_biometrics">使用生物辨識解鎖</string>
+    <string name="p1_ui_enable_biometric_unlock">啟用生物辨識解鎖</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">使用指紋或支援的生物辨識方式驗證身分</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">生物辨識無法使用。請使用 PIN 碼，或在 Android 設定中登錄指紋。</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">生物辨識驗證無法使用。請使用 PIN 碼，並在設定中重新啟用生物辨識。</string>
+    <string name="p1_ui_could_not_disable_biometrics">無法停用生物辨識。</string>
+    <string name="p1_ui_use_pin">使用 PIN 碼</string>
+</resources>

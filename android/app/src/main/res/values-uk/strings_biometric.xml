@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">БЛОКУВАННЯ</string>
+    <string name="p1_ui_biometric_unlock">БІОМЕТРИЧНЕ РОЗБЛОКУВАННЯ</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Розблоковуйте за біометрією. Ваш шестизначний PIN залишається доступним.</string>
+    <string name="p1_ui_enable_biometrics">УВІМКНУТИ БІОМЕТРІЮ</string>
+    <string name="p1_ui_disable_biometrics">ВИМКНУТИ БІОМЕТРІЮ</string>
+    <string name="p1_ui_unlock_with_biometrics">Розблокувати за біометрією</string>
+    <string name="p1_ui_enable_biometric_unlock">Увімкнути біометричне розблокування</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Підтвердьте особу відбитком пальця або підтримуваною біометрією</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Біометрія недоступна. Скористайтеся PIN або додайте відбиток пальця в налаштуваннях Android.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Біометрична перевірка недоступна. Скористайтеся PIN і знову увімкніть біометрію в налаштуваннях.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Не вдалося вимкнути біометрію.</string>
+    <string name="p1_ui_use_pin">Скористатися PIN</string>
+</resources>

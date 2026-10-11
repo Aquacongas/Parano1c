@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">BLOKADA</string>
+    <string name="p1_ui_biometric_unlock">ODBLOKOWANIE BIOMETRYCZNE</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Odblokuj biometrią. Twój sześciocyfrowy PIN pozostaje dostępny.</string>
+    <string name="p1_ui_enable_biometrics">WŁĄCZ BIOMETRIĘ</string>
+    <string name="p1_ui_disable_biometrics">WYŁĄCZ BIOMETRIĘ</string>
+    <string name="p1_ui_unlock_with_biometrics">Odblokuj biometrią</string>
+    <string name="p1_ui_enable_biometric_unlock">Włącz odblokowanie biometryczne</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Potwierdź tożsamość odciskiem palca lub obsługiwaną biometrią</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Biometria niedostępna. Użyj PIN-u lub dodaj odcisk palca w ustawieniach Androida.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Weryfikacja biometryczna niedostępna. Użyj PIN-u i ponownie włącz biometrię w ustawieniach.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Nie udało się wyłączyć biometrii.</string>
+    <string name="p1_ui_use_pin">Użyj PIN-u</string>
+</resources>

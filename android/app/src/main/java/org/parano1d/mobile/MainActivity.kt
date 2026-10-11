@@ -1,11 +1,11 @@
 package org.parano1d.mobile
 
 import android.os.Bundle
-import androidx.activity.ComponentActivity
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.compose.setContent
 
 class MainActivity :
-    ComponentActivity() {
+    FragmentActivity() {
 
     override fun onCreate(
         savedInstanceState: Bundle?

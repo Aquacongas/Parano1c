@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">잠금</string>
+    <string name="p1_ui_biometric_unlock">생체 인증 잠금 해제</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">생체 인증으로 잠금을 해제하세요. 6자리 PIN도 계속 사용할 수 있습니다.</string>
+    <string name="p1_ui_enable_biometrics">생체 인증 활성화</string>
+    <string name="p1_ui_disable_biometrics">생체 인증 비활성화</string>
+    <string name="p1_ui_unlock_with_biometrics">생체 인증으로 잠금 해제</string>
+    <string name="p1_ui_enable_biometric_unlock">생체 인증 잠금 해제 활성화</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">지문 또는 지원되는 생체 인증으로 인증하세요</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">생체 인증을 사용할 수 없습니다. PIN을 사용하거나 Android 설정에서 지문을 등록하세요.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">생체 인증을 사용할 수 없습니다. PIN을 사용하고 설정에서 생체 인증을 다시 활성화하세요.</string>
+    <string name="p1_ui_could_not_disable_biometrics">생체 인증을 비활성화하지 못했습니다.</string>
+    <string name="p1_ui_use_pin">PIN 사용</string>
+</resources>

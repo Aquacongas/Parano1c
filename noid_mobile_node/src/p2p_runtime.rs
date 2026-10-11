@@ -2767,6 +2767,39 @@ impl MobileP2PRuntime {
                         anyhow::anyhow!("embedded HistoryStep verifier unavailable")
                     })?;
 
+                android_sync_log("FORK ORIGIN ENSURE BEGIN");
+
+                if let Err(error) = crate::origin_recovery::ensure_terminal_origin(
+                    &history_runtime,
+                    &terminal_bytes,
+                    from,
+                    &self.network.cmd_tx,
+                )
+                .await
+                {
+                    android_sync_log(format!("FORK ORIGIN ENSURE FAILED: {error}"));
+
+                    let _ = validated_headers.discard();
+                    self.snapshot_offer.lock().await.take();
+
+                    let mut stage = self.bootstrap.lock().await;
+                    if matches!(
+                        *stage,
+                        MobileBootstrapStage::WaitingTerminal {
+                            generation: active_generation,
+                            peer: active_peer,
+                            ..
+                        } if active_generation == generation && active_peer == from
+                    ) {
+                        *stage = MobileBootstrapStage::Idle;
+                        publish_mobile_sync_phase(0);
+                    }
+
+                    anyhow::bail!("authenticate mobile snapshot fork origin: {error}");
+                }
+
+                android_sync_log("FORK ORIGIN ENSURE OK");
+
                 android_sync_log("HISTORY VERIFY BEGIN");
 
                 let verified_boundary = {

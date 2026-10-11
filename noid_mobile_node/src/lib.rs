@@ -28,6 +28,8 @@ use noid_wallet::{SharedWallet, WalletState};
 
 use tokio::sync::RwLock;
 
+mod origin_recovery;
+
 pub mod p2p_runtime;
 pub mod p2p_startup;
 pub mod send;

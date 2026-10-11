@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">القفل</string>
+    <string name="p1_ui_biometric_unlock">فتح القفل بالبصمة</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">افتح القفل بالقياسات الحيوية. يظل رمز PIN المكوّن من ستة أرقام متاحًا.</string>
+    <string name="p1_ui_enable_biometrics">تفعيل القياسات الحيوية</string>
+    <string name="p1_ui_disable_biometrics">تعطيل القياسات الحيوية</string>
+    <string name="p1_ui_unlock_with_biometrics">فتح القفل بالقياسات الحيوية</string>
+    <string name="p1_ui_enable_biometric_unlock">تفعيل فتح القفل بالقياسات الحيوية</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">تحقق من هويتك بالبصمة أو القياسات الحيوية المدعومة</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">القياسات الحيوية غير متاحة. استخدم PIN أو سجّل بصمة إصبع في إعدادات Android.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">التحقق بالقياسات الحيوية غير متاح. استخدم PIN وأعد تفعيل القياسات الحيوية في الإعدادات.</string>
+    <string name="p1_ui_could_not_disable_biometrics">تعذّر تعطيل القياسات الحيوية.</string>
+    <string name="p1_ui_use_pin">استخدام PIN</string>
+</resources>

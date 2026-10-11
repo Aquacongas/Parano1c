@@ -26,7 +26,7 @@ import javax.crypto.Mac
 import javax.crypto.SecretKey
 
 /** UI access PIN. Not a wallet seed/password, and not a substitute for wallet encryption. */
-private object PinStore {
+internal object PinStore {
     private const val PREF = "parano1c_app_pin_v1"
     private const val ALIAS = "parano1c_app_pin_hmac_v1"
     private const val HEADER = "Parano1c UI PIN V1|"
@@ -109,6 +109,13 @@ internal fun WalletPinGate(content: @Composable () -> Unit) {
         }
         activity.lifecycle.addObserver(observer)
         onDispose { activity.lifecycle.removeObserver(observer) }
+    }
+
+    val requestBiometric = rememberWalletBiometricUnlock(unlocked) {
+        typed = ""
+        first = ""
+        message = ""
+        unlocked = true
     }
 
     if (unlocked) {
@@ -202,6 +209,11 @@ internal fun WalletPinGate(content: @Composable () -> Unit) {
                     }
                 }
             ) { Text(if (!hasPin && first.isEmpty()) t("CONTINUE") else t("CONFIRM")) }
+            if (hasPin && WalletBiometricStore.enabled(ctx)) {
+                TextButton(onClick = { requestBiometric() }) {
+                    Text(WalletLanguage.uiString("Unlock with biometrics"), color = ParanoGreen)
+                }
+            }
             if (!hasPin && first.isNotEmpty()) {
                 TextButton(onClick = { first = ""; typed = ""; message = "" }) {
                     Text(t("START OVER"))

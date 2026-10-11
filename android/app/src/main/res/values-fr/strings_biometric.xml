@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">VERROUILLAGE</string>
+    <string name="p1_ui_biometric_unlock">DÉVERROUILLAGE BIOMÉTRIQUE</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Déverrouillez par biométrie. Votre PIN à six chiffres reste disponible.</string>
+    <string name="p1_ui_enable_biometrics">ACTIVER LA BIOMÉTRIE</string>
+    <string name="p1_ui_disable_biometrics">DÉSACTIVER LA BIOMÉTRIE</string>
+    <string name="p1_ui_unlock_with_biometrics">Déverrouiller par biométrie</string>
+    <string name="p1_ui_enable_biometric_unlock">Activer le déverrouillage biométrique</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Utilisez votre empreinte ou une biométrie compatible</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Biométrie indisponible. Utilisez le PIN ou ajoutez une empreinte dans les paramètres Android.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Vérification biométrique indisponible. Utilisez le PIN et réactivez la biométrie dans les paramètres.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Impossible de désactiver la biométrie.</string>
+    <string name="p1_ui_use_pin">Utiliser le PIN</string>
+</resources>

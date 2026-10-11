@@ -2647,6 +2647,50 @@ private fun ReceiveDialog(
 }
 
 @Composable
+internal fun WalletSafetyCard(
+    enabled: Boolean,
+    error: String,
+    onToggle: () -> Unit
+) {
+    Spacer(Modifier.height(18.dp))
+    TerminalCard(accent = Yellow) {
+        AccentLabel(
+            text = WalletLanguage.uiString("LOCK"),
+            accent = Yellow
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            WalletLanguage.uiString("BIOMETRIC UNLOCK"),
+            color = TextMain,
+            fontFamily = Mono,
+            fontWeight = FontWeight.Bold,
+            fontSize = 13.sp
+        )
+        Spacer(Modifier.height(6.dp))
+        Text(
+            WalletLanguage.uiString(
+                "Unlock with biometrics. Your six-digit PIN remains available."
+            ),
+            color = Muted,
+            fontFamily = Mono,
+            fontSize = 10.sp
+        )
+        Spacer(Modifier.height(14.dp))
+        AccentButton(
+            text = WalletLanguage.uiString(
+                if (enabled) "DISABLE BIOMETRICS" else "ENABLE BIOMETRICS"
+            ),
+            accent = Yellow,
+            onClick = onToggle
+        )
+        if (error.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            ErrorText(error)
+        }
+    }
+}
+
+@Composable
 private fun SettingsScreen(
     context: Context,
     controller: WalletController,
@@ -2734,6 +2778,7 @@ private fun SettingsScreen(
         )
 
         WalletLanguageSetting()
+        WalletBiometricSetting()
 
         Spacer(
             Modifier.height(18.dp)
@@ -2825,7 +2870,7 @@ private fun SettingsScreen(
             )
 
             Text(
-                WalletLanguage.uiString("SUPPORT PARANO1D"),
+                "SUPPORT PARANO1C",
                 color = TextMain,
                 fontFamily = Mono,
                 fontWeight =

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">लॉक</string>
+    <string name="p1_ui_biometric_unlock">बायोमेट्रिक अनलॉक</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">बायोमेट्रिक्स से अनलॉक करें। आपका छह अंकों का PIN भी उपलब्ध रहेगा।</string>
+    <string name="p1_ui_enable_biometrics">बायोमेट्रिक्स चालू करें</string>
+    <string name="p1_ui_disable_biometrics">बायोमेट्रिक्स बंद करें</string>
+    <string name="p1_ui_unlock_with_biometrics">बायोमेट्रिक्स से अनलॉक करें</string>
+    <string name="p1_ui_enable_biometric_unlock">बायोमेट्रिक अनलॉक चालू करें</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">फिंगरप्रिंट या समर्थित बायोमेट्रिक्स से पहचान सत्यापित करें</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">बायोमेट्रिक्स उपलब्ध नहीं है। PIN इस्तेमाल करें या Android सेटिंग में फिंगरप्रिंट जोड़ें।</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">बायोमेट्रिक सत्यापन उपलब्ध नहीं है। PIN इस्तेमाल करें और सेटिंग में बायोमेट्रिक्स फिर चालू करें।</string>
+    <string name="p1_ui_could_not_disable_biometrics">बायोमेट्रिक्स बंद नहीं हो सका।</string>
+    <string name="p1_ui_use_pin">PIN इस्तेमाल करें</string>
+</resources>

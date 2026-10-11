@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">ロック</string>
+    <string name="p1_ui_biometric_unlock">生体認証でロック解除</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">生体認証でロックを解除します。6桁のPINも引き続き使用できます。</string>
+    <string name="p1_ui_enable_biometrics">生体認証を有効にする</string>
+    <string name="p1_ui_disable_biometrics">生体認証を無効にする</string>
+    <string name="p1_ui_unlock_with_biometrics">生体認証でロック解除</string>
+    <string name="p1_ui_enable_biometric_unlock">生体認証によるロック解除を有効にする</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">指紋または対応する生体認証で本人確認してください</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">生体認証を利用できません。PINを使用するか、Androidの設定で指紋を登録してください。</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">生体認証による確認を利用できません。PINを使用し、設定で生体認証を再度有効にしてください。</string>
+    <string name="p1_ui_could_not_disable_biometrics">生体認証を無効にできませんでした。</string>
+    <string name="p1_ui_use_pin">PINを使用</string>
+</resources>

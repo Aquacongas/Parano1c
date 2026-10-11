@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="p1_ui_lock">KİLİT</string>
+    <string name="p1_ui_biometric_unlock">BİYOMETRİK KİLİT AÇMA</string>
+    <string name="p1_ui_unlock_with_biometrics_your_six_digit_pin_remains_available">Biyometri ile kilidi açın. Altı haneli PIN\'inizi kullanmaya devam edebilirsiniz.</string>
+    <string name="p1_ui_enable_biometrics">BİYOMETRİYİ ETKİNLEŞTİR</string>
+    <string name="p1_ui_disable_biometrics">BİYOMETRİYİ DEVRE DIŞI BIRAK</string>
+    <string name="p1_ui_unlock_with_biometrics">Biyometri ile kilidi aç</string>
+    <string name="p1_ui_enable_biometric_unlock">Biyometrik kilit açmayı etkinleştir</string>
+    <string name="p1_ui_authenticate_using_your_fingerprint_or_supported_biometrics">Parmak izinizi veya desteklenen biyometriyi kullanın</string>
+    <string name="p1_ui_biometrics_unavailable_use_pin_or_enroll_a_fingerprint_in_android">Biyometri kullanılamıyor. PIN kullanın veya Android Ayarları\'nda parmak izi kaydedin.</string>
+    <string name="p1_ui_biometric_verification_unavailable_use_pin_and_enable_biometrics_">Biyometrik doğrulama kullanılamıyor. PIN kullanın ve Ayarlar\'dan biyometriyi yeniden etkinleştirin.</string>
+    <string name="p1_ui_could_not_disable_biometrics">Biyometri devre dışı bırakılamadı.</string>
+    <string name="p1_ui_use_pin">PIN kullan</string>
+</resources>
