@@ -113,7 +113,6 @@ impl MobileNodeRuntime {
             ChainView::from_mdbx(&chain_guard)
         };
 
-        let mempool = AsyncMempool::new(initial_view, MempoolConfig::default());
 
         // ------------------------------------------------------------
         // Full wallet
@@ -180,6 +179,18 @@ impl MobileNodeRuntime {
                 );
             }
         }
+
+        // Use the same authenticated V2 admission budgets as the desktop node.
+        let mut mempool_config = MempoolConfig::default();
+        if let Some(budgets) = history_step_runtime
+            .as_deref()
+            .and_then(|runtime| runtime.v2_admission_budgets())
+        {
+            mempool_config = mempool_config.with_v2_block_budgets(budgets);
+            tracing::info!("mobile mempool authenticated V2 budgets configured");
+        }
+
+        let mempool = AsyncMempool::new(initial_view, mempool_config);
 
         let apply_gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
@@ -547,6 +558,21 @@ impl MobileNodeRuntime {
     /// This is wallet-wide display history only; SEND still uses the selected
     /// active address exclusively.
     pub fn mobile_recent_transactions(&self, limit: usize) -> Result<Vec<MobileRecentTransaction>> {
+        self.mobile_recent_transactions_scoped(limit, false)
+    }
+
+    pub fn mobile_active_address_transactions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MobileRecentTransaction>> {
+        self.mobile_recent_transactions_scoped(limit, true)
+    }
+
+    fn mobile_recent_transactions_scoped(
+        &self,
+        limit: usize,
+        active_only: bool,
+    ) -> Result<Vec<MobileRecentTransaction>> {
         let guard = self
             .wallet
             .lock()
@@ -556,11 +582,24 @@ impl MobileNodeRuntime {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("wallet is not loaded"))?;
 
+        let active_address = wallet.active_address().to_bech32();
+        let limit = limit.min(if active_only { 5000 } else { 20 });
+
         Ok(wallet
             .history
             .iter()
             .rev()
-            .take(limit.min(20))
+            .filter(|entry| {
+                if !active_only {
+                    return true;
+                }
+                // Prefer the stored key index; use the address for legacy rows.
+                match entry.own_key_index {
+                    Some(index) => index == wallet.active_index,
+                    None => entry.own_address.as_deref() == Some(active_address.as_str()),
+                }
+            })
+            .take(limit)
             .map(|entry| MobileRecentTransaction {
                 txid: entry.tx_hash,
                 direction: entry.direction,

@@ -182,6 +182,19 @@ fun WalletApp(
     }
     var transactionLimit by remember { mutableStateOf(100) }
     var transactionLoading by remember { mutableStateOf(false) }
+    var addressChangeState by remember { mutableStateOf("LOADING") }
+    var addressChanging by remember { mutableStateOf(false) }
+    var walletInitiallyLoaded by remember { mutableStateOf(false) }
+    var sendingOperation by remember { mutableStateOf(false) }
+
+    val addressButtonState = when {
+        !walletInitiallyLoaded -> "LOADING"
+        sendingOperation || addressChangeState == "PENDING" -> "PENDING"
+        addressChanging -> "CHANGING"
+        else -> "CHANGE"
+    }
+
+
 
     var startupError by remember {
         mutableStateOf<String?>(null)
@@ -289,6 +302,7 @@ fun WalletApp(
         if (
             screen == AppScreen.Wallet ||
             screen == AppScreen.Settings ||
+            screen == AppScreen.Addresses ||
             screen == AppScreen.Transactions
         ) {
             while (true) {
@@ -312,6 +326,26 @@ fun WalletApp(
                     ) {
                         controller.walletOverview()
                     }
+
+                val readiness = withContext(Dispatchers.IO) {
+                    try {
+                        NativeNode.addressChangeState()
+                    } catch (_: Exception) {
+                        "LOADING"
+                    }
+                }
+
+                if (readiness == "PENDING") {
+                    addressChangeState = "PENDING"
+                } else if (
+                    readiness == "CHANGE" &&
+                    overview.error == null &&
+                    overview.addressCount > 0
+                ) {
+                    walletInitiallyLoaded = true
+                    addressChangeState = "CHANGE"
+                }
+                // LOADING is never restored after the initial successful load.
 
                 if (screen == AppScreen.Transactions) {
                     transactionLoading = true
@@ -408,6 +442,11 @@ fun WalletApp(
                 controller = controller,
                 node = node,
                 overview = overview,
+                addressButtonState = addressButtonState,
+                onSendingChanged = { sending ->
+                    sendingOperation = sending
+                    if (sending) addressChangeState = "PENDING"
+                },
                 startupError = startupError,
                 initialSendDestination =
                     pendingSendDestination,
@@ -445,6 +484,7 @@ fun WalletApp(
         AppScreen.Addresses ->
             AddressesScreen(
                 overview = overview,
+                addressButtonState = addressButtonState,
 
                 onBack = {
                     screen =
@@ -464,28 +504,31 @@ fun WalletApp(
                         }
                 },
 
-                onSelectAddress = {
-                    keyIndex ->
-
-                    kotlinx.coroutines.MainScope()
-                        .launch {
-                            overview =
-                                withContext(
-                                    Dispatchers.IO
-                                ) {
-                                    controller
-                                        .setActiveAddress(
-                                            keyIndex
-                                        )
+                onSelectAddress = { keyIndex ->
+                    if (addressButtonState == "CHANGE") {
+                        addressChanging = true
+                        kotlinx.coroutines.MainScope().launch {
+                            try {
+                                // Recheck readiness immediately before changing.
+                                val ready = withContext(Dispatchers.IO) {
+                                    NativeNode.addressChangeState()
                                 }
-
-                            if (
-                                overview.error == null
-                            ) {
-                                screen =
-                                    AppScreen.Wallet
+                                if (ready == "PENDING") {
+                                    addressChangeState = "PENDING"
+                                }
+                                if (ready == "CHANGE") {
+                                    overview = withContext(Dispatchers.IO) {
+                                        controller.setActiveAddress(keyIndex)
+                                    }
+                                    if (overview.error == null) {
+                                        screen = AppScreen.Wallet
+                                    }
+                                }
+                            } finally {
+                                addressChanging = false
                             }
                         }
+                    }
                 }
             )
 
@@ -959,6 +1002,8 @@ private fun WalletHome(
     controller: WalletController,
     node: NodeStatus,
     overview: WalletOverview,
+    addressButtonState: String,
+    onSendingChanged: (Boolean) -> Unit,
     startupError: String?,
     initialSendDestination: String?,
     onSendDestinationConsumed: () -> Unit,
@@ -1179,10 +1224,15 @@ private fun WalletHome(
                         }
 
                         CompactOutlineButton(
-                            text = WalletLanguage.uiString("CHANGE"),
+                            text = WalletLanguage.uiString(
+                                if (addressButtonState == "CHANGING")
+                                    "CHANGE" else addressButtonState
+                            ),
                             accent = Green,
-                            onClick =
-                                onAddresses
+                            enabled = addressButtonState == "CHANGE",
+                            onClick = {
+                                if (addressButtonState == "CHANGE") onAddresses()
+                            }
                         )
                     }
 
@@ -1343,6 +1393,7 @@ private fun WalletHome(
     if (sendDialog) {
         SendDialog(
             controller = controller,
+            onSendingChanged = onSendingChanged,
             initialDestination =
                 initialSendDestination
                     .orEmpty(),
@@ -1376,6 +1427,7 @@ private fun WalletHome(
 @Composable
 private fun AddressesScreen(
     overview: WalletOverview,
+    addressButtonState: String,
     onBack: () -> Unit,
     onNewAddress: () -> Unit,
     onSelectAddress: (Int) -> Unit
@@ -1509,6 +1561,7 @@ private fun AddressesScreen(
                     } else {
 
                         TextButton(
+                            enabled = addressButtonState == "CHANGE",
                             onClick = {
                                 onSelectAddress(
                                     item.keyIndex
@@ -1516,7 +1569,12 @@ private fun AddressesScreen(
                             }
                         ) {
                             Text(
-                                WalletLanguage.uiString("SELECT"),
+                                WalletLanguage.uiString(
+                                    if (
+                                        addressButtonState == "CHANGE" ||
+                                        addressButtonState == "CHANGING"
+                                    ) "SELECT" else addressButtonState
+                                ),
                                 color = Cyan,
                                 fontSize = 11.sp,
                                 fontWeight =
@@ -2025,18 +2083,15 @@ private fun RecentTransactionsCard(
                                     FontWeight.Bold
                             )
 
-                            if (tx.pending) {
-                                Spacer(
-                                    Modifier.width(7.dp)
-                                )
-
-                                Text(
-                                    WalletLanguage.uiString("PENDING"),
-                                    color = Yellow,
-                                    fontFamily = Mono,
-                                    fontSize = 8.sp
-                                )
-                            }
+                            Spacer(Modifier.width(7.dp))
+                            Text(
+                                WalletLanguage.uiString(
+                                    if (tx.pending) "PENDING" else "CONFIRMED"
+                                ),
+                                color = if (tx.pending) Yellow else Green,
+                                fontFamily = Mono,
+                                fontSize = 8.sp
+                            )
                         }
 
                         Spacer(
@@ -2130,6 +2185,7 @@ private fun RecentTransactionsCard(
 @Composable
 private fun SendDialog(
     controller: WalletController,
+    onSendingChanged: (Boolean) -> Unit,
     initialDestination: String = "",
     onDismiss: () -> Unit
 ) {
@@ -2154,6 +2210,10 @@ private fun SendDialog(
 
     var working by remember {
         mutableStateOf(false)
+    }
+
+    LaunchedEffect(working) {
+        onSendingChanged(working)
     }
 
     var result by remember {
@@ -3567,6 +3627,7 @@ private fun OutlineActionButton(
 private fun CompactOutlineButton(
     text: String,
     accent: Color,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Button(
@@ -3575,7 +3636,7 @@ private fun CompactOutlineButton(
                 .height(38.dp)
                 .border(
                     1.dp,
-                    accent,
+                    if (enabled) accent else Muted,
                     RoundedCornerShape(
                         7.dp
                     )
@@ -3592,12 +3653,13 @@ private fun CompactOutlineButton(
                     contentColor =
                         accent
                 ),
+        enabled = enabled,
         onClick =
             onClick
     ) {
         Text(
             text,
-            color = accent,
+            color = if (enabled) accent else Muted,
             fontFamily = Mono,
             fontWeight =
                 FontWeight.Bold,

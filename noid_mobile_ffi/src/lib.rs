@@ -1266,6 +1266,13 @@ fn send_all_inner(destination: String) -> SendResult {
 }
 
 fn recent_transactions_inner(limit: usize) -> RecentTransactionsResult {
+    recent_transactions_scoped_inner(limit, false)
+}
+
+fn recent_transactions_scoped_inner(
+    limit: usize,
+    active_only: bool,
+) -> RecentTransactionsResult {
     let node = match running_mobile_node() {
         Ok(node) => node,
         Err(error) => {
@@ -1277,7 +1284,13 @@ fn recent_transactions_inner(limit: usize) -> RecentTransactionsResult {
         }
     };
 
-    match node.mobile_recent_transactions(limit) {
+    let result = if active_only {
+        node.mobile_active_address_transactions(limit)
+    } else {
+        node.mobile_recent_transactions(limit)
+    };
+
+    match result {
         Ok(items) => RecentTransactionsResult {
             ok: true,
             transactions: items
@@ -1330,6 +1343,62 @@ pub extern "system" fn Java_org_parano1d_mobile_NativeNode_sendAll(
     };
 
     java_string(&mut env, json(&send_all_inner(destination)))
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_parano1d_mobile_NativeNode_activeAddressTransactions(
+    mut env: JNIEnv,
+    _class: JClass,
+    limit: jint,
+) -> jstring {
+    let limit = if limit <= 0 {
+        5usize
+    } else {
+        usize::try_from(limit).unwrap_or(5).min(5000)
+    };
+
+    java_string(
+        &mut env,
+        json(&recent_transactions_scoped_inner(limit, true)),
+    )
+}
+
+// Read readiness without waiting for wallet or canonical-state locks.
+fn address_change_state_inner() -> &'static str {
+    let Ok(node) = running_mobile_node() else {
+        return "LOADING";
+    };
+
+    {
+        let Ok(guard) = node.wallet.try_lock() else {
+            return "LOADING";
+        };
+        let Some(wallet) = guard.as_ref() else {
+            return "LOADING";
+        };
+        if wallet.has_pending_activity() {
+            return "PENDING";
+        }
+    }
+
+    let status = noid_mobile_node::p2p_runtime::mobile_p2p_status();
+    if status.syncing || status.phase.to_string() != "SYNCED" {
+        return "LOADING";
+    }
+
+    if node.apply_gate.try_lock().is_err() {
+        return "LOADING";
+    }
+
+    "CHANGE"
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_parano1d_mobile_NativeNode_addressChangeState(
+    mut env: JNIEnv,
+    _class: JClass,
+) -> jstring {
+    java_string(&mut env, address_change_state_inner().to_owned())
 }
 
 #[no_mangle]

@@ -104,7 +104,7 @@ class NodeSyncService : Service() {
         if (wallet.address.isBlank() || wallet.error != null) return
         val status = controller.status()
         if (status.tipHeight <= 0) return
-        val transactions = controller.recentTransactions(100)
+        val transactions = controller.recentTransactions(100, activeAddressOnly = false)
         val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
         // Use wallet identity to avoid stale notifications across account changes.
         val identity = wallet.address

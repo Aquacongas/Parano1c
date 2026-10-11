@@ -328,15 +328,17 @@ class WalletController(
         JSONObject(NativeNode.receipt(txid))
 
     fun recentTransactions(
-        limit: Int = 5
+        limit: Int = 5,
+        activeAddressOnly: Boolean = true
     ): List<RecentTransaction> {
         return try {
             val json =
                 JSONObject(
-                    NativeNode
-                        .recentTransactions(
-                            limit
-                        )
+                    if (activeAddressOnly) {
+                        NativeNode.activeAddressTransactions(limit)
+                    } else {
+                        NativeNode.recentTransactions(limit)
+                    }
                 )
 
             if (!json.optBoolean("ok", false)) {

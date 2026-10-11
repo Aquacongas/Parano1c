@@ -28,6 +28,8 @@ object NativeNode {
 
     external fun walletOverview(): String
 
+    external fun addressChangeState(): String
+
     external fun newAddress(): String
 
     external fun setActiveAddress(
@@ -48,6 +50,10 @@ object NativeNode {
     external fun receipt(txid: String): String
 
     external fun verifyReceiptHex(receipt: String): String
+
+    external fun activeAddressTransactions(
+        limit: Int
+    ): String
 
     external fun recentTransactions(
         limit: Int
